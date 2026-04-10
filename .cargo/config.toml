@@ -1,0 +1,12 @@
+# Build-time optimizations for the NOX mixnet node.
+#
+# target-cpu=native enables SIMD/AVX2/SHA-NI instructions for the local machine.
+# This makes binaries non-portable but significantly faster (~2-3x for SHA-256,
+# ~1.5x for field arithmetic).
+#
+# For CI or cross-compilation, override with RUSTFLAGS="" or remove this file.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=native"]
+
+[target.'cfg(target_arch = "aarch64")']
+rustflags = ["-C", "target-cpu=native"]

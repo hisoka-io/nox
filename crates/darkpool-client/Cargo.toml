@@ -1,0 +1,38 @@
+[package]
+name = "darkpool-client"
+version = "0.1.0"
+edition = "2021"
+authors = ["Hisoka IO"]
+description = "DarkPool SDK: notes, proofs, UTXO state, and transaction building"
+license = "Apache-2.0"
+repository = "https://github.com/hisoka-io/nox"
+
+[features]
+default = []
+mixnet = ["dep:nox-client"]
+
+[dependencies]
+darkpool-crypto = { path = "../darkpool-crypto" }
+nox-core = { path = "../nox-core" }
+nox-client = { path = "../nox-client", optional = true }
+ethers = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+ark-ff = { workspace = true }
+num-bigint = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+curve25519-dalek = { version = "4.1", features = ["rand_core"] }
+zeroize = { workspace = true }
+tokio = { workspace = true }
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+
+[dev-dependencies]
+darkpool-crypto = { path = "../darkpool-crypto" }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,64 @@
+[graph]
+targets = []
+all-features = false
+no-default-features = false
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Upstream advisories in transitive deps. Tracked, not blocking CI.
+ignore = [
+    "RUSTSEC-2025-0141", # bincode unmaintained (we use bincode v1, migration to v2 is non-trivial)
+    "RUSTSEC-2026-0007", # bytes integer overflow (in ethers transitive dep, awaiting upstream fix)
+    "RUSTSEC-2025-0057", # fxhash unmaintained (transitive via ethers)
+    "RUSTSEC-2024-0384", # instant unmaintained (transitive via ethers/libp2p)
+    "RUSTSEC-2024-0436", # paste unmaintained (transitive)
+    "RUSTSEC-2025-0009", # aes panic on overflow check (transitive, low practical risk)
+    "RUSTSEC-2025-0010", # ring <0.17 unmaintained (transitive via ethers/rustls)
+    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained (transitive)
+    "RUSTSEC-2026-0009", # DoS via stack exhaustion (transitive dep)
+    "RUSTSEC-2026-0049", # webpki CRL matching logic (transitive via noir_rs, limited impact)
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unlicense",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "OpenSSL",
+    "BSL-1.0",
+    "MPL-2.0",
+    "CC0-1.0",
+    "BlueOak-1.0.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[[licenses.clarify]]
+name = "noir_rs"
+expression = "MIT OR Apache-2.0"
+license-files = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    "https://github.com/zkpassport/noir_rs",
+]

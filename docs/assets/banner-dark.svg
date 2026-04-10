@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 200" fill="none">
+  <!-- background -->
+  <rect width="960" height="200" rx="12" fill="#0c0c0c"/>
+
+  <!-- subtle border -->
+  <rect width="960" height="200" rx="12" fill="none" stroke="#1a1a1a" stroke-width="1"/>
+
+  <!-- NOX wordmark -->
+  <text x="480" y="90" font-family="'SF Mono', 'Fira Code', 'JetBrains Mono', monospace" font-size="60" font-weight="700" fill="#ffffff" text-anchor="middle" letter-spacing="24">NOX</text>
+
+  <!-- node path: 4 dots with connecting lines -->
+  <circle cx="340" cy="120" r="4" fill="#aaa"/>
+  <circle cx="430" cy="120" r="4" fill="#aaa"/>
+  <circle cx="520" cy="120" r="4" fill="#aaa"/>
+  <circle cx="610" cy="120" r="4" fill="#aaa"/>
+
+  <line x1="344" y1="120" x2="426" y2="120" stroke="#888" stroke-width="1" stroke-dasharray="4 4"/>
+  <line x1="434" y1="120" x2="516" y2="120" stroke="#888" stroke-width="1" stroke-dasharray="4 4"/>
+  <line x1="524" y1="120" x2="606" y2="120" stroke="#888" stroke-width="1" stroke-dasharray="4 4"/>
+
+  <!-- node labels -->
+  <text x="340" y="140" font-family="'SF Mono', 'Fira Code', monospace" font-size="10" fill="#aaa" text-anchor="middle">entry</text>
+  <text x="430" y="140" font-family="'SF Mono', 'Fira Code', monospace" font-size="10" fill="#aaa" text-anchor="middle">mix</text>
+  <text x="520" y="140" font-family="'SF Mono', 'Fira Code', monospace" font-size="10" fill="#aaa" text-anchor="middle">exit</text>
+  <text x="610" y="140" font-family="'SF Mono', 'Fira Code', monospace" font-size="10" fill="#aaa" text-anchor="middle">chain</text>
+
+  <!-- tagline -->
+  <text x="480" y="172" font-family="'Inter', 'Helvetica Neue', sans-serif" font-size="12" fill="#bbb" text-anchor="middle" letter-spacing="5">MIXNET FOR PRIVATE DEFI</text>
+</svg>

@@ -1,0 +1,99 @@
+[package]
+name = "nox-sim"
+version = "0.1.0"
+edition = "2021"
+authors = ["Hisoka IO"]
+description = "Simulation and stress-testing binaries for NOX mixnet"
+license = "Apache-2.0"
+repository = "https://github.com/hisoka-io/nox"
+
+[features]
+default = []
+mock-prover = []
+dev-node = ["nox-node/dev-node"]
+hop-metrics = ["nox-node/hop-metrics", "nox-crypto/hop-metrics"]
+
+[dependencies]
+tokio = { version = "1.36", features = ["full", "tracing"] }
+tokio-util = { version = "0.7", features = ["time"] }
+futures = "0.3"
+async-trait = "0.1"
+anyhow = "1.0"
+bincode = "1.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+clap = { version = "4.4", features = ["derive", "env"] }
+hex = "0.4"
+rand = "0.8"
+x25519-dalek = { version = "2.0.0", features = ["static_secrets", "serde"] }
+parking_lot = "0.12"
+ethers = { version = "2.0", features = ["ws", "ipc", "openssl", "abigen"] }
+libp2p = { version = "0.53", features = ["tcp", "dns", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros", "tokio", "cbor"] }
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+axum = "0.7"
+reqwest = { version = "0.12", features = ["json"] }
+tempfile = "3.10"
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+darkpool-crypto = { path = "../darkpool-crypto" }
+darkpool-client = { path = "../darkpool-client", features = ["mixnet"] }
+nox-core = { path = "../nox-core" }
+nox-crypto = { path = "../nox-crypto" }
+nox-client = { path = "../nox-client" }
+nox-node = { path = "../nox-node" }
+nox-prover = { path = "../nox-prover" }
+nox-test-infra = { path = "../nox-test-infra" }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "micro_mainnet_sim"
+path = "src/bin/micro_mainnet_sim.rs"
+
+[[bin]]
+name = "nox_multi_sim"
+path = "src/bin/nox_multi_sim.rs"
+required-features = ["dev-node"]
+
+[[bin]]
+name = "stress_test"
+path = "src/bin/stress_test.rs"
+required-features = ["mock-prover"]
+
+[[bin]]
+name = "nox_bench"
+path = "src/bin/nox_bench.rs"
+required-features = ["dev-node"]
+
+[[bin]]
+name = "nox_multiprocess_bench"
+path = "src/bin/nox_multiprocess_bench.rs"
+required-features = ["dev-node"]
+
+[[bin]]
+name = "nox_realworld_bench"
+path = "src/bin/nox_realworld_bench.rs"
+required-features = ["dev-node"]
+
+[[bin]]
+name = "nox_privacy_analytics"
+path = "src/bin/nox_privacy_analytics.rs"
+required-features = ["dev-node"]
+
+[[bin]]
+name = "nox_economics"
+path = "src/bin/nox_economics.rs"
+required-features = ["dev-node"]
+
+[[bin]]
+name = "nox_mesh_server"
+path = "src/bin/nox_mesh_server.rs"
+required-features = ["dev-node"]
+
+[[bin]]
+name = "nox_dashboard_sim"
+path = "src/bin/nox_dashboard_sim.rs"
+required-features = ["dev-node"]

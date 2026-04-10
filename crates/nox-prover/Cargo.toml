@@ -1,0 +1,28 @@
+[package]
+name = "nox-prover"
+version = "0.1.0"
+edition = "2021"
+authors = ["Hisoka IO"]
+description = "ZK proof infrastructure: native Rust prover (noir_rs FFI) and Node.js fallback"
+license = "Apache-2.0"
+repository = "https://github.com/hisoka-io/nox"
+
+[features]
+default = ["native-prover"]
+mock-prover = []
+native-prover = ["noir_rs"]
+nodejs-prover = []
+
+[dependencies]
+nox-core = { path = "../nox-core" }
+noir_rs = { git = "https://github.com/zkpassport/noir_rs.git", tag = "v1.0.0-beta.19-1", features = ["barretenberg"], optional = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,50 @@
+# NOX Exit Node Configuration
+#
+# Exit nodes execute on-chain transactions on behalf of clients.
+# Requires an ETH wallet with gas funds and access to contract addresses.
+#
+# Secrets should be provided via environment variables:
+#   NOX_ROUTING_PRIVATE_KEY=<32-byte hex X25519 secret key>
+#   NOX_ETH_WALLET_PRIVATE_KEY=<hex private key for on-chain TX signing>
+
+eth_rpc_url = "https://mainnet.infura.io/v3/YOUR_KEY"
+oracle_url = "http://127.0.0.1:3000"
+chain_id = 1
+node_role = "exit"
+
+# Contract addresses (replace with deployed addresses)
+registry_contract_address = "0x0000000000000000000000000000000000000000"
+relayer_multicall_address = "0x0000000000000000000000000000000000000000"
+nox_reward_pool_address = "0x0000000000000000000000000000000000000000"
+
+# Economics
+min_gas_balance = "10000000000000000"    # 0.01 ETH - warn if wallet drops below
+min_profit_margin_percent = 10            # Reject TXs below 10% profit margin
+
+# P2P networking
+p2p_port = 9000
+p2p_listen_addr = "0.0.0.0"
+p2p_identity_path = "./data/p2p_id.key"
+
+min_pow_difficulty = 3
+metrics_port = 9090
+db_path = "./data/nox_db"
+
+# Block polling (12s = 1 Ethereum block)
+block_poll_interval_secs = 12
+
+# HTTP proxy (exit nodes serve HTTP requests routed through the mixnet)
+[http]
+request_timeout_secs = 10
+max_response_bytes = 1048576  # 1 MB
+allow_private_ips = false
+
+[network]
+max_connections = 1000
+max_connections_per_peer = 2
+
+[relayer]
+queue_size = 10000
+mix_delay_ms = 500.0
+cover_traffic_rate = 0.05
+drop_traffic_rate = 0.05

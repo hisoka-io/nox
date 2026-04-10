@@ -1,0 +1,57 @@
+services:
+  price-server:
+    image: ghcr.io/hisoka-io/nox:latest
+    container_name: nox-price-server
+    entrypoint: ["price_server"]
+    environment:
+      - PRICE_SERVER_PORT=15004
+      - PRICE_SERVER_BIND=0.0.0.0
+      - RUST_LOG=info
+    network_mode: host
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:15004/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  nox:
+    image: ghcr.io/hisoka-io/nox:latest
+    container_name: nox-node
+    network_mode: host
+    volumes:
+      - ./config.toml:/etc/nox/config.toml:ro
+      - nox-identity:/var/lib/nox/identity
+      - nox-data:/var/lib/nox/data
+      - nox-logs:/var/lib/nox/logs
+    env_file:
+      - .env
+    environment:
+      - RUST_LOG=debug
+      - NOX_LOG_DIR=/var/lib/nox/logs
+    depends_on:
+      price-server:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:15001/topology"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  nox-identity:
+  nox-data:
+  nox-logs:

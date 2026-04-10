@@ -1,0 +1,10 @@
+# NOX Configuration (3-tier system)
+#
+# Config loading order (later overrides earlier):
+#   1. Defaults -- NoxConfig::default() in crates/nox-node/src/config.rs
+#   2. This file -- optional TOML overrides (loaded via config crate, .required(false))
+#   3. Environment variables -- NOX_ prefix (e.g. NOX_RPC_URL, NOX_PRIVATE_KEY)
+#
+# This file is intentionally minimal. All fields have sensible defaults.
+# For production, use environment variables for secrets (private keys, RPC URLs).
+# See NoxConfig struct for all available fields and their defaults.

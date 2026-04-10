@@ -1,0 +1,93 @@
+# NOX nox-1 - entry node (3.236.170.102)
+# Arbitrum Sepolia testnet deployment
+# Generated: 2026-03-17
+
+eth_rpc_url = "https://sepolia-rollup.arbitrum.io/rpc"
+chain_id = 421614
+node_role = "relay"
+
+# Price oracle (local sidecar)
+oracle_url = "http://127.0.0.1:15004"
+
+# Private keys (overridden by env vars NOX__ROUTING_PRIVATE_KEY etc)
+routing_private_key = ""
+p2p_private_key = ""
+eth_wallet_private_key = ""
+
+# Contract addresses (Arb Sepolia 2026-03-17)
+registry_contract_address = "0x5e00d71a66804f58dAd2dFa6dA6857F6B1F1F4F2"
+relayer_multicall_address = "0xCc09Fe53bC36c0F34996A6AD3088E937Ef44C94E"
+nox_reward_pool_address = "0x89277aD4519d62AC9C26E431eb6236C30C893956"
+
+# Economics
+min_gas_balance = "10000000000000000"
+min_profit_margin_percent = 10
+
+# P2P networking
+p2p_port = 15000
+p2p_listen_addr = "0.0.0.0"
+p2p_identity_path = "/var/lib/nox/identity/p2p_id.key"
+
+# PoW difficulty
+min_pow_difficulty = 3
+
+# Admin / metrics
+metrics_port = 15001
+
+# Persistence
+db_path = "/var/lib/nox/data/db"
+
+# Block polling (5s for Arb Sepolia L2)
+block_poll_interval_secs = 5
+chain_start_block = 251066390
+
+# Max TX size (larger for L2)
+max_broadcast_tx_size = 262144
+
+# HTTP ingress (entry nodes accept Sphinx packets from clients)
+ingress_port = 15002
+response_prune_interval_secs = 60
+
+# Public topology API (seed node)
+topology_api_port = 15003
+
+# Topology bootstrap
+bootstrap_topology_urls = ["http://3.236.170.102:15003/topology", "http://18.214.97.24:15003/topology"]
+
+[http]
+request_timeout_secs = 120
+max_response_bytes = 134217728
+allow_private_ips = false
+
+[network]
+max_connections = 500
+max_connections_per_peer = 10
+ping_interval_secs = 15
+idle_connection_timeout_secs = 3600
+
+[network.rate_limit]
+burst_unknown = 500
+rate_unknown = 1000
+burst_trusted = 1000
+rate_trusted = 2000
+
+[relayer]
+queue_size = 10000
+worker_count = 2
+mix_delay_ms = 200.0
+cover_traffic_rate = 0.02
+drop_traffic_rate = 0.02
+replay_window = 3600
+bloom_capacity = 100000
+
+[relayer.fragmentation]
+timeout_seconds = 300
+prune_interval_seconds = 60
+
+# Token registry for profitability engine
+# Maps testnet token addresses to oracle price IDs
+[[tokens]]
+address = "0x50716a09f40cB9c1eA7aCA86255bAf02513B0238"
+symbol = "NOX-STK"
+decimals = 18
+price_id = "usd-coin"

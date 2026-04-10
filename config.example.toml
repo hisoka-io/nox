@@ -1,0 +1,180 @@
+# NOX Configuration Example
+#
+# Loads: defaults -> this file -> env vars (NOX_ prefix).
+# Later values override earlier ones. See docs/configuration.md.
+#
+# For nested fields, use NOX_ prefix with __ separator:
+#   NOX_NETWORK__MAX_CONNECTIONS=500
+#   NOX_RELAYER__MIX_DELAY_MS=200.0
+#
+# Use env vars for secrets in production.
+
+# ---
+# Core Settings
+# ---
+
+# Ethereum JSON-RPC endpoint
+eth_rpc_url = "http://127.0.0.1:8545"
+
+# Price oracle HTTP URL (for gas profitability calculations)
+oracle_url = "http://127.0.0.1:3000"
+
+# Ethereum chain ID (1=Mainnet, 11155111=Sepolia, 421614=Arb Sepolia)
+chain_id = 1
+
+# Node role: "relay", "exit", or "full"
+#   relay -- Entry/mix relay node (no wallet or chain execution needed)
+#   exit  -- Exit node (requires wallet, chain executor, transaction manager)
+#   full  -- All capabilities (default, backward compatible)
+node_role = "full"
+
+# ---
+# Contract Addresses
+# ---
+
+# NoxRegistry contract (topology + staking)
+registry_contract_address = "0x0000000000000000000000000000000000000000"
+
+# RelayerMulticall contract (batched TX execution)
+relayer_multicall_address = "0x0000000000000000000000000000000000000000"
+
+# NoxRewardPool contract (ZK gas payment event validation)
+nox_reward_pool_address = "0x0000000000000000000000000000000000000000"
+
+# ---
+# Identity & Keys (use env vars in production)
+# ---
+
+# X25519 routing key (hex-encoded, 32 bytes)
+# Set via: NOX_ROUTING_PRIVATE_KEY=<hex>
+routing_private_key = ""
+
+# Ed25519 P2P identity key (hex-encoded)
+# Set via: NOX_P2P_PRIVATE_KEY=<hex>
+# If empty, generates ephemeral or loads from p2p_identity_path
+p2p_private_key = ""
+
+# Path to persist the P2P identity key
+p2p_identity_path = "./data/p2p_id.key"
+
+# Secp256k1 wallet key for TX execution (exit/full nodes only)
+# Set via: NOX_ETH_WALLET_PRIVATE_KEY=<hex>
+eth_wallet_private_key = ""
+
+# ---
+# Networking
+# ---
+
+# libp2p listening port
+p2p_port = 9000
+p2p_listen_addr = "0.0.0.0"
+
+# Prometheus metrics (localhost-only admin API also serves /topology)
+metrics_port = 9090
+
+# Public topology API port (0 = disabled)
+topology_api_port = 0
+
+# HTTP ingress server port for external packet injection (0 = disabled)
+ingress_port = 0
+
+# Seed node URLs for topology bootstrap (faster than on-chain replay)
+bootstrap_topology_urls = []
+
+# ---
+# Economics
+# ---
+
+# Minimum ETH balance in wei before warning (default: 0.01 ETH)
+min_gas_balance = "10000000000000000"
+
+# Minimum profit margin (%) for TX execution
+min_profit_margin_percent = 10
+
+# ---
+# Relay Pipeline
+# ---
+
+# Minimum PoW difficulty for incoming packets (0-63)
+min_pow_difficulty = 3
+
+# Sled database directory
+db_path = "./data/nox_db"
+
+# Block polling interval in seconds
+block_poll_interval_secs = 12
+
+# Max signed broadcast TX size in bytes (default: 128 KB = Ethereum limit)
+max_broadcast_tx_size = 131072
+
+# SURB response buffer prune interval in seconds
+response_prune_interval_secs = 60
+
+# Skip production validations (testing only)
+benchmark_mode = false
+
+# ---
+# [network] -- P2P Connection Settings
+# ---
+
+[network]
+max_connections = 1000
+max_connections_per_peer = 2
+ping_interval_secs = 15
+ping_timeout_secs = 10
+gossip_heartbeat_secs = 1
+idle_connection_timeout_secs = 3600
+session_ttl_secs = 86400          # 24 hours
+
+# Graduated rate limiting (packets/sec by reputation tier)
+[network.rate_limit]
+burst_unknown = 50
+rate_unknown = 100
+burst_trusted = 100
+rate_trusted = 200
+burst_penalized = 10
+rate_penalized = 25
+violations_before_disconnect = 5
+violation_window_secs = 60
+trust_promotion_time_secs = 3600  # 1 hour of good behavior
+
+# Anti-Sybil subnet filtering
+[network.connection_filter]
+max_per_subnet = 50
+subnet_prefix_len = 24            # /24 for IPv4
+ipv6_subnet_prefix_len = 48       # /48 for IPv6
+
+# ---
+# [relayer] -- Relay Pipeline Settings
+# ---
+
+[relayer]
+queue_size = 10000
+# worker_count defaults to num_cpus (omit to auto-detect)
+replay_window = 3600              # Replay tag TTL in seconds
+
+# Poisson mix delay (ms). Higher = more anonymity, more latency.
+# Set to 0.0 to disable mixing (instant forwarding).
+mix_delay_ms = 500.0
+
+# Cover traffic rates (packets/sec). 0.0 = disabled.
+cover_traffic_rate = 0.05         # ~1 loop packet every 20s
+drop_traffic_rate = 0.05          # ~1 drop packet every 20s
+
+# Fragment reassembly limits
+[relayer.fragmentation]
+max_pending_bytes = 10485760      # 10 MB total buffer
+max_concurrent_messages = 50
+timeout_seconds = 300
+prune_interval_seconds = 60
+
+# ---
+# [http] -- HTTP Proxy (Exit Node)
+# ---
+
+[http]
+# Domain whitelist. null = open web (with SSRF protection).
+# allowed_domains = ["api.example.com"]
+allow_private_ips = false
+request_timeout_secs = 10
+max_response_bytes = 1048576      # 1 MB

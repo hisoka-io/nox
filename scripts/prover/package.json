@@ -1,0 +1,11 @@
+{
+  "name": "nox-prover-scripts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Node.js bridge scripts for ZK proof generation via bb.js",
+  "dependencies": {
+    "@aztec/bb.js": "4.0.0-nightly.20260218",
+    "@noir-lang/noir_js": "1.0.0-beta.19"
+  }
+}

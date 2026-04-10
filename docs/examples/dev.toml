@@ -1,0 +1,45 @@
+# NOX Development Configuration
+#
+# For local development and testing with Anvil.
+# Uses benchmark_mode=true to skip production validation checks:
+#   - Allows empty private keys (ephemeral keys generated at startup)
+#   - Allows zero-address contracts
+#   - Allows chain_id=0
+#
+# Start Anvil first: anvil --host 127.0.0.1 --port 8545
+
+eth_rpc_url = "http://127.0.0.1:8545"
+oracle_url = "http://127.0.0.1:3000"
+chain_id = 31337
+node_role = "full"
+benchmark_mode = true
+
+# Zero addresses - contracts will be deployed by test harness
+registry_contract_address = "0x0000000000000000000000000000000000000000"
+relayer_multicall_address = "0x0000000000000000000000000000000000000000"
+nox_reward_pool_address = "0x0000000000000000000000000000000000000000"
+
+# Local networking
+p2p_port = 9000
+p2p_listen_addr = "127.0.0.1"
+metrics_port = 9090
+db_path = "./data/dev_db"
+min_pow_difficulty = 1  # Low PoW for fast testing
+
+# Short delays for fast iteration
+block_poll_interval_secs = 1
+
+[network]
+max_connections = 100
+ping_interval_secs = 5
+
+[relayer]
+queue_size = 1000
+mix_delay_ms = 1.0          # Near-zero delay for fast testing
+cover_traffic_rate = 0.0     # No cover traffic in dev
+drop_traffic_rate = 0.0      # No drop traffic in dev
+replay_window = 60
+
+[http]
+allow_private_ips = true     # OK for local dev only
+request_timeout_secs = 5

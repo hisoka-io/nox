@@ -1,0 +1,36 @@
+[package]
+name = "nox-client"
+version = "0.1.0"
+edition = "2021"
+authors = ["Hisoka IO"]
+description = "NOX mixnet transport client: route selection, Sphinx packets, SURB management, topology sync"
+license = "Apache-2.0"
+repository = "https://github.com/hisoka-io/nox"
+
+[dependencies]
+nox-core = { path = "../nox-core" }
+nox-crypto = { path = "../nox-crypto" }
+ethers = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = "1.3"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+rand_distr = "0.4"
+rayon = "1.10"
+parking_lot = "0.12"
+x25519-dalek = { version = "2.0.0", features = ["static_secrets", "serde"] }
+reqwest = { version = "0.12", features = ["json"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

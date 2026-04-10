@@ -1,0 +1,162 @@
+[workspace]
+members = [
+    ".",
+    "crates/darkpool-crypto",
+    "crates/darkpool-client",
+    "crates/nox-core",
+    "crates/nox-crypto",
+    "crates/nox-client",
+    "crates/nox-node",
+    "crates/nox-test-infra",
+    "crates/nox-oracle",
+    "crates/nox-prover",
+    "crates/nox-sim",
+]
+
+[workspace.dependencies]
+tokio = { version = "1.36", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+thiserror = "2.0.17"
+tracing = "0.1"
+async-trait = "0.1"
+rand = "0.8"
+hex = "0.4"
+ethers = { version = "2.0", features = ["ws", "ipc", "openssl", "abigen"] }
+ark-ed-on-bn254 = "0.5.0"
+ark-ff = { version = "0.5.0", features = ["asm"] }
+ark-std = "0.5.0"
+ark-bn254 = "0.5.0"
+sha2 = { version = "0.10", features = ["asm"] }
+num-bigint = { version = "0.4", features = ["serde"] }
+taceo-poseidon2 = "0.2.0"
+parking_lot = "0.12"
+zeroize = { version = "1.8", features = ["derive"] }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+unused_self = "allow"
+unused_async = "allow"
+needless_pass_by_value = "allow"
+items_after_statements = "allow"
+unnecessary_wraps = "allow"
+return_self_not_must_use = "allow"
+doc_link_with_quotes = "allow"
+
+[package]
+name = "nox"
+version = "0.1.0"
+edition = "2021"
+authors = ["Hisoka IO"]
+description = "Sphinx mixnet relay node for Ethereum"
+license = "Apache-2.0"
+repository = "https://github.com/hisoka-io/nox"
+
+[features]
+default = []
+mock-prover = []
+dev-node = ["nox-node/dev-node"]
+hop-metrics = ["nox-node/hop-metrics", "nox-crypto/hop-metrics"]
+
+[dependencies]
+tokio = { version = "1.36", features = ["full", "tracing"] }
+futures = "0.3"
+async-trait = "0.1"
+thiserror = "2.0.17"
+anyhow = "1.0"
+bincode = "1.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+clap = { version = "4.4", features = ["derive", "env"] }
+hex = "0.4"
+rand = "0.8"
+x25519-dalek = { version = "2.0.0", features = ["static_secrets", "serde"] }
+parking_lot = "0.12"
+chrono = { version = "0.4", features = ["serde"] }
+ethers = { version = "2.0", features = ["ws", "ipc", "openssl", "abigen"] }
+libp2p = { version = "0.53", features = ["tcp", "dns", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros", "tokio", "cbor"] }
+axum = "0.7"
+tempfile = "3.10"
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+nox-node = { path = "crates/nox-node" }
+nox-oracle = { path = "crates/nox-oracle" }
+
+
+[dev-dependencies]
+darkpool-crypto = { path = "crates/darkpool-crypto" }
+darkpool-client = { path = "crates/darkpool-client", features = ["mixnet"] }
+nox-core = { path = "crates/nox-core" }
+nox-crypto = { path = "crates/nox-crypto" }
+nox-client = { path = "crates/nox-client" }
+nox-prover = { path = "crates/nox-prover" }
+nox-test-infra = { path = "crates/nox-test-infra" }
+mockall = "0.12"
+sha2 = { workspace = true }
+tokio-test = "0.4"
+tempfile = "3.10"
+anyhow = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
+ethers = { version = "2.0", features = ["ws", "ipc", "openssl", "abigen", "rustls"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+ethers-solc = "2.0"
+proptest = "1.6.0"
+wiremock = "0.6"
+reqwest = { version = "0.12", features = ["json"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+ark-bn254 = "0.5.0"
+ark-ff = "0.5.0"
+aes = "0.8"
+cbc = "0.1"
+cipher = "0.4"
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+curve25519-dalek = { version = "4.1", features = ["rand_core"] }
+hmac = "0.12"
+
+[lints]
+workspace = true
+
+
+[[bench]]
+name = "replay_bench"
+harness = false
+
+
+[[bin]]
+name = "price_server"
+path = "src/bin/price_server.rs"
+
+[[bench]]
+name = "exit_bench"
+harness = false
+
+[[bench]]
+name = "pipeline_bench"
+harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.bench]
+lto = "fat"
+codegen-units = 1
+

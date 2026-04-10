@@ -1,0 +1,45 @@
+# NOX Relay Node Configuration
+#
+# Minimal config for a relay-only (entry/mix) node.
+# Relay nodes forward Sphinx packets but do not execute on-chain transactions.
+# No wallet key or chain execution infrastructure required.
+#
+# Secrets should be provided via environment variables:
+#   NOX_ROUTING_PRIVATE_KEY=<32-byte hex X25519 secret key>
+
+eth_rpc_url = "https://mainnet.infura.io/v3/YOUR_KEY"
+chain_id = 1
+node_role = "relay"
+
+# Registry contract for topology discovery
+registry_contract_address = "0x0000000000000000000000000000000000000000"
+
+# P2P networking
+p2p_port = 9000
+p2p_listen_addr = "0.0.0.0"
+p2p_identity_path = "./data/p2p_id.key"
+
+# Proof-of-Work difficulty for incoming packets (3 = ~8 hashes avg)
+min_pow_difficulty = 3
+
+# Prometheus metrics (localhost only)
+metrics_port = 9090
+
+# Persistence
+db_path = "./data/nox_db"
+
+# Topology bootstrap (fetch from known seed nodes for fast startup)
+bootstrap_topology_urls = []
+
+[network]
+max_connections = 1000
+max_connections_per_peer = 2
+ping_interval_secs = 15
+idle_connection_timeout_secs = 3600
+
+[relayer]
+queue_size = 10000
+mix_delay_ms = 500.0
+cover_traffic_rate = 0.05
+drop_traffic_rate = 0.05
+replay_window = 3600

@@ -1,0 +1,37 @@
+[package]
+name = "darkpool-crypto"
+version = "0.1.0"
+edition = "2021"
+authors = ["Hisoka IO"]
+description = "Pure cryptographic primitives for the DarkPool protocol (BJJ, Poseidon2, AES, KDF)"
+license = "Apache-2.0"
+repository = "https://github.com/hisoka-io/nox"
+
+[dependencies]
+ark-bn254 = { workspace = true }
+ark-ed-on-bn254 = { workspace = true }
+ark-ff = { workspace = true }
+ark-std = { workspace = true }
+taceo-poseidon2 = { workspace = true }
+num-bigint = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+ethers-core = "2.0"
+aes = "0.8"
+cbc = "0.1"
+cipher = "0.4"
+sha2 = { workspace = true }
+zeroize = "1.8"
+subtle = "2.6"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "crypto_bench"
+harness = false

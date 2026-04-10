@@ -1,0 +1,76 @@
+name: NOX Slow Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Test suite to run"
+        required: true
+        default: "anvil"
+        type: choice
+        options:
+          - anvil
+          - heavy
+          - all
+  schedule:
+    # Nightly at 02:00 UTC
+    - cron: "0 2 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  anvil-tests:
+    name: Anvil Tests
+    if: >
+      github.event_name == 'schedule' ||
+      inputs.suite == 'anvil' ||
+      inputs.suite == 'all'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Foundry (anvil)
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Bootstrap artifacts
+        run: ./scripts/bootstrap-artifacts.sh
+      - name: Run economics_e2e
+        run: cargo test --test economics_e2e --features dev-node -- --ignored --nocapture
+      - name: Run anvil_trace_debug
+        run: cargo test --test anvil_trace_debug -- --ignored --nocapture
+
+  heavy-tests:
+    name: Heavy Tests (Anvil + Node.js)
+    if: >
+      github.event_name == 'schedule' ||
+      inputs.suite == 'heavy' ||
+      inputs.suite == 'all'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Foundry (anvil)
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Bootstrap artifacts
+        run: ./scripts/bootstrap-artifacts.sh
+      - name: Run master_e2e
+        run: cargo test --test master_e2e --features dev-node -- --ignored --nocapture 2>&1 | tail -100
+      - name: Run native_prover_parity
+        run: cargo test --test native_prover_parity -- --ignored --nocapture

@@ -1,0 +1,69 @@
+# NOX Full Node Configuration
+#
+# Full nodes have all capabilities: relay + exit + topology API.
+# This is the default role and maintains backward compatibility.
+#
+# Secrets should be provided via environment variables:
+#   NOX_ROUTING_PRIVATE_KEY=<32-byte hex X25519 secret key>
+#   NOX_ETH_WALLET_PRIVATE_KEY=<hex private key for on-chain TX signing>
+
+eth_rpc_url = "https://mainnet.infura.io/v3/YOUR_KEY"
+oracle_url = "http://127.0.0.1:3000"
+chain_id = 1
+node_role = "full"
+
+# Contract addresses
+registry_contract_address = "0x0000000000000000000000000000000000000000"
+relayer_multicall_address = "0x0000000000000000000000000000000000000000"
+nox_reward_pool_address = "0x0000000000000000000000000000000000000000"
+
+# Economics
+min_gas_balance = "10000000000000000"
+min_profit_margin_percent = 10
+
+# Networking
+p2p_port = 9000
+p2p_listen_addr = "0.0.0.0"
+p2p_identity_path = "./data/p2p_id.key"
+min_pow_difficulty = 3
+metrics_port = 9090
+db_path = "./data/nox_db"
+block_poll_interval_secs = 12
+
+# Public topology API (seed node for other nodes to bootstrap from)
+topology_api_port = 8080
+
+# HTTP ingress (external clients submit Sphinx packets via HTTP POST)
+ingress_port = 8443
+response_prune_interval_secs = 60
+
+# Signed broadcast (max TX size for L1 - increase for L2s)
+max_broadcast_tx_size = 131072  # 128 KB
+
+[http]
+request_timeout_secs = 10
+max_response_bytes = 1048576
+allow_private_ips = false
+
+[network]
+max_connections = 1000
+max_connections_per_peer = 2
+ping_interval_secs = 15
+idle_connection_timeout_secs = 3600
+
+[network.rate_limit]
+burst_unknown = 50
+rate_unknown = 100
+burst_trusted = 100
+rate_trusted = 200
+
+[relayer]
+queue_size = 10000
+mix_delay_ms = 500.0
+cover_traffic_rate = 0.05
+drop_traffic_rate = 0.05
+replay_window = 3600
+
+[relayer.fragmentation]
+timeout_seconds = 300
+prune_interval_seconds = 60

@@ -1,0 +1,89 @@
+name: NOX CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy (production code)
+        run: cargo clippy --workspace --features dev-node --exclude nox-sim --exclude nox-test-infra --lib --bins -- -D warnings
+      - name: Clippy (test & bench code - relaxed for test ergonomics)
+        run: |
+          cargo clippy --workspace --features dev-node --exclude nox --exclude nox-sim --exclude nox-test-infra --tests --benches -- \
+            -D warnings \
+            -A clippy::unwrap_used \
+            -A clippy::expect_used \
+            -A clippy::semicolon_if_nothing_returned \
+            -A clippy::doc_markdown \
+            -A clippy::needless_pass_by_value \
+            -A clippy::float_cmp \
+            -A clippy::bool_to_int_with_if \
+            -A clippy::uninlined_format_args \
+            -A clippy::redundant_closure_for_method_calls \
+            -A clippy::panic \
+            -A clippy::match_wildcard_for_single_variants \
+            -A clippy::unreadable_literal \
+            -A clippy::manual_let_else \
+            -A clippy::needless_range_loop \
+            -A clippy::explicit_auto_deref \
+            -A clippy::explicit_iter_loop \
+            -A clippy::vec_init_then_push \
+            -A clippy::large_digit_groups \
+            -A clippy::io_other_error \
+            -A clippy::allow_attributes_without_reason \
+            -A clippy::ignore_without_reason \
+            -A clippy::manual_assert \
+            -A clippy::let_unit_value \
+            -A clippy::ignored_unit_patterns
+
+  test:
+    name: Test
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Test subcrates
+        run: cargo nextest run --workspace --exclude nox --exclude nox-sim --exclude nox-test-infra
+      - name: Test HTTP E2E integration
+        run: cargo test --test http_e2e
+      - name: Test FEC E2E integration
+        run: cargo test --test fec_e2e
+
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans

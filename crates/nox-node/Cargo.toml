@@ -1,0 +1,64 @@
+[package]
+name = "nox-node"
+version = "0.1.0"
+edition = "2021"
+authors = ["Hisoka IO"]
+description = "NOX production relay/exit node: packet processing, P2P networking, Ethereum integration"
+license = "Apache-2.0"
+repository = "https://github.com/hisoka-io/nox"
+
+[features]
+default = []
+dev-node = []
+hop-metrics = ["nox-crypto/hop-metrics"]
+
+[dependencies]
+nox-core = { path = "../nox-core" }
+nox-crypto = { path = "../nox-crypto" }
+tokio = { version = "1.36", features = ["full", "tracing"] }
+futures = "0.3"
+async-trait = { workspace = true }
+tokio-util = { version = "0.7", features = ["time"] }
+async-channel = "2.2"
+async-stream = "0.3"
+thiserror = { workspace = true }
+anyhow = "1.0"
+bincode = "1.3"
+tracing = { workspace = true }
+config = { version = "0.14", features = ["toml"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+rayon = "1.10"
+rand_distr = "0.4"
+rand_chacha = "0.3.1"
+x25519-dalek = { version = "2.0.0", features = ["static_secrets", "serde"] }
+zeroize = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+ethers = { workspace = true }
+libp2p = { version = "0.53", features = ["tcp", "dns", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros", "tokio", "cbor"] }
+sled = "0.34"
+prometheus-client = "0.22"
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["cors"] }
+governor = "0.6"
+dashmap = "6.0"
+ipnet = "2.9"
+fastbloom = "0.14.0"
+tempfile = "3.10"
+num_cpus = "1.17.0"
+parking_lot = { workspace = true }
+uuid = { version = "1.7", features = ["v4"] }
+regex = "1.10"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+url = "2.5"
+http = "1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true
