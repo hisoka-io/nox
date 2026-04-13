@@ -73,6 +73,11 @@ RUN cargo build --release --bin nox --bin price_server
 # ==============================================================================
 FROM debian:bookworm-slim
 
+LABEL org.opencontainers.image.source="https://github.com/hisoka-io/nox"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.url="https://hisoka.io"
+LABEL org.opencontainers.image.title="nox"
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*

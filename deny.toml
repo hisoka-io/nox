@@ -18,6 +18,7 @@ ignore = [
     "RUSTSEC-2025-0134", # rustls-pemfile unmaintained (transitive)
     "RUSTSEC-2026-0009", # DoS via stack exhaustion (transitive dep)
     "RUSTSEC-2026-0049", # webpki CRL matching logic (transitive via noir_rs, limited impact)
+    "RUSTSEC-2026-0097", # rand unsound with custom logger + rand::rng() (we use tracing, not a custom logger)
 ]
 
 [licenses]
