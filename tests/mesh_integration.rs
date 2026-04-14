@@ -135,10 +135,8 @@ async fn collect_exit_payloads(
                     break;
                 }
             }
-            Ok(Ok(_)) => {} // other events
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
-            Ok(Err(broadcast::error::RecvError::Closed)) => break,
-            Err(_) => break, // timeout
+            Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => break,
         }
     }
 

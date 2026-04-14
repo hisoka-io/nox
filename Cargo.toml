@@ -58,13 +58,17 @@ return_self_not_must_use = "allow"
 doc_link_with_quotes = "allow"
 
 [package]
-name = "nox"
+name = "nox-mixnet"
 version = "0.1.0"
 edition = "2021"
 authors = ["Hisoka IO"]
 description = "Sphinx mixnet relay node for Ethereum"
 license = "Apache-2.0"
 repository = "https://github.com/hisoka-io/nox"
+
+[[bin]]
+name = "nox"
+path = "src/main.rs"
 
 [features]
 default = []
@@ -110,9 +114,9 @@ nox-crypto = { path = "crates/nox-crypto", version = "0.1.0" }
 
 nox-client = { path = "crates/nox-client", version = "0.1.0" }
 
-nox-prover = { path = "crates/nox-prover", version = "0.1.0" }
+nox-prover = { path = "crates/nox-prover" }
 
-nox-test-infra = { path = "crates/nox-test-infra", version = "0.1.0" }
+nox-test-infra = { path = "crates/nox-test-infra" }
 
 mockall = "0.12"
 sha2 = { workspace = true }
