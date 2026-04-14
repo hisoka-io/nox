@@ -12,9 +12,12 @@ default = []
 mixnet = ["dep:nox-client"]
 
 [dependencies]
-darkpool-crypto = { path = "../darkpool-crypto" }
-nox-core = { path = "../nox-core" }
-nox-client = { path = "../nox-client", optional = true }
+darkpool-crypto = { path = "../darkpool-crypto", version = "0.1.0" }
+
+nox-core = { path = "../nox-core", version = "0.1.0" }
+
+nox-client = { path = "../nox-client", version = "0.1.0", optional = true }
+
 ethers = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -31,7 +34,8 @@ tokio = { workspace = true }
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 
 [dev-dependencies]
-darkpool-crypto = { path = "../darkpool-crypto" }
+darkpool-crypto = { path = "../darkpool-crypto", version = "0.1.0" }
+
 serde_json = { workspace = true }
 
 [lints]

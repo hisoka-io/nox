@@ -13,8 +13,10 @@ dev-node = []
 hop-metrics = ["nox-crypto/hop-metrics"]
 
 [dependencies]
-nox-core = { path = "../nox-core" }
-nox-crypto = { path = "../nox-crypto" }
+nox-core = { path = "../nox-core", version = "0.1.0" }
+
+nox-crypto = { path = "../nox-crypto", version = "0.1.0" }
+
 tokio = { version = "1.36", features = ["full", "tracing"] }
 futures = "0.3"
 async-trait = { workspace = true }

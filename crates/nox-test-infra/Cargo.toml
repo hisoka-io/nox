@@ -6,6 +6,7 @@ authors = ["Hisoka IO"]
 description = "Test infrastructure for NOX: contract deployment, virtual nodes, test harness, simulation"
 license = "Apache-2.0"
 repository = "https://github.com/hisoka-io/nox"
+publish = false
 
 [dependencies]
 ethers = { workspace = true }

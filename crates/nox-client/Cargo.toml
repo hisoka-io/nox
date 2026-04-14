@@ -8,8 +8,10 @@ license = "Apache-2.0"
 repository = "https://github.com/hisoka-io/nox"
 
 [dependencies]
-nox-core = { path = "../nox-core" }
-nox-crypto = { path = "../nox-crypto" }
+nox-core = { path = "../nox-core", version = "0.1.0" }
+
+nox-crypto = { path = "../nox-crypto", version = "0.1.0" }
+
 ethers = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

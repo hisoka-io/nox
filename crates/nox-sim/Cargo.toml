@@ -6,6 +6,7 @@ authors = ["Hisoka IO"]
 description = "Simulation and stress-testing binaries for NOX mixnet"
 license = "Apache-2.0"
 repository = "https://github.com/hisoka-io/nox"
+publish = false
 
 [features]
 default = []
@@ -37,14 +38,21 @@ reqwest = { version = "0.12", features = ["json"] }
 tempfile = "3.10"
 toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
-darkpool-crypto = { path = "../darkpool-crypto" }
-darkpool-client = { path = "../darkpool-client", features = ["mixnet"] }
-nox-core = { path = "../nox-core" }
-nox-crypto = { path = "../nox-crypto" }
-nox-client = { path = "../nox-client" }
-nox-node = { path = "../nox-node" }
-nox-prover = { path = "../nox-prover" }
-nox-test-infra = { path = "../nox-test-infra" }
+darkpool-crypto = { path = "../darkpool-crypto", version = "0.1.0" }
+
+darkpool-client = { path = "../darkpool-client", version = "0.1.0", features = ["mixnet"] }
+
+nox-core = { path = "../nox-core", version = "0.1.0" }
+
+nox-crypto = { path = "../nox-crypto", version = "0.1.0" }
+
+nox-client = { path = "../nox-client", version = "0.1.0" }
+
+nox-node = { path = "../nox-node", version = "0.1.0" }
+
+nox-prover = { path = "../nox-prover", version = "0.1.0" }
+
+nox-test-infra = { path = "../nox-test-infra", version = "0.1.0" }
 
 [lints]
 workspace = true

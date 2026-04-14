@@ -95,18 +95,25 @@ libp2p = { version = "0.53", features = ["tcp", "dns", "noise", "yamux", "gossip
 axum = "0.7"
 tempfile = "3.10"
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
-nox-node = { path = "crates/nox-node" }
-nox-oracle = { path = "crates/nox-oracle" }
+nox-node = { path = "crates/nox-node", version = "0.1.0" }
 
+nox-oracle = { path = "crates/nox-oracle", version = "0.1.0" }
 
 [dev-dependencies]
-darkpool-crypto = { path = "crates/darkpool-crypto" }
-darkpool-client = { path = "crates/darkpool-client", features = ["mixnet"] }
-nox-core = { path = "crates/nox-core" }
-nox-crypto = { path = "crates/nox-crypto" }
-nox-client = { path = "crates/nox-client" }
-nox-prover = { path = "crates/nox-prover" }
-nox-test-infra = { path = "crates/nox-test-infra" }
+darkpool-crypto = { path = "crates/darkpool-crypto", version = "0.1.0" }
+
+darkpool-client = { path = "crates/darkpool-client", version = "0.1.0", features = ["mixnet"] }
+
+nox-core = { path = "crates/nox-core", version = "0.1.0" }
+
+nox-crypto = { path = "crates/nox-crypto", version = "0.1.0" }
+
+nox-client = { path = "crates/nox-client", version = "0.1.0" }
+
+nox-prover = { path = "crates/nox-prover", version = "0.1.0" }
+
+nox-test-infra = { path = "crates/nox-test-infra", version = "0.1.0" }
+
 mockall = "0.12"
 sha2 = { workspace = true }
 tokio-test = "0.4"
@@ -132,11 +139,9 @@ hmac = "0.12"
 [lints]
 workspace = true
 
-
 [[bench]]
 name = "replay_bench"
 harness = false
-
 
 [[bin]]
 name = "price_server"
