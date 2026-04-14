@@ -31,7 +31,7 @@ jobs:
         run: cargo clippy --workspace --features dev-node --exclude nox-sim --exclude nox-test-infra --lib --bins -- -D warnings
       - name: Clippy (test & bench code - relaxed for test ergonomics)
         run: |
-          cargo clippy --workspace --features dev-node --exclude nox --exclude nox-sim --exclude nox-test-infra --tests --benches -- \
+          cargo clippy --workspace --features dev-node --exclude nox-mixnet --exclude nox-sim --exclude nox-test-infra --tests --benches -- \
             -D warnings \
             -A clippy::unwrap_used \
             -A clippy::expect_used \
@@ -73,7 +73,7 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Test subcrates
-        run: cargo nextest run --workspace --exclude nox --exclude nox-sim --exclude nox-test-infra
+        run: cargo nextest run --workspace --exclude nox-mixnet --exclude nox-sim --exclude nox-test-infra
       - name: Test HTTP E2E integration
         run: cargo test --test http_e2e
       - name: Test FEC E2E integration
