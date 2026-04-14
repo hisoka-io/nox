@@ -8,8 +8,10 @@ license = "Apache-2.0"
 repository = "https://github.com/hisoka-io/nox"
 
 [dependencies]
-darkpool-crypto = { path = "../darkpool-crypto" }
-nox-crypto = { path = "../nox-crypto" }
+darkpool-crypto = { path = "../darkpool-crypto", version = "0.1.0" }
+
+nox-crypto = { path = "../nox-crypto", version = "0.1.0" }
+
 ark-bn254 = { workspace = true }
 ark-ff = { workspace = true }
 ark-std = { workspace = true }
