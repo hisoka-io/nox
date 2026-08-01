@@ -14,6 +14,11 @@ use tracing::{debug, error, info, warn};
 /// Storage key for persisting the last processed block number
 const LAST_BLOCK_KEY: &[u8] = b"chain_observer:last_block";
 
+/// Maximum blocks per `eth_getLogs` call. Public RPC providers commonly cap the
+/// range (10k is the widely supported ceiling), and an unbounded catch-up after
+/// downtime would otherwise be rejected outright.
+const MAX_BLOCK_RANGE: u64 = 10_000;
+
 // Generate type-safe bindings for the specific events we care about
 abigen!(
     NoxRegistryContract,
@@ -185,31 +190,52 @@ impl ChainObserver {
 
             debug!("Processing blocks {} to {}", last_block + 1, current_block);
 
-            let filter = Filter::new()
-                .address(self.registry_address)
-                .from_block(last_block + 1)
-                .to_block(current_block);
-
-            match self.provider.get_logs(&filter).await {
-                Ok(logs) => {
-                    for log in logs {
-                        self.process_log(&contract, log).await;
-                    }
+            // Scan in bounded chunks. A stale cursor (node downtime, or a storage
+            // layer that could not persist progress) can leave a gap of millions
+            // of blocks, and RPC providers reject unbounded `eth_getLogs` ranges.
+            let mut cursor = last_block;
+            while cursor < current_block {
+                if self.cancel_token.is_cancelled() {
+                    info!("Chain Observer shutting down (cancellation token).");
+                    return;
                 }
-                Err(e) => {
-                    error!("Failed to fetch logs: {}", e);
-                    self.metrics
-                        .chain_observer_errors_total
-                        .get_or_create(&vec![("type".into(), "rpc_error".into())])
-                        .inc();
+
+                let chunk_end = current_block.min(cursor + MAX_BLOCK_RANGE);
+                let filter = Filter::new()
+                    .address(self.registry_address)
+                    .from_block(cursor + 1)
+                    .to_block(chunk_end);
+
+                match self.provider.get_logs(&filter).await {
+                    Ok(logs) => {
+                        for log in logs {
+                            self.process_log(&contract, log).await;
+                        }
+                        // Only advance past a range that was actually scanned, so a
+                        // failure can never silently skip registry events.
+                        cursor = chunk_end;
+                        self.metrics.chain_observer_last_block.set(cursor as i64);
+                        self.save_last_block(cursor).await;
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to fetch logs for blocks {}..={}: {}. \
+                             Cursor held at {}; range will be retried.",
+                            cursor + 1,
+                            chunk_end,
+                            e,
+                            cursor
+                        );
+                        self.metrics
+                            .chain_observer_errors_total
+                            .get_or_create(&vec![("type".into(), "rpc_error".into())])
+                            .inc();
+                        break;
+                    }
                 }
             }
 
-            last_block = current_block;
-            self.metrics
-                .chain_observer_last_block
-                .set(current_block as i64);
-            self.save_last_block(current_block).await;
+            last_block = cursor;
             tokio::select! {
                 () = sleep(self.poll_interval) => {}
                 () = self.cancel_token.cancelled() => {

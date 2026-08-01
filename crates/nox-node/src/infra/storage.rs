@@ -2,40 +2,108 @@ use async_trait::async_trait;
 use sled::Db;
 use std::{
     path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tracing::warn;
+use tracing::{error, info, warn};
 
 use nox_core::traits::{IReplayProtection, IStorageRepository, InfrastructureError};
 
-/// Retry once on transient sled IO errors (100ms backoff). Non-IO errors are not retried.
-fn with_retry<T, F: Fn() -> Result<T, sled::Error>>(
-    op_name: &str,
-    f: F,
-) -> Result<T, InfrastructureError> {
-    match f() {
-        Ok(val) => Ok(val),
-        Err(first_err) => {
-            if matches!(first_err, sled::Error::Io(_)) {
-                warn!("Sled {op_name}: transient IO error, retrying in 100ms: {first_err}");
-                std::thread::sleep(Duration::from_millis(100));
-                f().map_err(|e| InfrastructureError::Database(e.to_string()))
-            } else {
-                Err(InfrastructureError::Database(first_err.to_string()))
-            }
-        }
-    }
-}
+/// Backoff schedule for transient sled IO errors. A single short retry is not
+/// enough to ride out a disk that is briefly full, and escalating delays avoid
+/// hot-looping against a filesystem that is genuinely out of space.
+const RETRY_BACKOFF_MS: [u64; 3] = [100, 500, 2000];
+
+/// Shared flag describing whether the storage layer is failing writes.
+pub type DegradedFlag = Arc<AtomicBool>;
 
 #[derive(Clone)]
 pub struct SledRepository {
     db: Db,
+    /// Set once an IO error survives every retry. sled cannot rebuild its
+    /// allocator in-process after a disk-full condition, so once this latches the
+    /// node needs a restart to recover; surfacing it stops the failure from being
+    /// an endless stream of warnings that nothing acts on.
+    degraded: DegradedFlag,
 }
 
 impl SledRepository {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, InfrastructureError> {
         let db = sled::open(path).map_err(|e| InfrastructureError::Database(e.to_string()))?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            degraded: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// True when writes are persistently failing and the node needs a restart.
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Relaxed)
+    }
+
+    /// Shared handle to the degraded flag, for health reporting.
+    #[must_use]
+    pub fn degraded_flag(&self) -> DegradedFlag {
+        self.degraded.clone()
+    }
+
+    /// Run a sled operation, retrying transient IO errors on an escalating
+    /// backoff. Non-IO errors fail immediately. If every attempt fails the
+    /// repository latches into a degraded state and logs once at ERROR.
+    fn with_retry<T, F: Fn() -> Result<T, sled::Error>>(
+        &self,
+        op_name: &str,
+        f: F,
+    ) -> Result<T, InfrastructureError> {
+        let mut last_err = match f() {
+            Ok(val) => {
+                self.clear_degraded();
+                return Ok(val);
+            }
+            Err(e) => e,
+        };
+
+        for (attempt, backoff_ms) in RETRY_BACKOFF_MS.iter().enumerate() {
+            if !matches!(last_err, sled::Error::Io(_)) {
+                return Err(InfrastructureError::Database(last_err.to_string()));
+            }
+            warn!(
+                "Sled {op_name}: transient IO error (attempt {}/{}), retrying in {backoff_ms}ms: {last_err}",
+                attempt + 1,
+                RETRY_BACKOFF_MS.len()
+            );
+            std::thread::sleep(Duration::from_millis(*backoff_ms));
+            match f() {
+                Ok(val) => {
+                    self.clear_degraded();
+                    return Ok(val);
+                }
+                Err(e) => last_err = e,
+            }
+        }
+
+        if matches!(last_err, sled::Error::Io(_)) && !self.degraded.swap(true, Ordering::SeqCst) {
+            error!(
+                "Sled {op_name}: IO error persisted through {} retries: {last_err}. \
+                 Storage is DEGRADED and writes are being lost. sled cannot rebuild its \
+                 allocator in-process after a disk-full condition, so the node must be \
+                 restarted once free space is available.",
+                RETRY_BACKOFF_MS.len()
+            );
+        }
+
+        Err(InfrastructureError::Database(last_err.to_string()))
+    }
+
+    /// Clear the degraded latch after a successful operation.
+    fn clear_degraded(&self) {
+        if self.degraded.swap(false, Ordering::SeqCst) {
+            info!("Sled: storage recovered, writes are succeeding again");
+        }
     }
 
     /// Flush and scan to trigger GC on old log segments. Call periodically.
@@ -60,11 +128,11 @@ impl SledRepository {
 #[async_trait]
 impl IStorageRepository for SledRepository {
     async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, InfrastructureError> {
-        let db = self.db.clone();
+        let repo = self.clone();
         let key = key.to_vec();
         tokio::task::spawn_blocking(move || {
-            with_retry("get", || {
-                db.get(&key).map(|opt| opt.map(|ivec| ivec.to_vec()))
+            repo.with_retry("get", || {
+                repo.db.get(&key).map(|opt| opt.map(|ivec| ivec.to_vec()))
             })
         })
         .await
@@ -72,28 +140,32 @@ impl IStorageRepository for SledRepository {
     }
 
     async fn put(&self, key: &[u8], value: &[u8]) -> Result<(), InfrastructureError> {
-        let db = self.db.clone();
+        let repo = self.clone();
         let key = key.to_vec();
         let value = value.to_vec();
         tokio::task::spawn_blocking(move || {
-            with_retry("put", || db.insert(&key, value.as_slice()).map(|_| ()))
+            repo.with_retry("put", || repo.db.insert(&key, value.as_slice()).map(|_| ()))
         })
         .await
         .map_err(|e| InfrastructureError::Database(format!("spawn_blocking join error: {e}")))?
     }
 
     async fn exists(&self, key: &[u8]) -> Result<bool, InfrastructureError> {
-        let db = self.db.clone();
+        let repo = self.clone();
         let key = key.to_vec();
-        tokio::task::spawn_blocking(move || with_retry("exists", || db.contains_key(&key)))
+        tokio::task::spawn_blocking(move || {
+            repo.with_retry("exists", || repo.db.contains_key(&key))
+        })
             .await
             .map_err(|e| InfrastructureError::Database(format!("spawn_blocking join error: {e}")))?
     }
 
     async fn delete(&self, key: &[u8]) -> Result<(), InfrastructureError> {
-        let db = self.db.clone();
+        let repo = self.clone();
         let key = key.to_vec();
-        tokio::task::spawn_blocking(move || with_retry("delete", || db.remove(&key).map(|_| ())))
+        tokio::task::spawn_blocking(move || {
+            repo.with_retry("delete", || repo.db.remove(&key).map(|_| ()))
+        })
             .await
             .map_err(|e| InfrastructureError::Database(format!("spawn_blocking join error: {e}")))?
     }
@@ -280,39 +352,102 @@ mod tests {
         assert!(repo.exists(b"fresh").await.unwrap());
     }
 
+    fn test_repo() -> SledRepository {
+        let dir = tempfile::tempdir().expect("tempdir");
+        SledRepository::new(dir.path()).expect("open sled")
+    }
+
+    fn io_error(msg: &'static str) -> sled::Error {
+        sled::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, msg))
+    }
+
     #[test]
     fn test_with_retry_succeeds_on_first_try() {
-        let result = with_retry("test", || Ok::<_, sled::Error>(42));
+        let repo = test_repo();
+        let result = repo.with_retry("test", || Ok::<_, sled::Error>(42));
         assert_eq!(result.unwrap(), 42);
+        assert!(!repo.is_degraded());
     }
 
     #[test]
     fn test_with_retry_fails_on_non_io_error() {
-        let result: Result<(), _> = with_retry("test", || {
+        let repo = test_repo();
+        let result: Result<(), _> = repo.with_retry("test", || {
             Err(sled::Error::CollectionNotFound(sled::IVec::from(
                 b"missing" as &[u8],
             )))
         });
         assert!(result.is_err());
+        // A logic error is not a storage fault, so the node must not be marked degraded.
+        assert!(!repo.is_degraded());
     }
 
     #[test]
     fn test_with_retry_retries_io_error() {
-        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::atomic::AtomicU32;
+        let repo = test_repo();
         let call_count = AtomicU32::new(0);
 
-        let result = with_retry("test", || {
+        let result = repo.with_retry("test", || {
             let count = call_count.fetch_add(1, Ordering::Relaxed);
             if count == 0 {
-                Err(sled::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "transient disk error",
-                )))
+                Err(io_error("transient disk error"))
             } else {
                 Ok(99)
             }
         });
         assert_eq!(result.unwrap(), 99);
         assert_eq!(call_count.load(Ordering::Relaxed), 2);
+        assert!(!repo.is_degraded());
+    }
+
+    #[test]
+    fn test_persistent_io_error_latches_degraded() {
+        use std::sync::atomic::AtomicU32;
+        let repo = test_repo();
+        let call_count = AtomicU32::new(0);
+
+        let result: Result<(), _> = repo.with_retry("test", || {
+            call_count.fetch_add(1, Ordering::Relaxed);
+            Err(io_error("no space left on device"))
+        });
+
+        assert!(result.is_err());
+        // Initial attempt plus one per backoff step.
+        assert_eq!(
+            call_count.load(Ordering::Relaxed) as usize,
+            RETRY_BACKOFF_MS.len() + 1
+        );
+        assert!(
+            repo.is_degraded(),
+            "a wedged storage layer must be visible, not just logged"
+        );
+    }
+
+    #[test]
+    fn test_degraded_clears_after_recovery() {
+        let repo = test_repo();
+
+        let failed: Result<(), _> = repo.with_retry("test", || Err(io_error("disk full")));
+        assert!(failed.is_err());
+        assert!(repo.is_degraded());
+
+        // Space comes back and the next operation succeeds.
+        let ok = repo.with_retry("test", || Ok::<_, sled::Error>(1));
+        assert_eq!(ok.unwrap(), 1);
+        assert!(!repo.is_degraded());
+    }
+
+    #[test]
+    fn test_degraded_flag_is_shared_across_clones() {
+        let repo = test_repo();
+        let flag = repo.degraded_flag();
+        let clone = repo.clone();
+
+        let failed: Result<(), _> = repo.with_retry("test", || Err(io_error("disk full")));
+        assert!(failed.is_err());
+
+        assert!(flag.load(Ordering::Relaxed));
+        assert!(clone.is_degraded());
     }
 }

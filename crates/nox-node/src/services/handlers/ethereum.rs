@@ -593,12 +593,14 @@ impl ServiceHandler for EthereumHandler {
                         .profitability_outcomes_total
                         .get_or_create(&vec![("result".into(), "profitable".into())])
                         .inc();
+                    // Micro-USD, matching the primary path above. Using 100.0 here
+                    // under-reported this path by 10,000x.
                     self.metrics
                         .cumulative_revenue_usd
-                        .inc_by((profit_result.revenue_usd * 100.0) as u64);
+                        .inc_by((profit_result.revenue_usd * 1_000_000.0) as u64);
                     self.metrics
                         .cumulative_cost_usd
-                        .inc_by((profit_result.cost_usd * 100.0) as u64);
+                        .inc_by((profit_result.cost_usd * 1_000_000.0) as u64);
 
                     info!(
                         "Profitable TX {}: Cost=${:.4}, Revenue=${:.4}, Margin={:.2}x",
