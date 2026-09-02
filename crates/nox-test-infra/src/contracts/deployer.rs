@@ -326,11 +326,7 @@ impl<M: Middleware + 'static> ContractDeployer<M> {
     }
 
     /// Deploys raw creation bytecode and returns the resulting address.
-    async fn deploy_bytecode(
-        &self,
-        bytecode: Bytes,
-        label: &str,
-    ) -> Result<Address, DeployError> {
+    async fn deploy_bytecode(&self, bytecode: Bytes, label: &str) -> Result<Address, DeployError> {
         let tx = TransactionRequest::new().data(bytecode);
         let pending = self
             .client
@@ -343,9 +339,9 @@ impl<M: Middleware + 'static> ContractDeployer<M> {
             .map_err(|e| DeployError::Provider(e.to_string()))?
             .ok_or_else(|| DeployError::DeploymentFailed(format!("No receipt for {label}")))?;
 
-        receipt
-            .contract_address
-            .ok_or_else(|| DeployError::DeploymentFailed(format!("No contract address for {label}")))
+        receipt.contract_address.ok_or_else(|| {
+            DeployError::DeploymentFailed(format!("No contract address for {label}"))
+        })
     }
 
     fn read_bytecode(&self, path: &str) -> Result<Bytes, DeployError> {

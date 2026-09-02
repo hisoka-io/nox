@@ -29,7 +29,11 @@ fn read_bytecode_hex(path: &str) -> String {
     bytecode.strip_prefix("0x").unwrap_or(bytecode).to_string()
 }
 
-async fn deploy_raw<M: Middleware + 'static>(client: Arc<M>, bytes: Vec<u8>, label: &str) -> Address {
+async fn deploy_raw<M: Middleware + 'static>(
+    client: Arc<M>,
+    bytes: Vec<u8>,
+    label: &str,
+) -> Address {
     let tx = TransactionRequest::new().data(Bytes::from(bytes));
     let pending = client
         .send_transaction(tx, None)

@@ -37,7 +37,10 @@ fn vendored_verifier_bytecode_carries_a_library_placeholder() {
     // says so rather than silently passing.
     let mut found = 0;
     for name in VERIFIERS {
-        let path = format!("{}/contracts/verifiers/{name}.sol/HonkVerifier.json", artifacts_path());
+        let path = format!(
+            "{}/contracts/verifiers/{name}.sol/HonkVerifier.json",
+            artifacts_path()
+        );
         let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         let json: serde_json::Value = serde_json::from_str(&raw).expect("valid artifact JSON");
         let bytecode = json["bytecode"].as_str().expect("bytecode field");
@@ -72,7 +75,8 @@ async fn all_vendored_verifiers_deploy_with_linked_library() {
     let wallet = wallet.with_chain_id(anvil.chain_id());
     let client = Arc::new(SignerMiddleware::new(provider, wallet));
 
-    let deployer = nox_test_infra::contracts::ContractDeployer::new(client.clone(), &artifacts_path());
+    let deployer =
+        nox_test_infra::contracts::ContractDeployer::new(client.clone(), &artifacts_path());
 
     for name in VERIFIERS {
         let address = deployer

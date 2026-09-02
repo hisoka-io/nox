@@ -156,8 +156,8 @@ impl IStorageRepository for SledRepository {
         tokio::task::spawn_blocking(move || {
             repo.with_retry("exists", || repo.db.contains_key(&key))
         })
-            .await
-            .map_err(|e| InfrastructureError::Database(format!("spawn_blocking join error: {e}")))?
+        .await
+        .map_err(|e| InfrastructureError::Database(format!("spawn_blocking join error: {e}")))?
     }
 
     async fn delete(&self, key: &[u8]) -> Result<(), InfrastructureError> {
@@ -166,8 +166,8 @@ impl IStorageRepository for SledRepository {
         tokio::task::spawn_blocking(move || {
             repo.with_retry("delete", || repo.db.remove(&key).map(|_| ()))
         })
-            .await
-            .map_err(|e| InfrastructureError::Database(format!("spawn_blocking join error: {e}")))?
+        .await
+        .map_err(|e| InfrastructureError::Database(format!("spawn_blocking join error: {e}")))?
     }
 
     async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, InfrastructureError> {
