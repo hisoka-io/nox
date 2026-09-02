@@ -1,0 +1,16 @@
+{
+  "$comment": "Vendored build artifacts. Regenerate with scripts/bootstrap-artifacts.sh.",
+  "source_repo": "https://github.com/hisoka-io/darkpool-v2",
+  "source_branch": "release/campaign",
+  "source_commit": "6ddaccdcf7791cb9221f4187e517f1279fa31ac1",
+  "vendored_at": "2026-09-02T07:49:47Z",
+  "toolchain": {
+    "nargo": "1.0.0-beta.19",
+    "node": "v22.23.1",
+    "pnpm": "10.26.2"
+  },
+  "contents": {
+    "circuits/": "7 Noir circuits compiled with nargo (darkpool-v2 CI pins 1.0.0-beta.19)",
+    "artifacts/contracts/": "Hardhat artifacts read by nox-test-infra ContractDeployer and native_prover_parity"
+  }
+}

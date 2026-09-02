@@ -100,6 +100,7 @@ fi
 if [[ "$SKIP_CONTRACTS" == false ]]; then
     check_tool node
     check_tool npx
+    check_tool pnpm
 fi
 
 if [[ "$SKIP_CIRCUITS" == false ]]; then
@@ -139,13 +140,17 @@ info "Using darkpool-v2 at commit $ACTUAL_COMMIT"
 
 # --- Compile contracts ---
 if [[ "$SKIP_CONTRACTS" == false ]]; then
-    info "Installing dependencies for evm-contracts..."
-    cd "$CLONE_DIR/packages/evm-contracts"
+    # darkpool-v2 is a pnpm workspace: its package.json files use the
+    # "workspace:^" protocol, which npm cannot resolve (EUNSUPPORTEDPROTOCOL).
+    # Install from the workspace root with pnpm, not npm from the package dir.
+    info "Installing workspace dependencies (pnpm)..."
+    cd "$CLONE_DIR"
 
-    # Install node_modules if needed
     if [[ ! -d "node_modules" ]]; then
-        npm install --legacy-peer-deps 2>&1 | tail -3
+        pnpm install --frozen-lockfile 2>&1 | tail -3
     fi
+
+    cd "$CLONE_DIR/packages/evm-contracts"
 
     info "Compiling Solidity contracts (Hardhat)..."
     npx hardhat compile 2>&1 | tail -5

@@ -216,11 +216,33 @@ impl<M: Middleware + 'static> ContractDeployer<M> {
     }
 
     async fn deploy_verifier(&self, verifier_name: &str) -> Result<Address, DeployError> {
+        // Each *Verifier.sol also defines a ZKTranscriptLib with external
+        // functions, so HonkVerifier ships with an unlinked library placeholder
+        // (`__$<34 hex>$__`). Deploy the library first and link it, mirroring
+        // darkpool-v2's own fixtures; deploying the raw bytecode fails hex
+        // decoding on the placeholder.
+        let lib_path = format!(
+            "{}/contracts/verifiers/{}.sol/ZKTranscriptLib.json",
+            self.artifacts_path, verifier_name
+        );
+        let lib_addr = self
+            .deploy_bytecode(
+                self.read_bytecode(&lib_path)?,
+                &format!("{verifier_name}:ZKTranscriptLib"),
+            )
+            .await?;
+
         let verifier_path = format!(
             "{}/contracts/verifiers/{}.sol/HonkVerifier.json",
             self.artifacts_path, verifier_name
         );
-        let bytecode = self.read_bytecode(&verifier_path)?;
+        let bytecode_hex = self.read_bytecode_raw(&verifier_path)?;
+        let lib_addr_hex = format!("{lib_addr:x}").to_lowercase();
+        let bytecode_hex = self.link_library(&bytecode_hex, "ZKTranscriptLib", &lib_addr_hex);
+        let bytecode = Bytes::from(
+            hex::decode(&bytecode_hex)
+                .map_err(|e| DeployError::Contract(format!("Invalid hex bytecode: {e}")))?,
+        );
 
         let tx = TransactionRequest::new().data(bytecode);
         let pending = self
@@ -301,6 +323,29 @@ impl<M: Middleware + 'static> ContractDeployer<M> {
         })?;
 
         Ok(DarkPool::new(address, self.client.clone()))
+    }
+
+    /// Deploys raw creation bytecode and returns the resulting address.
+    async fn deploy_bytecode(
+        &self,
+        bytecode: Bytes,
+        label: &str,
+    ) -> Result<Address, DeployError> {
+        let tx = TransactionRequest::new().data(bytecode);
+        let pending = self
+            .client
+            .send_transaction(tx, None)
+            .await
+            .map_err(|e| DeployError::Provider(e.to_string()))?;
+
+        let receipt = pending
+            .await
+            .map_err(|e| DeployError::Provider(e.to_string()))?
+            .ok_or_else(|| DeployError::DeploymentFailed(format!("No receipt for {label}")))?;
+
+        receipt
+            .contract_address
+            .ok_or_else(|| DeployError::DeploymentFailed(format!("No contract address for {label}")))
     }
 
     fn read_bytecode(&self, path: &str) -> Result<Bytes, DeployError> {

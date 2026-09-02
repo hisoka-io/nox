@@ -29,12 +29,47 @@ fn read_bytecode_hex(path: &str) -> String {
     bytecode.strip_prefix("0x").unwrap_or(bytecode).to_string()
 }
 
+async fn deploy_raw<M: Middleware + 'static>(client: Arc<M>, bytes: Vec<u8>, label: &str) -> Address {
+    let tx = TransactionRequest::new().data(Bytes::from(bytes));
+    let pending = client
+        .send_transaction(tx, None)
+        .await
+        .unwrap_or_else(|_| panic!("Failed to send {label} deploy tx"));
+    pending
+        .await
+        .unwrap_or_else(|_| panic!("{label} tx failed"))
+        .unwrap_or_else(|| panic!("No receipt for {label}"))
+        .contract_address
+        .unwrap_or_else(|| panic!("No contract address for {label}"))
+}
+
 async fn deploy_verifier<M: Middleware + 'static>(client: Arc<M>, verifier_name: &str) -> Address {
+    // *Verifier.sol also defines ZKTranscriptLib with external functions, so
+    // HonkVerifier ships with an unlinked `__$<34 hex>$__` placeholder. Deploy
+    // the library first and substitute its address, or hex decoding fails.
+    let lib_path =
+        format!("{ARTIFACTS_PATH}/contracts/verifiers/{verifier_name}.sol/ZKTranscriptLib.json");
+    let lib_bytes = hex::decode(read_bytecode_hex(&lib_path))
+        .unwrap_or_else(|e| panic!("Bad hex in ZKTranscriptLib: {e}"));
+    let lib_addr = deploy_raw(client.clone(), lib_bytes, "ZKTranscriptLib").await;
+
     let verifier_path =
         format!("{ARTIFACTS_PATH}/contracts/verifiers/{verifier_name}.sol/HonkVerifier.json");
     let verifier_hex = read_bytecode_hex(&verifier_path);
+    // Placeholder is exactly `__$` + 34 hex + `$__` = 40 chars, the same width
+    // as the 40-hex-char address that replaces it, so offsets are preserved.
+    let addr_hex = format!("{lib_addr:x}").to_lowercase();
+    let mut linked = verifier_hex;
+    while let Some(start) = linked.find("__$") {
+        let end = start + 40;
+        assert!(
+            linked.len() >= end && &linked[end - 3..end] == "$__",
+            "malformed library placeholder at offset {start}"
+        );
+        linked.replace_range(start..end, &addr_hex);
+    }
     let verifier_bytes =
-        hex::decode(&verifier_hex).unwrap_or_else(|e| panic!("Bad hex in HonkVerifier: {e}"));
+        hex::decode(&linked).unwrap_or_else(|e| panic!("Bad hex in HonkVerifier: {e}"));
 
     let verifier_tx = TransactionRequest::new().data(Bytes::from(verifier_bytes));
     let verifier_pending = client

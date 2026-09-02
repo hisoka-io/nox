@@ -69,25 +69,24 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-      # darkpool-v2 is a PRIVATE repo; actions/checkout only authenticates THIS
-      # repo, so the cross-repo clone in bootstrap-artifacts.sh needs its own
-      # credential. Requires repo secret DARKPOOL_REPO_TOKEN (PAT or app token
-      # with read access to hisoka-io/darkpool-v2).
-      - name: Authenticate cross-repo clone
-        env:
-          DARKPOOL_REPO_TOKEN: ${{ secrets.DARKPOOL_REPO_TOKEN }}
+      # No bootstrap step: the circuit and Hardhat artifacts these tests deploy
+      # are vendored in circuits/ and artifacts/. That removes the cross-repo
+      # clone of the private darkpool-v2 repo, so CI needs no credentials.
+      # Refresh them with scripts/bootstrap-artifacts.sh; provenance (source
+      # commit + toolchain versions) is in artifacts/PROVENANCE.json.
+      - name: Verify vendored artifacts present
         run: |
-          if [ -z "$DARKPOOL_REPO_TOKEN" ]; then
-            echo "::error::DARKPOOL_REPO_TOKEN is not set. bootstrap-artifacts.sh cannot clone the private hisoka-io/darkpool-v2 repo."
-            exit 1
-          fi
-          # Scoped to the one private repo so the token is not attached to
-          # unrelated github.com fetches.
-          git config --global \
-            url."https://x-access-token:${DARKPOOL_REPO_TOKEN}@github.com/hisoka-io/darkpool-v2".insteadOf \
-            "https://github.com/hisoka-io/darkpool-v2"
-      - name: Bootstrap artifacts
-        run: ./scripts/bootstrap-artifacts.sh
+          missing=0
+          for f in circuits/gas_payment.json \
+                   artifacts/contracts/DarkPool.sol/DarkPool.json \
+                   artifacts/contracts/Poseidon/Poseidon2.sol/Poseidon2.json; do
+            [ -f "$f" ] || { echo "::error::missing vendored artifact: $f"; missing=1; }
+          done
+          for v in Deposit Withdraw Transfer Join Split PublicClaim GasPayment; do
+            f="artifacts/contracts/verifiers/${v}Verifier.sol/HonkVerifier.json"
+            [ -f "$f" ] || { echo "::error::missing vendored verifier: $f"; missing=1; }
+          done
+          exit $missing
       - name: Run master_e2e
         run: cargo test --test master_e2e --features dev-node -- --ignored --nocapture 2>&1 | tail -100
       - name: Run native_prover_parity
