@@ -215,7 +215,7 @@ impl<M: Middleware + 'static> ContractDeployer<M> {
             .ok_or_else(|| DeployError::DeploymentFailed("No contract address in receipt".into()))
     }
 
-    async fn deploy_verifier(&self, verifier_name: &str) -> Result<Address, DeployError> {
+    pub async fn deploy_verifier(&self, verifier_name: &str) -> Result<Address, DeployError> {
         // Each *Verifier.sol also defines a ZKTranscriptLib with external
         // functions, so HonkVerifier ships with an unlinked library placeholder
         // (`__$<34 hex>$__`). Deploy the library first and link it, mirroring

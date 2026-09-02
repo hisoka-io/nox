@@ -17,5 +17,8 @@ tracing = { workspace = true }
 regex = "1.10"
 hex = { workspace = true }
 
+[dev-dependencies]
+tokio = { workspace = true }
+
 [lints]
 workspace = true
