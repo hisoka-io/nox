@@ -39,8 +39,9 @@ jobs:
         uses: foundry-rs/foundry-toolchain@v1
         with:
           version: stable
-      - name: Bootstrap artifacts
-        run: ./scripts/bootstrap-artifacts.sh
+      # No bootstrap step: economics_e2e deploys from the committed Hardhat
+      # artifacts in abi/ (they carry `bytecode`), and anvil_trace_debug reads
+      # no artifacts at all. See scripts/bootstrap-artifacts.sh header.
       - name: Run economics_e2e
         run: cargo test --test economics_e2e --features dev-node -- --ignored --nocapture
       - name: Run anvil_trace_debug
@@ -68,6 +69,23 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+      # darkpool-v2 is a PRIVATE repo; actions/checkout only authenticates THIS
+      # repo, so the cross-repo clone in bootstrap-artifacts.sh needs its own
+      # credential. Requires repo secret DARKPOOL_REPO_TOKEN (PAT or app token
+      # with read access to hisoka-io/darkpool-v2).
+      - name: Authenticate cross-repo clone
+        env:
+          DARKPOOL_REPO_TOKEN: ${{ secrets.DARKPOOL_REPO_TOKEN }}
+        run: |
+          if [ -z "$DARKPOOL_REPO_TOKEN" ]; then
+            echo "::error::DARKPOOL_REPO_TOKEN is not set. bootstrap-artifacts.sh cannot clone the private hisoka-io/darkpool-v2 repo."
+            exit 1
+          fi
+          # Scoped to the one private repo so the token is not attached to
+          # unrelated github.com fetches.
+          git config --global \
+            url."https://x-access-token:${DARKPOOL_REPO_TOKEN}@github.com/hisoka-io/darkpool-v2".insteadOf \
+            "https://github.com/hisoka-io/darkpool-v2"
       - name: Bootstrap artifacts
         run: ./scripts/bootstrap-artifacts.sh
       - name: Run master_e2e
