@@ -19,6 +19,25 @@ ignore = [
     "RUSTSEC-2026-0009", # DoS via stack exhaustion (transitive dep)
     "RUSTSEC-2026-0049", # webpki CRL matching logic (transitive via noir_rs, limited impact)
     "RUSTSEC-2026-0097", # rand unsound with custom logger + rand::rng() (we use tracing, not a custom logger)
+    # --- rustls-webpki 0.101.7, pinned by ethers -> rustls 0.21. Fixed in
+    # 0.103.12+, which ethers cannot reach without a major rustls bump. The
+    # newer rustls-webpki in the tree is already updated to 0.103.15.
+    "RUSTSEC-2026-0098", # webpki accepted URI name constraints (transitive via ethers/rustls 0.21)
+    "RUSTSEC-2026-0099", # webpki accepted wildcard name constraints (transitive via ethers/rustls 0.21)
+    "RUSTSEC-2026-0104", # webpki CRL parsing panic (transitive via ethers/rustls 0.21)
+    # --- h2 0.3.27 via ethers -> hyper 0.14. Fix lands in 0.4.16; the 0.3 line
+    # has none. Requires migrating ethers off hyper 0.14.
+    "RUSTSEC-2026-0258", # h2 unbounded empty DATA frames (transitive via ethers/hyper 0.14)
+    # --- hickory-proto 0.24.4 via libp2p-dns 0.41. Fix is 0.26.1, which needs a
+    # libp2p major upgrade.
+    "RUSTSEC-2026-0119", # hickory-proto O(n^2) name compression (transitive via libp2p 0.53)
+    # --- core2 via multihash <- libp2p-core 0.41. Same libp2p upgrade.
+    "RUSTSEC-2026-0105", # core2 unmaintained and yanked (transitive via libp2p 0.53)
+    # --- im and its deps via noirc_evaluator, pinned to a noir git rev. Moving
+    # off it means changing the proving toolchain.
+    "RUSTSEC-2026-0247", # bitmaps unmaintained (transitive via noir -> im)
+    "RUSTSEC-2026-0248", # im unmaintained (transitive via noir)
+    "RUSTSEC-2026-0251", # sized-chunks unmaintained (transitive via noir -> im)
 ]
 
 [licenses]
