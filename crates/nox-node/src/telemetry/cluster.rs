@@ -41,16 +41,13 @@ pub async fn spawn_cluster_api(port: u16) -> ClusterState {
         .layer(
             CorsLayer::new()
                 .allow_origin(AllowOrigin::predicate(|origin, _| {
-                    origin
-                        .to_str()
-                        .map(|s| {
-                            let lower = s.to_lowercase();
-                            lower.starts_with("http://localhost")
-                                || lower.starts_with("http://127.0.0.1")
-                                || lower.starts_with("https://localhost")
-                                || lower.starts_with("https://127.0.0.1")
-                        })
-                        .unwrap_or(false)
+                    origin.to_str().is_ok_and(|s| {
+                        let lower = s.to_lowercase();
+                        lower.starts_with("http://localhost")
+                            || lower.starts_with("http://127.0.0.1")
+                            || lower.starts_with("https://localhost")
+                            || lower.starts_with("https://127.0.0.1")
+                    })
                 }))
                 .allow_methods(tower_http::cors::Any)
                 .allow_headers(tower_http::cors::Any),

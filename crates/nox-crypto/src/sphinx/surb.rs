@@ -524,7 +524,7 @@ mod tests {
         assert!(
             wrong_result.is_err(),
             "offset 1036 unexpectedly decrypted Ok({} bytes)",
-            wrong_result.as_ref().map(|v| v.len()).unwrap_or(0)
+            wrong_result.as_ref().map_or(0, |v| v.len())
         );
 
         let correct_body = &packet_bytes[correct_offset..];

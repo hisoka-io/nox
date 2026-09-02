@@ -280,7 +280,7 @@ mod tests {
             seed_urls: vec![],
             eth_rpc_url: "http://localhost:8545".into(),
             registry_address: Address::zero(),
-            refresh_interval: Duration::from_secs(60),
+            refresh_interval: Duration::from_mins(1),
             request_timeout: Duration::from_secs(10),
             skip_chain_verification: false,
         };
@@ -295,7 +295,7 @@ mod tests {
             seed_urls: vec!["http://seed1:8080/topology".into()],
             eth_rpc_url: "http://localhost:8545".into(),
             registry_address: Address::zero(),
-            refresh_interval: Duration::from_secs(60),
+            refresh_interval: Duration::from_mins(1),
             request_timeout: Duration::from_secs(10),
             skip_chain_verification: false,
         };

@@ -356,7 +356,7 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<IngressState>) {
     let mut subscribed: HashSet<String> = HashSet::new();
     let poll_interval = Duration::from_millis(100);
     let ping_interval = Duration::from_secs(15);
-    let timeout = Duration::from_secs(300);
+    let timeout = Duration::from_mins(5);
     let start = Instant::now();
     let mut last_ping = Instant::now();
 
@@ -471,7 +471,7 @@ async fn stream_responses(
 
     let stream = async_stream::stream! {
         let start = Instant::now();
-        let timeout = Duration::from_secs(60);
+        let timeout = Duration::from_mins(1);
         let poll_interval = Duration::from_millis(100);
         let mut remaining: Vec<String> = surb_ids;
 

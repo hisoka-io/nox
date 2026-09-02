@@ -1403,8 +1403,7 @@ impl<M: Middleware + Clone + 'static> PrivacyClient<M> {
                             self.signer.get_block_number(),
                         )
                         .await
-                        .map(|b| b.as_u64())
-                        .unwrap_or(block_num + 5);
+                        .map_or(block_num + 5, |b| b.as_u64());
                     let search_to = current.max(block_num + 5);
 
                     let wide_filter = Filter::new()

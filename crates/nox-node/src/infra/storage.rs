@@ -341,7 +341,7 @@ mod tests {
         repo.check_and_tag(b"old", 0).await.unwrap();
 
         // Wait to guarantee 'now' > 'expiry'
-        sleep(Duration::from_millis(2000)).await;
+        sleep(Duration::from_secs(2)).await;
 
         repo.check_and_tag(b"fresh", 100).await.unwrap();
 

@@ -139,7 +139,7 @@ impl ProverWorker {
 
         let mut response_line = String::new();
         tokio::time::timeout(
-            std::time::Duration::from_secs(120),
+            std::time::Duration::from_mins(2),
             stdout.read_line(&mut response_line),
         )
         .await

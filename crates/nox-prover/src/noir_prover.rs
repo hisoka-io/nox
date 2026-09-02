@@ -91,7 +91,7 @@ impl NoirProver {
         debug!("ZK: Calling Node.js prover bridge for {}...", circuit_name);
 
         let node_output = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
+            std::time::Duration::from_mins(2),
             Command::new("node")
                 .arg(script_str)
                 .arg(circuit_name)

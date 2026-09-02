@@ -164,7 +164,7 @@ mod tests {
             crate::infra::persistence::rotational_bloom::RotationalBloomFilter::new(
                 1000,
                 0.01,
-                std::time::Duration::from_secs(60),
+                std::time::Duration::from_mins(1),
             ),
         );
         let (worker_tx, _worker_rx) = async_channel::bounded(16);

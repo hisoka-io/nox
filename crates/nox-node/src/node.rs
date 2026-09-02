@@ -327,8 +327,7 @@ impl NoxNode {
             let compaction_db = db.clone();
             let compaction_shutdown = shutdown_token.clone();
             join_set.spawn(async move {
-                const COMPACTION_INTERVAL: std::time::Duration =
-                    std::time::Duration::from_secs(6 * 3600);
+                const COMPACTION_INTERVAL: std::time::Duration = std::time::Duration::from_hours(6);
                 loop {
                     tokio::select! {
                         () = tokio::time::sleep(COMPACTION_INTERVAL) => {
@@ -821,8 +820,7 @@ async fn handle_topology_request(
     let fingerprint = topology_manager.get_current_fingerprint();
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
 
     Json(TopologySnapshot {
         nodes,

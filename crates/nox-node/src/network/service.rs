@@ -211,7 +211,7 @@ impl P2PService {
         self.bootstrap_peers().await;
 
         let mut bus_rx = self.bus_subscriber.subscribe();
-        let mut cleanup_interval = tokio::time::interval(Duration::from_secs(60));
+        let mut cleanup_interval = tokio::time::interval(Duration::from_mins(1));
         let cancel = self.cancel_token.clone().unwrap_or_default();
         info!("P2P Service Active.");
 
@@ -232,11 +232,11 @@ impl P2PService {
                     }
                 }
                 _ = cleanup_interval.tick() => {
-                    self.rate_limiter.cleanup_inactive(Duration::from_secs(600));
+                    self.rate_limiter.cleanup_inactive(Duration::from_mins(10));
                     self.connection_filter.cleanup_expired();
                     let ttl = self.session_ttl;
                     self.session_cache.retain(|_, state| state.created_at.elapsed() < ttl);
-                    self.topology_request_timestamps.retain(|_, ts| ts.elapsed() < Duration::from_secs(600));
+                    self.topology_request_timestamps.retain(|_, ts| ts.elapsed() < Duration::from_mins(10));
                 }
                 () = cancel.cancelled() => {
                     info!("P2P Service shutting down (cancellation token).");

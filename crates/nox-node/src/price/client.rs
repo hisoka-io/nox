@@ -57,12 +57,12 @@ impl PriceClient {
             base_url: base_url.to_string(),
             cache: Arc::new(RwLock::new((
                 Instant::now()
-                    .checked_sub(Duration::from_secs(60))
+                    .checked_sub(Duration::from_mins(1))
                     .unwrap_or_else(Instant::now),
                 HashMap::new(),
             ))),
             ttl: Duration::from_secs(10), // Cache for 10 seconds
-            max_staleness: Duration::from_secs(300), // Reject stale cache older than 5 minutes
+            max_staleness: Duration::from_mins(5), // Reject stale cache older than 5 minutes
             metrics: None,
         }
     }

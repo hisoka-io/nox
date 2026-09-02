@@ -44,7 +44,7 @@ pub struct MixnetClientConfig {
 impl Default for MixnetClientConfig {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_secs(300),
+            timeout: Duration::from_mins(5),
             pow_difficulty: 0,
             surbs_per_request: 10,
             entry_node_pubkey: None,
@@ -1148,7 +1148,7 @@ impl MixnetClient {
             .rpc_call_with_budget_and_url(method, params, budget, rpc_url)
             .await;
         if let Ok(ref val) = result {
-            let size = serde_json::to_vec(val).map(|v| v.len()).unwrap_or(0);
+            let size = serde_json::to_vec(val).map_or(0, |v| v.len());
             self.adaptive_budget.record(method, size);
         }
         result
@@ -1275,7 +1275,7 @@ impl MixnetClient {
 
         let logs: Vec<Log> =
             serde_json::from_value(result).map_err(|e| MixnetClientError::Parse(e.to_string()))?;
-        let response_size = serde_json::to_vec(&logs).map(|v| v.len()).unwrap_or(0);
+        let response_size = serde_json::to_vec(&logs).map_or(0, |v| v.len());
         self.adaptive_budget.record("eth_getLogs", response_size);
         Ok(logs)
     }
@@ -1604,7 +1604,7 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = MixnetClientConfig::default();
-        assert_eq!(config.timeout, Duration::from_secs(300));
+        assert_eq!(config.timeout, Duration::from_mins(5));
         assert_eq!(config.pow_difficulty, 0);
         assert_eq!(config.surbs_per_request, 10);
         assert!((config.default_fec_ratio - 0.3).abs() < f64::EPSILON);
@@ -1785,7 +1785,7 @@ mod tests {
     #[test]
     fn test_config_timeout_is_300s() {
         let config = MixnetClientConfig::default();
-        assert_eq!(config.timeout, Duration::from_secs(300));
+        assert_eq!(config.timeout, Duration::from_mins(5));
     }
 
     #[test]

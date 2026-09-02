@@ -171,7 +171,7 @@ fn test_memory_limit_eviction() {
     let config = ReassemblerConfig {
         max_buffer_bytes: 1000,     // Very small: 1KB
         max_concurrent_messages: 3, // Max 3 messages
-        stale_timeout: Duration::from_secs(60),
+        stale_timeout: Duration::from_mins(1),
     };
     let mut reassembler = Reassembler::new(config);
 
@@ -193,7 +193,7 @@ fn test_max_message_size_roundtrip() {
     let mut reassembler = Reassembler::new(ReassemblerConfig {
         max_buffer_bytes: 100_000_000, // 100MB for test
         max_concurrent_messages: 10,
-        stale_timeout: Duration::from_secs(60),
+        stale_timeout: Duration::from_mins(1),
     });
 
     let size = 640 * 1024;
@@ -236,7 +236,7 @@ fn test_interleaved_messages_chaos() {
     let mut reassembler = Reassembler::new(ReassemblerConfig {
         max_buffer_bytes: 50_000_000,
         max_concurrent_messages: 100,
-        stale_timeout: Duration::from_secs(60),
+        stale_timeout: Duration::from_mins(1),
     });
 
     let mut rng = rand::thread_rng();
