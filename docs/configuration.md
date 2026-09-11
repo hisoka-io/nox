@@ -23,6 +23,19 @@ cargo run --release -- --config config.toml
 | `min_pow_difficulty` | `u32` | `3` | PoW difficulty for incoming packets (0-63) |
 | `min_profit_margin_percent` | `u64` | `10` | TX profitability threshold (%) |
 | `min_gas_balance` | `String` | `"10000000000000000"` | Min ETH balance in wei (0.01 ETH) |
+| `native_asset_price_id` | `String` | empty | Oracle asset ID for the chain gas token |
+| `native_asset_decimals` | `u8` | `18` | Chain gas-token decimals |
+| `chain_data_fee_mode` | enum | `rpc_gas_estimate_includes_data_fee` | Treat RPC gas estimate as total chain gas |
+| `gas_limit_buffer_bps` | `u32` | `2000` | Gas-limit reservation buffer |
+| `initial_fee_buffer_bps` | `u32` | `2000` | Initial gas-price buffer |
+| `replacement_step_bps` | `u32` | `2000` | Capped replacement increase |
+| `quote_ttl_secs` | `u64` | `0` | Signed quote lifetime; required for Exit/Full |
+| `quote_network_fee_bps` | `u32` | `0` | Network reward share of exit fee |
+| `quote_maximum_transaction_gas` | `u64` | `0` | Operator ceiling for caller gas reservations |
+| `quote_max_outstanding` | `u32` | `0` | Durable outstanding quote capacity |
+| `quote_max_pending_sponsored_gas` | `u64` | `0` | Aggregate sponsored-gas reservation limit |
+| `quote_rolling_loss_limit_native` | `String` | `"0"` | Rolling unreimbursed gas-loss ceiling |
+| `quote_rolling_loss_window_secs` | `u64` | `0` | Rolling loss window |
 | `benchmark_mode` | `bool` | `false` | Skip production validations |
 | `bootstrap_topology_urls` | `Vec<String>` | `[]` | Seed node URLs |
 
@@ -31,7 +44,7 @@ cargo run --release -- --config config.toml
 | Field | Required for |
 |---|---|
 | `registry_contract_address` | All roles (production) |
-| `relayer_multicall_address` | Exit/Full |
+| `nox_entry_point_address` | Exit/Full |
 | `nox_reward_pool_address` | Exit/Full |
 
 ### Sensitive fields
@@ -43,6 +56,14 @@ Excluded from logs and serialization, zeroized on drop:
 | `routing_private_key` | X25519 hex | All roles (production) |
 | `p2p_private_key` | Ed25519 hex | Optional (auto-generated if empty) |
 | `eth_wallet_private_key` | Secp256k1 hex | Exit/Full |
+
+### `[[payment_adapters]]` and `[[tokens]]`
+
+Exit and Full nodes require an explicit adapter allowlist and token metadata. Each adapter declares its address,
+allowed fee assets, and maximum payment gas. Every allowed fee asset must have exactly one `[[tokens]]` entry
+with a nonzero address, symbol, decimals, and oracle price ID. Production nodes do not inherit mainnet token
+addresses. Measure each enabled adapter's complete transaction under production-equivalent conditions, apply the
+configured gas buffer, and set quote and aggregate pending-gas ceilings above that measured bound.
 
 ## Nested configuration
 
@@ -121,7 +142,7 @@ NOX_NODE_ROLE=exit
 NOX_ROUTING_PRIVATE_KEY=<32-byte hex>
 NOX_ETH_WALLET_PRIVATE_KEY=<32-byte hex>
 NOX_REGISTRY_CONTRACT_ADDRESS=0x...
-NOX_RELAYER_MULTICALL_ADDRESS=0x...
+NOX_NOX_ENTRY_POINT_ADDRESS=0x...
 NOX_NOX_REWARD_POOL_ADDRESS=0x...
 NOX_INGRESS_PORT=8080
 NOX_METRICS_PORT=9090

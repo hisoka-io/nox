@@ -1,7 +1,21 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum TxStatus {
+use crate::{ExecutionQuoteV1, PaidQuoteRequestV2};
+
+pub type ExecutionId = [u8; 32];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TxStatusV2 {
+    Prepared,
+    Submitted,
+    ReplacementPrepared,
+    Replaced,
+    Mined,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LegacyTxStatus {
     Pending,
     Mined,
     Failed,
@@ -9,7 +23,27 @@ pub enum TxStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingTransaction {
+#[serde(deny_unknown_fields)]
+pub struct PendingTransactionV2 {
+    pub execution_id: ExecutionId,
+    pub to: String,
+    pub data_hash: [u8; 32],
+    pub nonce: u64,
+    pub gas_limit: String,
+    pub gas_price: String,
+    pub maximum_fee_per_gas: String,
+    pub raw_signed_tx: Vec<u8>,
+    pub tx_hash: String,
+    pub prior_transaction_hashes: Vec<String>,
+    pub replacement_attempts: u32,
+    pub first_sent_at: u64,
+    pub last_update_at: u64,
+    pub status: TxStatusV2,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyPendingTransaction {
     pub id: String,
     pub to: String,
     pub data: Vec<u8>,
@@ -19,66 +53,45 @@ pub struct PendingTransaction {
     pub tx_hash: String,
     pub first_sent_at: u64,
     pub last_update_at: u64,
-    pub status: TxStatus,
+    pub status: LegacyTxStatus,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub type PendingTransaction = LegacyPendingTransaction;
+pub type TxStatus = LegacyTxStatus;
 
-    #[test]
-    fn test_tx_status_serialization_roundtrip() {
-        for status in [
-            TxStatus::Pending,
-            TxStatus::Mined,
-            TxStatus::Failed,
-            TxStatus::Replaced,
-        ] {
-            let json = serde_json::to_string(&status).unwrap();
-            let decoded: TxStatus = serde_json::from_str(&json).unwrap();
-            assert_eq!(status, decoded);
-        }
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredTransactionV2 {
+    pub schema: u8,
+    pub transaction: PendingTransactionV2,
+}
 
-    #[test]
-    fn test_pending_transaction_json_roundtrip() {
-        let tx = PendingTransaction {
-            id: "packet-abc123".to_string(),
-            to: "0xdeadbeef00000000000000000000000000000001".to_string(),
-            data: vec![1, 2, 3, 4],
-            nonce: 42,
-            gas_limit: "21000".to_string(),
-            gas_price: "1000000000".to_string(),
-            tx_hash: "0xabc".to_string(),
-            first_sent_at: 1_700_000_000,
-            last_update_at: 1_700_000_100,
-            status: TxStatus::Pending,
-        };
+#[derive(Debug, Clone)]
+pub enum DecodedTransaction {
+    V2(PendingTransactionV2),
+    Legacy(LegacyPendingTransaction),
+}
 
-        let json = serde_json::to_string(&tx).unwrap();
-        let decoded: PendingTransaction = serde_json::from_str(&json).unwrap();
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum QuoteStatusV2 {
+    Outstanding,
+    Inflight,
+    Submitted,
+    Confirmed,
+    Reverted,
+    Expired,
+    Rejected,
+}
 
-        assert_eq!(decoded.id, tx.id);
-        assert_eq!(decoded.nonce, tx.nonce);
-        assert_eq!(decoded.status, tx.status);
-        assert_eq!(decoded.data, tx.data);
-    }
-
-    #[test]
-    fn test_tx_status_all_variants_distinct() {
-        let statuses = [
-            TxStatus::Pending,
-            TxStatus::Mined,
-            TxStatus::Failed,
-            TxStatus::Replaced,
-        ];
-        // Each variant is different from all others
-        for i in 0..statuses.len() {
-            for j in 0..statuses.len() {
-                if i != j {
-                    assert_ne!(statuses[i], statuses[j]);
-                }
-            }
-        }
-    }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StoredQuoteV2 {
+    pub schema: u8,
+    pub request: PaidQuoteRequestV2,
+    pub quote: ExecutionQuoteV1,
+    pub execution_id: ExecutionId,
+    pub exit_signature: Vec<u8>,
+    pub pending_sponsored_gas: u64,
+    pub rolling_loss_window_secs: u64,
+    pub status: QuoteStatusV2,
 }

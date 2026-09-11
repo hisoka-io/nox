@@ -48,10 +48,12 @@ pub struct MetricsService {
 
     pub profitability_outcomes_total: Family<Vec<(String, String)>, Counter>,
     pub profitability_margin_ratio: Histogram,
-    pub tx_revenue_usd: Histogram,
-    pub tx_cost_usd: Histogram,
-    pub cumulative_revenue_usd: Counter,
+    pub tx_authorized_revenue_usd: Histogram,
+    pub tx_planned_cost_usd: Histogram,
+    pub tx_maximum_cost_usd: Histogram,
+    pub cumulative_authorized_revenue_usd: Counter,
     pub cumulative_cost_usd: Counter,
+    pub cumulative_maximum_cost_usd: Counter,
     pub eth_tx_gas_used: Histogram,
     pub eth_tx_outcomes_total: Family<Vec<(String, String)>, Counter>,
     pub chain_observer_last_block: Gauge<i64, AtomicI64>,
@@ -302,26 +304,35 @@ impl MetricsService {
             profitability_margin_ratio.clone(),
         );
 
-        let tx_revenue_usd =
+        let tx_authorized_revenue_usd =
             Histogram::new([0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0].into_iter());
         registry.register(
-            "nox_tx_revenue_usd",
-            "Per-transaction revenue in USD",
-            tx_revenue_usd.clone(),
+            "nox_tx_authorized_revenue_usd",
+            "Authorized per-transaction revenue in USD",
+            tx_authorized_revenue_usd.clone(),
         );
 
-        let tx_cost_usd = Histogram::new([0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0].into_iter());
+        let tx_planned_cost_usd =
+            Histogram::new([0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0].into_iter());
         registry.register(
-            "nox_tx_cost_usd",
-            "Per-transaction cost in USD",
-            tx_cost_usd.clone(),
+            "nox_tx_planned_cost_usd",
+            "Per-transaction planned initial cost in USD",
+            tx_planned_cost_usd.clone(),
         );
 
-        let cumulative_revenue_usd = Counter::default();
+        let tx_maximum_cost_usd =
+            Histogram::new([0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0].into_iter());
         registry.register(
-            "nox_cumulative_revenue_usd",
-            "Cumulative revenue in USD",
-            cumulative_revenue_usd.clone(),
+            "nox_tx_maximum_cost_usd",
+            "Per-transaction maximum authorized cost in USD",
+            tx_maximum_cost_usd.clone(),
+        );
+
+        let cumulative_authorized_revenue_usd = Counter::default();
+        registry.register(
+            "nox_cumulative_authorized_revenue_usd",
+            "Cumulative authorized revenue in USD",
+            cumulative_authorized_revenue_usd.clone(),
         );
 
         let cumulative_cost_usd = Counter::default();
@@ -329,6 +340,13 @@ impl MetricsService {
             "nox_cumulative_cost_usd",
             "Cumulative cost in USD",
             cumulative_cost_usd.clone(),
+        );
+
+        let cumulative_maximum_cost_usd = Counter::default();
+        registry.register(
+            "nox_cumulative_maximum_cost_usd",
+            "Cumulative maximum authorized cost in USD",
+            cumulative_maximum_cost_usd.clone(),
         );
 
         let eth_tx_gas_used = Histogram::new(
@@ -565,10 +583,12 @@ impl MetricsService {
             event_bus_publish_errors_total,
             profitability_outcomes_total,
             profitability_margin_ratio,
-            tx_revenue_usd,
-            tx_cost_usd,
-            cumulative_revenue_usd,
+            tx_authorized_revenue_usd,
+            tx_planned_cost_usd,
+            tx_maximum_cost_usd,
+            cumulative_authorized_revenue_usd,
             cumulative_cost_usd,
+            cumulative_maximum_cost_usd,
             eth_tx_gas_used,
             eth_tx_outcomes_total,
             chain_observer_last_block,
@@ -741,18 +761,24 @@ impl MetricsService {
         );
 
         m.insert(
-            "cumulativeRevenueUsd".into(),
-            serde_json::Value::from(self.cumulative_revenue_usd.get() as f64 / 1_000_000.0),
+            "cumulativeAuthorizedRevenueUsd".into(),
+            serde_json::Value::from(
+                self.cumulative_authorized_revenue_usd.get() as f64 / 1_000_000.0,
+            ),
         );
         m.insert(
             "cumulativeCostUsd".into(),
             serde_json::Value::from(self.cumulative_cost_usd.get() as f64 / 1_000_000.0),
         );
         m.insert(
+            "cumulativeMaximumCostUsd".into(),
+            serde_json::Value::from(self.cumulative_maximum_cost_usd.get() as f64 / 1_000_000.0),
+        );
+        m.insert(
             "profitableCount".into(),
             fc(
                 &self.profitability_outcomes_total,
-                &[("result", "profitable")],
+                &[("result", "accepted")],
             )
             .into(),
         );
@@ -760,7 +786,7 @@ impl MetricsService {
             "unprofitableCount".into(),
             fc(
                 &self.profitability_outcomes_total,
-                &[("result", "unprofitable")],
+                &[("result", "UNPROFITABLE")],
             )
             .into(),
         );
@@ -1013,5 +1039,29 @@ impl MetricsService {
 impl Default for MetricsService {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dashboard_projection_uses_typed_profitability_labels() {
+        let metrics = MetricsService::new();
+        metrics
+            .profitability_outcomes_total
+            .get_or_create(&vec![("result".into(), "accepted".into())])
+            .inc();
+        metrics
+            .profitability_outcomes_total
+            .get_or_create(&vec![("result".into(), "UNPROFITABLE".into())])
+            .inc();
+        metrics.cumulative_maximum_cost_usd.inc_by(1_250_000);
+
+        let projection = metrics.to_json();
+        assert_eq!(projection["profitableCount"], 1);
+        assert_eq!(projection["unprofitableCount"], 1);
+        assert_eq!(projection["cumulativeMaximumCostUsd"], 1.25);
     }
 }

@@ -457,7 +457,7 @@ mod tests {
         assert!(bloom_path.exists());
 
         // Create a new filter and restore from file
-        let filter2 = RotationalBloomFilter::new(1_000, 0.001, Duration::from_secs(3600))
+        let filter2 = RotationalBloomFilter::new(1_000, 0.001, Duration::from_hours(1))
             .with_file_persistence(&bloom_path);
         filter2.restore_from_file().await.unwrap();
 

@@ -1,11 +1,31 @@
 use config::{Config, ConfigError, Environment, File};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 use tracing::info;
 use zeroize::Zeroize;
 
 use nox_core::models::handshake::Capabilities;
 use x25519_dalek::StaticSecret as X25519SecretKey;
+
+pub const DEFAULT_ORACLE_CACHE_TTL_SECS: u64 = 10;
+pub const DEFAULT_ORACLE_MAX_OBSERVATION_AGE_SECS: u64 = 300;
+pub const DEFAULT_ORACLE_MAX_FUTURE_SKEW_SECS: u64 = 30;
+pub const MAX_ORACLE_OBSERVATION_AGE_SECS: u64 = 3_600;
+pub const MAX_ORACLE_FUTURE_SKEW_SECS: u64 = 300;
+pub const DEFAULT_GAS_LIMIT_BUFFER_BPS: u32 = 2_000;
+pub const DEFAULT_INITIAL_FEE_BUFFER_BPS: u32 = 2_000;
+pub const DEFAULT_REPLACEMENT_STEP_BPS: u32 = 2_000;
+pub const MAX_BUFFER_BPS: u32 = 10_000;
+pub const MAX_MARGIN_PERCENT: u64 = 1_000;
+pub const MAX_NATIVE_ASSET_DECIMALS: u8 = 36;
+pub const BASIS_POINTS: u128 = 10_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainDataFeeMode {
+    RpcGasEstimateIncludesDataFee,
+}
 
 /// Maps a token contract address to its symbol, decimals, and oracle price ID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,6 +35,13 @@ pub struct TokenConfig {
     pub decimals: u8,
     /// Must match a key returned by the price oracle at /prices
     pub price_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaymentAdapterConfig {
+    pub address: String,
+    pub fee_assets: Vec<String>,
+    pub maximum_payment_gas: u64,
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +256,15 @@ pub struct NoxConfig {
 
     pub min_gas_balance: String,
     pub min_profit_margin_percent: u64,
+    pub oracle_cache_ttl_secs: u64,
+    pub oracle_max_observation_age_secs: u64,
+    pub oracle_max_future_skew_secs: u64,
+    pub native_asset_price_id: String,
+    pub native_asset_decimals: u8,
+    pub gas_limit_buffer_bps: u32,
+    pub initial_fee_buffer_bps: u32,
+    pub replacement_step_bps: u32,
+    pub chain_data_fee_mode: ChainDataFeeMode,
 
     pub chain_id: u64,
 
@@ -251,8 +287,17 @@ pub struct NoxConfig {
     /// 0 = disabled.
     pub ingress_port: u16,
     pub response_prune_interval_secs: u64,
-    pub relayer_multicall_address: String,
     pub nox_reward_pool_address: String,
+    pub nox_entry_point_address: String,
+    pub quote_ttl_secs: u64,
+    pub quote_network_fee_bps: u32,
+    pub quote_maximum_transaction_gas: u64,
+    pub quote_max_outstanding: u32,
+    pub quote_max_pending_sponsored_gas: u64,
+    pub quote_rolling_loss_limit_native: String,
+    pub quote_rolling_loss_window_secs: u64,
+    #[serde(default)]
+    pub payment_adapters: Vec<PaymentAdapterConfig>,
     /// Non-empty replaces hardcoded mainnet defaults.
     #[serde(default)]
     pub tokens: Vec<TokenConfig>,
@@ -283,6 +328,21 @@ impl std::fmt::Debug for NoxConfig {
             .field("eth_wallet_private_key", &"[REDACTED]")
             .field("min_gas_balance", &self.min_gas_balance)
             .field("min_profit_margin_percent", &self.min_profit_margin_percent)
+            .field("oracle_cache_ttl_secs", &self.oracle_cache_ttl_secs)
+            .field(
+                "oracle_max_observation_age_secs",
+                &self.oracle_max_observation_age_secs,
+            )
+            .field(
+                "oracle_max_future_skew_secs",
+                &self.oracle_max_future_skew_secs,
+            )
+            .field("native_asset_price_id", &self.native_asset_price_id)
+            .field("native_asset_decimals", &self.native_asset_decimals)
+            .field("gas_limit_buffer_bps", &self.gas_limit_buffer_bps)
+            .field("initial_fee_buffer_bps", &self.initial_fee_buffer_bps)
+            .field("replacement_step_bps", &self.replacement_step_bps)
+            .field("chain_data_fee_mode", &self.chain_data_fee_mode)
             .field("chain_id", &self.chain_id)
             .field("network", &self.network)
             .field("relayer", &self.relayer)
@@ -299,8 +359,31 @@ impl std::fmt::Debug for NoxConfig {
                 "response_prune_interval_secs",
                 &self.response_prune_interval_secs,
             )
-            .field("relayer_multicall_address", &self.relayer_multicall_address)
             .field("nox_reward_pool_address", &self.nox_reward_pool_address)
+            .field("nox_entry_point_address", &self.nox_entry_point_address)
+            .field("quote_ttl_secs", &self.quote_ttl_secs)
+            .field("quote_network_fee_bps", &self.quote_network_fee_bps)
+            .field(
+                "quote_maximum_transaction_gas",
+                &self.quote_maximum_transaction_gas,
+            )
+            .field("quote_max_outstanding", &self.quote_max_outstanding)
+            .field(
+                "quote_max_pending_sponsored_gas",
+                &self.quote_max_pending_sponsored_gas,
+            )
+            .field(
+                "quote_rolling_loss_limit_native",
+                &self.quote_rolling_loss_limit_native,
+            )
+            .field(
+                "quote_rolling_loss_window_secs",
+                &self.quote_rolling_loss_window_secs,
+            )
+            .field(
+                "payment_adapters",
+                &format!("{} configured", self.payment_adapters.len()),
+            )
             .field("tokens", &format!("{} registered", self.tokens.len()))
             .finish()
     }
@@ -324,6 +407,15 @@ impl Default for NoxConfig {
             eth_wallet_private_key: String::new(),
             min_gas_balance: "10000000000000000".to_string(),
             min_profit_margin_percent: 10,
+            oracle_cache_ttl_secs: DEFAULT_ORACLE_CACHE_TTL_SECS,
+            oracle_max_observation_age_secs: DEFAULT_ORACLE_MAX_OBSERVATION_AGE_SECS,
+            oracle_max_future_skew_secs: DEFAULT_ORACLE_MAX_FUTURE_SKEW_SECS,
+            native_asset_price_id: String::new(),
+            native_asset_decimals: 18,
+            gas_limit_buffer_bps: DEFAULT_GAS_LIMIT_BUFFER_BPS,
+            initial_fee_buffer_bps: DEFAULT_INITIAL_FEE_BUFFER_BPS,
+            replacement_step_bps: DEFAULT_REPLACEMENT_STEP_BPS,
+            chain_data_fee_mode: ChainDataFeeMode::RpcGasEstimateIncludesDataFee,
             chain_id: 0,
 
             network: NetworkConfig::default(),
@@ -343,8 +435,16 @@ impl Default for NoxConfig {
             ingress_port: 0,
             response_prune_interval_secs: 60,
 
-            relayer_multicall_address: "0x0000000000000000000000000000000000000000".to_string(),
             nox_reward_pool_address: "0x0000000000000000000000000000000000000000".to_string(),
+            nox_entry_point_address: "0x0000000000000000000000000000000000000000".to_string(),
+            quote_ttl_secs: 0,
+            quote_network_fee_bps: 0,
+            quote_maximum_transaction_gas: 0,
+            quote_max_outstanding: 0,
+            quote_max_pending_sponsored_gas: 0,
+            quote_rolling_loss_limit_native: "0".to_string(),
+            quote_rolling_loss_window_secs: 0,
+            payment_adapters: Vec::new(),
 
             tokens: Vec::new(),
         }
@@ -378,8 +478,8 @@ impl NoxConfig {
         let zero_addr = "0x0000000000000000000000000000000000000000";
         for (name, addr) in [
             ("registry_contract_address", &self.registry_contract_address),
-            ("relayer_multicall_address", &self.relayer_multicall_address),
             ("nox_reward_pool_address", &self.nox_reward_pool_address),
+            ("nox_entry_point_address", &self.nox_entry_point_address),
         ] {
             if !addr.starts_with("0x") || addr.len() != 42 || hex::decode(&addr[2..]).is_err() {
                 errors.push(format!(
@@ -392,15 +492,14 @@ impl NoxConfig {
             if self.registry_contract_address == zero_addr {
                 errors.push("registry_contract_address is zero address".into());
             }
-            if self.node_role.is_exit_capable() && self.relayer_multicall_address == zero_addr {
-                errors.push(
-                    "relayer_multicall_address is zero address (required for exit/full role)"
-                        .into(),
-                );
-            }
             if self.node_role.is_exit_capable() && self.nox_reward_pool_address == zero_addr {
                 errors.push(
                     "nox_reward_pool_address is zero address (required for exit/full role)".into(),
+                );
+            }
+            if self.node_role.is_exit_capable() && self.nox_entry_point_address == zero_addr {
+                errors.push(
+                    "nox_entry_point_address is zero address (required for exit/full role)".into(),
                 );
             }
         }
@@ -419,6 +518,153 @@ impl NoxConfig {
 
         if self.oracle_url.is_empty() && self.node_role.is_exit_capable() && !self.benchmark_mode {
             errors.push("oracle_url is empty (required for exit/full role)".into());
+        }
+
+        if self.node_role.is_exit_capable() && !self.benchmark_mode {
+            if self.oracle_max_observation_age_secs == 0
+                || self.oracle_max_observation_age_secs > MAX_ORACLE_OBSERVATION_AGE_SECS
+            {
+                errors.push(format!(
+                    "oracle_max_observation_age_secs must be in 1..={MAX_ORACLE_OBSERVATION_AGE_SECS}"
+                ));
+            }
+            if self.oracle_cache_ttl_secs == 0
+                || self.oracle_cache_ttl_secs > self.oracle_max_observation_age_secs
+            {
+                errors.push(
+                    "oracle_cache_ttl_secs must be in 1..=oracle_max_observation_age_secs".into(),
+                );
+            }
+            if self.oracle_max_future_skew_secs > MAX_ORACLE_FUTURE_SKEW_SECS {
+                errors.push(format!(
+                    "oracle_max_future_skew_secs must be in 0..={MAX_ORACLE_FUTURE_SKEW_SECS}"
+                ));
+            }
+            if self.native_asset_price_id.trim().is_empty() {
+                errors.push("native_asset_price_id is empty (required for exit/full role)".into());
+            }
+            if self.native_asset_decimals == 0
+                || self.native_asset_decimals > MAX_NATIVE_ASSET_DECIMALS
+            {
+                errors.push(format!(
+                    "native_asset_decimals must be in 1..={MAX_NATIVE_ASSET_DECIMALS}"
+                ));
+            }
+            if self.gas_limit_buffer_bps > MAX_BUFFER_BPS {
+                errors.push(format!("gas_limit_buffer_bps must be <= {MAX_BUFFER_BPS}"));
+            }
+            if self.initial_fee_buffer_bps > MAX_BUFFER_BPS {
+                errors.push(format!(
+                    "initial_fee_buffer_bps must be <= {MAX_BUFFER_BPS}"
+                ));
+            }
+            if self.replacement_step_bps == 0 || self.replacement_step_bps > MAX_BUFFER_BPS {
+                errors.push(format!(
+                    "replacement_step_bps must be in 1..={MAX_BUFFER_BPS}"
+                ));
+            }
+            if self.min_profit_margin_percent > MAX_MARGIN_PERCENT {
+                errors.push(format!(
+                    "min_profit_margin_percent must be <= {MAX_MARGIN_PERCENT}"
+                ));
+            }
+            if self.quote_ttl_secs == 0 || self.quote_ttl_secs > 300 {
+                errors.push("quote_ttl_secs must be in 1..=300".to_string());
+            }
+            if self.quote_network_fee_bps > MAX_BUFFER_BPS {
+                errors.push(format!("quote_network_fee_bps must be <= {MAX_BUFFER_BPS}"));
+            }
+            if self.quote_maximum_transaction_gas == 0 {
+                errors.push("quote_maximum_transaction_gas must be positive".to_string());
+            }
+            if self.quote_max_outstanding == 0 {
+                errors.push("quote_max_outstanding must be positive".to_string());
+            }
+            if self.quote_max_pending_sponsored_gas == 0 {
+                errors.push("quote_max_pending_sponsored_gas must be positive".to_string());
+            }
+            if self
+                .quote_rolling_loss_limit_native
+                .parse::<ethers::types::U256>()
+                .map_or(true, |limit| limit.is_zero())
+            {
+                errors
+                    .push("quote_rolling_loss_limit_native must be a positive integer".to_string());
+            }
+            if self.quote_rolling_loss_window_secs == 0 {
+                errors.push("quote_rolling_loss_window_secs must be positive".to_string());
+            }
+            if self.payment_adapters.is_empty() {
+                errors.push("payment_adapters must contain at least one exit adapter".to_string());
+            }
+            if self.tokens.is_empty() {
+                errors.push("tokens must contain explicit exit fee-asset metadata".to_string());
+            }
+            let mut token_addresses = HashSet::new();
+            for token in &self.tokens {
+                match token.address.parse::<ethers::types::Address>() {
+                    Ok(address) if !address.is_zero() => {
+                        if !token_addresses.insert(address) {
+                            errors.push("token addresses must be unique".to_string());
+                        }
+                    }
+                    Ok(_) | Err(_) => errors.push("token address is invalid".to_string()),
+                }
+                if token.symbol.trim().is_empty() {
+                    errors.push("token symbol must not be empty".to_string());
+                }
+                if token.price_id.trim().is_empty() {
+                    errors.push("token price_id must not be empty".to_string());
+                }
+                if token.decimals > MAX_NATIVE_ASSET_DECIMALS {
+                    errors.push(format!(
+                        "token decimals must be <= {MAX_NATIVE_ASSET_DECIMALS}"
+                    ));
+                }
+            }
+            let mut adapter_addresses = HashSet::new();
+            for adapter in &self.payment_adapters {
+                if adapter.maximum_payment_gas == 0 {
+                    errors.push("payment adapter maximum_payment_gas must be positive".to_string());
+                }
+                if adapter.fee_assets.is_empty() {
+                    errors.push("payment adapter must allow at least one fee asset".to_string());
+                }
+                if let Ok(address) = adapter.address.parse::<ethers::types::Address>() {
+                    if !adapter_addresses.insert(address) {
+                        errors.push("payment adapter addresses must be unique".to_string());
+                    }
+                }
+                let mut fee_assets = HashSet::new();
+                for asset in &adapter.fee_assets {
+                    if let Ok(address) = asset.parse::<ethers::types::Address>() {
+                        if !fee_assets.insert(address) {
+                            errors.push("payment adapter fee assets must be unique".to_string());
+                        }
+                        if !token_addresses.contains(&address) {
+                            errors.push(format!(
+                                "payment adapter fee asset {address:?} is missing token metadata"
+                            ));
+                        }
+                    }
+                }
+                for (field, address) in std::iter::once(("payment adapter", &adapter.address))
+                    .chain(
+                        adapter
+                            .fee_assets
+                            .iter()
+                            .map(|asset| ("payment adapter fee asset", asset)),
+                    )
+                {
+                    if !address.starts_with("0x")
+                        || address.len() != 42
+                        || hex::decode(&address[2..]).is_err()
+                        || address == zero_addr
+                    {
+                        errors.push(format!("{field} address is invalid"));
+                    }
+                }
+            }
         }
 
         if self.network.max_connections == 0 {
@@ -440,6 +686,12 @@ impl NoxConfig {
         } else {
             Err(errors)
         }
+    }
+
+    pub fn min_profit_margin_bps(&self) -> Result<u128, String> {
+        u128::from(self.min_profit_margin_percent)
+            .checked_mul(100)
+            .ok_or_else(|| "min_profit_margin_percent conversion overflow".to_string())
     }
 
     /// Ephemeral keys only available with `dev-node` feature + `benchmark_mode`.
@@ -472,6 +724,27 @@ impl NoxConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn configure_quote_policy(config: &mut NoxConfig) {
+        config.quote_ttl_secs = 30;
+        config.quote_network_fee_bps = 500;
+        config.quote_maximum_transaction_gas = 10_000_000;
+        config.quote_max_outstanding = 256;
+        config.quote_max_pending_sponsored_gas = 500_000_000;
+        config.quote_rolling_loss_limit_native = "100000000000000000".to_string();
+        config.quote_rolling_loss_window_secs = 3_600;
+        config.payment_adapters = vec![PaymentAdapterConfig {
+            address: "0x2222222222222222222222222222222222222222".to_string(),
+            fee_assets: vec!["0x3333333333333333333333333333333333333333".to_string()],
+            maximum_payment_gas: 4_000_000,
+        }];
+        config.tokens = vec![TokenConfig {
+            address: "0x3333333333333333333333333333333333333333".to_string(),
+            symbol: "TEST".to_string(),
+            decimals: 18,
+            price_id: "test-token".to_string(),
+        }];
+    }
 
     #[test]
     fn test_fragmentation_config_matches_core_defaults() {
@@ -543,9 +816,11 @@ mod tests {
         config.routing_private_key = "aa".repeat(32);
         config.eth_wallet_private_key = "bb".repeat(32);
         config.registry_contract_address = "0x1234567890abcdef1234567890abcdef12345678".to_string();
-        config.relayer_multicall_address = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string();
         config.nox_reward_pool_address = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string();
+        config.nox_entry_point_address = "0x1111111111111111111111111111111111111111".to_string();
+        config.native_asset_price_id = "avalanche-2".to_string();
         config.chain_id = 1;
+        configure_quote_policy(&mut config);
         let result = config.validate();
         assert!(
             result.is_ok(),
@@ -591,5 +866,126 @@ mod tests {
             "Relay role should not require exit-only fields: {:?}",
             result
         );
+    }
+
+    #[test]
+    fn oracle_freshness_and_economics_boundaries_are_enforced() {
+        let mut config = NoxConfig::default();
+        config.benchmark_mode = false;
+        config.node_role = NodeRole::Exit;
+        config.routing_private_key = "aa".repeat(32);
+        config.eth_wallet_private_key = "bb".repeat(32);
+        config.registry_contract_address = "0x1234567890abcdef1234567890abcdef12345678".to_string();
+        config.nox_reward_pool_address = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string();
+        config.nox_entry_point_address = "0x1111111111111111111111111111111111111111".to_string();
+        config.chain_id = 1;
+        config.native_asset_price_id = "avalanche-2".to_string();
+        configure_quote_policy(&mut config);
+        assert!(config.validate().is_ok());
+
+        config.oracle_cache_ttl_secs = config.oracle_max_observation_age_secs + 1;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .iter()
+            .any(|error| error.contains("oracle_cache_ttl_secs")));
+        config.oracle_cache_ttl_secs = DEFAULT_ORACLE_CACHE_TTL_SECS;
+        config.oracle_max_future_skew_secs = MAX_ORACLE_FUTURE_SKEW_SECS + 1;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .iter()
+            .any(|error| error.contains("oracle_max_future_skew_secs")));
+        config.oracle_max_future_skew_secs = DEFAULT_ORACLE_MAX_FUTURE_SKEW_SECS;
+        config.gas_limit_buffer_bps = MAX_BUFFER_BPS + 1;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .iter()
+            .any(|error| error.contains("gas_limit_buffer_bps")));
+    }
+
+    #[test]
+    fn percent_to_basis_points_is_exact() {
+        let mut config = NoxConfig::default();
+        config.min_profit_margin_percent = 10;
+        assert_eq!(config.min_profit_margin_bps().unwrap(), 1_000);
+    }
+
+    #[test]
+    fn rpc_total_gas_cost_mode_is_the_only_accepted_spelling() {
+        assert_eq!(
+            serde_json::from_str::<ChainDataFeeMode>(r#""rpc_gas_estimate_includes_data_fee""#,)
+                .unwrap(),
+            ChainDataFeeMode::RpcGasEstimateIncludesDataFee,
+        );
+        assert!(serde_json::from_str::<ChainDataFeeMode>(r#""zero""#).is_err());
+    }
+
+    #[test]
+    fn exit_requires_a_nonzero_entry_point() {
+        let mut config = NoxConfig::default();
+        config.node_role = NodeRole::Exit;
+        config.nox_entry_point_address = "0x0000000000000000000000000000000000000000".to_string();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .iter()
+            .any(|error| error.contains("nox_entry_point_address")));
+    }
+
+    #[test]
+    fn quote_policy_rejects_duplicate_adapters_and_fee_assets() {
+        let mut config = NoxConfig::default();
+        config.node_role = NodeRole::Exit;
+        configure_quote_policy(&mut config);
+        let duplicate_asset = config.payment_adapters[0].fee_assets[0].clone();
+        config.payment_adapters[0].fee_assets.push(duplicate_asset);
+        let duplicate_adapter = config.payment_adapters[0].clone();
+        config.payment_adapters.push(duplicate_adapter);
+        let errors = config.validate().unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("addresses must be unique")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("fee assets must be unique")));
+    }
+
+    #[test]
+    fn exit_quote_assets_require_explicit_unambiguous_token_metadata() {
+        let mut config = NoxConfig::default();
+        config.node_role = NodeRole::Exit;
+        configure_quote_policy(&mut config);
+
+        config.tokens.clear();
+        let errors = config.validate().unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("tokens must contain")));
+
+        configure_quote_policy(&mut config);
+        config.tokens.push(config.tokens[0].clone());
+        let errors = config.validate().unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("token addresses must be unique")));
+
+        configure_quote_policy(&mut config);
+        config.tokens[0].price_id.clear();
+        config.tokens[0].symbol.clear();
+        config.tokens[0].decimals = MAX_NATIVE_ASSET_DECIMALS + 1;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|error| error.contains("token symbol")));
+        assert!(errors.iter().any(|error| error.contains("token price_id")));
+        assert!(errors.iter().any(|error| error.contains("token decimals")));
+
+        configure_quote_policy(&mut config);
+        config.payment_adapters[0].fee_assets[0] =
+            "0x4444444444444444444444444444444444444444".to_string();
+        let errors = config.validate().unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("missing token metadata")));
     }
 }

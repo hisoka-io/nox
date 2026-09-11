@@ -1,7 +1,6 @@
 use dashmap::DashMap;
 use nox_core::utils::{compute_topology_fingerprint, xor_into_fingerprint};
 use parking_lot::RwLock;
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -203,18 +202,12 @@ impl TopologyManager {
     ) {
         debug!("Processing registration for {} (role={})", address, role);
 
-        let mut node = RelayerNode::new(address.clone(), sphinx_key, url.clone(), stake, role);
-        node.ingress_url = ingress_url.or_else(|| derive_ingress_url_from_multiaddr(&url));
+        let mut node = RelayerNode::new(address.clone(), sphinx_key, url, stake, role);
+        node.ingress_url = ingress_url;
         node.metadata_url = metadata_url;
 
         let address_lower = address.to_lowercase();
-        let hash = Sha256::digest(address_lower.as_bytes());
-
-        let primary_layer = match role {
-            1 => hash[0] % 2,
-            2 => 2,
-            _ => hash[0] % 3,
-        };
+        let primary_layer = nox_core::primary_layer_for_role(&address_lower, role);
         node.layer = primary_layer;
 
         for mut entry in self.layers.iter_mut() {
@@ -394,15 +387,12 @@ impl TopologyManager {
     }
 
     pub fn get_all_nodes(&self) -> Vec<RelayerNode> {
-        let mut seen = std::collections::HashSet::new();
-        let mut all = Vec::new();
-        for entry in self.layers.iter() {
-            for node in entry.value() {
-                if seen.insert(node.address.to_lowercase()) {
-                    all.push(node.clone());
-                }
-            }
-        }
+        let mut all = self
+            .address_index
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        all.sort_by_key(|node| node.address.to_lowercase());
         all
     }
 
@@ -420,11 +410,6 @@ impl TopologyManager {
 
         let mut addresses = Vec::with_capacity(nodes.len());
         for node in &nodes {
-            let mut node = node.clone();
-            if node.ingress_url.is_none() {
-                node.ingress_url = derive_ingress_url_from_multiaddr(&node.url);
-            }
-            let node = &node;
             for &layer in nox_core::models::topology::layers_for_role(node.role) {
                 let mut layer_node = node.clone();
                 layer_node.layer = layer;
@@ -468,15 +453,71 @@ impl TopologyManager {
     }
 }
 
-/// Derives `http://<ip>:<p2p_port+2>` from a `/ip4/.../tcp/.../p2p/...` multiaddr.
-fn derive_ingress_url_from_multiaddr(multiaddr: &str) -> Option<String> {
-    let parts: Vec<&str> = multiaddr.split('/').collect();
-    if parts.len() >= 5 && parts[1] == "ip4" && parts[3] == "tcp" {
-        let ip = parts[2];
-        if let Ok(p2p_port) = parts[4].parse::<u16>() {
-            let ingress_port = p2p_port + 2;
-            return Some(format!("http://{ip}:{ingress_port}"));
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infra::{event_bus::TokioEventBus, storage::SledRepository};
+    use nox_core::IEventSubscriber;
+
+    #[tokio::test]
+    async fn registry_ingress_is_never_synthesized_from_p2p_url() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let bus = Arc::new(TokioEventBus::new(8));
+        let subscriber: Arc<dyn IEventSubscriber> = bus;
+        let manager = TopologyManager::new(storage, subscriber, None);
+        let address = "0x1111111111111111111111111111111111111111".to_string();
+
+        manager
+            .handle_registration(
+                address.clone(),
+                "11".repeat(32),
+                "/ip4/127.0.0.1/tcp/9000/p2p/test".to_string(),
+                "0".to_string(),
+                1,
+                None,
+                Some(String::new()),
+            )
+            .await;
+
+        assert_eq!(
+            manager.lookup_by_address(&address).unwrap().ingress_url,
+            None
+        );
     }
-    None
+
+    #[tokio::test]
+    async fn canonical_snapshot_uses_primary_layers_and_stable_address_order() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let bus = Arc::new(TokioEventBus::new(8));
+        let subscriber: Arc<dyn IEventSubscriber> = bus;
+        let manager = TopologyManager::new(storage, subscriber, None);
+
+        for address in [
+            "0x3333333333333333333333333333333333333333",
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+        ] {
+            manager
+                .handle_registration(
+                    address.to_string(),
+                    "11".repeat(32),
+                    "/ip4/127.0.0.1/tcp/9000/p2p/test".to_string(),
+                    "0".to_string(),
+                    1,
+                    Some(String::new()),
+                    Some(String::new()),
+                )
+                .await;
+        }
+
+        let nodes = manager.get_all_nodes();
+        assert!(nodes
+            .windows(2)
+            .all(|pair| pair[0].address < pair[1].address));
+        assert!(nodes.iter().all(|node| {
+            node.layer == nox_core::primary_layer_for_role(&node.address, node.role)
+        }));
+    }
 }

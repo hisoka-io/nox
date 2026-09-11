@@ -1,7 +1,7 @@
 //! Anonymous JSON-RPC proxy via the mixnet.
 //! Default provider path enforces a read-only method whitelist; user-supplied URLs allow any method.
 
-use crate::blockchain::executor::ChainExecutor;
+use crate::blockchain::executor::{build_ethers_http1_provider, ChainExecutor};
 use crate::services::response_packer::{PackResult, ResponsePacker};
 use crate::services::security;
 use crate::telemetry::metrics::MetricsService;
@@ -49,7 +49,7 @@ impl RpcHandler {
         rpc_url: &str,
         metrics: MetricsService,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let provider = Provider::<Http>::try_from(rpc_url)?;
+        let provider = build_ethers_http1_provider(rpc_url)?;
 
         let allowed_methods: HashSet<String> = [
             // Account & state queries
@@ -119,7 +119,7 @@ impl RpcHandler {
         allowed_methods: HashSet<String>,
         metrics: MetricsService,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let provider = Provider::<Http>::try_from(rpc_url)?;
+        let provider = build_ethers_http1_provider(rpc_url)?;
 
         let quota = Quota::per_second(NonZeroU32::new(100).unwrap_or(NonZeroU32::MIN));
         let rate_limiter = Arc::new(RateLimiter::direct(quota));
@@ -143,7 +143,7 @@ impl RpcHandler {
         rpc_url: &str,
         metrics: MetricsService,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let provider = Provider::<Http>::try_from(rpc_url)?;
+        let provider = build_ethers_http1_provider(rpc_url)?;
 
         let allowed_methods: HashSet<String> = [
             "eth_call",
@@ -266,9 +266,12 @@ impl RpcHandler {
                 url.to_string()
             };
 
-            let user_provider = Provider::<Http>::try_from(provider_url.as_str()).map_err(|e| {
-                ServiceError::ProcessingFailed(format!("Failed to create provider for {url}: {e}"))
-            })?;
+            let user_provider =
+                build_ethers_http1_provider(provider_url.as_str()).map_err(|e| {
+                    ServiceError::ProcessingFailed(format!(
+                        "Failed to create provider for {url}: {e}"
+                    ))
+                })?;
 
             tokio::time::timeout(
                 RPC_REQUEST_TIMEOUT,

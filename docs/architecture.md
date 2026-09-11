@@ -118,13 +118,19 @@ DoS protection: token-bucket rate limiting (3 tiers: Unknown/Trusted/Penalized),
 
 ## Topology
 
-3 layers: Entry (0), Mix (1), Exit (2). Layer assignment is deterministic from `SHA256(address)`. Nodes discovered via HTTP seed bootstrap, on-chain `NoxRegistry` events, or P2P sync. XOR fingerprint over all registered nodes matches on-chain for consistency verification.
+3 layers: Entry (0), Mix (1), Exit (2). Primary layer assignment is derived from the first byte of
+`SHA256(lowercase 0x address text)` and the on-chain role. Production topology schema 2 carries the complete,
+canonically ordered Registry membership at one block plus a separate liveness record for every member. Clients verify
+the full fingerprint, count, profiles, roles, and derived layers against that block before using fresh online liveness
+to select routes. The client default liveness window is three minutes; future or older observations are ineligible.
+Frozen members remain in the authenticated membership set but are not route eligible. Node-local
+topology endpoints remain schema 1 diagnostics; the indexer owns the production liveness feed.
 
 ---
 
 ## Economic model
 
-Clients pay exit nodes via `gas_payment` ZK proof: "I own a note with sufficient balance and I'm transferring X to relayer Y" - without revealing the note or sender. Exit nodes verify the proof, simulate the TX (`eth_simulateV1`), check profitability (revenue/cost >= 1 + margin), then submit.
+Clients submit application-opaque EntryPoint calldata bound to a selected exit and execution ID. Exit nodes validate the request before simulation, accept only the EntryPoint settlement event for their own address, value only the exit fee, authorize the maximum transaction plan with fixed-point prices, persist signed bytes, and then submit.
 
 Price oracle (`nox-oracle`) aggregates from Binance and CoinGecko.
 

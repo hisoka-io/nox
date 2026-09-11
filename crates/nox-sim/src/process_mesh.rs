@@ -129,7 +129,7 @@ pub fn find_nox_binary(explicit: Option<&str>) -> Result<PathBuf> {
         .map(|p| p.display().to_string())
         .collect();
     bail!(
-        "nox binary not found. Build it first: cargo build --release -p nox\n\
+        "nox binary not found. Build it first: cargo build --release --bin nox\n\
          Searched:\n  {}",
         searched.join("\n  ")
     );
@@ -187,13 +187,35 @@ pub async fn register_topology(
     p2p_multiaddr: &str,
     ingress_url: Option<&str>,
 ) -> Result<()> {
+    register_topology_with_role(
+        client,
+        target_metrics_port,
+        address,
+        sphinx_key_hex,
+        p2p_multiaddr,
+        ingress_url,
+        3,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn register_topology_with_role(
+    client: &reqwest::Client,
+    target_metrics_port: u16,
+    address: &str,
+    sphinx_key_hex: &str,
+    p2p_multiaddr: &str,
+    ingress_url: Option<&str>,
+    role: u8,
+) -> Result<()> {
     let url = format!("http://127.0.0.1:{target_metrics_port}/admin/topology/register");
     let mut body = serde_json::json!({
         "address": address,
         "sphinx_key": sphinx_key_hex,
         "url": p2p_multiaddr,
         "stake": "1000",
-        "role": 3
+        "role": role
     });
     if let Some(ingress) = ingress_url {
         body["ingress_url"] = serde_json::Value::String(ingress.to_string());

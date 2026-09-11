@@ -1,5 +1,6 @@
 use super::PriceProvider;
 use crate::error::ProviderError;
+use crate::types::PriceE8;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,8 +24,11 @@ impl PriceProvider for AggregateProvider {
     }
 
     /// Queries all providers, takes median per asset, rejects >50% outliers.
-    async fn get_prices(&self, assets: &[String]) -> Result<HashMap<String, f64>, ProviderError> {
-        let mut all_results: Vec<(String, HashMap<String, f64>)> = Vec::new();
+    async fn get_prices(
+        &self,
+        assets: &[String],
+    ) -> Result<HashMap<String, PriceE8>, ProviderError> {
+        let mut all_results: Vec<(String, HashMap<String, PriceE8>)> = Vec::new();
 
         for provider in &self.providers {
             match provider.get_prices(assets).await {
@@ -53,37 +57,38 @@ impl PriceProvider for AggregateProvider {
                 .ok_or_else(|| ProviderError::Other("No provider results".to_string()));
         }
 
-        let mut aggregated: HashMap<String, f64> = HashMap::new();
+        let mut aggregated: HashMap<String, PriceE8> = HashMap::new();
 
         for asset in assets {
-            let mut quotes: Vec<f64> = all_results
+            let mut quotes: Vec<PriceE8> = all_results
                 .iter()
                 .filter_map(|(_, prices)| prices.get(asset).copied())
-                .filter(|p| p.is_finite() && *p > 0.0)
                 .collect();
 
             if quotes.is_empty() {
                 continue;
             }
 
-            quotes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            quotes.sort_unstable();
             let median = if quotes.len().is_multiple_of(2) {
-                f64::midpoint(quotes[quotes.len() / 2 - 1], quotes[quotes.len() / 2])
+                midpoint(quotes[quotes.len() / 2 - 1], quotes[quotes.len() / 2])?
             } else {
                 quotes[quotes.len() / 2]
             };
 
-            let filtered: Vec<f64> = quotes
+            let filtered: Vec<PriceE8> = quotes
                 .iter()
-                .filter(|&&p| {
-                    let deviation = (p - median).abs() / median;
-                    if deviation > 0.5 {
+                .filter(|&&price| {
+                    let deviation = price.get().abs_diff(median.get());
+                    let is_outlier = deviation
+                        .checked_mul(2)
+                        .is_none_or(|twice_deviation| twice_deviation > median.get());
+                    if is_outlier {
                         warn!(
-                            "Outlier rejected for {}: {} (median: {}, deviation: {:.1}%)",
+                            "Outlier rejected for {}: {} (median: {})",
                             asset,
-                            p,
-                            median,
-                            deviation * 100.0
+                            price.get(),
+                            median.get()
                         );
                         false
                     } else {
@@ -94,13 +99,10 @@ impl PriceProvider for AggregateProvider {
                 .collect();
 
             if filtered.is_empty() {
-                aggregated.insert(asset.clone(), median);
+                warn!("No acceptable price quorum for {asset}");
             } else if filtered.len().is_multiple_of(2) {
                 let mid = filtered.len() / 2;
-                aggregated.insert(
-                    asset.clone(),
-                    f64::midpoint(filtered[mid - 1], filtered[mid]),
-                );
+                aggregated.insert(asset.clone(), midpoint(filtered[mid - 1], filtered[mid])?);
             } else {
                 aggregated.insert(asset.clone(), filtered[filtered.len() / 2]);
             }
@@ -116,7 +118,17 @@ impl PriceProvider for AggregateProvider {
     }
 }
 
+fn midpoint(lower: PriceE8, upper: PriceE8) -> Result<PriceE8, ProviderError> {
+    let value = lower
+        .get()
+        .checked_add((upper.get() - lower.get()) / 2)
+        .ok_or_else(|| ProviderError::Other("Price midpoint overflow".to_string()))?;
+    PriceE8::parse_decimal(&format!("{value}e-8"))
+        .map_err(|error| ProviderError::Parse(error.to_string()))
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
@@ -125,12 +137,12 @@ mod tests {
     struct MockProvider {
         id: &'static str,
         should_fail: bool,
-        prices: HashMap<String, f64>,
+        prices: HashMap<String, PriceE8>,
         call_count: Arc<Mutex<usize>>,
     }
 
     impl MockProvider {
-        fn new(id: &'static str, should_fail: bool, prices: HashMap<String, f64>) -> Self {
+        fn new(id: &'static str, should_fail: bool, prices: HashMap<String, PriceE8>) -> Self {
             Self {
                 id,
                 should_fail,
@@ -149,7 +161,7 @@ mod tests {
         async fn get_prices(
             &self,
             _assets: &[String],
-        ) -> Result<HashMap<String, f64>, ProviderError> {
+        ) -> Result<HashMap<String, PriceE8>, ProviderError> {
             *self.call_count.lock().unwrap() += 1;
             if self.should_fail {
                 Err(ProviderError::Network(
@@ -166,18 +178,26 @@ mod tests {
     }
 
     fn mock_with_prices(id: &'static str, prices: &[(&str, f64)]) -> Arc<MockProvider> {
-        let map: HashMap<String, f64> = prices.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        let map: HashMap<String, PriceE8> = prices
+            .iter()
+            .map(|(asset, value)| {
+                (
+                    (*asset).to_string(),
+                    PriceE8::parse_decimal(&value.to_string()).expect("valid test price"),
+                )
+            })
+            .collect();
         Arc::new(MockProvider::new(id, false, map))
     }
 
     #[tokio::test]
     async fn test_failover_logic() {
         let mut p1_prices = HashMap::new();
-        p1_prices.insert("A".to_string(), 100.0);
+        p1_prices.insert("A".to_string(), PriceE8::parse_decimal("100").unwrap());
         let p1 = Arc::new(MockProvider::new("p1", true, p1_prices)); // Fails
 
         let mut p2_prices = HashMap::new();
-        p2_prices.insert("A".to_string(), 200.0);
+        p2_prices.insert("A".to_string(), PriceE8::parse_decimal("200").unwrap());
         let p2 = Arc::new(MockProvider::new("p2", false, p2_prices)); // Succeeds
 
         let agg = AggregateProvider::new(vec![p1.clone(), p2.clone()]);
@@ -185,7 +205,7 @@ mod tests {
         let prices = agg.get_prices(&["A".to_string()]).await.unwrap();
 
         // Should get price from P2
-        assert_eq!(*prices.get("A").unwrap(), 200.0);
+        assert_eq!(prices.get("A").unwrap().get(), 20_000_000_000);
 
         // P1 should be called
         assert_eq!(*p1.call_count.lock().unwrap(), 1);
@@ -203,9 +223,9 @@ mod tests {
         let prices = agg.get_prices(&["ETH".to_string()]).await.unwrap();
 
         assert!(
-            (prices["ETH"] - 2000.0).abs() < f64::EPSILON,
+            prices["ETH"].get() == 200_000_000_000,
             "median of [1000, 2000, 3000] should be 2000, got {}",
-            prices["ETH"]
+            prices["ETH"].get()
         );
     }
 
@@ -220,9 +240,9 @@ mod tests {
         let prices = agg.get_prices(&["ETH".to_string()]).await.unwrap();
 
         assert!(
-            (prices["ETH"] - 2500.0).abs() < f64::EPSILON,
+            prices["ETH"].get() == 250_000_000_000,
             "median of [1000, 2000, 3000, 4000] should be 2500, got {}",
-            prices["ETH"]
+            prices["ETH"].get()
         );
     }
 
@@ -240,9 +260,9 @@ mod tests {
         // 1000 is ~809% away from median -> rejected
         // Filtered set: [100, 110] -> median = 105
         assert!(
-            (prices["ETH"] - 105.0).abs() < f64::EPSILON,
+            prices["ETH"].get() == 10_500_000_000,
             "outlier should be rejected, expected 105.0, got {}",
-            prices["ETH"]
+            prices["ETH"].get()
         );
     }
 
@@ -273,46 +293,12 @@ mod tests {
             .unwrap();
 
         assert!(
-            (prices["ETH"] - 42.0).abs() < f64::EPSILON,
+            prices["ETH"].get() == 4_200_000_000,
             "single provider should return ETH directly"
         );
         assert!(
-            (prices["BTC"] - 99.0).abs() < f64::EPSILON,
+            prices["BTC"].get() == 9_900_000_000,
             "single provider should return BTC directly"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_nan_infinity_filtered() {
-        let p1 = mock_with_prices("p1", &[("ETH", f64::NAN)]);
-        let p2 = mock_with_prices("p2", &[("ETH", f64::INFINITY)]);
-        let p3 = mock_with_prices("p3", &[("ETH", 100.0)]);
-
-        let agg = AggregateProvider::new(vec![p1, p2, p3]);
-        let prices = agg.get_prices(&["ETH".to_string()]).await.unwrap();
-
-        // NaN and Infinity filtered by `is_finite() && > 0.0`. Only [100.0] remains.
-        assert!(
-            (prices["ETH"] - 100.0).abs() < f64::EPSILON,
-            "NaN and Infinity should be filtered, expected 100.0, got {}",
-            prices["ETH"]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_negative_and_zero_prices_filtered() {
-        let p1 = mock_with_prices("p1", &[("ETH", -50.0)]);
-        let p2 = mock_with_prices("p2", &[("ETH", 0.0)]);
-        let p3 = mock_with_prices("p3", &[("ETH", 200.0)]);
-
-        let agg = AggregateProvider::new(vec![p1, p2, p3]);
-        let prices = agg.get_prices(&["ETH".to_string()]).await.unwrap();
-
-        // Negative and zero prices filtered by `> 0.0`. Only [200.0] remains.
-        assert!(
-            (prices["ETH"] - 200.0).abs() < f64::EPSILON,
-            "negative/zero prices should be filtered, expected 200.0, got {}",
-            prices["ETH"]
         );
     }
 
@@ -330,15 +316,15 @@ mod tests {
 
         // ETH: median of [100, 110, 120] = 110
         assert!(
-            (prices["ETH"] - 110.0).abs() < f64::EPSILON,
+            prices["ETH"].get() == 11_000_000_000,
             "ETH median should be 110.0, got {}",
-            prices["ETH"]
+            prices["ETH"].get()
         );
         // BTC: median of [49000, 50000, 51000] = 50000
         assert!(
-            (prices["BTC"] - 50000.0).abs() < f64::EPSILON,
+            prices["BTC"].get() == 5_000_000_000_000,
             "BTC median should be 50000.0, got {}",
-            prices["BTC"]
+            prices["BTC"].get()
         );
     }
 
@@ -357,15 +343,29 @@ mod tests {
 
         // ETH: [100, 110] -> median = 105
         assert!(
-            (prices["ETH"] - 105.0).abs() < f64::EPSILON,
+            prices["ETH"].get() == 10_500_000_000,
             "ETH should be 105.0, got {}",
-            prices["ETH"]
+            prices["ETH"].get()
         );
         // BTC: [50000, 51000] -> median = 50500
         assert!(
-            (prices["BTC"] - 50500.0).abs() < f64::EPSILON,
+            prices["BTC"].get() == 5_050_000_000_000,
             "BTC should be 50500.0, got {}",
-            prices["BTC"]
+            prices["BTC"].get()
         );
+    }
+
+    #[tokio::test]
+    async fn disputed_asset_is_omitted_while_agreed_asset_remains() {
+        let first = mock_with_prices("first", &[("fee", 100.0), ("native", 100.0)]);
+        let second = mock_with_prices("second", &[("fee", 1000.0), ("native", 100.0)]);
+        let aggregate = AggregateProvider::new(vec![first, second]);
+        let prices = aggregate
+            .get_prices(&["fee".to_string(), "native".to_string()])
+            .await
+            .unwrap();
+
+        assert!(!prices.contains_key("fee"));
+        assert_eq!(prices["native"].get(), 10_000_000_000);
     }
 }

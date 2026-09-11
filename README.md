@@ -4,9 +4,8 @@
 
 <p align="center">
   <a href="https://github.com/hisoka-io/nox/actions/workflows/ci.yml"><img src="https://github.com/hisoka-io/nox/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-stable-orange.svg" alt="Rust" /></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.95.0-orange.svg" alt="Rust 1.95.0" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License" /></a>
-  <a href="#testing"><img src="https://img.shields.io/badge/tests-845%20passed-brightgreen.svg" alt="Tests" /></a>
 </p>
 
 <br />
@@ -31,7 +30,7 @@ DeFi transactions leak metadata. ZK proofs hide _what_ you did, but your IP addr
 | Anonymous responses | ❌ | ✅ | ❌ | ✅ |
 | Native TX execution | ❌ | ❌ | ❌ | ✅ |
 
-Sphinx packets go in, executed transactions come out. The relayer gets paid via ZK proof and never learns who sent it.
+Sphinx packets go in, opaque actions come out. Paid execution is protocol-neutral and bound to a selected exit.
 
 ## Key features
 
@@ -39,7 +38,7 @@ Sphinx packets go in, executed transactions come out. The relayer gets paid via 
 - Random delays at each hop to break timing correlation
 - Anonymous reply packets (SURBs) so responses don't reveal the sender
 - Error correction on responses so lost packets don't require retransmission
-- ZK gas payment so relayers get paid without learning who paid them
+- Fixed-point paid execution with durable transaction recovery
 - Proof of work anti-spam to rate limit without identity
 
 ## Quick start

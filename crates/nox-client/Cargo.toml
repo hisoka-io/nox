@@ -2,6 +2,7 @@
 name = "nox-client"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.95"
 authors = ["Hisoka IO"]
 description = "NOX mixnet transport client: route selection, Sphinx packets, SURB management, topology sync"
 license = "Apache-2.0"
@@ -27,10 +28,9 @@ rayon = "1.10"
 parking_lot = "0.12"
 x25519-dalek = { version = "2.0.0", features = ["static_secrets", "serde"] }
 reqwest = { version = "0.12", features = ["json"] }
+reqwest-legacy = { package = "reqwest", version = "0.11.27", default-features = false, features = ["native-tls"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
-tiny-keccak = { version = "2.0", features = ["keccak"] }
-
 [dev-dependencies]
 serde_json = { workspace = true }
 

@@ -2,6 +2,7 @@
 name = "nox-node"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.95"
 authors = ["Hisoka IO"]
 description = "NOX production relay/exit node: packet processing, P2P networking, Ethereum integration"
 license = "Apache-2.0"
@@ -30,15 +31,12 @@ tracing = { workspace = true }
 config = { version = "0.14", features = ["toml"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 rayon = "1.10"
 rand_distr = "0.4"
-rand_chacha = "0.3.1"
 x25519-dalek = { version = "2.0.0", features = ["static_secrets", "serde"] }
 zeroize = { workspace = true }
-chrono = { version = "0.4", features = ["serde"] }
 ethers = { workspace = true }
 libp2p = { version = "0.53", features = ["tcp", "dns", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros", "tokio", "cbor"] }
 sled = "0.34"
@@ -53,13 +51,12 @@ tempfile = "3.10"
 num_cpus = "1.17.0"
 parking_lot = { workspace = true }
 uuid = { version = "1.7", features = ["v4"] }
-regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest-legacy = { package = "reqwest", version = "0.11.27", default-features = false, features = ["native-tls"] }
 url = "2.5"
 http = "1"
 
 [dev-dependencies]
-tokio-test = "0.4"
 tower = { version = "0.5", features = ["util"] }
 
 [lints]

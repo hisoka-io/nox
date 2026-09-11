@@ -6,7 +6,7 @@
 # Stage 3: Minimal runtime image
 # ==============================================================================
 
-FROM rust:1.82-bookworm AS builder
+FROM rust:1.95.0-bookworm AS builder
 
 WORKDIR /build
 
@@ -18,23 +18,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy workspace manifests for dependency resolution
 COPY Cargo.toml Cargo.lock ./
 
-# Only copy Cargo.toml for crates we actually build (nox, nox-node, nox-oracle
-# and their transitive workspace deps). Skip nox-prover and nox-sim which pull
-# noir_rs/acvm git dependencies not needed for the node binary.
+# Copy each active workspace manifest so Cargo can resolve the graph.
 COPY crates/nox-core/Cargo.toml crates/nox-core/Cargo.toml
 COPY crates/nox-crypto/Cargo.toml crates/nox-crypto/Cargo.toml
 COPY crates/nox-node/Cargo.toml crates/nox-node/Cargo.toml
 COPY crates/nox-oracle/Cargo.toml crates/nox-oracle/Cargo.toml
 COPY crates/nox-client/Cargo.toml crates/nox-client/Cargo.toml
-COPY crates/darkpool-crypto/Cargo.toml crates/darkpool-crypto/Cargo.toml
-COPY crates/darkpool-client/Cargo.toml crates/darkpool-client/Cargo.toml
-COPY crates/nox-prover/Cargo.toml crates/nox-prover/Cargo.toml
 COPY crates/nox-test-infra/Cargo.toml crates/nox-test-infra/Cargo.toml
 COPY crates/nox-sim/Cargo.toml crates/nox-sim/Cargo.toml
 
 # Create stubs for all workspace members (cargo needs parseable src for each)
 RUN for dir in nox-core nox-crypto nox-node nox-oracle nox-client \
-    darkpool-crypto darkpool-client nox-prover nox-test-infra nox-sim; do \
+    nox-test-infra nox-sim; do \
     mkdir -p "crates/$dir/src" && echo "// stub" > "crates/$dir/src/lib.rs"; \
     done && \
     mkdir -p src && echo "fn main() {}" > src/main.rs && \
@@ -46,9 +41,9 @@ RUN for dir in nox-core nox-crypto nox-node nox-oracle nox-client \
 
 # nox-sim bin stubs
 RUN mkdir -p crates/nox-sim/src/bin && \
-    for bin in micro_mainnet_sim nox_multi_sim stress_test nox_bench \
+    for bin in nox_multi_sim stress_test nox_bench \
     nox_multiprocess_bench nox_realworld_bench nox_privacy_analytics \
-    nox_economics nox_mesh_server nox_dashboard_sim; do \
+    nox_mesh_server nox_paid_mesh_server nox_dashboard_sim; do \
     echo "fn main() {}" > "crates/nox-sim/src/bin/${bin}.rs"; \
     done
 
@@ -80,12 +75,18 @@ LABEL org.opencontainers.image.title="nox"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 nox \
+    && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent \
+        --shell /usr/sbin/nologin nox
 
 COPY --from=builder /build/target/release/nox /usr/local/bin/nox
 COPY --from=builder /build/target/release/price_server /usr/local/bin/price_server
 
-RUN mkdir -p /etc/nox /var/lib/nox
+RUN install -d -o 0 -g 0 -m 0755 /etc/nox \
+    && install -d -o 10001 -g 10001 -m 0750 /var/lib/nox
+
+USER 10001:10001
 
 EXPOSE 15000 15001 15002 15003 15004
 

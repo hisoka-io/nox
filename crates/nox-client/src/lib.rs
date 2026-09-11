@@ -17,5 +17,6 @@ pub use surb_budget::{
 };
 pub use topology_node::TopologyNode;
 pub use topology_sync::{
-    TopologySyncClient, TopologySyncConfig, TopologySyncError, DEFAULT_SEED_URLS,
+    TopologySyncClient, TopologySyncConfig, TopologySyncError, VerifiedTopologySnapshot,
+    DEFAULT_LIVENESS_MAX_AGE, DEFAULT_SEED_URLS,
 };

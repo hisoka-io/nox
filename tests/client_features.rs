@@ -292,6 +292,8 @@ fn test_topology_snapshot_pow_difficulty_roundtrip() {
         timestamp: 1700000000,
         block_number: 100,
         pow_difficulty: 16,
+        schema_version: 1,
+        liveness: Vec::new(),
     };
 
     let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -340,6 +342,8 @@ fn test_topology_snapshot_pow_difficulty_high_value() {
         timestamp: 0,
         block_number: 0,
         pow_difficulty: u32::MAX,
+        schema_version: 1,
+        liveness: Vec::new(),
     };
     let json = serde_json::to_string(&snapshot).expect("serialize");
     let back: TopologySnapshot = serde_json::from_str(&json).expect("deserialize");

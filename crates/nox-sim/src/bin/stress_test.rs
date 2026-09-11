@@ -305,14 +305,22 @@ async fn spawn_mock_node(id: usize) -> anyhow::Result<VirtualNode> {
 
     // Chain & Exit
     let executor = Arc::new(ChainExecutor::new(&config).await?);
-    let tx_manager =
-        Arc::new(TransactionManager::new(executor.clone(), db.clone(), metrics.clone()).await?);
+    let tx_manager = Arc::new(
+        TransactionManager::new(
+            executor.clone(),
+            db.clone(),
+            metrics.clone(),
+            nox_node::config::DEFAULT_REPLACEMENT_STEP_BPS,
+        )
+        .await?,
+    );
 
     // Wire up Exit
     // Mock Price Client
-    let price_client = Arc::new(nox_node::price::client::PriceClient::new(
-        "http://localhost:3000",
-    ));
+    let price_client = Arc::new(
+        nox_node::price::client::PriceClient::new("http://localhost:3000", Default::default())
+            .map_err(|error| anyhow::anyhow!("price client initialization failed: {error}"))?,
+    );
 
     let ethereum_handler = Arc::new(
         nox_node::services::handlers::ethereum::EthereumHandler::from_config(
@@ -323,6 +331,11 @@ async fn spawn_mock_node(id: usize) -> anyhow::Result<VirtualNode> {
             price_client,
             &config.nox_reward_pool_address,
             config.max_broadcast_tx_size,
+            "ethereum",
+            18,
+            nox_node::config::DEFAULT_GAS_LIMIT_BUFFER_BPS,
+            nox_node::config::DEFAULT_INITIAL_FEE_BUFFER_BPS,
+            &config.nox_entry_point_address,
         )
         .expect("Failed to create EthereumHandler"),
     );

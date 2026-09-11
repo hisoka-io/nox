@@ -1,5 +1,6 @@
 use super::PriceProvider;
 use crate::error::ProviderError;
+use crate::types::PriceE8;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
@@ -71,7 +72,10 @@ impl PriceProvider for KrakenProvider {
         "kraken"
     }
 
-    async fn get_prices(&self, assets: &[String]) -> Result<HashMap<String, f64>, ProviderError> {
+    async fn get_prices(
+        &self,
+        assets: &[String],
+    ) -> Result<HashMap<String, PriceE8>, ProviderError> {
         let pairs: Vec<&str> = assets
             .iter()
             .filter_map(|a| Self::asset_to_pair(a))
@@ -124,9 +128,9 @@ impl PriceProvider for KrakenProvider {
         for (pair, ticker) in &result {
             if let Some(asset_id) = Self::pair_to_asset(pair) {
                 if let Some(price_str) = ticker.c.first() {
-                    if let Ok(price) = price_str.parse::<f64>() {
-                        prices.insert(asset_id.to_string(), price);
-                    }
+                    let price = PriceE8::parse_decimal(price_str)
+                        .map_err(|error| ProviderError::Parse(error.to_string()))?;
+                    prices.insert(asset_id.to_string(), price);
                 }
             }
         }
@@ -136,6 +140,7 @@ impl PriceProvider for KrakenProvider {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
@@ -161,8 +166,8 @@ mod tests {
         let assets = vec!["ethereum".to_string(), "bitcoin".to_string()];
         let prices = provider.get_prices(&assets).await.unwrap();
 
-        assert!((prices["ethereum"] - 2400.0).abs() < 0.01);
-        assert!((prices["bitcoin"] - 44000.0).abs() < 0.01);
+        assert_eq!(prices["ethereum"].get(), 240_000_000_000);
+        assert_eq!(prices["bitcoin"].get(), 4_400_000_000_000);
     }
 
     #[tokio::test]

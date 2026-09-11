@@ -160,7 +160,7 @@ if ! $CHARTS_ONLY && ! $SKIP_BUILD; then
         (cd "$NOX_ROOT" && cargo build $CARGO_PROFILE -p nox-sim --bin nox_multiprocess_bench --features dev-node 2>&1 | tail -5) >&2
 
         log "Building nox binary (for multi-process)..."
-        (cd "$NOX_ROOT" && cargo build --release -p nox 2>&1 | tail -5) >&2
+        (cd "$NOX_ROOT" && cargo build --release --bin nox 2>&1 | tail -5) >&2
     fi
 
     log "Build complete."
@@ -189,10 +189,6 @@ if $RUN_TIER1 && ! $CHARTS_ONLY; then
     log "Running pow_bench (nox-crypto)..."
     run_bench "pow_bench" \
         cargo bench --bench pow_bench -p nox-crypto
-
-    log "Running crypto_bench (darkpool-crypto)..."
-    run_bench "crypto_bench" \
-        cargo bench --bench crypto_bench -p darkpool-crypto
 
     log "Running protocol_bench (nox-core)..."
     run_bench "protocol_bench" \
@@ -313,7 +309,7 @@ json.dump(data, sys.stdout, indent=2)
              --duration 15 --warmup-secs 3 \
              > \"$DATA_DIR/concurrency_sweep.json\""
     else
-        skip_bench "Multi-process benchmarks (nox binary not found at $NOX_BIN -- build with cargo build --release -p nox)"
+        skip_bench "Multi-process benchmarks (nox binary not found at $NOX_BIN -- build with cargo build --release --bin nox)"
     fi
 fi
 
@@ -329,7 +325,7 @@ if $RUN_TIER3 && ! $CHARTS_ONLY; then
         (cd "$NOX_ROOT" && cargo build $CARGO_PROFILE -p nox-sim --bin nox_realworld_bench --features dev-node 2>&1 | tail -5) >&2
 
         log "Building nox binary (release, for multi-process mesh)..."
-        (cd "$NOX_ROOT" && cargo build --release -p nox 2>&1 | tail -5) >&2
+        (cd "$NOX_ROOT" && cargo build --release --bin nox 2>&1 | tail -5) >&2
     fi
 
     RW_BENCH="$NOX_ROOT/target/$PROFILE_NAME/nox_realworld_bench"
@@ -486,49 +482,6 @@ if $RUN_TIER4 && ! $CHARTS_ONLY; then
              > \"$DATA_DIR/combined_anonymity.json\""
     else
         skip_bench "Privacy analytics (nox_privacy_analytics not found at $PRIV_BENCH)"
-    fi
-fi
-
-# ---
-# Tier 5: Economics & Gas Profiling
-# ---
-
-if $RUN_TIER5 && ! $CHARTS_ONLY; then
-    hdr "Tier 5: Economics & Gas Profiling"
-
-    if ! $SKIP_BUILD; then
-        log "Building nox_economics..."
-        (cd "$NOX_ROOT" && cargo build $CARGO_PROFILE -p nox-sim --bin nox_economics --features dev-node 2>&1 | tail -5) >&2
-    fi
-
-    ECON_BENCH="$NOX_ROOT/target/$PROFILE_NAME/nox_economics"
-
-    if [ -f "$ECON_BENCH" ]; then
-        # --- Gas Profile (per-circuit gas consumption) ---
-        log "Gas profile (7 circuit types)..."
-        run_bench "gas_profile" bash -c \
-            "\"$ECON_BENCH\" gas-profile \
-             > \"$DATA_DIR/gas_profile.json\""
-
-        # --- DeFi Pipeline E2E Timing ---
-        log "DeFi pipeline (proof gen → Sphinx → mixnet → chain exec)..."
-        run_bench "defi_pipeline" bash -c \
-            "\"$ECON_BENCH\" defi-pipeline \
-             > \"$DATA_DIR/defi_pipeline.json\""
-
-        # --- Economics (break-even analysis) ---
-        log "Economics analysis (break-even, profitability)..."
-        run_bench "economics" bash -c \
-            "\"$ECON_BENCH\" economics \
-             > \"$DATA_DIR/economics.json\""
-
-        # --- Operational Costs ---
-        log "Operational cost breakdown..."
-        run_bench "operational" bash -c \
-            "\"$ECON_BENCH\" operational \
-             > \"$DATA_DIR/operational.json\""
-    else
-        skip_bench "Economics (nox_economics not found at $ECON_BENCH)"
     fi
 fi
 

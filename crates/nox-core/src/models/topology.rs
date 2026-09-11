@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelayerNode {
@@ -27,6 +28,24 @@ fn default_role() -> u8 {
     3
 }
 
+const fn default_topology_schema_version() -> u8 {
+    1
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TopologyLivenessStatus {
+    Online,
+    Offline,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TopologyLiveness {
+    pub address: String,
+    pub status: TopologyLivenessStatus,
+    pub observed_at_unix: u64,
+}
+
 /// Maps on-chain role to allowed topology layers.
 /// Role 1 (Relay) -> [0,1]; Role 2 (Exit) / 3 (Full) -> [0,1,2].
 #[must_use]
@@ -34,6 +53,16 @@ pub fn layers_for_role(role: u8) -> &'static [u8] {
     match role {
         1 => &[0, 1],
         _ => &[0, 1, 2],
+    }
+}
+
+#[must_use]
+pub fn primary_layer_for_role(address: &str, role: u8) -> u8 {
+    let hash = Sha256::digest(address.to_lowercase().as_bytes());
+    match role {
+        1 => hash[0] % 2,
+        2 => 2,
+        _ => hash[0] % 3,
     }
 }
 
@@ -78,11 +107,17 @@ pub struct TopologySnapshot {
     pub nodes: Vec<RelayerNode>,
     /// XOR(keccak256(addr) for each node), hex-encoded
     pub fingerprint: String,
+    #[serde(default)]
     pub timestamp: u64,
+    #[serde(default)]
     pub block_number: u64,
     /// `PoW` difficulty required by the network. Clients use this instead of guessing.
     #[serde(default)]
     pub pow_difficulty: u32,
+    #[serde(default = "default_topology_schema_version")]
+    pub schema_version: u8,
+    #[serde(default)]
+    pub liveness: Vec<TopologyLiveness>,
 }
 
 #[cfg(test)]
@@ -218,10 +253,46 @@ mod tests {
             timestamp: 1700000000,
             block_number: 42,
             pow_difficulty: 0,
+            schema_version: 2,
+            liveness: vec![
+                TopologyLiveness {
+                    address: "0x1".to_string(),
+                    status: TopologyLivenessStatus::Online,
+                    observed_at_unix: 1_700_000_000,
+                },
+                TopologyLiveness {
+                    address: "0x2".to_string(),
+                    status: TopologyLivenessStatus::Offline,
+                    observed_at_unix: 1_700_000_000,
+                },
+            ],
         };
         let json = serde_json::to_string(&snapshot).expect("serialize");
         let back: TopologySnapshot = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(snapshot, back);
+    }
+
+    #[test]
+    fn legacy_seed_snapshot_defaults_missing_observation_fields() {
+        let json = r#"{
+            "nodes": [{
+                "address": "0x1234567890abcdef1234567890abcdef12345678",
+                "sphinx_key": "0xdead",
+                "url": "/ip4/127.0.0.1/tcp/9000",
+                "stake": "1000",
+                "last_seen": 0,
+                "is_privileged": false,
+                "layer": 0,
+                "role": 1
+            }],
+            "fingerprint": "abcdef",
+            "pow_difficulty": 0
+        }"#;
+        let snapshot: TopologySnapshot = serde_json::from_str(json).expect("legacy snapshot");
+        assert_eq!(snapshot.timestamp, 0);
+        assert_eq!(snapshot.block_number, 0);
+        assert_eq!(snapshot.schema_version, 1);
+        assert!(snapshot.liveness.is_empty());
     }
 
     #[test]
@@ -243,6 +314,34 @@ mod tests {
     fn test_layers_for_role_unknown_defaults_to_all() {
         assert_eq!(layers_for_role(0), &[0, 1, 2]);
         assert_eq!(layers_for_role(255), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn primary_layer_uses_lowercase_prefixed_address_text() {
+        let lower = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let mixed = "0xAbCdEfAbCdEfAbCdEfAbCdEfAbCdEfAbCdEfAbCd";
+        assert_eq!(
+            primary_layer_for_role(lower, 1),
+            primary_layer_for_role(mixed, 1)
+        );
+        assert_eq!(primary_layer_for_role(lower, 2), 2);
+        assert!(primary_layer_for_role(lower, 3) <= 2);
+        assert_eq!(
+            primary_layer_for_role("0x0000000000000000000000000000000000000001", 1),
+            1
+        );
+        assert_eq!(
+            primary_layer_for_role("0x0000000000000000000000000000000000000001", 3),
+            2
+        );
+        assert_eq!(
+            primary_layer_for_role("0x0000000000000000000000000000000000000004", 1),
+            0
+        );
+        assert_eq!(
+            primary_layer_for_role("0x0000000000000000000000000000000000000004", 3),
+            1
+        );
     }
 
     #[test]

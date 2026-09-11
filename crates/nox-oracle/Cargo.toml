@@ -2,6 +2,7 @@
 name = "nox-oracle"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.95"
 authors = ["Hisoka IO"]
 description = "Standalone price oracle server for NOX node profitability calculations"
 license = "Apache-2.0"
@@ -16,10 +17,10 @@ serde = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 chrono = { version = "0.4", features = ["serde"] }
 axum = "0.7"
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
-serde_json = { workspace = true }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"

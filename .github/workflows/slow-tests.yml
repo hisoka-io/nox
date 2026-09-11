@@ -10,7 +10,7 @@ on:
         type: choice
         options:
           - anvil
-          - heavy
+          - large-payload
           - all
   schedule:
     # Nightly at 02:00 UTC
@@ -30,47 +30,56 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install Foundry (anvil)
-        uses: foundry-rs/foundry-toolchain@v1
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
         with:
-          version: stable
-      - name: Bootstrap artifacts
-        run: ./scripts/bootstrap-artifacts.sh
-      - name: Run economics_e2e
-        run: cargo test --test economics_e2e --features dev-node -- --ignored --nocapture
+          toolchain: 1.95.0
+      - name: Verify Rust version
+        run: rustc --version | grep -F "rustc 1.95.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install Foundry (anvil)
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: v1.3.2
+      - name: Verify Anvil version
+        run: anvil --version | grep -F "anvil Version: 1.3.2"
+      - name: Install Solidity 0.8.30
+        run: |
+          curl --fail --location --silent --show-error \
+            https://github.com/ethereum/solidity/releases/download/v0.8.30/solc-static-linux \
+            --output /tmp/solc-static-linux
+          echo "f3e987dc6ecebd4bd350c48edcbc320b46cf9e3109bd3fc3d88f1acaf4c428f7  /tmp/solc-static-linux" | sha256sum --check --strict
+          sudo install -m 0755 /tmp/solc-static-linux /usr/local/bin/solc
+      - name: Run transaction plan
+        run: cargo test --test transaction_plan -- --nocapture
+      - name: Run durable transaction outbox
+        run: cargo test --test transaction_outbox -- --nocapture
+      - name: Run committed payment evidence
+        run: cargo test --test payment_trace_safety --features dev-node -- --nocapture
       - name: Run anvil_trace_debug
         run: cargo test --test anvil_trace_debug -- --ignored --nocapture
 
-  heavy-tests:
-    name: Heavy Tests (Anvil + Node.js)
+  large-payload-tests:
+    name: Large Payload Tests
     if: >
       github.event_name == 'schedule' ||
-      inputs.suite == 'heavy' ||
+      inputs.suite == 'large-payload' ||
       inputs.suite == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install Foundry (anvil)
-        uses: foundry-rs/foundry-toolchain@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          version: stable
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
         with:
-          node-version: "20"
-      - name: Bootstrap artifacts
-        run: ./scripts/bootstrap-artifacts.sh
-      - name: Run master_e2e
-        run: cargo test --test master_e2e --features dev-node -- --ignored --nocapture 2>&1 | tail -100
-      - name: Run native_prover_parity
-        run: cargo test --test native_prover_parity -- --ignored --nocapture
+          toolchain: 1.95.0
+      - name: Verify Rust version
+        run: rustc --version | grep -F "rustc 1.95.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Run large-payload suite
+        run: cargo test --test large_payload -- --ignored --nocapture

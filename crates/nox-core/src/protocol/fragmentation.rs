@@ -683,7 +683,7 @@ mod tests {
         let config = ReassemblerConfig {
             max_buffer_bytes: 1000,
             max_concurrent_messages: 2,
-            stale_timeout: Duration::from_secs(60),
+            stale_timeout: Duration::from_mins(1),
         };
         let mut reassembler = Reassembler::new(config);
 
@@ -758,7 +758,7 @@ mod tests {
         let config = ReassemblerConfig {
             max_buffer_bytes: 1000,
             max_concurrent_messages: 2,
-            stale_timeout: Duration::from_secs(60),
+            stale_timeout: Duration::from_mins(1),
         };
         let mut reassembler = Reassembler::new(config);
 

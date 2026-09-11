@@ -30,7 +30,7 @@ err() { echo -e "${RED}[bench]${NC} $*" >&2; exit 1; }
 
 # Build nox binary (release for accurate numbers)
 log "Building nox binary (release)..."
-(cd "$WORKSPACE_ROOT" && cargo build --release -p nox 2>&1 | tail -3) >&2
+(cd "$WORKSPACE_ROOT" && cargo build --release --bin nox 2>&1 | tail -3) >&2
 
 NOX_BIN="$WORKSPACE_ROOT/target/release/nox"
 if [ ! -f "$NOX_BIN" ]; then

@@ -5,7 +5,7 @@
 use ethers::prelude::*;
 use nox_core::{
     models::payloads::{encode_payload, RelayerPayload, ServiceRequest},
-    IEventPublisher, IEventSubscriber, NoxEvent,
+    IEventPublisher, IEventSubscriber, IStorageRepository, NoxEvent, PaidQuoteRequestV2,
 };
 use nox_crypto::{PathHop, Surb};
 use nox_node::{
@@ -43,9 +43,14 @@ async fn make_tx_manager(exec: Arc<ChainExecutor>) -> Arc<TransactionManager> {
     let dir = tempdir().expect("tempdir");
     let storage = Arc::new(SledRepository::new(dir.path()).expect("sled"));
     Arc::new(
-        TransactionManager::new(exec, storage, MetricsService::new())
-            .await
-            .expect("tx_manager"),
+        TransactionManager::new(
+            exec,
+            storage,
+            MetricsService::new(),
+            nox_node::config::DEFAULT_REPLACEMENT_STEP_BPS,
+        )
+        .await
+        .expect("tx_manager"),
     )
 }
 
@@ -58,10 +63,70 @@ async fn make_ethereum_handler(price_uri: &str) -> Arc<EthereumHandler> {
         tx_mgr,
         MetricsService::new(),
         10,
-        Arc::new(PriceClient::new(price_uri)),
+        Arc::new(PriceClient::new(price_uri, Default::default()).expect("price client")),
         pool,
         128 * 1024,
     ))
+}
+
+async fn make_quote_handler(
+    price_uri: &str,
+) -> (Arc<EthereumHandler>, Arc<SledRepository>, tempfile::TempDir) {
+    let entry_point = Address::from_low_u64_be(11);
+    let adapter = Address::from_low_u64_be(12);
+    let fee_asset = Address::from_low_u64_be(13);
+    let pool = Address::from_low_u64_be(14);
+    let mut config = NoxConfig::default();
+    config.benchmark_mode = true;
+    config.chain_id = 31_337;
+    config.eth_wallet_private_key = TEST_PRIVATE_KEY.to_string();
+    config.nox_entry_point_address = format!("{entry_point:?}");
+    config.nox_reward_pool_address = format!("{pool:?}");
+    config.quote_ttl_secs = 30;
+    config.quote_network_fee_bps = 500;
+    config.quote_maximum_transaction_gas = 2_000_000;
+    config.quote_max_outstanding = 4;
+    config.quote_max_pending_sponsored_gas = 8_000_000;
+    config.quote_rolling_loss_limit_native = "100000000000000000".to_string();
+    config.quote_rolling_loss_window_secs = 3_600;
+    config.payment_adapters = vec![nox_node::config::PaymentAdapterConfig {
+        address: format!("{adapter:?}"),
+        fee_assets: vec![format!("{fee_asset:?}")],
+        maximum_payment_gas: 600_000,
+    }];
+    let executor = Arc::new(ChainExecutor::new(&config).await.expect("executor"));
+    let directory = tempdir().expect("tempdir");
+    let storage = Arc::new(SledRepository::new(directory.path()).expect("sled"));
+    let manager = Arc::new(
+        TransactionManager::new(
+            executor.clone(),
+            storage.clone(),
+            MetricsService::new(),
+            nox_node::config::DEFAULT_REPLACEMENT_STEP_BPS,
+        )
+        .await
+        .expect("tx manager"),
+    );
+    let prices = Arc::new(PriceClient::new(price_uri, Default::default()).expect("price client"));
+    let mut handler = EthereumHandler::from_config(
+        executor,
+        manager,
+        MetricsService::new(),
+        10,
+        prices,
+        &config.nox_reward_pool_address,
+        128 * 1024,
+        "ethereum",
+        18,
+        nox_node::config::DEFAULT_GAS_LIMIT_BUFFER_BPS,
+        nox_node::config::DEFAULT_INITIAL_FEE_BUFFER_BPS,
+        &config.nox_entry_point_address,
+    )
+    .expect("handler")
+    .with_quote_policy(&config)
+    .expect("quote policy");
+    handler.register_token(fee_asset, "USDC", 6, "usd-coin");
+    (Arc::new(handler), storage, directory)
 }
 
 fn make_surbs(count: usize) -> Vec<Surb> {
@@ -213,6 +278,61 @@ async fn test_exit_service_anon_submit_tx_sends_response_via_surbs() {
         got_send,
         "Expected SendPacket (echo- prefix) for paid tx response"
     );
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn paid_quote_without_reply_surb_does_not_reserve_capacity() {
+    let price_server = MockServer::start().await;
+    let observed_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    Mock::given(method("GET"))
+        .and(path("/prices"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ethereum": { "price_e8": "300000000000", "observed_at_unix": observed_at_unix, "asset_id": "ethereum", "source": "test" },
+            "usd-coin": { "price_e8": "100000000", "observed_at_unix": observed_at_unix, "asset_id": "usd-coin", "source": "test" }
+        })))
+        .mount(&price_server)
+        .await;
+    let (handler, storage, _directory) = make_quote_handler(&price_server.uri()).await;
+    let (service, bus) = make_exit_service_with_eth(handler).await;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let service = service.with_cancel_token(cancel.clone());
+    tokio::spawn(async move { service.run().await });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let request = PaidQuoteRequestV2 {
+        chain_id: 31_337,
+        entry_point: Address::from_low_u64_be(11).0,
+        client_intent_id: [2; 32],
+        payment_adapter: Address::from_low_u64_be(12).0,
+        payment_id: [4; 32],
+        fee_asset: Address::from_low_u64_be(13).0,
+        payment_gas_limit: 500_000,
+        action_target: Address::from_low_u64_be(15).0,
+        action_calldata_hash: [7; 32],
+        action_gas_limit: 700_000,
+        tracked_assets_hash: [8; 32],
+        maximum_transaction_gas: 1_600_000,
+        return_data_limit: 256,
+        valid_until_unix: observed_at_unix + 60,
+    };
+    let payload = RelayerPayload::AnonymousRequest {
+        inner: encode_payload(&ServiceRequest::PaidQuoteRequestV2(request)).expect("inner"),
+        reply_surbs: Vec::new(),
+    };
+    bus.publish(NoxEvent::PayloadDecrypted {
+        packet_id: "quote-without-surb".to_string(),
+        payload: encode_payload(&payload).expect("outer"),
+    })
+    .expect("publish");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(storage.scan(b"quote:execution:").await.unwrap().is_empty());
+    assert!(storage.get(b"quote:outstanding").await.unwrap().is_none());
+    assert!(storage.get(b"quote:pending-gas").await.unwrap().is_none());
     cancel.cancel();
 }
 

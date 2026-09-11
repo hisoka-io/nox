@@ -159,7 +159,8 @@ async fn deploy_lightweight_contracts(
 )> {
     info!("Phase 1: Deploying lightweight contracts...");
 
-    let provider = Provider::<Http>::try_from(anvil_rpc)?.interval(Duration::from_millis(100));
+    let provider = nox_node::blockchain::executor::build_ethers_http1_provider(anvil_rpc)?
+        .interval(Duration::from_millis(100));
     let chain_id = provider.get_chainid().await?.as_u64();
 
     // Use Anvil's first default account as admin
@@ -1131,7 +1132,7 @@ async fn main() -> Result<()> {
             "Switching Anvil to {}s block time for realistic chain behavior...",
             args.block_time
         );
-        let provider = Provider::<Http>::try_from(&anvil_rpc)?;
+        let provider = nox_node::blockchain::executor::build_ethers_http1_provider(&anvil_rpc)?;
         // evm_setIntervalMining(interval_seconds) -- Anvil-specific RPC
         let _: bool = provider
             .request("evm_setIntervalMining", [args.block_time])

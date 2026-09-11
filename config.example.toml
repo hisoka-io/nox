@@ -35,11 +35,11 @@ node_role = "full"
 # NoxRegistry contract (topology + staking)
 registry_contract_address = "0x0000000000000000000000000000000000000000"
 
-# RelayerMulticall contract (batched TX execution)
-relayer_multicall_address = "0x0000000000000000000000000000000000000000"
-
-# NoxRewardPool contract (ZK gas payment event validation)
+# NoxRewardPool contract for execution-scoped fee accounting
 nox_reward_pool_address = "0x0000000000000000000000000000000000000000"
+
+# NoxEntryPoint contract for versioned paid execution
+nox_entry_point_address = "0x0000000000000000000000000000000000000000"
 
 # ---
 # Identity & Keys (use env vars in production)
@@ -90,6 +90,22 @@ min_gas_balance = "10000000000000000"
 
 # Minimum profit margin (%) for TX execution
 min_profit_margin_percent = 10
+oracle_cache_ttl_secs = 10
+oracle_max_observation_age_secs = 300
+oracle_max_future_skew_secs = 30
+native_asset_price_id = "ethereum"
+native_asset_decimals = 18
+gas_limit_buffer_bps = 2000
+initial_fee_buffer_bps = 2000
+replacement_step_bps = 2000
+chain_data_fee_mode = "rpc_gas_estimate_includes_data_fee"
+quote_ttl_secs = 30
+quote_network_fee_bps = 500
+quote_maximum_transaction_gas = 12000000
+quote_max_outstanding = 256
+quote_max_pending_sponsored_gas = 3072000000
+quote_rolling_loss_limit_native = "100000000000000000"
+quote_rolling_loss_window_secs = 3600
 
 # ---
 # Relay Pipeline
@@ -178,3 +194,14 @@ prune_interval_seconds = 60
 allow_private_ips = false
 request_timeout_secs = 10
 max_response_bytes = 1048576      # 1 MB
+
+[[payment_adapters]]
+address = "0x0000000000000000000000000000000000000000"
+fee_assets = ["0x0000000000000000000000000000000000000000"]
+maximum_payment_gas = 4000000
+
+[[tokens]]
+address = "0x0000000000000000000000000000000000000000"
+symbol = "FEE_ASSET"
+decimals = 18
+price_id = "fee-asset-oracle-id"

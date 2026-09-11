@@ -10,7 +10,7 @@ fn test_duplicate_before_ensure_capacity() {
     let config = ReassemblerConfig {
         max_buffer_bytes: 100_000,
         max_concurrent_messages: 2, // Only 2 slots
-        stale_timeout: Duration::from_secs(60),
+        stale_timeout: Duration::from_mins(1),
     };
     let mut reassembler = Reassembler::new(config);
 

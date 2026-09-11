@@ -29,10 +29,10 @@ We will credit reporters in the advisory unless they prefer to remain anonymous.
 ### In Scope
 
 - All Rust code in this repository
-- Cryptographic implementations (Sphinx, SURB, PoW, ECDH, Poseidon2, AES)
+- Cryptographic implementations (Sphinx, SURB, PoW, X25519, ChaCha20)
 - Network protocols (P2P, HTTP ingress, packet format)
 - Configuration handling (key material, validation, zeroization)
-- Economic model (profitability calculation, gas payment verification)
+- Economic model (fixed-point paid execution, quote limits, and durable submission)
 
 ### Out of Scope
 
@@ -47,3 +47,28 @@ We will credit reporters in the advisory unless they prefer to remain anonymous.
 | -------------- | ----------- |
 | Latest `main`  | Yes         |
 | Older releases | Best effort |
+
+## Temporary Dependency Exceptions
+
+`cargo deny` remains blocking. Exceptions and accepted yanked warnings require a named owner, a removal deadline,
+documented reachability, and an enforced control.
+
+| Advisory | Reachability | Compensating control | Migration owner | Deadline |
+| --- | --- | --- | --- | --- |
+| `RUSTSEC-2025-0141` | Bincode v1 encodes the versioned mixnet wire | Payload size/version limits and strict inner decoding are enforced; outer Sphinx padding has a dedicated zero-only decoder | protocol-wire | 2026-12-31 |
+| `RUSTSEC-2025-0057` | `ethers-providers -> hashers -> fxhash` internal request maps | RPC methods, payload sizes, concurrency, and timeouts are bounded | chain-transport | 2026-12-31 |
+| `RUSTSEC-2024-0384` | Ethers and libp2p runtime timing | Protocol expiry and money arithmetic use explicit chain or standard monotonic time, not this crate | networking | 2026-12-31 |
+| `RUSTSEC-2024-0436` | `libp2p -> netlink-packet-utils -> paste` proc macro | Build-time expansion only; no runtime input reaches the macro | networking | 2026-12-31 |
+| `RUSTSEC-2025-0009` | `ethers-providers -> jsonwebtoken -> ring 0.16` | Nox does not use the affected QUIC header protection or single-buffer 64 GiB AES paths; packet and response sizes are bounded | chain-transport | 2026-12-31 |
+| `RUSTSEC-2025-0010` | Same Ethers JSON Web Token dependency path | No Nox runtime JWT call site; migrate the legacy Ethers provider rather than adopting another obsolete Ring line | chain-transport | 2026-12-31 |
+| `RUSTSEC-2025-0134` | `ethers -> reqwest 0.11 -> rustls-pemfile` | Ethers Rustls features are disabled and production Ethers HTTP clients use HTTP/1 with native TLS | chain-transport | 2026-12-31 |
+| `RUSTSEC-2026-0258` | `ethers 2.0.14 -> reqwest 0.11 -> h2 0.3` | Every production Ethers HTTP provider is built with an HTTP/1-only client; Ethers' redundant Rustls feature is disabled | chain-transport | 2026-11-30 |
+| `RUSTSEC-2026-0119` | `libp2p -> hickory-proto 0.24` DNS name encoding | Peering addresses come from chain-verified Registry profiles or operator configuration; connection and request rates are bounded | networking | 2026-12-15 |
+| `RUSTSEC-2026-0105` | `libp2p -> multihash -> core2 0.4` | This is an unmaintained/yanked notice with no published exploit; packet, address, and connection bounds remain enforced | networking | 2026-12-15 |
+| Yanked `keccak 0.1.5` | Ethers signing, ABI, and hash dependencies | Cargo lock checksum is pinned; EIP-712, transaction identity, and cross-language hash vectors are tested | chain-transport | 2026-12-31 |
+| Yanked `spin 0.9.8` | `reed-solomon-erasure 6` synchronization | Fragment/shard counts and memory are bounded; FEC property, corruption, and recovery suites cover the path | protocol-wire | 2026-12-31 |
+| Yanked `core2 0.4.0` | Same libp2p multihash path as `RUSTSEC-2026-0105` | Same bounded networking controls; remove with the libp2p migration | networking | 2026-12-15 |
+
+Owners must migrate Ethers to Alloy, update libp2p and Reed-Solomon dependencies, and move the v1 bincode wire to a
+versioned replacement before the recorded deadlines. `scripts/check-rustsec-exceptions.sh` blocks expired advisory
+exceptions. Expired yanked-package entries fail review and must not be extended without a new security assessment.

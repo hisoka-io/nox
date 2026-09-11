@@ -3,6 +3,7 @@ pub mod handlers;
 pub mod mixing;
 pub mod network_manager;
 pub mod profitability;
+pub mod quotes;
 pub mod relayer;
 pub mod response_packer;
 pub mod security;

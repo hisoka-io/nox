@@ -1,233 +1,356 @@
-//! Profitability calculator using simulation logs as the source of truth.
-
-use ethers::prelude::*;
-use ethers::types::U256;
+use crate::blockchain::transaction_plan::{CostCandidate, TransactionPlan, BASIS_POINTS};
+use crate::price::client::FixedPriceSource;
+use crate::services::token_registry::TokenRegistry;
+use ethers::types::{Address, Log, H256, U256, U512};
 use ethers::utils::keccak256;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use thiserror::Error;
 
-use crate::price::client::PriceSource;
-use crate::services::token_registry::TokenRegistry;
-use nox_core::utils::{token_to_f64, wei_to_eth_f64};
-
-pub struct ProfitabilityCalculator {
-    min_profit_margin: f64,
-    price_client: Arc<dyn PriceSource>,
-    token_registry: TokenRegistry,
-    /// Events MUST come from this address to prevent spoofed reward events.
-    nox_reward_pool_address: Address,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfitAuthorization {
+    pub plan: TransactionPlan,
+    pub revenue_value_e8: U256,
+    pub planned_initial_cost_value_e8: U256,
+    pub maximum_cost_value_e8: U256,
 }
 
-#[derive(Debug)]
-pub struct ProfitabilityResult {
-    pub is_profitable: bool,
-    pub cost_usd: f64,
-    pub revenue_usd: f64,
-    pub margin: f64,
-    pub payment_found: bool,
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ProfitabilityError {
+    #[error("no committed payment")]
+    PaymentMissing,
+    #[error("price unavailable for {asset_id}: {detail}")]
+    PriceUnavailable { asset_id: String, detail: String },
+    #[error("payment is below the required margin")]
+    Unprofitable {
+        revenue_value_e8: U256,
+        maximum_cost_value_e8: U256,
+    },
+    #[error("profitability arithmetic failed: {detail}")]
+    Arithmetic { detail: String },
+}
+
+pub struct ProfitabilityCalculator {
+    margin_bps: u128,
+    price_client: Arc<dyn FixedPriceSource>,
+    token_registry: TokenRegistry,
+    nox_reward_pool_address: Address,
+    native_asset_price_id: String,
+    native_asset_decimals: u8,
 }
 
 impl ProfitabilityCalculator {
-    pub fn new(
-        min_profit_margin_percent: u64,
-        price_client: Arc<dyn PriceSource>,
-        nox_reward_pool_address: Address,
-    ) -> Self {
-        if nox_reward_pool_address == Address::zero() {
-            warn!(
-                "ProfitabilityCalculator initialized with zero NoxRewardPool address. \
-                 All reward event validation will fail -- no transaction will appear profitable."
-            );
-        }
-
-        info!(
-            "Profitability Calculator initialized. Min margin: {}%, RewardPool: {:?}",
-            min_profit_margin_percent, nox_reward_pool_address
-        );
-
-        Self {
-            min_profit_margin: (min_profit_margin_percent as f64) / 100.0,
-            price_client,
-            token_registry: TokenRegistry::default(),
-            nox_reward_pool_address,
-        }
+    pub async fn quote_exit_fee(
+        &self,
+        fee_asset: Address,
+        maximum_transaction_gas: U256,
+        maximum_fee_per_gas: U256,
+    ) -> Result<U256, ProfitabilityError> {
+        let price_id = self
+            .token_registry
+            .get_price_id(fee_asset)
+            .ok_or(ProfitabilityError::PaymentMissing)?;
+        let decimals = self
+            .token_registry
+            .get_decimals(fee_asset)
+            .ok_or(ProfitabilityError::PaymentMissing)?;
+        let fee_quote = self
+            .price_client
+            .get_price(price_id)
+            .await
+            .map_err(|error| ProfitabilityError::PriceUnavailable {
+                asset_id: price_id.to_string(),
+                detail: error.to_string(),
+            })?;
+        validate_quote(price_id, &fee_quote)?;
+        let native_quote = self
+            .price_client
+            .get_price(&self.native_asset_price_id)
+            .await
+            .map_err(|error| ProfitabilityError::PriceUnavailable {
+                asset_id: self.native_asset_price_id.clone(),
+                detail: error.to_string(),
+            })?;
+        validate_quote(&self.native_asset_price_id, &native_quote)?;
+        let native_price_upper =
+            native_quote
+                .price_e8
+                .checked_add(1)
+                .ok_or_else(|| ProfitabilityError::Arithmetic {
+                    detail: "native price upper rounding overflow".to_string(),
+                })?;
+        let maximum_cost_e8 = mul3_div_ceil(
+            maximum_transaction_gas,
+            maximum_fee_per_gas,
+            U256::from(native_price_upper),
+            pow10(self.native_asset_decimals)?,
+        )?;
+        let margin_weight =
+            U256::from(BASIS_POINTS.checked_add(self.margin_bps).ok_or_else(|| {
+                ProfitabilityError::Arithmetic {
+                    detail: "quote margin basis-point addition overflow".to_string(),
+                }
+            })?);
+        let required_revenue_e8 =
+            mul_div_ceil(maximum_cost_e8, margin_weight, U256::from(BASIS_POINTS))?;
+        mul_div_ceil(
+            required_revenue_e8,
+            pow10(decimals)?,
+            U256::from(fee_quote.price_e8),
+        )
     }
 
-    pub fn with_token_registry(
+    pub async fn authorize_fee(
+        &self,
+        candidate: CostCandidate,
+        fee_asset: Address,
+        fee_amount: U256,
+    ) -> Result<ProfitAuthorization, ProfitabilityError> {
+        let mut asset_topic = [0_u8; 32];
+        asset_topic[12..].copy_from_slice(fee_asset.as_bytes());
+        let mut amount = [0_u8; 32];
+        fee_amount.to_big_endian(&mut amount);
+        self.authorize(
+            candidate,
+            &[Log {
+                address: self.nox_reward_pool_address,
+                topics: vec![
+                    H256::from(keccak256(b"RewardsDeposited(address,address,uint256)")),
+                    H256::from(asset_topic),
+                    H256::zero(),
+                ],
+                data: amount.to_vec().into(),
+                ..Default::default()
+            }],
+        )
+        .await
+    }
+
+    pub async fn authorize_fee_with_maximum_fee_per_gas(
+        &self,
+        candidate: CostCandidate,
+        fee_asset: Address,
+        fee_amount: U256,
+        maximum_fee_per_gas: U256,
+    ) -> Result<ProfitAuthorization, ProfitabilityError> {
+        let mut asset_topic = [0_u8; 32];
+        asset_topic[12..].copy_from_slice(fee_asset.as_bytes());
+        let mut amount = [0_u8; 32];
+        fee_amount.to_big_endian(&mut amount);
+        self.authorize_with_maximum_fee_per_gas(
+            candidate,
+            &[Log {
+                address: self.nox_reward_pool_address,
+                topics: vec![
+                    H256::from(keccak256(b"RewardsDeposited(address,address,uint256)")),
+                    H256::from(asset_topic),
+                    H256::zero(),
+                ],
+                data: amount.to_vec().into(),
+                ..Default::default()
+            }],
+            Some(maximum_fee_per_gas),
+        )
+        .await
+    }
+
+    pub fn new(
         min_profit_margin_percent: u64,
-        price_client: Arc<dyn PriceSource>,
+        price_client: Arc<dyn FixedPriceSource>,
+        nox_reward_pool_address: Address,
+    ) -> Self {
+        Self::with_economics(
+            u128::from(min_profit_margin_percent) * 100,
+            price_client,
+            nox_reward_pool_address,
+            TokenRegistry::default(),
+            "ethereum".to_string(),
+            18,
+        )
+    }
+
+    pub fn with_economics(
+        margin_bps: u128,
+        price_client: Arc<dyn FixedPriceSource>,
         nox_reward_pool_address: Address,
         token_registry: TokenRegistry,
+        native_asset_price_id: String,
+        native_asset_decimals: u8,
     ) -> Self {
         Self {
-            min_profit_margin: (min_profit_margin_percent as f64) / 100.0,
+            margin_bps,
             price_client,
             token_registry,
             nox_reward_pool_address,
+            native_asset_price_id,
+            native_asset_decimals,
         }
     }
 
-    pub async fn analyze(
+    pub async fn authorize(
         &self,
-        gas_used: u64,
-        gas_price: U256,
+        candidate: CostCandidate,
         logs: &[Log],
-    ) -> ProfitabilityResult {
-        if gas_price.is_zero() {
-            warn!("Gas price is zero -- rejecting transaction (potential manipulation or misconfigured network)");
-            return ProfitabilityResult {
-                is_profitable: false,
-                cost_usd: 0.0,
-                revenue_usd: 0.0,
-                margin: 0.0,
-                payment_found: false,
-            };
+    ) -> Result<ProfitAuthorization, ProfitabilityError> {
+        self.authorize_with_maximum_fee_per_gas(candidate, logs, None)
+            .await
+    }
+
+    async fn authorize_with_maximum_fee_per_gas(
+        &self,
+        candidate: CostCandidate,
+        logs: &[Log],
+        maximum_fee_cap: Option<U256>,
+    ) -> Result<ProfitAuthorization, ProfitabilityError> {
+        if candidate.gas_limit.is_zero() || candidate.initial_fee_per_gas.is_zero() {
+            return Err(ProfitabilityError::Arithmetic {
+                detail: "gas limit and initial fee must be positive".to_string(),
+            });
         }
 
-        let eth_price = match self.price_client.get_price("ethereum").await {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("Failed to fetch ETH price: {}. Assuming unprofitable.", e);
-                return ProfitabilityResult {
-                    is_profitable: false,
-                    cost_usd: 0.0,
-                    revenue_usd: 0.0,
-                    margin: 0.0,
-                    payment_found: false,
-                };
-            }
-        };
+        let revenue_value_e8 = self.payment_revenue(logs).await?;
+        let native_quote = self
+            .price_client
+            .get_price(&self.native_asset_price_id)
+            .await
+            .map_err(|error| ProfitabilityError::PriceUnavailable {
+                asset_id: self.native_asset_price_id.clone(),
+                detail: error.to_string(),
+            })?;
+        validate_quote(&self.native_asset_price_id, &native_quote)?;
+        let native_price_upper_e8 =
+            native_quote
+                .price_e8
+                .checked_add(1)
+                .ok_or_else(|| ProfitabilityError::Arithmetic {
+                    detail: "native price upper rounding overflow".to_string(),
+                })?;
+        let native_scale = pow10(self.native_asset_decimals)?;
+        let chain_data_fee_value_e8 = mul_div_ceil(
+            candidate.chain_data_fee_native,
+            U256::from(native_price_upper_e8),
+            native_scale,
+        )?;
+        let initial_gas_value_e8 = mul3_div_ceil(
+            candidate.gas_limit,
+            candidate.initial_fee_per_gas,
+            U256::from(native_price_upper_e8),
+            native_scale,
+        )?;
+        let initial_cost_value_e8 = initial_gas_value_e8
+            .checked_add(chain_data_fee_value_e8)
+            .ok_or_else(|| ProfitabilityError::Arithmetic {
+                detail: "initial total cost overflow".to_string(),
+            })?;
+        let required_cost_weight =
+            U256::from(BASIS_POINTS.checked_add(self.margin_bps).ok_or_else(|| {
+                ProfitabilityError::Arithmetic {
+                    detail: "margin basis-point addition overflow".to_string(),
+                }
+            })?);
+        let revenue_weight = U512::from(revenue_value_e8) * U512::from(BASIS_POINTS);
+        let cost_weight = U512::from(initial_cost_value_e8) * U512::from(required_cost_weight);
+        if revenue_weight < cost_weight {
+            return Err(ProfitabilityError::Unprofitable {
+                revenue_value_e8,
+                maximum_cost_value_e8: initial_cost_value_e8,
+            });
+        }
 
-        let cost_eth = wei_to_eth_f64(U256::from(gas_used) * gas_price);
-        let cost_usd = cost_eth * eth_price;
+        let maximum_total_cost_e8 = mul_div_floor(
+            revenue_value_e8,
+            U256::from(BASIS_POINTS),
+            required_cost_weight,
+        )?;
+        let maximum_gas_value_e8 = maximum_total_cost_e8
+            .checked_sub(chain_data_fee_value_e8)
+            .ok_or(ProfitabilityError::Unprofitable {
+                revenue_value_e8,
+                maximum_cost_value_e8: initial_cost_value_e8,
+            })?;
+        let affordable_fee_per_gas = maximum_fee_per_gas(
+            maximum_gas_value_e8,
+            native_scale,
+            candidate.gas_limit,
+            U256::from(native_price_upper_e8),
+        )?;
+        let maximum_fee_per_gas = maximum_fee_cap.map_or(affordable_fee_per_gas, |cap| {
+            affordable_fee_per_gas.min(cap)
+        });
+        if candidate.initial_fee_per_gas > maximum_fee_per_gas {
+            return Err(ProfitabilityError::Unprofitable {
+                revenue_value_e8,
+                maximum_cost_value_e8: initial_cost_value_e8,
+            });
+        }
 
+        let maximum_gas_cost_value_e8 = mul3_div_ceil(
+            candidate.gas_limit,
+            maximum_fee_per_gas,
+            U256::from(native_price_upper_e8),
+            native_scale,
+        )?;
+        let maximum_cost_value_e8 = maximum_gas_cost_value_e8
+            .checked_add(chain_data_fee_value_e8)
+            .ok_or_else(|| ProfitabilityError::Arithmetic {
+                detail: "maximum executable cost overflow".to_string(),
+            })?;
+
+        Ok(ProfitAuthorization {
+            plan: TransactionPlan {
+                gas_limit: candidate.gas_limit,
+                initial_fee_per_gas: candidate.initial_fee_per_gas,
+                maximum_fee_per_gas,
+                chain_data_fee_native: candidate.chain_data_fee_native,
+            },
+            revenue_value_e8,
+            planned_initial_cost_value_e8: initial_cost_value_e8,
+            maximum_cost_value_e8,
+        })
+    }
+
+    async fn payment_revenue(&self, logs: &[Log]) -> Result<U256, ProfitabilityError> {
         let rewards_topic = H256::from(keccak256(b"RewardsDeposited(address,address,uint256)"));
-
-        let mut revenue_usd = 0.0;
+        let mut revenue = U256::zero();
         let mut payment_found = false;
 
         for log in logs {
-            // Reject events from non-NoxRewardPool addresses (fake contract attack vector).
-            if log.address != self.nox_reward_pool_address {
-                if log.topics.first() == Some(&rewards_topic) {
-                    warn!(
-                        "SECURITY: Ignoring RewardsDeposited from WRONG address {:?} (expected {:?})",
-                        log.address, self.nox_reward_pool_address
-                    );
-                }
+            if log.address != self.nox_reward_pool_address
+                || log.topics.len() != 3
+                || log.topics[0] != rewards_topic
+                || log.data.len() != 32
+            {
                 continue;
             }
-
-            if log.topics.len() >= 3 && log.topics[0] == rewards_topic {
-                let asset_address = Address::from(log.topics[1]);
-
-                let amount = if log.data.len() >= 32 {
-                    U256::from_big_endian(&log.data[..32])
-                } else {
-                    warn!("Invalid RewardsDeposited data length: {}", log.data.len());
-                    continue;
-                };
-
-                let price = self.get_asset_price(asset_address).await;
-
-                let Some(decimals) = self.get_decimals(asset_address) else {
-                    warn!(
-                        "Unknown token {:?} -- cannot determine decimals. \
-                         Skipping payment to prevent incorrect valuation. \
-                         Register this token via `register_token()`.",
-                        asset_address
-                    );
-                    continue;
-                };
-
-                let token_amount = token_to_f64(amount, decimals);
-                let value_usd = token_amount * price;
-
-                debug!(
-                    "Valid Payment: {} {} (decimals: {}, price: ${:.2}) = ${:.4}",
-                    token_amount,
-                    self.token_registry
-                        .get_info(asset_address)
-                        .map_or("UNKNOWN", |t| t.symbol.as_str()),
-                    decimals,
-                    price,
-                    value_usd
-                );
-
-                revenue_usd += value_usd;
-                payment_found = true;
-            }
+            let asset = Address::from(log.topics[1]);
+            let Some(price_id) = self.token_registry.get_price_id(asset) else {
+                continue;
+            };
+            let Some(decimals) = self.token_registry.get_decimals(asset) else {
+                continue;
+            };
+            let quote = self
+                .price_client
+                .get_price(price_id)
+                .await
+                .map_err(|error| ProfitabilityError::PriceUnavailable {
+                    asset_id: price_id.to_string(),
+                    detail: error.to_string(),
+                })?;
+            validate_quote(price_id, &quote)?;
+            let amount = U256::from_big_endian(log.data.as_ref());
+            let value = mul_div_floor(amount, U256::from(quote.price_e8), pow10(decimals)?)?;
+            revenue = revenue
+                .checked_add(value)
+                .ok_or_else(|| ProfitabilityError::Arithmetic {
+                    detail: "payment revenue overflow".to_string(),
+                })?;
+            payment_found = true;
         }
 
         if !payment_found {
-            warn!("No valid RewardsDeposited event found from NoxRewardPool. Transaction provides 0 payment.");
+            return Err(ProfitabilityError::PaymentMissing);
         }
-
-        let margin = if cost_usd > 0.0 {
-            revenue_usd / cost_usd
-        } else {
-            f64::INFINITY
-        };
-
-        let is_profitable = cost_usd == 0.0 || margin >= (1.0 + self.min_profit_margin);
-
-        if is_profitable {
-            debug!(
-                "Profitable: Margin {:.2}x >= {:.2}x (Rev ${:.4} / Cost ${:.4})",
-                margin,
-                1.0 + self.min_profit_margin,
-                revenue_usd,
-                cost_usd
-            );
-        } else {
-            warn!(
-                "Unprofitable: Margin {:.2}x < {:.2}x (Rev ${:.4} / Cost ${:.4})",
-                margin,
-                1.0 + self.min_profit_margin,
-                revenue_usd,
-                cost_usd
-            );
-        }
-
-        ProfitabilityResult {
-            is_profitable,
-            cost_usd,
-            revenue_usd,
-            margin,
-            payment_found,
-        }
-    }
-
-    pub async fn is_profitable(&self, gas_used: u64, gas_price: U256, logs: &[Log]) -> bool {
-        self.analyze(gas_used, gas_price, logs).await.is_profitable
-    }
-
-    async fn get_asset_price(&self, asset: Address) -> f64 {
-        let price_id = self.token_registry.get_price_id(asset);
-
-        if price_id == "unknown" {
-            warn!(
-                "Unknown asset {:?} - cannot determine price. Assuming $0",
-                asset
-            );
-            return 0.0;
-        }
-
-        match self.price_client.get_price(&price_id).await {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(
-                    "Failed to fetch price for {} (asset {:?}): {}. Assuming $0",
-                    price_id, asset, e
-                );
-                0.0
-            }
-        }
-    }
-
-    /// Returns `None` for unregistered tokens (callers must not assume 18 decimals).
-    fn get_decimals(&self, asset: Address) -> Option<u32> {
-        self.token_registry.get_decimals(asset).map(u32::from)
+        Ok(revenue)
     }
 
     pub fn register_token(&mut self, address: Address, symbol: &str, decimals: u8, price_id: &str) {
@@ -240,186 +363,117 @@ impl ProfitabilityCalculator {
             },
         );
     }
+
+    pub(crate) fn clear_tokens(&mut self) {
+        self.token_registry.clear();
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::price::client::PriceClientError;
-    use std::str::FromStr;
-
-    struct MockPriceClient {
-        prices: std::collections::HashMap<String, f64>,
+fn validate_quote(
+    requested_asset_id: &str,
+    quote: &crate::price::client::PriceQuote,
+) -> Result<(), ProfitabilityError> {
+    if quote.price_e8 == 0 || quote.asset_id != requested_asset_id {
+        return Err(ProfitabilityError::PriceUnavailable {
+            asset_id: requested_asset_id.to_string(),
+            detail: "price source returned a zero or mismatched quote".to_string(),
+        });
     }
+    Ok(())
+}
 
-    #[async_trait::async_trait]
-    impl PriceSource for MockPriceClient {
-        async fn get_price(&self, asset: &str) -> Result<f64, PriceClientError> {
-            self.prices
-                .get(asset)
-                .copied()
-                .ok_or(PriceClientError::AssetNotFound)
-        }
+fn pow10(decimals: u8) -> Result<U256, ProfitabilityError> {
+    (0..decimals).try_fold(U256::one(), |value, _| {
+        value
+            .checked_mul(U256::from(10))
+            .ok_or_else(|| ProfitabilityError::Arithmetic {
+                detail: "decimal scale overflow".to_string(),
+            })
+    })
+}
+
+fn mul_div_floor(left: U256, right: U256, divisor: U256) -> Result<U256, ProfitabilityError> {
+    if divisor.is_zero() {
+        return Err(ProfitabilityError::Arithmetic {
+            detail: "division by zero".to_string(),
+        });
     }
+    narrow(U512::from(left) * U512::from(right) / U512::from(divisor))
+}
 
-    fn create_rewards_log(pool_address: Address, asset: Address, amount: U256) -> Log {
-        let topic0 = H256::from(keccak256(b"RewardsDeposited(address,address,uint256)"));
-        let mut topic1 = [0u8; 32];
-        topic1[12..].copy_from_slice(asset.as_bytes());
-        let topic2 = H256::zero(); // 'from' address, not used
-
-        let mut data = vec![0u8; 32];
-        amount.to_big_endian(&mut data);
-
-        Log {
-            address: pool_address,
-            topics: vec![topic0, H256::from(topic1), topic2],
-            data: data.into(),
-            block_hash: None,
-            block_number: None,
-            transaction_hash: None,
-            transaction_index: None,
-            log_index: None,
-            transaction_log_index: None,
-            log_type: None,
-            removed: None,
-        }
+fn mul_div_ceil(left: U256, right: U256, divisor: U256) -> Result<U256, ProfitabilityError> {
+    if divisor.is_zero() {
+        return Err(ProfitabilityError::Arithmetic {
+            detail: "division by zero".to_string(),
+        });
     }
+    let numerator = U512::from(left) * U512::from(right);
+    let divisor = U512::from(divisor);
+    let rounded = numerator
+        .checked_add(divisor - U512::one())
+        .ok_or_else(|| ProfitabilityError::Arithmetic {
+            detail: "rounded numerator overflow".to_string(),
+        })?;
+    narrow(rounded / divisor)
+}
 
-    #[tokio::test]
-    async fn test_usdc_decimal_handling() {
-        let mut prices = std::collections::HashMap::new();
-        prices.insert("ethereum".to_string(), 3000.0);
-        prices.insert("usd-coin".to_string(), 1.0);
-
-        let price_client = Arc::new(MockPriceClient { prices });
-        let pool_address = Address::from_str("0x1234567890123456789012345678901234567890").unwrap();
-        let usdc_address = Address::from_str("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48").unwrap();
-
-        let calc = ProfitabilityCalculator::new(10, price_client, pool_address);
-
-        // 10 USDC = 10_000_000 (6 decimals)
-        let amount = U256::from(10_000_000u64);
-        let log = create_rewards_log(pool_address, usdc_address, amount);
-
-        let result = calc
-            .analyze(50_000, U256::from(10_000_000_000u64), &[log])
-            .await;
-
-        // Revenue should be ~$10, not $0.00000000001
-        assert!(
-            result.revenue_usd > 9.0 && result.revenue_usd < 11.0,
-            "USDC revenue should be ~$10, got ${:.6}",
-            result.revenue_usd
-        );
+fn mul3_div_ceil(
+    first: U256,
+    second: U256,
+    third: U256,
+    divisor: U256,
+) -> Result<U256, ProfitabilityError> {
+    if divisor.is_zero() {
+        return Err(ProfitabilityError::Arithmetic {
+            detail: "division by zero".to_string(),
+        });
     }
+    let numerator = U512::from(first)
+        .checked_mul(U512::from(second))
+        .and_then(|value| value.checked_mul(U512::from(third)))
+        .ok_or_else(|| ProfitabilityError::Arithmetic {
+            detail: "widened cost product overflow".to_string(),
+        })?;
+    let divisor = U512::from(divisor);
+    let rounded = numerator
+        .checked_add(divisor - U512::one())
+        .ok_or_else(|| ProfitabilityError::Arithmetic {
+            detail: "rounded widened numerator overflow".to_string(),
+        })?;
+    narrow(rounded / divisor)
+}
 
-    #[tokio::test]
-    async fn test_rejects_fake_reward_pool() {
-        let mut prices = std::collections::HashMap::new();
-        prices.insert("ethereum".to_string(), 3000.0);
-        prices.insert("usd-coin".to_string(), 1.0);
-
-        let price_client = Arc::new(MockPriceClient { prices });
-        let real_pool = Address::from_str("0x1234567890123456789012345678901234567890").unwrap();
-        let fake_pool = Address::from_str("0xDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF").unwrap();
-        let usdc_address = Address::from_str("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48").unwrap();
-
-        let calc = ProfitabilityCalculator::new(10, price_client, real_pool);
-
-        // Create log from FAKE pool (should be rejected!)
-        let amount = U256::from(10_000_000_000u64); // 10,000 USDC
-        let fake_log = create_rewards_log(fake_pool, usdc_address, amount);
-
-        let result = calc
-            .analyze(50_000, U256::from(10_000_000_000u64), &[fake_log])
-            .await;
-
-        // CRITICAL: Should NOT find payment from fake pool
-        assert!(
-            !result.payment_found,
-            "Should reject RewardsDeposited from wrong address"
-        );
-        assert_eq!(
-            result.revenue_usd, 0.0,
-            "Revenue should be 0 from fake pool"
-        );
+fn maximum_fee_per_gas(
+    maximum_gas_value_e8: U256,
+    native_scale: U256,
+    gas_limit: U256,
+    native_price_upper_e8: U256,
+) -> Result<U256, ProfitabilityError> {
+    let numerator = U512::from(maximum_gas_value_e8)
+        .checked_mul(U512::from(native_scale))
+        .ok_or_else(|| ProfitabilityError::Arithmetic {
+            detail: "maximum fee numerator overflow".to_string(),
+        })?;
+    let denominator = U512::from(gas_limit)
+        .checked_mul(U512::from(native_price_upper_e8))
+        .ok_or_else(|| ProfitabilityError::Arithmetic {
+            detail: "maximum fee denominator overflow".to_string(),
+        })?;
+    if denominator.is_zero() {
+        return Err(ProfitabilityError::Arithmetic {
+            detail: "maximum fee denominator is zero".to_string(),
+        });
     }
+    narrow(numerator / denominator)
+}
 
-    #[tokio::test]
-    async fn test_profitable_transaction() {
-        let mut prices = std::collections::HashMap::new();
-        prices.insert("ethereum".to_string(), 3000.0);
-        prices.insert("usd-coin".to_string(), 1.0);
-
-        let price_client = Arc::new(MockPriceClient { prices });
-        let pool_address = Address::from_str("0x1234567890123456789012345678901234567890").unwrap();
-        let usdc_address = Address::from_str("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48").unwrap();
-
-        let calc = ProfitabilityCalculator::new(10, price_client, pool_address);
-
-        // Gas: 100k gas at 20 gwei = 0.002 ETH = $6 at $3000/ETH
-        // Payment: 100 USDC = $100
-        // Margin: $100 / $6 = 16.6x >> 1.1x required
-        let amount = U256::from(100_000_000u64); // 100 USDC (6 decimals)
-        let log = create_rewards_log(pool_address, usdc_address, amount);
-
-        let result = calc
-            .analyze(100_000, U256::from(20_000_000_000u64), &[log])
-            .await;
-
-        assert!(result.is_profitable);
-        assert!(result.payment_found);
-        assert!(result.margin > 10.0);
+fn narrow(value: U512) -> Result<U256, ProfitabilityError> {
+    if value > U512::from(U256::MAX) {
+        return Err(ProfitabilityError::Arithmetic {
+            detail: "U512 value exceeds U256".to_string(),
+        });
     }
-
-    #[tokio::test]
-    async fn test_unprofitable_transaction() {
-        let mut prices = std::collections::HashMap::new();
-        prices.insert("ethereum".to_string(), 3000.0);
-        prices.insert("usd-coin".to_string(), 1.0);
-
-        let price_client = Arc::new(MockPriceClient { prices });
-        let pool_address = Address::from_str("0x1234567890123456789012345678901234567890").unwrap();
-        let usdc_address = Address::from_str("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48").unwrap();
-
-        let calc = ProfitabilityCalculator::new(10, price_client, pool_address);
-
-        // Gas: 500k gas at 100 gwei = 0.05 ETH = $150 at $3000/ETH
-        // Payment: 1 USDC = $1
-        // Margin: $1 / $150 = 0.0067x << 1.1x required
-        let amount = U256::from(1_000_000u64); // 1 USDC (6 decimals)
-        let log = create_rewards_log(pool_address, usdc_address, amount);
-
-        let result = calc
-            .analyze(500_000, U256::from(100_000_000_000u64), &[log])
-            .await;
-
-        assert!(!result.is_profitable);
-        assert!(result.payment_found);
-        assert!(result.margin < 0.1);
-    }
-
-    #[tokio::test]
-    async fn test_zero_gas_price_rejected() {
-        let mut prices = std::collections::HashMap::new();
-        prices.insert("ethereum".to_string(), 3000.0);
-        prices.insert("usd-coin".to_string(), 1.0);
-
-        let price_client = Arc::new(MockPriceClient { prices });
-        let pool_address = Address::from_str("0x1234567890123456789012345678901234567890").unwrap();
-        let usdc_address = Address::from_str("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48").unwrap();
-
-        let calc = ProfitabilityCalculator::new(10, price_client, pool_address);
-
-        let amount = U256::from(100_000_000u64); // 100 USDC
-        let log = create_rewards_log(pool_address, usdc_address, amount);
-
-        let result = calc.analyze(100_000, U256::zero(), &[log]).await;
-        assert!(!result.is_profitable, "Zero gas price should be rejected");
-        assert!(
-            !result.payment_found,
-            "Should not even scan logs when gas price is zero"
-        );
-    }
+    let mut bytes = [0_u8; 64];
+    value.to_big_endian(&mut bytes);
+    Ok(U256::from_big_endian(&bytes[32..]))
 }

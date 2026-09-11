@@ -25,10 +25,10 @@ impl BanRecord {
 
     fn ban_duration(&self) -> Duration {
         match self.ban_count {
-            1 => Duration::from_secs(60),   // 1 minute
-            2 => Duration::from_secs(300),  // 5 minutes
-            3 => Duration::from_secs(1800), // 30 minutes
-            _ => Duration::from_secs(3600), // 1 hour (max)
+            1 => Duration::from_mins(1),  // 1 minute
+            2 => Duration::from_mins(5),  // 5 minutes
+            3 => Duration::from_mins(30), // 30 minutes
+            _ => Duration::from_hours(1), // 1 hour (max)
         }
     }
 
@@ -320,7 +320,7 @@ mod tests {
                 .denied_ips
                 .get(&IpAddr::V4("192.168.1.1".parse().expect("valid")))
                 .map(|r| r.ban_duration()),
-            Some(Duration::from_secs(60))
+            Some(Duration::from_mins(1))
         );
 
         // Second ban: 5 minutes
@@ -330,7 +330,7 @@ mod tests {
                 .denied_ips
                 .get(&IpAddr::V4("192.168.1.1".parse().expect("valid")))
                 .map(|r| r.ban_duration()),
-            Some(Duration::from_secs(300))
+            Some(Duration::from_mins(5))
         );
     }
 

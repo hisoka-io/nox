@@ -11,7 +11,8 @@ use crate::telemetry::metrics::MetricsService;
 use ethers::types::{Address, Bytes};
 use nox_core::events::NoxEvent;
 use nox_core::models::payloads::{
-    decode_payload_limited, encode_payload, RelayerPayload, ServiceRequest,
+    decode_padded_relayer_payload_limited, decode_payload_limited, encode_payload, RelayerPayload,
+    ServiceRequest,
 };
 use nox_core::protocol::fragmentation::{
     Fragment, Reassembler, ReassemblerConfig, MAX_MESSAGE_SIZE,
@@ -426,7 +427,7 @@ impl ExitService {
 
     async fn handle_payload(&self, packet_id: String, payload_bytes: Vec<u8>) {
         let command: RelayerPayload =
-            match decode_payload_limited(&payload_bytes, MAX_SINGLE_PAYLOAD_SIZE) {
+            match decode_padded_relayer_payload_limited(&payload_bytes, MAX_SINGLE_PAYLOAD_SIZE) {
                 Ok(cmd) => cmd,
                 Err(e) => {
                     debug!(
@@ -679,8 +680,15 @@ impl ExitService {
                         if !reply_surbs.is_empty() {
                             if let Some(ref echo) = self.echo_handler {
                                 let response_data = match &tx_result {
-                                    Ok(tx_hash) => tx_hash.as_bytes().to_vec(),
-                                    Err(e) => format!("tx_error:{e}").into_bytes(),
+                                    Ok(crate::services::handlers::ethereum::PaidOutcome::Submitted {
+                                        transaction_hash,
+                                        ..
+                                    }) => transaction_hash.as_bytes().to_vec(),
+                                    Err(rejection) => format!(
+                                        "tx_error:{}",
+                                        rejection.public_detail()
+                                    )
+                                    .into_bytes(),
                                 };
                                 let inner = match encode_payload(&ServiceRequest::Echo {
                                     data: response_data,
@@ -712,6 +720,123 @@ impl ExitService {
                                 packet_id = %packet_id,
                                 error = %e,
                                 "Paid transaction handler failed"
+                            );
+                        }
+                    }
+                    Ok(ServiceRequest::PaidTransactionV2(request)) => {
+                        self.metrics
+                            .exit_payloads_dispatched_total
+                            .get_or_create(&vec![(
+                                "handler".to_string(),
+                                "ethereum_v2".to_string(),
+                            )])
+                            .inc();
+                        let outcome = match &self.ethereum_handler {
+                            Some(handler) => {
+                                handler.handle_paid_transaction_v2(request.clone()).await
+                            }
+                            None => nox_core::PaidTransactionOutcomeV2::Rejected {
+                                execution_id: Some(request.execution_id),
+                                code: nox_core::PaidTransactionRejectionCodeV2::SubmissionFailure,
+                                retryable: true,
+                                detail: "paid execution handler unavailable".to_string(),
+                            },
+                        };
+                        if !reply_surbs.is_empty() {
+                            if let Some(ref echo) = self.echo_handler {
+                                let response_data = match encode_payload(&outcome) {
+                                    Ok(bytes) => bytes,
+                                    Err(error) => {
+                                        warn!(
+                                            packet_id = %packet_id,
+                                            error = %error,
+                                            "Failed to encode paid v2 outcome"
+                                        );
+                                        return;
+                                    }
+                                };
+                                let inner = match encode_payload(&ServiceRequest::Echo {
+                                    data: response_data,
+                                }) {
+                                    Ok(bytes) => bytes,
+                                    Err(error) => {
+                                        warn!(
+                                            packet_id = %packet_id,
+                                            error = %error,
+                                            "Failed to encode paid v2 SURB response"
+                                        );
+                                        return;
+                                    }
+                                };
+                                let response =
+                                    RelayerPayload::AnonymousRequest { inner, reply_surbs };
+                                if let Err(error) = echo.handle(packet_id, &response).await {
+                                    warn!(
+                                        packet_id = %packet_id,
+                                        error = %error,
+                                        "Failed to send paid v2 response via SURBs"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Ok(ServiceRequest::PaidQuoteRequestV2(request)) => {
+                        if reply_surbs.is_empty() {
+                            warn!(
+                                packet_id = %packet_id,
+                                "Paid quote request has no reply SURB; rejecting before reservation"
+                            );
+                            return;
+                        }
+                        let Some(ref echo) = self.echo_handler else {
+                            warn!(
+                                packet_id = %packet_id,
+                                "Paid quote response handler unavailable; rejecting before reservation"
+                            );
+                            return;
+                        };
+                        self.metrics
+                            .exit_payloads_dispatched_total
+                            .get_or_create(&vec![("handler".to_string(), "quote_v2".to_string())])
+                            .inc();
+                        let outcome = match &self.ethereum_handler {
+                            Some(handler) => handler.handle_paid_quote_v2(request).await,
+                            None => nox_core::PaidQuoteOutcomeV2::Rejected {
+                                code: nox_core::PaidTransactionRejectionCodeV2::SubmissionFailure,
+                                retryable: true,
+                                detail: "paid quote handler unavailable".to_string(),
+                            },
+                        };
+                        let response_data = match encode_payload(&outcome) {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
+                                warn!(
+                                    packet_id = %packet_id,
+                                    error = %error,
+                                    "Failed to encode paid quote outcome"
+                                );
+                                return;
+                            }
+                        };
+                        let inner = match encode_payload(&ServiceRequest::Echo {
+                            data: response_data,
+                        }) {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
+                                warn!(
+                                    packet_id = %packet_id,
+                                    error = %error,
+                                    "Failed to encode paid quote SURB response"
+                                );
+                                return;
+                            }
+                        };
+                        let response = RelayerPayload::AnonymousRequest { inner, reply_surbs };
+                        if let Err(error) = echo.handle(packet_id, &response).await {
+                            warn!(
+                                packet_id = %packet_id,
+                                error = %error,
+                                "Failed to send paid quote response via SURBs"
                             );
                         }
                     }

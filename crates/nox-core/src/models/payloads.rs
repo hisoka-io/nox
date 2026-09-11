@@ -17,13 +17,18 @@ pub fn encode_payload<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
 
 /// Decode a versioned wire payload back into `T`.
 pub fn decode_payload<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, String> {
+    use bincode::Options;
     match bytes.split_first() {
         None => Err("empty payload bytes".into()),
         Some((&ver, body)) => {
             if ver != PAYLOAD_VERSION {
                 return Err(format!("unsupported payload version {ver}"));
             }
-            bincode::deserialize(body).map_err(|e| e.to_string())
+            bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .reject_trailing_bytes()
+                .deserialize(body)
+                .map_err(|e| e.to_string())
         }
     }
 }
@@ -43,11 +48,45 @@ pub fn decode_payload_limited<T: for<'de> Deserialize<'de>>(
             bincode::DefaultOptions::new()
                 .with_limit(max_bytes)
                 .with_fixint_encoding()
-                .allow_trailing_bytes()
                 .deserialize(body)
                 .map_err(|e| e.to_string())
         }
     }
+}
+
+pub fn decode_padded_relayer_payload_limited(
+    bytes: &[u8],
+    max_bytes: u64,
+) -> Result<RelayerPayload, String> {
+    use bincode::Options;
+    if u64::try_from(bytes.len()).map_or(true, |length| length > max_bytes) {
+        return Err(format!(
+            "padded relayer payload exceeds {max_bytes}-byte limit"
+        ));
+    }
+    let (&version, body) = bytes
+        .split_first()
+        .ok_or_else(|| "empty payload bytes".to_string())?;
+    if version != PAYLOAD_VERSION {
+        return Err(format!("unsupported payload version {version}"));
+    }
+    let mut cursor = std::io::Cursor::new(body);
+    let payload = bincode::DefaultOptions::new()
+        .with_limit(max_bytes.saturating_sub(1))
+        .with_fixint_encoding()
+        .deserialize_from(&mut cursor)
+        .map_err(|error| error.to_string())?;
+    let consumed = usize::try_from(cursor.position())
+        .map_err(|_| "decoded relayer payload length exceeds usize".to_string())?;
+    if !body
+        .get(consumed..)
+        .ok_or_else(|| "decoded relayer payload length exceeds input".to_string())?
+        .iter()
+        .all(|byte| *byte == 0)
+    {
+        return Err("padded relayer payload has nonzero trailing bytes".to_string());
+    }
+    Ok(payload)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +119,111 @@ pub enum RelayerPayload {
     NeedMoreSurbs {
         request_id: u64,
         fragments_remaining: u32,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaidTransactionRequestV2 {
+    pub chain_id: u64,
+    pub entry_point: [u8; 20],
+    pub calldata: Vec<u8>,
+    pub execution_id: [u8; 32],
+    pub valid_until_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaidQuoteRequestV2 {
+    pub chain_id: u64,
+    pub entry_point: [u8; 20],
+    pub client_intent_id: [u8; 32],
+    pub payment_adapter: [u8; 20],
+    pub payment_id: [u8; 32],
+    pub fee_asset: [u8; 20],
+    pub payment_gas_limit: u64,
+    pub action_target: [u8; 20],
+    pub action_calldata_hash: [u8; 32],
+    pub action_gas_limit: u64,
+    pub tracked_assets_hash: [u8; 32],
+    pub maximum_transaction_gas: u64,
+    pub return_data_limit: u32,
+    pub valid_until_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionQuoteV1 {
+    pub quote_version: u8,
+    pub chain_id: [u8; 32],
+    pub entry_point: [u8; 20],
+    pub exit_address: [u8; 20],
+    pub client_intent_id: [u8; 32],
+    pub payment_adapter: [u8; 20],
+    pub payment_id: [u8; 32],
+    pub fee_asset: [u8; 20],
+    pub exit_fee: [u8; 32],
+    pub network_fee: [u8; 32],
+    pub payment_gas_limit: [u8; 32],
+    pub action_target: [u8; 20],
+    pub action_calldata_hash: [u8; 32],
+    pub action_gas_limit: [u8; 32],
+    pub tracked_assets_hash: [u8; 32],
+    pub maximum_transaction_gas: [u8; 32],
+    pub maximum_fee_per_gas: [u8; 32],
+    pub return_data_limit: [u8; 32],
+    pub valid_after_unix: u64,
+    pub valid_until_unix: u64,
+    pub quote_nonce: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "bincode wire layout is frozen across Rust and TypeScript"
+)]
+pub enum PaidQuoteOutcomeV2 {
+    Issued {
+        quote: ExecutionQuoteV1,
+        execution_id: [u8; 32],
+        exit_signature: Vec<u8>,
+    },
+    Rejected {
+        code: PaidTransactionRejectionCodeV2,
+        retryable: bool,
+        detail: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PaidTransactionRejectionCodeV2 {
+    MalformedRequest,
+    WrongChain,
+    WrongEntryPoint,
+    UnknownQuote,
+    ExpiredQuote,
+    DuplicateExecution,
+    SimulationFailure,
+    PaymentMissing,
+    PaymentReverted,
+    UnsupportedFeeAsset,
+    StalePrice,
+    Unprofitable,
+    GasCapExceeded,
+    SubmissionFailure,
+    UnsupportedPaymentAdapter,
+    QuoteCapacityExceeded,
+    PendingLossLimit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PaidTransactionOutcomeV2 {
+    Submitted {
+        execution_id: [u8; 32],
+        transaction_hash: [u8; 32],
+    },
+    Rejected {
+        execution_id: Option<[u8; 32]>,
+        code: PaidTransactionRejectionCodeV2,
+        retryable: bool,
+        detail: String,
     },
 }
 
@@ -117,6 +261,8 @@ pub enum ServiceRequest {
         request_id: u64,
         surbs: Vec<nox_crypto::sphinx::surb::Surb>,
     },
+    PaidTransactionV2(PaidTransactionRequestV2),
+    PaidQuoteRequestV2(PaidQuoteRequestV2),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,6 +362,193 @@ mod tests {
     fn test_decode_rejects_empty_bytes() {
         let result: Result<ServiceRequest, _> = decode_payload(&[]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn paid_v2_request_is_append_only_after_legacy_ordinals() {
+        let legacy = encode_payload(&ServiceRequest::ReplenishSurbs {
+            request_id: 1,
+            surbs: Vec::new(),
+        })
+        .unwrap();
+        let request = PaidTransactionRequestV2 {
+            chain_id: 421_614,
+            entry_point: [1; 20],
+            calldata: vec![2, 3],
+            execution_id: [4; 32],
+            valid_until_unix: 1_800_000_000,
+        };
+        let encoded = encode_payload(&ServiceRequest::PaidTransactionV2(request.clone())).unwrap();
+        assert_eq!(
+            hex::encode(&encoded),
+            "0106000000ee6e060000000000010101010101010101010101010101010101010102000000000000000203040404040404040404040404040404040404040404040404040404040404040400d2496b00000000",
+        );
+
+        assert_eq!(&legacy[1..5], 5_u32.to_le_bytes().as_slice());
+        assert_eq!(&encoded[1..5], 6_u32.to_le_bytes().as_slice());
+        let decoded: ServiceRequest = decode_payload(&encoded).unwrap();
+        assert!(matches!(
+            decoded,
+            ServiceRequest::PaidTransactionV2(decoded) if decoded == request
+        ));
+    }
+
+    #[test]
+    fn paid_v2_outcome_roundtrips_typed_rejection() {
+        let outcome = PaidTransactionOutcomeV2::Rejected {
+            execution_id: Some([7; 32]),
+            code: PaidTransactionRejectionCodeV2::WrongChain,
+            retryable: false,
+            detail: "request chain does not match exit chain".to_string(),
+        };
+        let encoded = encode_payload(&outcome).unwrap();
+        let decoded: PaidTransactionOutcomeV2 = decode_payload(&encoded).unwrap();
+        assert_eq!(decoded, outcome);
+    }
+
+    #[test]
+    fn paid_quote_request_is_append_only_at_ordinal_seven() {
+        let request = PaidQuoteRequestV2 {
+            chain_id: 421_614,
+            entry_point: [1; 20],
+            client_intent_id: [2; 32],
+            payment_adapter: [3; 20],
+            payment_id: [4; 32],
+            fee_asset: [5; 20],
+            payment_gas_limit: 500_000,
+            action_target: [6; 20],
+            action_calldata_hash: [7; 32],
+            action_gas_limit: 700_000,
+            tracked_assets_hash: [8; 32],
+            maximum_transaction_gas: 1_500_000,
+            return_data_limit: 256,
+            valid_until_unix: 1_800_000_000,
+        };
+        let encoded = encode_payload(&ServiceRequest::PaidQuoteRequestV2(request.clone())).unwrap();
+        assert_eq!(
+            hex::encode(&encoded),
+            "0107000000ee6e0600000000000101010101010101010101010101010101010101020202020202020202020202020202020202020202020202020202020202020203030303030303030303030303030303030303030404040404040404040404040404040404040404040404040404040404040404050505050505050505050505050505050505050520a10700000000000606060606060606060606060606060606060606070707070707070707070707070707070707070707070707070707070707070760ae0a0000000000080808080808080808080808080808080808080808080808080808080808080860e31600000000000001000000d2496b00000000",
+        );
+        assert_eq!(&encoded[1..5], 7_u32.to_le_bytes().as_slice());
+        let decoded: ServiceRequest = decode_payload(&encoded).unwrap();
+        assert!(
+            matches!(decoded, ServiceRequest::PaidQuoteRequestV2(decoded) if decoded == request)
+        );
+    }
+
+    #[test]
+    fn paid_quote_rejection_has_a_pinned_wire_vector() {
+        let outcome = PaidQuoteOutcomeV2::Rejected {
+            code: PaidTransactionRejectionCodeV2::WrongChain,
+            retryable: false,
+            detail: "wrong chain".to_string(),
+        };
+        let encoded = encode_payload(&outcome).unwrap();
+        assert_eq!(
+            hex::encode(&encoded),
+            "010100000001000000000b0000000000000077726f6e6720636861696e",
+        );
+        let decoded: PaidQuoteOutcomeV2 = decode_payload(&encoded).unwrap();
+        assert_eq!(decoded, outcome);
+    }
+
+    #[test]
+    fn paid_quote_issued_has_a_pinned_wire_vector() {
+        let word = |value: u64| {
+            let mut encoded = [0_u8; 32];
+            encoded[24..].copy_from_slice(&value.to_be_bytes());
+            encoded
+        };
+        let quote = ExecutionQuoteV1 {
+            quote_version: 1,
+            chain_id: word(421_614),
+            entry_point: [0x11; 20],
+            exit_address: [0x22; 20],
+            client_intent_id: [0x33; 32],
+            payment_adapter: [0x44; 20],
+            payment_id: [0x55; 32],
+            fee_asset: [0x66; 20],
+            exit_fee: word(77),
+            network_fee: word(8),
+            payment_gas_limit: word(500_000),
+            action_target: [0x77; 20],
+            action_calldata_hash: [0x88; 32],
+            action_gas_limit: word(700_000),
+            tracked_assets_hash: [0x99; 32],
+            maximum_transaction_gas: word(1_450_000),
+            maximum_fee_per_gas: word(123),
+            return_data_limit: word(256),
+            valid_after_unix: 1_799_999_900,
+            valid_until_unix: 1_800_000_000,
+            quote_nonce: word(1),
+        };
+        let outcome = PaidQuoteOutcomeV2::Issued {
+            quote,
+            execution_id: [0xab; 32],
+            exit_signature: vec![0xcd; 65],
+        };
+        let encoded = encode_payload(&outcome).unwrap();
+        assert_eq!(
+            hex::encode(&encoded),
+            "0100000000010000000000000000000000000000000000000000000000000000000000066eee111111111111111111111111111111111111111122222222222222222222222222222222222222223333333333333333333333333333333333333333333333333333333333333333444444444444444444444444444444444444444455555555555555555555555555555555555555555555555555555555555555556666666666666666666666666666666666666666000000000000000000000000000000000000000000000000000000000000004d0000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000007a1207777777777777777777777777777777777777777888888888888888888888888888888888888888888888888888888888888888800000000000000000000000000000000000000000000000000000000000aae6099999999999999999999999999999999999999999999999999999999999999990000000000000000000000000000000000000000000000000000000000162010000000000000000000000000000000000000000000000000000000000000007b00000000000000000000000000000000000000000000000000000000000001009cd1496b0000000000d2496b000000000000000000000000000000000000000000000000000000000000000000000001abababababababababababababababababababababababababababababababab4100000000000000cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        );
+        let decoded: PaidQuoteOutcomeV2 = decode_payload(&encoded).unwrap();
+        assert_eq!(decoded, outcome);
+    }
+
+    #[test]
+    fn paid_v2_wire_rejects_trailing_bytes() {
+        let mut transaction = encode_payload(&ServiceRequest::PaidTransactionV2(
+            PaidTransactionRequestV2 {
+                chain_id: 1,
+                entry_point: [1; 20],
+                calldata: Vec::new(),
+                execution_id: [2; 32],
+                valid_until_unix: 3,
+            },
+        ))
+        .unwrap();
+        transaction.push(0xff);
+        assert!(decode_payload::<ServiceRequest>(&transaction).is_err());
+        assert!(decode_payload_limited::<ServiceRequest>(&transaction, 1_024).is_err());
+
+        let mut quote = encode_payload(&ServiceRequest::PaidQuoteRequestV2(PaidQuoteRequestV2 {
+            chain_id: 1,
+            entry_point: [1; 20],
+            client_intent_id: [2; 32],
+            payment_adapter: [3; 20],
+            payment_id: [4; 32],
+            fee_asset: [5; 20],
+            payment_gas_limit: 1,
+            action_target: [6; 20],
+            action_calldata_hash: [7; 32],
+            action_gas_limit: 1,
+            tracked_assets_hash: [8; 32],
+            maximum_transaction_gas: 2,
+            return_data_limit: 0,
+            valid_until_unix: 3,
+        }))
+        .unwrap();
+        quote.push(0xff);
+        assert!(decode_payload::<ServiceRequest>(&quote).is_err());
+        assert!(decode_payload_limited::<ServiceRequest>(&quote, 1_024).is_err());
+    }
+
+    #[test]
+    fn outer_relayer_payload_accepts_only_zero_sphinx_padding() {
+        let payload = RelayerPayload::AnonymousRequest {
+            inner: encode_payload(&ServiceRequest::Echo { data: vec![1, 2] }).unwrap(),
+            reply_surbs: Vec::new(),
+        };
+        let mut encoded = encode_payload(&payload).unwrap();
+        encoded.resize(1_024, 0);
+        assert_eq!(
+            encode_payload(&decode_padded_relayer_payload_limited(&encoded, 1_024).unwrap())
+                .unwrap(),
+            encode_payload(&payload).unwrap(),
+        );
+        *encoded.last_mut().unwrap() = 1;
+        assert!(decode_padded_relayer_payload_limited(&encoded, 1_024).is_err());
     }
 
     /// Verify TS SDK bincode encoding matches Rust (cross-language parity).

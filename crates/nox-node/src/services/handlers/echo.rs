@@ -70,6 +70,16 @@ impl EchoHandler {
                     "Echo handler cannot process SubmitTransaction requests".into(),
                 ));
             }
+            Ok(ServiceRequest::PaidTransactionV2(_)) => {
+                return Err(ServiceError::ProcessingFailed(
+                    "Echo handler cannot process PaidTransactionV2 requests".into(),
+                ));
+            }
+            Ok(ServiceRequest::PaidQuoteRequestV2(_)) => {
+                return Err(ServiceError::ProcessingFailed(
+                    "Echo handler cannot process PaidQuoteRequestV2 requests".into(),
+                ));
+            }
             Ok(ServiceRequest::BroadcastSignedTransaction { .. }) => {
                 warn!(
                     request_id = request_id,

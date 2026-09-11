@@ -12,7 +12,7 @@ use tokio::sync::Notify;
 use tracing::{debug, warn};
 
 /// Default TTL for buffered responses (5 minutes).
-const DEFAULT_TTL: Duration = Duration::from_secs(300);
+const DEFAULT_TTL: Duration = Duration::from_mins(5);
 
 /// Default maximum number of buffered responses.
 ///
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn test_max_entries_eviction() {
-        let buf = ResponseBuffer::with_ttl_and_capacity(Duration::from_secs(60), 3);
+        let buf = ResponseBuffer::with_ttl_and_capacity(Duration::from_mins(1), 3);
         buf.store_response("a", vec![1]);
         buf.store_response("b", vec![2]);
         buf.store_response("c", vec![3]);
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn test_max_entries_cap_of_one() {
-        let buf = ResponseBuffer::with_ttl_and_capacity(Duration::from_secs(60), 1);
+        let buf = ResponseBuffer::with_ttl_and_capacity(Duration::from_mins(1), 1);
         buf.store_response("first", vec![1]);
         buf.store_response("second", vec![2]);
 

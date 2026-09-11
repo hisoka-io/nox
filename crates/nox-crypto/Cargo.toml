@@ -2,6 +2,7 @@
 name = "nox-crypto"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.95"
 authors = ["Hisoka IO"]
 description = "Mixnet cryptography: Sphinx packets, SURBs, PoW, X25519 ECDH"
 license = "Apache-2.0"

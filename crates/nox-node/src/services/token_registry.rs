@@ -104,17 +104,18 @@ impl TokenRegistry {
         self.tokens.insert(address, info);
     }
 
+    pub(crate) fn clear(&mut self) {
+        self.tokens.clear();
+    }
+
     #[must_use]
     pub fn get_decimals(&self, asset: Address) -> Option<u8> {
         self.tokens.get(&asset).map(|t| t.decimals)
     }
 
-    /// Returns "unknown" if the token is not registered.
     #[must_use]
-    pub fn get_price_id(&self, asset: Address) -> String {
-        self.tokens
-            .get(&asset)
-            .map_or_else(|| "unknown".to_string(), |t| t.price_id.clone())
+    pub fn get_price_id(&self, asset: Address) -> Option<&str> {
+        self.tokens.get(&asset).map(|token| token.price_id.as_str())
     }
 
     #[must_use]
@@ -164,8 +165,27 @@ mod tests {
 
         let price_id = registry.get_price_id(usdc);
         assert_eq!(
-            price_id, "usd-coin",
+            price_id,
+            Some("usd-coin"),
             "USDC should map to 'usd-coin' for price API"
         );
+    }
+
+    #[test]
+    fn configured_tokens_replace_mainnet_defaults() {
+        let mut registry = TokenRegistry::default();
+        let mainnet_usdc = Address::from_str("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48").unwrap();
+        let configured = Address::from_low_u64_be(77);
+        registry.clear();
+        registry.register(
+            configured,
+            TokenInfo {
+                symbol: "AVAX-USDC".to_string(),
+                decimals: 6,
+                price_id: "usd-coin".to_string(),
+            },
+        );
+        assert!(!registry.is_known(mainnet_usdc));
+        assert!(registry.is_known(configured));
     }
 }

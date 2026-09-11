@@ -16,7 +16,7 @@ benchmark_mode = true
 
 # Zero addresses - contracts will be deployed by test harness
 registry_contract_address = "0x0000000000000000000000000000000000000000"
-relayer_multicall_address = "0x0000000000000000000000000000000000000000"
+nox_entry_point_address = "0x0000000000000000000000000000000000000000"
 nox_reward_pool_address = "0x0000000000000000000000000000000000000000"
 
 # Local networking

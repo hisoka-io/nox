@@ -1,21 +1,406 @@
 use ethers::prelude::*;
+#[cfg(feature = "dev-node")]
+use ethers::providers::MiddlewareError;
+use ethers::providers::{ProviderError, RpcError};
 use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers::types::{
-    BlockId, BlockNumber, CallConfig, CallFrame, GethDebugBuiltInTracerConfig,
+    BlockId, BlockNumber, CallConfig, CallFrame, CallLogFrame, GethDebugBuiltInTracerConfig,
     GethDebugBuiltInTracerType, GethDebugTracerConfig, GethDebugTracerType,
     GethDebugTracingCallOptions, GethDebugTracingOptions, GethTrace, GethTraceFrame,
 };
 use std::str::FromStr;
+#[cfg(feature = "dev-node")]
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 use crate::config::NoxConfig;
 use nox_core::traits::InfrastructureError;
 
+pub fn build_ethers_http1_provider(rpc_url: &str) -> Result<Provider<Http>, InfrastructureError> {
+    let url = rpc_url.parse::<url::Url>().map_err(|error| {
+        InfrastructureError::Blockchain(format!("invalid Ethers RPC URL: {error}"))
+    })?;
+    let client = reqwest_legacy::Client::builder()
+        .http1_only()
+        .build()
+        .map_err(|error| {
+            InfrastructureError::Blockchain(format!(
+                "Ethers HTTP/1 client initialization failed: {error}"
+            ))
+        })?;
+    Ok(Provider::new(Http::new_with_client(url, client)))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum OutboxBroadcastError {
+    #[error("transaction is already known")]
+    AlreadyKnown,
+    #[error("transaction was rejected before acceptance: {detail}")]
+    Rejected { detail: &'static str },
+    #[error("transaction broadcast outcome is uncertain: {detail}")]
+    Uncertain { detail: &'static str },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimulationBackendError {
+    Unsupported {
+        backend: &'static str,
+    },
+    Timeout {
+        backend: &'static str,
+    },
+    Transport {
+        backend: &'static str,
+    },
+    ResponseDecode {
+        backend: &'static str,
+    },
+    ExecutionRejected {
+        backend: &'static str,
+    },
+    EvidenceMalformed {
+        backend: &'static str,
+        field: &'static str,
+    },
+    IdentityMismatch {
+        backend: &'static str,
+        field: &'static str,
+    },
+    #[cfg_attr(
+        not(feature = "dev-node"),
+        allow(dead_code, reason = "receipt simulation is gated by dev-node")
+    )]
+    StateRestoration,
+}
+
+impl SimulationBackendError {
+    #[must_use]
+    const fn allows_fallback(self) -> bool {
+        matches!(self, Self::Unsupported { .. })
+    }
+
+    #[cfg_attr(
+        not(feature = "dev-node"),
+        allow(dead_code, reason = "receipt simulation is gated by dev-node")
+    )]
+    const fn after_side_effect(self) -> Self {
+        match self {
+            Self::Unsupported { backend } => Self::ExecutionRejected { backend },
+            terminal => terminal,
+        }
+    }
+
+    fn into_infrastructure(self) -> InfrastructureError {
+        let message = match self {
+            Self::Unsupported { backend } => format!("{backend} method unsupported"),
+            Self::Timeout { backend } => format!("{backend} RPC timeout"),
+            Self::Transport { backend } => format!("{backend} RPC transport failure"),
+            Self::ResponseDecode { backend } => format!("{backend} RPC response decode failure"),
+            Self::ExecutionRejected { backend } => format!("{backend} execution rejected"),
+            Self::EvidenceMalformed { backend, field } => {
+                format!("{backend} evidence malformed: {field}")
+            }
+            Self::IdentityMismatch { backend, field } => {
+                format!("{backend} identity mismatch: {field}")
+            }
+            Self::StateRestoration => "committed-receipt state restoration failed".into(),
+        };
+        InfrastructureError::Blockchain(message)
+    }
+}
+
+fn classify_provider_error(error: &ProviderError, backend: &'static str) -> SimulationBackendError {
+    if matches!(
+        error,
+        ProviderError::UnsupportedRPC | ProviderError::UnsupportedNodeClient
+    ) || RpcError::as_error_response(error).is_some_and(|response| response.code == -32601)
+    {
+        return SimulationBackendError::Unsupported { backend };
+    }
+    if RpcError::as_error_response(error).is_some() {
+        return SimulationBackendError::ExecutionRejected { backend };
+    }
+    if RpcError::is_serde_error(error) {
+        return SimulationBackendError::ResponseDecode { backend };
+    }
+    if let ProviderError::HTTPError(http_error) = error {
+        return classify_http_failure(backend, http_error.is_timeout());
+    }
+    SimulationBackendError::Transport { backend }
+}
+
+const fn classify_http_failure(backend: &'static str, timed_out: bool) -> SimulationBackendError {
+    if timed_out {
+        SimulationBackendError::Timeout { backend }
+    } else {
+        SimulationBackendError::Transport { backend }
+    }
+}
+
+#[cfg(feature = "dev-node")]
+fn classify_middleware_error<E: MiddlewareError<Inner = ProviderError>>(
+    error: &E,
+    backend: &'static str,
+) -> SimulationBackendError {
+    error
+        .as_inner()
+        .map_or(SimulationBackendError::Transport { backend }, |provider| {
+            classify_provider_error(provider, backend)
+        })
+}
+
+/// Backend provenance for simulated execution evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimulationSource {
+    SuccessfulCallTrace,
+    CommittedReceipt,
+    FlatSimulation,
+}
+
+/// Gas and logs returned by one simulation backend.
+#[derive(Debug)]
+pub struct SimulationEvidence {
+    pub gas_used: u64,
+    pub logs: Vec<Log>,
+    pub source: SimulationSource,
+}
+
+/// Identity expected from a mined simulation transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpectedTransactionIdentity {
+    pub transaction_hash: H256,
+    pub from: Address,
+    pub to: Address,
+}
+
+impl SimulationEvidence {
+    /// Converts a successful mined receipt into committed simulation evidence.
+    pub fn from_committed_receipt(
+        receipt: TransactionReceipt,
+        expected: ExpectedTransactionIdentity,
+    ) -> Result<Self, InfrastructureError> {
+        Self::from_committed_receipt_checked(receipt, expected)
+            .map_err(SimulationBackendError::into_infrastructure)
+    }
+
+    fn from_committed_receipt_checked(
+        receipt: TransactionReceipt,
+        expected: ExpectedTransactionIdentity,
+    ) -> Result<Self, SimulationBackendError> {
+        if receipt.status != Some(U64::one()) {
+            return Err(SimulationBackendError::ExecutionRejected {
+                backend: "committed-receipt",
+            });
+        }
+        if receipt.transaction_hash != expected.transaction_hash {
+            return Err(SimulationBackendError::IdentityMismatch {
+                backend: "committed-receipt",
+                field: "transaction_hash",
+            });
+        }
+        if receipt.from != expected.from {
+            return Err(SimulationBackendError::IdentityMismatch {
+                backend: "committed-receipt",
+                field: "from",
+            });
+        }
+        if receipt.to != Some(expected.to) {
+            return Err(SimulationBackendError::IdentityMismatch {
+                backend: "committed-receipt",
+                field: "to",
+            });
+        }
+        let block_hash = receipt
+            .block_hash
+            .ok_or(SimulationBackendError::EvidenceMalformed {
+                backend: "committed-receipt",
+                field: "block_hash",
+            })?;
+        let block_number =
+            receipt
+                .block_number
+                .ok_or(SimulationBackendError::EvidenceMalformed {
+                    backend: "committed-receipt",
+                    field: "block_number",
+                })?;
+        let gas_used = receipt
+            .gas_used
+            .ok_or(SimulationBackendError::EvidenceMalformed {
+                backend: "committed-receipt",
+                field: "gas_used",
+            })?;
+
+        for log in &receipt.logs {
+            if log.removed != Some(false) {
+                return Err(SimulationBackendError::EvidenceMalformed {
+                    backend: "committed-receipt",
+                    field: "log.removed",
+                });
+            }
+            require_log_identity(log.log_index, None, "log.log_index")?;
+            require_log_identity(
+                log.transaction_hash,
+                Some(receipt.transaction_hash),
+                "log.transaction_hash",
+            )?;
+            require_log_identity(
+                log.transaction_index,
+                Some(receipt.transaction_index),
+                "log.transaction_index",
+            )?;
+            require_log_identity(log.block_hash, Some(block_hash), "log.block_hash")?;
+            require_log_identity(log.block_number, Some(block_number), "log.block_number")?;
+        }
+
+        Ok(Self {
+            gas_used: gas_used.as_u64(),
+            logs: receipt.logs,
+            source: SimulationSource::CommittedReceipt,
+        })
+    }
+
+    #[must_use]
+    /// Returns only logs whose backend proves committed execution ancestry.
+    pub fn legacy_payment_logs(&self) -> Option<&[Log]> {
+        match self.source {
+            SimulationSource::SuccessfulCallTrace | SimulationSource::CommittedReceipt => {
+                Some(&self.logs)
+            }
+            SimulationSource::FlatSimulation => None,
+        }
+    }
+}
+
+fn require_log_identity<T: Copy + PartialEq>(
+    actual: Option<T>,
+    expected: Option<T>,
+    field: &'static str,
+) -> Result<(), SimulationBackendError> {
+    let Some(actual) = actual else {
+        return Err(SimulationBackendError::EvidenceMalformed {
+            backend: "committed-receipt",
+            field,
+        });
+    };
+    if let Some(expected) = expected {
+        if actual != expected {
+            return Err(SimulationBackendError::IdentityMismatch {
+                backend: "committed-receipt",
+                field,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn convert_trace_log(log: &CallLogFrame) -> Result<Log, SimulationBackendError> {
+    let address = log
+        .address
+        .ok_or(SimulationBackendError::EvidenceMalformed {
+            backend: "debug_traceCall",
+            field: "log.address",
+        })?;
+    let topics = log
+        .topics
+        .clone()
+        .ok_or(SimulationBackendError::EvidenceMalformed {
+            backend: "debug_traceCall",
+            field: "log.topics",
+        })?;
+    let data = log
+        .data
+        .clone()
+        .ok_or(SimulationBackendError::EvidenceMalformed {
+            backend: "debug_traceCall",
+            field: "log.data",
+        })?;
+
+    Ok(Log {
+        address,
+        topics,
+        data,
+        block_hash: None,
+        block_number: None,
+        transaction_hash: None,
+        transaction_index: None,
+        log_index: None,
+        transaction_log_index: None,
+        log_type: None,
+        removed: None,
+    })
+}
+
+fn collect_committed_logs(frame: &CallFrame) -> Result<Vec<Log>, SimulationBackendError> {
+    let mut committed = Vec::new();
+    let mut pending = vec![(frame, true)];
+
+    while let Some((current, ancestors_succeeded)) = pending.pop() {
+        let frame_succeeded = ancestors_succeeded && current.error.is_none();
+
+        if let Some(frame_logs) = &current.logs {
+            for trace_log in frame_logs {
+                let converted = convert_trace_log(trace_log)?;
+                if frame_succeeded {
+                    committed.push(converted);
+                }
+            }
+        }
+
+        if let Some(calls) = &current.calls {
+            pending.extend(calls.iter().rev().map(|child| (child, frame_succeeded)));
+        }
+    }
+
+    Ok(committed)
+}
+
+fn validate_trace_identity(
+    frame: &CallFrame,
+    expected_from: Address,
+    expected_to: Address,
+    expected_input: &Bytes,
+) -> Result<(), SimulationBackendError> {
+    const BACKEND: &str = "debug_traceCall";
+
+    if frame.typ != "CALL" {
+        return Err(SimulationBackendError::IdentityMismatch {
+            backend: BACKEND,
+            field: "type",
+        });
+    }
+    if frame.from != expected_from {
+        return Err(SimulationBackendError::IdentityMismatch {
+            backend: BACKEND,
+            field: "from",
+        });
+    }
+    if frame.to != Some(NameOrAddress::Address(expected_to)) {
+        return Err(SimulationBackendError::IdentityMismatch {
+            backend: BACKEND,
+            field: "to",
+        });
+    }
+    if frame.input != *expected_input {
+        return Err(SimulationBackendError::IdentityMismatch {
+            backend: BACKEND,
+            field: "input",
+        });
+    }
+    if frame.value != Some(U256::zero()) {
+        return Err(SimulationBackendError::IdentityMismatch {
+            backend: BACKEND,
+            field: "value",
+        });
+    }
+
+    Ok(())
+}
+
 pub struct ChainExecutor {
     provider: Provider<Http>,
     wallet: LocalWallet,
-    _chain_id: u64,
+    chain_id: u64,
     min_gas_balance: U256,
     /// Mock mode: skip all real blockchain operations (return dummy values).
     /// Only available with `dev-node` feature. Production binaries always have this as `false`.
@@ -25,8 +410,7 @@ pub struct ChainExecutor {
 
 impl ChainExecutor {
     pub async fn new(config: &NoxConfig) -> Result<Self, InfrastructureError> {
-        let provider = Provider::<Http>::try_from(&config.eth_rpc_url)
-            .map_err(|e| InfrastructureError::Blockchain(format!("Invalid RPC URL: {e}")))?;
+        let provider = build_ethers_http1_provider(&config.eth_rpc_url)?;
 
         // Determine mock mode -- only available with dev-node feature
         #[cfg(feature = "dev-node")]
@@ -95,11 +479,46 @@ impl ChainExecutor {
         Ok(Self {
             provider,
             wallet,
-            _chain_id: chain_id,
+            chain_id,
             min_gas_balance,
             #[cfg(feature = "dev-node")]
             is_mock,
         })
+    }
+
+    pub async fn latest_block_timestamp(&self) -> Result<u64, InfrastructureError> {
+        #[cfg(feature = "dev-node")]
+        if self.is_mock {
+            return SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .map_err(|_| {
+                    InfrastructureError::Blockchain(
+                        "system clock is before Unix epoch in benchmark mode".to_string(),
+                    )
+                });
+        }
+
+        let block = self
+            .provider
+            .get_block(BlockNumber::Latest)
+            .await
+            .map_err(|error| {
+                InfrastructureError::Blockchain(format!(
+                    "latest block timestamp lookup failed: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                InfrastructureError::Blockchain(
+                    "latest block timestamp lookup returned no block".to_string(),
+                )
+            })?;
+        if block.timestamp > U256::from(u64::MAX) {
+            return Err(InfrastructureError::Blockchain(
+                "latest block timestamp exceeds u64".to_string(),
+            ));
+        }
+        Ok(block.timestamp.as_u64())
     }
 
     /// Returns true if running in mock/benchmark mode.
@@ -142,59 +561,113 @@ impl ChainExecutor {
         self.wallet.address()
     }
 
-    /// Simulation with Logs: Executes the transaction in a sandboxed environment
-    /// and extracts emitted events for profitability analysis.
-    ///
-    /// **Production**: `debug_traceCall` with `callTracer` + `withLog: true` (Geth).
-    /// **Dev** (`--features dev-node`): tries `eth_simulateV1` first (stateless, returns
-    /// full nested logs), then `evm_snapshot`/`evm_revert`, then `debug_traceCall`.
-    /// Anvil silently ignores `withLog` in callTracer, so the first two strategies
-    /// are required for full nested logs on dev nodes.
+    #[must_use]
+    pub const fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    /// Simulates a transaction for diagnostics and records backend provenance.
+    pub async fn simulate_transaction_evidence(
+        &self,
+        to: Address,
+        data: Bytes,
+    ) -> Result<SimulationEvidence, InfrastructureError> {
+        if self.is_mock() {
+            return Ok(SimulationEvidence {
+                gas_used: 100_000,
+                logs: Vec::new(),
+                source: SimulationSource::FlatSimulation,
+            });
+        }
+
+        match self.simulate_via_eth_simulate(to, data.clone()).await {
+            Ok(evidence) => {
+                info!(
+                    "eth_simulateV1 succeeded: gas_used={}, logs={}",
+                    evidence.gas_used,
+                    evidence.logs.len()
+                );
+                return Ok(evidence);
+            }
+            Err(error) if error.allows_fallback() => {
+                info!("eth_simulateV1 method unsupported; trying committed evidence backends");
+            }
+            Err(error) => return Err(error.into_infrastructure()),
+        }
+
+        #[cfg(feature = "dev-node")]
+        {
+            match self.simulate_via_receipt(to, data.clone()).await {
+                Ok(evidence) => {
+                    info!(
+                        "committed-receipt simulation succeeded: gas_used={}, logs={}",
+                        evidence.gas_used,
+                        evidence.logs.len()
+                    );
+                    return Ok(evidence);
+                }
+                Err(error) if error.allows_fallback() => {
+                    info!("evm_snapshot method unsupported; trying debug_traceCall");
+                }
+                Err(error) => return Err(error.into_infrastructure()),
+            }
+        }
+
+        self.simulate_via_trace(to, data)
+            .await
+            .map_err(SimulationBackendError::into_infrastructure)
+    }
+
+    /// Compatibility wrapper for callers that do not authorize payment.
     pub async fn simulate_transaction_with_logs(
         &self,
         to: Address,
         data: Bytes,
     ) -> Result<(u64, Vec<Log>), InfrastructureError> {
+        let evidence = self.simulate_transaction_evidence(to, data).await?;
+        Ok((evidence.gas_used, evidence.logs))
+    }
+
+    /// Simulates a legacy paid transaction using committed or ancestry-bearing logs.
+    pub async fn simulate_legacy_paid_transaction(
+        &self,
+        to: Address,
+        data: Bytes,
+    ) -> Result<SimulationEvidence, InfrastructureError> {
         if self.is_mock() {
-            return Ok((100_000, vec![]));
+            return Err(InfrastructureError::Blockchain(
+                "legacy paid simulation requires committed execution evidence".into(),
+            ));
         }
 
-        // Primary: eth_simulateV1 (stateless, returns full nested logs).
-        // Works on Geth 1.14+, Arbitrum, and most modern L2s.
         match self.simulate_via_eth_simulate(to, data.clone()).await {
-            Ok((gas, logs)) => {
+            Ok(evidence) => {
                 info!(
-                    "Simulation via eth_simulateV1: gas_used={}, logs={}",
-                    gas,
-                    logs.len()
+                    "discarded flat simulation logs for legacy payment evidence: gas_used={}, logs={}",
+                    evidence.gas_used,
+                    evidence.logs.len()
                 );
-                return Ok((gas, logs));
             }
-            Err(e) => {
-                info!("eth_simulateV1 unavailable: {e}. Trying fallbacks.");
+            Err(error) if error.allows_fallback() => {
+                info!("eth_simulateV1 method unsupported for legacy paid simulation");
             }
+            Err(error) => return Err(error.into_infrastructure()),
         }
 
-        // Dev-only fallback: snapshot -> send -> receipt -> revert (Anvil/Hardhat)
         #[cfg(feature = "dev-node")]
         {
             match self.simulate_via_receipt(to, data.clone()).await {
-                Ok((gas, logs)) => {
-                    info!(
-                        "Simulation via snapshot/revert: gas_used={}, logs={}",
-                        gas,
-                        logs.len()
-                    );
-                    return Ok((gas, logs));
+                Ok(evidence) => return Ok(evidence),
+                Err(error) if error.allows_fallback() => {
+                    info!("evm_snapshot method unsupported for legacy payment evidence");
                 }
-                Err(e) => {
-                    info!("Snapshot/revert FAILED: {e}. Falling back to debug_traceCall.");
-                }
+                Err(error) => return Err(error.into_infrastructure()),
             }
         }
 
-        // Last resort: debug_traceCall with callTracer + withLog (Geth only)
-        self.simulate_via_trace(to, data).await
+        self.simulate_via_trace(to, data)
+            .await
+            .map_err(SimulationBackendError::into_infrastructure)
     }
 
     /// Simulate via `eth_simulateV1` (stateless, single RPC call).
@@ -214,7 +687,7 @@ impl ChainExecutor {
         &self,
         to: Address,
         data: Bytes,
-    ) -> Result<(u64, Vec<Log>), InfrastructureError> {
+    ) -> Result<SimulationEvidence, SimulationBackendError> {
         let from = self.wallet.address();
 
         // Build eth_simulateV1 request with state override for gas
@@ -242,60 +715,60 @@ impl ChainExecutor {
             .provider
             .request("eth_simulateV1", params)
             .await
-            .map_err(|e| {
-                InfrastructureError::Blockchain(format!("eth_simulateV1 RPC failed: {e}"))
-            })?;
+            .map_err(|error| classify_provider_error(&error, "eth_simulateV1"))?;
 
         // Parse response: result[0]["calls"][0]
-        let block = result.get(0).ok_or_else(|| {
-            InfrastructureError::Blockchain("eth_simulateV1: empty response array".into())
-        })?;
-        let call_result = block.get("calls").and_then(|c| c.get(0)).ok_or_else(|| {
-            InfrastructureError::Blockchain("eth_simulateV1: no call results in response".into())
-        })?;
+        let block = result
+            .get(0)
+            .ok_or(SimulationBackendError::EvidenceMalformed {
+                backend: "eth_simulateV1",
+                field: "response.blocks",
+            })?;
+        let call_result = block.get("calls").and_then(|calls| calls.get(0)).ok_or(
+            SimulationBackendError::EvidenceMalformed {
+                backend: "eth_simulateV1",
+                field: "response.calls",
+            },
+        )?;
 
         // Check status (0x1 = success)
         let status = call_result
             .get("status")
-            .and_then(|s| s.as_str())
-            .unwrap_or("0x0");
+            .and_then(serde_json::Value::as_str)
+            .ok_or(SimulationBackendError::EvidenceMalformed {
+                backend: "eth_simulateV1",
+                field: "status",
+            })?;
         if status != "0x1" {
-            let return_data = call_result
-                .get("returnData")
-                .and_then(|r| r.as_str())
-                .unwrap_or("0x");
-            return Err(InfrastructureError::Blockchain(format!(
-                "eth_simulateV1: call reverted (status={status}, returnData={return_data})"
-            )));
+            return Err(SimulationBackendError::ExecutionRejected {
+                backend: "eth_simulateV1",
+            });
         }
 
         // Extract gasUsed
         let gas_hex = call_result
             .get("gasUsed")
-            .and_then(|g| g.as_str())
-            .unwrap_or("0x0");
-        let gas_used = u64::from_str_radix(gas_hex.trim_start_matches("0x"), 16).map_err(|e| {
-            InfrastructureError::Blockchain(format!(
-                "eth_simulateV1: invalid gasUsed '{gas_hex}': {e}"
-            ))
+            .and_then(serde_json::Value::as_str)
+            .ok_or(SimulationBackendError::EvidenceMalformed {
+                backend: "eth_simulateV1",
+                field: "gas_used",
+            })?;
+        let gas_digits =
+            gas_hex
+                .strip_prefix("0x")
+                .ok_or(SimulationBackendError::EvidenceMalformed {
+                    backend: "eth_simulateV1",
+                    field: "gas_used",
+                })?;
+        let gas_used = u64::from_str_radix(gas_digits, 16).map_err(|_| {
+            SimulationBackendError::EvidenceMalformed {
+                backend: "eth_simulateV1",
+                field: "gas_used",
+            }
         })?;
 
         // Extract logs -> convert to ethers::types::Log
-        let logs = Self::parse_simulate_logs(call_result);
-
-        // Diagnostic: log raw response when 0 logs despite success
-        if logs.is_empty() {
-            let raw_preview: String = serde_json::to_string(call_result)
-                .unwrap_or_else(|_| "<serialization_error>".to_string())
-                .chars()
-                .take(2000)
-                .collect();
-            warn!(
-                "eth_simulateV1: 0 logs despite status=0x1 (gas_used={}). \
-                 Raw call_result preview: {}",
-                gas_used, raw_preview
-            );
-        }
+        let logs = Self::parse_simulate_logs(call_result)?;
 
         debug!(
             "eth_simulateV1: gas_used={}, logs={}, status={}",
@@ -304,39 +777,91 @@ impl ChainExecutor {
             status
         );
 
-        Ok((gas_used, logs))
+        Ok(SimulationEvidence {
+            gas_used,
+            logs,
+            source: SimulationSource::FlatSimulation,
+        })
     }
 
     /// Parse event logs from an `eth_simulateV1` call result into `ethers::types::Log`.
-    fn parse_simulate_logs(call_result: &serde_json::Value) -> Vec<Log> {
-        let Some(logs_array) = call_result.get("logs").and_then(|l| l.as_array()) else {
-            return vec![];
+    fn parse_simulate_logs(
+        call_result: &serde_json::Value,
+    ) -> Result<Vec<Log>, SimulationBackendError> {
+        let Some(logs) = call_result.get("logs") else {
+            return Ok(Vec::new());
         };
+        let logs_array = logs
+            .as_array()
+            .ok_or(SimulationBackendError::EvidenceMalformed {
+                backend: "eth_simulateV1",
+                field: "logs",
+            })?;
 
         logs_array
             .iter()
-            .filter_map(|log_json| {
-                let address_str = log_json.get("address")?.as_str()?;
-                let address = Address::from_str(address_str).ok()?;
+            .map(|log_json| {
+                let address_str = log_json
+                    .get("address")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(SimulationBackendError::EvidenceMalformed {
+                        backend: "eth_simulateV1",
+                        field: "log.address",
+                    })?;
+                let address = Address::from_str(address_str).map_err(|_| {
+                    SimulationBackendError::EvidenceMalformed {
+                        backend: "eth_simulateV1",
+                        field: "log.address",
+                    }
+                })?;
 
-                let topics: Vec<H256> = log_json
-                    .get("topics")?
-                    .as_array()?
+                let topics_json = log_json
+                    .get("topics")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or(SimulationBackendError::EvidenceMalformed {
+                        backend: "eth_simulateV1",
+                        field: "log.topics",
+                    })?;
+                let topics: Vec<H256> = topics_json
                     .iter()
-                    .filter_map(|t| {
-                        let s = t.as_str()?;
-                        H256::from_str(s).ok()
+                    .map(|topic| {
+                        let encoded =
+                            topic
+                                .as_str()
+                                .ok_or(SimulationBackendError::EvidenceMalformed {
+                                    backend: "eth_simulateV1",
+                                    field: "log.topics",
+                                })?;
+                        H256::from_str(encoded).map_err(|_| {
+                            SimulationBackendError::EvidenceMalformed {
+                                backend: "eth_simulateV1",
+                                field: "log.topics",
+                            }
+                        })
                     })
-                    .collect();
+                    .collect::<Result<_, _>>()?;
 
                 let data_str = log_json
                     .get("data")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("0x");
-                let data_hex = data_str.trim_start_matches("0x");
-                let data_bytes = hex::decode(data_hex).unwrap_or_default();
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(SimulationBackendError::EvidenceMalformed {
+                        backend: "eth_simulateV1",
+                        field: "log.data",
+                    })?;
+                let data_hex = data_str.strip_prefix("0x").ok_or(
+                    SimulationBackendError::EvidenceMalformed {
+                        backend: "eth_simulateV1",
+                        field: "log.data",
+                    },
+                )?;
+                let data_bytes = hex::decode(data_hex).map_err(|_| {
+                    SimulationBackendError::EvidenceMalformed {
+                        backend: "eth_simulateV1",
+                        field: "log.data",
+                    }
+                })?;
 
-                Some(Log {
+                Ok(Log {
                     address,
                     topics,
                     data: Bytes::from(data_bytes),
@@ -366,79 +891,56 @@ impl ChainExecutor {
         &self,
         to: Address,
         data: Bytes,
-    ) -> Result<(u64, Vec<Log>), InfrastructureError> {
+    ) -> Result<SimulationEvidence, SimulationBackendError> {
         let snapshot_id: U256 = self
             .provider
             .request("evm_snapshot", ())
             .await
-            .map_err(|e| {
-                InfrastructureError::Blockchain(format!("evm_snapshot unavailable: {e}"))
-            })?;
+            .map_err(|error| classify_provider_error(&error, "evm_snapshot"))?;
 
         // Anvil auto-mines by default
         let client = SignerMiddleware::new(self.provider.clone(), self.wallet.clone());
         let tx = TransactionRequest::new()
             .from(self.wallet.address())
             .to(to)
-            .data(data);
+            .data(data.clone());
 
         let result = async {
-            let pending = client.send_transaction(tx, None).await.map_err(|e| {
-                InfrastructureError::Blockchain(format!("Simulation tx send failed: {e}"))
-            })?;
+            let pending = client
+                .send_transaction(tx, None)
+                .await
+                .map_err(|error| classify_middleware_error(&error, "committed-receipt send"))?;
             let tx_hash = pending.tx_hash();
 
             let receipt = self
                 .provider
                 .get_transaction_receipt(tx_hash)
                 .await
-                .map_err(|e| {
-                    InfrastructureError::Blockchain(format!(
-                        "Failed to get simulation receipt: {e}"
-                    ))
-                })?
-                .ok_or_else(|| {
-                    InfrastructureError::Blockchain(
-                        "No receipt for simulation tx (block not mined?)".into(),
-                    )
+                .map_err(|error| classify_provider_error(&error, "committed-receipt lookup"))?
+                .ok_or(SimulationBackendError::EvidenceMalformed {
+                    backend: "committed-receipt",
+                    field: "receipt",
                 })?;
 
-            // Check for revert
-            if receipt.status == Some(U64::from(0)) {
-                return Err(InfrastructureError::Blockchain(
-                    "Simulation tx reverted on-chain (receipt.status=0)".into(),
-                ));
-            }
-
-            let gas_used = receipt.gas_used.unwrap_or_default().as_u64();
-            debug!(
-                "Simulation receipt: tx={:?}, status={:?}, gas_used={}, logs={}",
-                tx_hash,
-                receipt.status,
-                gas_used,
-                receipt.logs.len()
-            );
-
-            if receipt.logs.is_empty() && receipt.status == Some(U64::from(1)) {
-                warn!(
-                    "Simulation receipt has 0 logs despite status=1 (gas_used={}). \
-                     This is a known Anvil limitation with snapshot/revert. \
-                     eth_simulateV1 should be preferred (runs first in dev-node mode).",
-                    gas_used
-                );
-            }
-
-            Ok((gas_used, receipt.logs))
+            SimulationEvidence::from_committed_receipt_checked(
+                receipt,
+                ExpectedTransactionIdentity {
+                    transaction_hash: tx_hash,
+                    from: self.wallet.address(),
+                    to,
+                },
+            )
         }
-        .await;
+        .await
+        .map_err(SimulationBackendError::after_side_effect);
 
-        // ALWAYS revert state (even on error) -- fresh snapshot per cycle
-        if let Err(e) = self
+        let reverted = self
             .provider
             .request::<_, bool>("evm_revert", [snapshot_id])
             .await
-        {
-            warn!("evm_revert failed (state may be inconsistent): {e}");
+            .map_err(|_| SimulationBackendError::StateRestoration)?;
+        if !reverted {
+            return Err(SimulationBackendError::StateRestoration);
         }
 
         result
@@ -453,11 +955,11 @@ impl ChainExecutor {
         &self,
         to: Address,
         data: Bytes,
-    ) -> Result<(u64, Vec<Log>), InfrastructureError> {
+    ) -> Result<SimulationEvidence, SimulationBackendError> {
         let tx = TransactionRequest::new()
             .from(self.wallet.address())
             .to(to)
-            .data(data);
+            .data(data.clone());
 
         let tracing_options = GethDebugTracingOptions {
             tracer: Some(GethDebugTracerType::BuiltInTracer(
@@ -480,7 +982,7 @@ impl ChainExecutor {
 
         let typed_tx = TypedTransaction::Legacy(tx.clone());
 
-        match self
+        let trace = self
             .provider
             .debug_trace_call(
                 typed_tx,
@@ -488,112 +990,50 @@ impl ChainExecutor {
                 options,
             )
             .await
-        {
-            Ok(trace) => {
-                let logs = match &trace {
-                    GethTrace::Known(GethTraceFrame::CallTracer(frame)) => {
-                        let extracted = ChainExecutor::flatten_logs(frame);
-                        debug!(
-                            "debug_traceCall: CallTracer frame. \
-                             top_level_logs={}, nested_calls={}, extracted_logs={}",
-                            frame.logs.as_ref().map_or(0, Vec::len),
-                            frame.calls.as_ref().map_or(0, Vec::len),
-                            extracted.len()
-                        );
-                        if extracted.is_empty() {
-                            warn!(
-                                "debug_traceCall returned 0 logs. \
-                                 top_level_logs_present={}, nested_calls={}, \
-                                 frame_type={}, frame_error={:?}. \
-                                 If running on Anvil, this is expected (withLog not supported).",
-                                frame.logs.is_some(),
-                                frame.calls.as_ref().map_or(0, Vec::len),
-                                frame.typ,
-                                frame.error
-                            );
-                            if let Some(calls) = &frame.calls {
-                                for (i, sub) in calls.iter().enumerate() {
-                                    warn!(
-                                        "  subcall[{}]: type={}, to={:?}, \
-                                         logs={}, nested_calls={}, error={:?}",
-                                        i,
-                                        sub.typ,
-                                        sub.to,
-                                        sub.logs.as_ref().map_or(0, Vec::len),
-                                        sub.calls.as_ref().map_or(0, Vec::len),
-                                        sub.error
-                                    );
-                                }
-                            }
-                        }
-                        extracted
-                    }
-                    GethTrace::Known(other_frame) => {
-                        warn!(
-                            "debug_traceCall: unexpected trace variant: {:?}. Returning 0 logs.",
-                            std::mem::discriminant(other_frame)
-                        );
-                        vec![]
-                    }
-                    GethTrace::Unknown(raw_json) => {
-                        warn!(
-                            "debug_traceCall: Unknown trace (ethers-rs deserialization fell \
-                             through to raw JSON). Preview: {}",
-                            serde_json::to_string(raw_json)
-                                .unwrap_or_else(|_| "<serialization_error>".to_string())
-                                .chars()
-                                .take(500)
-                                .collect::<String>()
-                        );
-                        vec![]
-                    }
-                };
+            .map_err(|error| classify_provider_error(&error, "debug_traceCall"))?;
 
-                let gas = self
-                    .provider
-                    .estimate_gas(&TypedTransaction::Legacy(tx), None)
-                    .await
-                    .map_err(|e| {
-                        InfrastructureError::Blockchain(format!(
-                            "Gas estimation failed (tx likely reverts): {e}"
-                        ))
-                    })?
-                    .as_u64();
-
-                Ok((gas, logs))
+        let logs = match trace {
+            GethTrace::Known(GethTraceFrame::CallTracer(frame)) => {
+                validate_trace_identity(&frame, self.wallet.address(), to, &data)?;
+                if frame.error.is_some() {
+                    return Err(SimulationBackendError::ExecutionRejected {
+                        backend: "debug_traceCall",
+                    });
+                }
+                collect_committed_logs(&frame)?
             }
-            Err(e) => Err(InfrastructureError::Blockchain(format!(
-                "debug_traceCall failed: {e}"
-            ))),
-        }
-    }
-
-    fn flatten_logs(frame: &CallFrame) -> Vec<Log> {
-        let mut logs = vec![];
-        if let Some(frame_logs) = &frame.logs {
-            for l in frame_logs {
-                logs.push(Log {
-                    address: l.address.unwrap_or_default(),
-                    topics: l.topics.clone().unwrap_or_default(),
-                    data: l.data.clone().unwrap_or_default(),
-                    // Defaults for simulated log
-                    block_hash: None,
-                    block_number: None,
-                    transaction_hash: None,
-                    transaction_index: None,
-                    log_index: None,
-                    transaction_log_index: None,
-                    log_type: None,
-                    removed: None,
+            GethTrace::Known(
+                GethTraceFrame::Default(_)
+                | GethTraceFrame::NoopTracer(_)
+                | GethTraceFrame::FourByteTracer(_)
+                | GethTraceFrame::PreStateTracer(_),
+            )
+            | GethTrace::Unknown(_) => {
+                return Err(SimulationBackendError::EvidenceMalformed {
+                    backend: "debug_traceCall",
+                    field: "trace.variant",
                 });
             }
-        }
-        if let Some(frame_calls) = &frame.calls {
-            for sub in frame_calls {
-                logs.extend(ChainExecutor::flatten_logs(sub));
-            }
-        }
-        logs
+        };
+
+        let gas_used = self
+            .provider
+            .estimate_gas(&TypedTransaction::Legacy(tx), None)
+            .await
+            .map_err(|error| classify_provider_error(&error, "eth_estimateGas"))?
+            .as_u64();
+
+        debug!(
+            "debug_traceCall succeeded: gas_used={}, logs={}",
+            gas_used,
+            logs.len()
+        );
+
+        Ok(SimulationEvidence {
+            gas_used,
+            logs,
+            source: SimulationSource::SuccessfulCallTrace,
+        })
     }
 
     /// Simulation: Runs `eth_call` to check for reverts before spending gas.
@@ -744,6 +1184,32 @@ impl ChainExecutor {
             .map_err(|e| InfrastructureError::Blockchain(format!("Gas estimation failed: {e}")))
     }
 
+    pub async fn build_cost_candidate(
+        &self,
+        to: Address,
+        data: Bytes,
+        gas_limit_buffer_bps: u32,
+        initial_fee_buffer_bps: u32,
+    ) -> Result<crate::blockchain::transaction_plan::CostCandidate, InfrastructureError> {
+        use crate::blockchain::transaction_plan::{buffered, CostCandidate};
+
+        let estimated_gas = self.estimate_gas(to, data).await?;
+        let gas_limit = buffered(U256::from(estimated_gas), gas_limit_buffer_bps, "gas_limit")
+            .map_err(|error| InfrastructureError::Blockchain(error.to_string()))?;
+        let network_fee_per_gas = self.get_gas_price().await?;
+        let initial_fee_per_gas = buffered(
+            network_fee_per_gas,
+            initial_fee_buffer_bps,
+            "initial_fee_per_gas",
+        )
+        .map_err(|error| InfrastructureError::Blockchain(error.to_string()))?;
+        Ok(CostCandidate {
+            gas_limit,
+            initial_fee_per_gas,
+            chain_data_fee_native: U256::zero(),
+        })
+    }
+
     pub async fn send_raw(&self, tx: TransactionRequest) -> Result<H256, InfrastructureError> {
         if self.is_mock() {
             return Ok(H256::random());
@@ -759,27 +1225,489 @@ impl ChainExecutor {
         Ok(pending.tx_hash())
     }
 
+    pub async fn sign_legacy_transaction(
+        &self,
+        to: Address,
+        data: Bytes,
+        nonce: U256,
+        gas_limit: U256,
+        gas_price: U256,
+    ) -> Result<Bytes, InfrastructureError> {
+        let transaction = TransactionRequest::new()
+            .from(self.wallet.address())
+            .to(to)
+            .data(data)
+            .nonce(nonce)
+            .gas(gas_limit)
+            .gas_price(gas_price)
+            .chain_id(self.chain_id);
+        let typed = TypedTransaction::Legacy(transaction);
+        let signature = self
+            .wallet
+            .sign_transaction(&typed)
+            .await
+            .map_err(|error| {
+                InfrastructureError::Blockchain(format!("offline signing failed: {error}"))
+            })?;
+        Ok(typed.rlp_signed(&signature))
+    }
+
+    pub fn sign_execution_digest(&self, digest: H256) -> Result<Vec<u8>, InfrastructureError> {
+        self.wallet
+            .sign_hash(digest)
+            .map(|signature| signature.to_vec())
+            .map_err(|error| {
+                InfrastructureError::Blockchain(format!("execution quote signing failed: {error}"))
+            })
+    }
+
     /// Broadcast a pre-signed raw transaction via `eth_sendRawTransaction`.
     ///
     /// Unlike [`send_raw`](Self::send_raw) which signs via `SignerMiddleware`,
     /// this forwards already-signed bytes directly to the RPC node.
-    /// The user pays gas from their own wallet.
+    /// The signer encoded in the raw bytes pays gas.
     pub async fn broadcast_raw_signed_tx(
         &self,
         raw_tx: &[u8],
     ) -> Result<H256, InfrastructureError> {
+        self.broadcast_outbox_raw_signed_tx(raw_tx)
+            .await
+            .map_err(|error| InfrastructureError::Blockchain(error.to_string()))
+    }
+
+    pub(crate) async fn broadcast_outbox_raw_signed_tx(
+        &self,
+        raw_tx: &[u8],
+    ) -> Result<H256, OutboxBroadcastError> {
+        let expected_hash = H256::from(ethers::utils::keccak256(raw_tx));
         if self.is_mock() {
-            return Ok(H256::random());
+            return Ok(expected_hash);
         }
 
         let pending = self
             .provider
             .send_raw_transaction(Bytes::from(raw_tx.to_vec()))
             .await
-            .map_err(|e| {
-                InfrastructureError::Blockchain(format!("Broadcast signed TX failed: {e}"))
-            })?;
+            .map_err(classify_broadcast_provider_error)?;
 
-        Ok(pending.tx_hash())
+        let rpc_hash = pending.tx_hash();
+        if rpc_hash != expected_hash {
+            return Err(OutboxBroadcastError::Uncertain {
+                detail: "RPC returned a mismatched transaction hash",
+            });
+        }
+        Ok(rpc_hash)
+    }
+}
+
+fn classify_broadcast_provider_error(error: ProviderError) -> OutboxBroadcastError {
+    let Some(response) = RpcError::as_error_response(&error) else {
+        return OutboxBroadcastError::Uncertain {
+            detail: "transport, server, or response failure",
+        };
+    };
+    let message = response.message.to_ascii_lowercase();
+    if message.contains("already known") {
+        return OutboxBroadcastError::AlreadyKnown;
+    }
+    if let Some(classification) = [
+        "intrinsic gas too low",
+        "insufficient funds",
+        "invalid sender",
+        "invalid chain id",
+        "exceeds block gas limit",
+    ]
+    .iter()
+    .copied()
+    .find(|classification| message.contains(classification))
+    {
+        return OutboxBroadcastError::Rejected {
+            detail: classification,
+        };
+    }
+    OutboxBroadcastError::Uncertain {
+        detail: "unclassified JSON-RPC rejection",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethers::types::CallLogFrame;
+
+    const TRACE_BACKEND: &str = "debug_traceCall";
+
+    #[test]
+    fn connection_reset_and_http_5xx_are_uncertain_broadcasts() {
+        for detail in ["connection reset by peer", "HTTP status 503"] {
+            assert_eq!(
+                classify_broadcast_provider_error(ProviderError::CustomError(detail.to_string())),
+                OutboxBroadcastError::Uncertain {
+                    detail: "transport, server, or response failure"
+                }
+            );
+        }
+    }
+
+    async fn executor_with_rpc_url(rpc_url: &str) -> ChainExecutor {
+        let provider = Provider::<Http>::try_from(rpc_url).expect("test provider URL");
+        let wallet = LocalWallet::new(&mut rand::rngs::OsRng).with_chain_id(31_337_u64);
+        ChainExecutor {
+            provider,
+            wallet,
+            chain_id: 31_337,
+            min_gas_balance: U256::zero(),
+            #[cfg(feature = "dev-node")]
+            is_mock: false,
+        }
+    }
+
+    async fn one_shot_http_server(response: Option<&'static [u8]>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test RPC");
+        let address = listener.local_addr().expect("test RPC address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept test RPC request");
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            if let Some(response) = response {
+                socket
+                    .write_all(response)
+                    .await
+                    .expect("write test RPC response");
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn actual_http_5xx_and_eof_remain_uncertain() {
+        let unavailable = one_shot_http_server(Some(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ))
+        .await;
+        let eof = one_shot_http_server(None).await;
+        for rpc_url in [unavailable, eof] {
+            let executor = executor_with_rpc_url(&rpc_url).await;
+            assert!(matches!(
+                executor.broadcast_outbox_raw_signed_tx(&[1]).await,
+                Err(OutboxBroadcastError::Uncertain { .. })
+            ));
+        }
+    }
+
+    fn reward_trace_log() -> CallLogFrame {
+        let asset = Address::from_low_u64_be(2);
+        let payer = Address::from_low_u64_be(3);
+        let mut asset_topic = [0_u8; 32];
+        asset_topic[12..].copy_from_slice(asset.as_bytes());
+        let mut payer_topic = [0_u8; 32];
+        payer_topic[12..].copy_from_slice(payer.as_bytes());
+        let mut amount = [0_u8; 32];
+        U256::from(4).to_big_endian(&mut amount);
+        CallLogFrame {
+            address: Some(Address::from_low_u64_be(1)),
+            topics: Some(vec![
+                H256::from(ethers::utils::keccak256(
+                    "RewardsDeposited(address,address,uint256)",
+                )),
+                H256::from(asset_topic),
+                H256::from(payer_topic),
+            ]),
+            data: Some(Bytes::from(amount.to_vec())),
+        }
+    }
+
+    fn reward_log() -> Log {
+        Log {
+            address: Address::from_low_u64_be(1),
+            topics: vec![H256::from_low_u64_be(2)],
+            data: Bytes::from(vec![3]),
+            ..Default::default()
+        }
+    }
+
+    fn valid_trace() -> (CallFrame, Address, Address, Bytes) {
+        let from = Address::from_low_u64_be(11);
+        let to = Address::from_low_u64_be(12);
+        let input = Bytes::from(vec![0xaa, 0xbb]);
+        let frame = CallFrame {
+            typ: "CALL".into(),
+            from,
+            to: Some(NameOrAddress::Address(to)),
+            value: Some(U256::zero()),
+            input: input.clone(),
+            ..Default::default()
+        };
+        (frame, from, to, input)
+    }
+
+    fn assert_trace_identity_field(frame: &CallFrame, field: &'static str) {
+        let (_, from, to, input) = valid_trace();
+        assert_eq!(
+            validate_trace_identity(frame, from, to, &input),
+            Err(SimulationBackendError::IdentityMismatch {
+                backend: TRACE_BACKEND,
+                field,
+            })
+        );
+    }
+
+    fn collect_logs_unconditionally(frame: &CallFrame) -> Result<Vec<Log>, SimulationBackendError> {
+        let mut collected = Vec::new();
+        let mut pending = vec![frame];
+        while let Some(current) = pending.pop() {
+            if let Some(logs) = &current.logs {
+                collected.extend(
+                    logs.iter()
+                        .map(convert_trace_log)
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+            if let Some(calls) = &current.calls {
+                pending.extend(calls.iter().rev());
+            }
+        }
+        Ok(collected)
+    }
+
+    #[test]
+    fn caught_reverted_child_log_is_excluded() {
+        let child = CallFrame {
+            error: Some("execution reverted".into()),
+            logs: Some(vec![reward_trace_log()]),
+            ..Default::default()
+        };
+        let parent = CallFrame {
+            calls: Some(vec![child]),
+            ..Default::default()
+        };
+
+        assert!(collect_committed_logs(&parent)
+            .expect("valid frame")
+            .is_empty());
+    }
+
+    #[test]
+    fn successful_nested_log_remains_eligible() {
+        let child = CallFrame {
+            logs: Some(vec![reward_trace_log()]),
+            ..Default::default()
+        };
+        let parent = CallFrame {
+            calls: Some(vec![child]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            collect_committed_logs(&parent).expect("valid frame").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_ancestor_discards_successful_descendant_logs() {
+        let descendant = CallFrame {
+            logs: Some(vec![reward_trace_log()]),
+            ..Default::default()
+        };
+        let parent = CallFrame {
+            error: Some("execution reverted".into()),
+            calls: Some(vec![descendant]),
+            ..Default::default()
+        };
+
+        assert!(collect_committed_logs(&parent)
+            .expect("valid frame")
+            .is_empty());
+    }
+
+    #[test]
+    fn malformed_trace_log_rejects_complete_evidence() {
+        for malformed_log in [
+            CallLogFrame {
+                address: None,
+                ..reward_trace_log()
+            },
+            CallLogFrame {
+                topics: None,
+                ..reward_trace_log()
+            },
+            CallLogFrame {
+                data: None,
+                ..reward_trace_log()
+            },
+        ] {
+            let frame = CallFrame {
+                logs: Some(vec![malformed_log]),
+                ..Default::default()
+            };
+
+            assert!(collect_committed_logs(&frame).is_err());
+        }
+    }
+
+    #[test]
+    fn malformed_log_in_failed_subtree_rejects_complete_evidence() {
+        let child = CallFrame {
+            error: Some("execution reverted".into()),
+            logs: Some(vec![CallLogFrame {
+                data: None,
+                ..reward_trace_log()
+            }]),
+            ..Default::default()
+        };
+        let parent = CallFrame {
+            calls: Some(vec![child]),
+            ..Default::default()
+        };
+
+        assert!(collect_committed_logs(&parent).is_err());
+    }
+
+    #[test]
+    fn flat_simulation_logs_are_not_legacy_payment_evidence() {
+        let flat = SimulationEvidence {
+            gas_used: 21_000,
+            logs: vec![reward_log()],
+            source: SimulationSource::FlatSimulation,
+        };
+        let trace = SimulationEvidence {
+            gas_used: 21_000,
+            logs: vec![reward_log()],
+            source: SimulationSource::SuccessfulCallTrace,
+        };
+        let receipt = SimulationEvidence {
+            gas_used: 21_000,
+            logs: vec![reward_log()],
+            source: SimulationSource::CommittedReceipt,
+        };
+
+        assert_eq!(flat.legacy_payment_logs(), None);
+        assert_eq!(trace.legacy_payment_logs().map(<[Log]>::len), Some(1));
+        assert_eq!(receipt.legacy_payment_logs().map(<[Log]>::len), Some(1));
+    }
+
+    #[test]
+    fn trace_identity_accepts_exact_call() {
+        let (frame, from, to, input) = valid_trace();
+        assert_eq!(validate_trace_identity(&frame, from, to, &input), Ok(()));
+    }
+
+    #[test]
+    fn trace_identity_rejects_non_call_type() {
+        let (mut frame, _, _, _) = valid_trace();
+        frame.typ = "DELEGATECALL".into();
+        assert_trace_identity_field(&frame, "type");
+    }
+
+    #[test]
+    fn trace_identity_rejects_wrong_sender() {
+        let (mut frame, _, _, _) = valid_trace();
+        frame.from = Address::from_low_u64_be(13);
+        assert_trace_identity_field(&frame, "from");
+    }
+
+    #[test]
+    fn trace_identity_rejects_wrong_or_missing_target() {
+        let (mut frame, _, _, _) = valid_trace();
+        frame.to = Some(NameOrAddress::Address(Address::from_low_u64_be(13)));
+        assert_trace_identity_field(&frame, "to");
+
+        frame.to = None;
+        assert_trace_identity_field(&frame, "to");
+    }
+
+    #[test]
+    fn trace_identity_rejects_wrong_calldata() {
+        let (mut frame, _, _, _) = valid_trace();
+        frame.input = Bytes::from(vec![0xcc]);
+        assert_trace_identity_field(&frame, "input");
+    }
+
+    #[test]
+    fn trace_identity_rejects_nonzero_or_missing_value() {
+        let (mut frame, _, _, _) = valid_trace();
+        frame.value = Some(U256::one());
+        assert_trace_identity_field(&frame, "value");
+
+        frame.value = None;
+        assert_trace_identity_field(&frame, "value");
+    }
+
+    #[test]
+    fn old_collector_accepts_failed_subtree_log_that_production_rejects() {
+        let child = CallFrame {
+            error: Some("execution reverted".into()),
+            logs: Some(vec![reward_trace_log()]),
+            ..Default::default()
+        };
+        let parent = CallFrame {
+            calls: Some(vec![child]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            collect_logs_unconditionally(&parent)
+                .expect("historical collector input is valid")
+                .len(),
+            1
+        );
+        assert!(collect_committed_logs(&parent)
+            .expect("production collector input is valid")
+            .is_empty());
+    }
+
+    #[test]
+    fn http_timeout_and_transport_failures_have_distinct_categories() {
+        assert_eq!(
+            classify_http_failure("eth_simulateV1", true),
+            SimulationBackendError::Timeout {
+                backend: "eth_simulateV1",
+            }
+        );
+        assert_eq!(
+            classify_http_failure("eth_simulateV1", false),
+            SimulationBackendError::Transport {
+                backend: "eth_simulateV1",
+            }
+        );
+    }
+
+    #[test]
+    fn unsupported_after_side_effect_becomes_terminal() {
+        assert_eq!(
+            SimulationBackendError::Unsupported {
+                backend: "committed-receipt send",
+            }
+            .after_side_effect(),
+            SimulationBackendError::ExecutionRejected {
+                backend: "committed-receipt send",
+            }
+        );
+        assert_eq!(
+            SimulationBackendError::StateRestoration
+                .into_infrastructure()
+                .to_string(),
+            "Blockchain error: committed-receipt state restoration failed"
+        );
+    }
+
+    #[test]
+    fn provider_unsupported_variants_allow_fallback() {
+        for provider_error in [
+            ProviderError::UnsupportedRPC,
+            ProviderError::UnsupportedNodeClient,
+        ] {
+            assert_eq!(
+                classify_provider_error(&provider_error, "eth_simulateV1"),
+                SimulationBackendError::Unsupported {
+                    backend: "eth_simulateV1",
+                }
+            );
+        }
     }
 }

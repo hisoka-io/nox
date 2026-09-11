@@ -33,13 +33,14 @@ impl OracleFetcher {
             match self.provider.get_prices(&self.config.assets).await {
                 Ok(prices) => {
                     let mut cache_guard = self.cache.write().await;
-                    let now = Utc::now();
+                    let observed_at_unix = Utc::now().timestamp().unsigned_abs();
                     for (asset, price) in prices {
                         cache_guard.insert(
                             asset.clone(),
                             PriceEntry {
-                                price,
-                                last_updated: now,
+                                price_e8: price.get().to_string(),
+                                observed_at_unix,
+                                asset_id: asset,
                                 source: self.provider.id().to_string(),
                             },
                         );
@@ -55,20 +56,22 @@ impl OracleFetcher {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::error::ProviderError;
+    use crate::types::PriceE8;
     use async_trait::async_trait;
     use std::collections::HashMap;
     use tokio::sync::RwLock;
 
     struct MockProvider {
-        prices: HashMap<String, f64>,
+        prices: HashMap<String, PriceE8>,
         id: &'static str,
     }
 
     impl MockProvider {
-        fn new(prices: HashMap<String, f64>) -> Self {
+        fn new(prices: HashMap<String, PriceE8>) -> Self {
             Self { prices, id: "mock" }
         }
 
@@ -89,7 +92,7 @@ mod tests {
         async fn get_prices(
             &self,
             _assets: &[String],
-        ) -> Result<HashMap<String, f64>, ProviderError> {
+        ) -> Result<HashMap<String, PriceE8>, ProviderError> {
             if self.id == "mock-fail" {
                 return Err(ProviderError::Other("simulated failure".to_string()));
             }
@@ -101,8 +104,14 @@ mod tests {
     async fn test_fetcher_updates_cache_on_success() {
         let cache: PriceCache = Arc::new(RwLock::new(HashMap::new()));
         let mut prices = HashMap::new();
-        prices.insert("ethereum".to_string(), 2500.0);
-        prices.insert("bitcoin".to_string(), 45000.0);
+        prices.insert(
+            "ethereum".to_string(),
+            PriceE8::parse_decimal("2500").unwrap(),
+        );
+        prices.insert(
+            "bitcoin".to_string(),
+            PriceE8::parse_decimal("45000").unwrap(),
+        );
 
         let provider = Arc::new(MockProvider::new(prices));
         let config = OracleConfig {
@@ -120,13 +129,14 @@ mod tests {
                 .await
                 .unwrap();
             let mut guard = cache.write().await;
-            let now = Utc::now();
+            let observed_at_unix = Utc::now().timestamp().unsigned_abs();
             for (asset, price) in result {
                 guard.insert(
                     asset.clone(),
                     PriceEntry {
-                        price,
-                        last_updated: now,
+                        price_e8: price.get().to_string(),
+                        observed_at_unix,
+                        asset_id: asset,
                         source: fetcher.provider.id().to_string(),
                     },
                 );
@@ -134,8 +144,8 @@ mod tests {
         }
 
         let guard = cache.read().await;
-        assert!((guard["ethereum"].price - 2500.0).abs() < 0.01);
-        assert!((guard["bitcoin"].price - 45000.0).abs() < 0.01);
+        assert_eq!(guard["ethereum"].price_e8, "250000000000");
+        assert_eq!(guard["bitcoin"].price_e8, "4500000000000");
         assert_eq!(guard["ethereum"].source, "mock");
     }
 
@@ -148,8 +158,9 @@ mod tests {
             guard.insert(
                 "ethereum".to_string(),
                 PriceEntry {
-                    price: 1000.0,
-                    last_updated: Utc::now(),
+                    price_e8: "100000000000".to_string(),
+                    observed_at_unix: Utc::now().timestamp().unsigned_abs(),
+                    asset_id: "ethereum".to_string(),
                     source: "old".to_string(),
                 },
             );
@@ -163,14 +174,17 @@ mod tests {
         assert!(result.is_err());
 
         let guard = cache.read().await;
-        assert!((guard["ethereum"].price - 1000.0).abs() < 0.01);
+        assert_eq!(guard["ethereum"].price_e8, "100000000000");
     }
 
     #[tokio::test]
     async fn test_fetcher_price_entry_has_correct_source() {
         let cache: PriceCache = Arc::new(RwLock::new(HashMap::new()));
         let mut prices = HashMap::new();
-        prices.insert("ethereum".to_string(), 3000.0);
+        prices.insert(
+            "ethereum".to_string(),
+            PriceE8::parse_decimal("3000").unwrap(),
+        );
 
         let provider = Arc::new(MockProvider::new(prices));
         let config = OracleConfig {
@@ -187,13 +201,14 @@ mod tests {
                 .await
                 .unwrap();
             let mut guard = cache.write().await;
-            let now = Utc::now();
+            let observed_at_unix = Utc::now().timestamp().unsigned_abs();
             for (asset, price) in result {
                 guard.insert(
-                    asset,
+                    asset.clone(),
                     PriceEntry {
-                        price,
-                        last_updated: now,
+                        price_e8: price.get().to_string(),
+                        observed_at_unix,
+                        asset_id: asset,
                         source: fetcher.provider.id().to_string(),
                     },
                 );
@@ -208,15 +223,18 @@ mod tests {
     async fn test_fetcher_staleness_detection() {
         let cache: PriceCache = Arc::new(RwLock::new(HashMap::new()));
         let stale_threshold_secs = 60_i64;
-        let stale_time = Utc::now() - chrono::Duration::seconds(stale_threshold_secs + 10);
+        let stale_time = (Utc::now() - chrono::Duration::seconds(stale_threshold_secs + 10))
+            .timestamp()
+            .unsigned_abs();
 
         {
             let mut guard = cache.write().await;
             guard.insert(
                 "ethereum".to_string(),
                 PriceEntry {
-                    price: 2000.0,
-                    last_updated: stale_time,
+                    price_e8: "200000000000".to_string(),
+                    observed_at_unix: stale_time,
+                    asset_id: "ethereum".to_string(),
                     source: "old".to_string(),
                 },
             );
@@ -224,9 +242,9 @@ mod tests {
 
         let guard = cache.read().await;
         let entry = &guard["ethereum"];
-        let age_secs = (Utc::now() - entry.last_updated).num_seconds();
+        let age_secs = Utc::now().timestamp().unsigned_abs() - entry.observed_at_unix;
         assert!(
-            age_secs > stale_threshold_secs,
+            age_secs > stale_threshold_secs.unsigned_abs(),
             "entry should be considered stale: age={age_secs}s, threshold={stale_threshold_secs}s"
         );
     }

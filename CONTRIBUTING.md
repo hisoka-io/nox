@@ -15,13 +15,6 @@ cd nox
 cargo build --workspace
 ```
 
-Integration tests need artifacts from `darkpool-v2`:
-
-```bash
-./scripts/bootstrap-artifacts.sh              # clone, compile, copy
-./scripts/bootstrap-artifacts.sh --commit abc # pin a specific commit
-```
-
 ## Before submitting a PR
 
 ```bash
@@ -80,9 +73,9 @@ loop {
 |----------------------|------------------------------------------|
 | Service handler      | `crates/nox-node/src/services/handlers/` |
 | Event type           | `crates/nox-core/src/events.rs`          |
-| Crypto primitive     | `crates/darkpool-crypto/src/`            |
+| Crypto primitive     | `crates/nox-crypto/src/`                 |
 | Sphinx feature       | `crates/nox-crypto/src/sphinx/`          |
-| Client operation     | `crates/darkpool-client/src/`            |
+| Client operation     | `crates/nox-client/src/`                 |
 | Metric               | `crates/nox-node/src/telemetry/metrics.rs` |
 | Integration test     | `tests/`                                 |
 | Benchmark            | `benches/` or `crates/<crate>/benches/`  |
@@ -90,10 +83,10 @@ loop {
 ## Testing
 
 ```bash
-cargo test --workspace                                    # all 575 tests
+cargo test --workspace                                    # complete workspace suite
 cargo test --workspace --lib                              # unit tests only
 cargo test -p nox-crypto                                  # single crate
-cargo test --test master_e2e -- --ignored                 # E2E (needs Anvil + Node.js)
+cargo test --test payment_trace_safety --features dev-node # payment evidence (needs Anvil + solc)
 cargo bench                                               # criterion micro-benchmarks
 ```
 

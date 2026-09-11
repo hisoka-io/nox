@@ -1,5 +1,6 @@
 use super::PriceProvider;
 use crate::error::ProviderError;
+use crate::types::PriceE8;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
@@ -55,7 +56,10 @@ impl PriceProvider for BinanceProvider {
         "binance"
     }
 
-    async fn get_prices(&self, assets: &[String]) -> Result<HashMap<String, f64>, ProviderError> {
+    async fn get_prices(
+        &self,
+        assets: &[String],
+    ) -> Result<HashMap<String, PriceE8>, ProviderError> {
         let url = format!("{}/ticker/price", self.base_url);
 
         let resp = self
@@ -83,9 +87,9 @@ impl PriceProvider for BinanceProvider {
         for asset in assets {
             if let Some(target_symbol) = self.map_to_symbol(asset) {
                 if let Some(ticker) = tickers.iter().find(|t| t.symbol == target_symbol) {
-                    if let Ok(p) = ticker.price.parse::<f64>() {
-                        prices.insert(asset.clone(), p);
-                    }
+                    let price = PriceE8::parse_decimal(&ticker.price)
+                        .map_err(|error| ProviderError::Parse(error.to_string()))?;
+                    prices.insert(asset.clone(), price);
                 }
             }
         }
@@ -95,6 +99,7 @@ impl PriceProvider for BinanceProvider {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
@@ -117,8 +122,8 @@ mod tests {
         let assets = vec!["ethereum".to_string(), "bitcoin".to_string()];
         let prices = provider.get_prices(&assets).await.unwrap();
 
-        assert!((prices["ethereum"] - 2500.50).abs() < 0.01);
-        assert!((prices["bitcoin"] - 45000.0).abs() < 0.01);
+        assert_eq!(prices["ethereum"].get(), 250_050_000_000);
+        assert_eq!(prices["bitcoin"].get(), 4_500_000_000_000);
     }
 
     #[tokio::test]

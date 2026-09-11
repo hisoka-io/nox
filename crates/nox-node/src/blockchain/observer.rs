@@ -1,3 +1,4 @@
+use crate::blockchain::executor::build_ethers_http1_provider;
 use crate::config::NoxConfig;
 use crate::telemetry::metrics::MetricsService;
 use ethers::prelude::*;
@@ -58,8 +59,7 @@ impl ChainObserver {
         storage: Arc<dyn IStorageRepository>,
         metrics: MetricsService,
     ) -> Result<Self, InfrastructureError> {
-        let provider = Provider::<Http>::try_from(&config.eth_rpc_url)
-            .map_err(|e| InfrastructureError::Blockchain(format!("Invalid RPC URL: {e}")))?;
+        let provider = build_ethers_http1_provider(&config.eth_rpc_url)?;
 
         let address = registry_address_hex.parse::<Address>().map_err(|e| {
             InfrastructureError::Blockchain(format!("Invalid Registry Address: {e}"))
@@ -257,11 +257,7 @@ impl ChainObserver {
                 "User Registered: {:?} (role={})",
                 event.relayer, event.node_role
             );
-            let ingress = if event.ingress_url.is_empty() {
-                None
-            } else {
-                Some(event.ingress_url)
-            };
+            let ingress = Some(event.ingress_url);
             let metadata = if event.metadata_url.is_empty() {
                 None
             } else {
@@ -306,11 +302,7 @@ impl ChainObserver {
                 "Privileged Node Registered: {:?} (role={})",
                 event.relayer, event.node_role
             );
-            let ingress = if event.ingress_url.is_empty() {
-                None
-            } else {
-                Some(event.ingress_url)
-            };
+            let ingress = Some(event.ingress_url);
             let metadata = if event.metadata_url.is_empty() {
                 None
             } else {

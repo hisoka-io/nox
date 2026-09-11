@@ -2,6 +2,14 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+- Replaced the embedded Howl wallet, prover, `gas_payment`, and RelayerMulticall stack with protocol-neutral
+  paid quote and EntryPoint execution types.
+- Added fixed-point profitability, committed settlement evidence, durable signed transaction recovery, and
+  bounded quote reservations.
+- Removed the retired DarkPool crypto/client/prover crates and divergent deployment kit.
+
 ## [0.1.0] - 2026-04-10
 
 Initial release. 11-crate workspace implementing a Loopix-model Sphinx mixnet for private DeFi on Ethereum.

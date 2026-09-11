@@ -4835,10 +4835,10 @@ def gen_cost_of_privacy_chart(data_dir: Path, out_dir: Path):
     avg_private_cost = sum(
         c["cost_usd"]
         for name, c in circuit_costs.items()
-        if name not in ("public_transfer", "gas_payment")
+        if name != "public_transfer"
     ) / max(
         1,
-        len([n for n in circuit_costs if n not in ("public_transfer", "gas_payment")]),
+        len([n for n in circuit_costs if n != "public_transfer"]),
     )
     avg_mainnet_cost = avg_private_cost * mainnet_factor
     nox_user_monthly = (

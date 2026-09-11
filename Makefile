@@ -15,19 +15,20 @@ test-http:
 test-fec:
 	cargo test --test fec_e2e
 
-# Anvil-dependent tests (~60s) - requires: anvil on PATH, bootstrap-artifacts.sh run
+# Anvil-dependent paid execution tests
 test-anvil:
-	cargo test --test economics_e2e --features dev-node -- --ignored --nocapture
+	cargo test --test transaction_plan -- --nocapture
+	cargo test --test transaction_outbox -- --nocapture
+	cargo test --test payment_trace_safety --features dev-node -- --nocapture
 	cargo test --test anvil_trace_debug -- --ignored --nocapture
 
 # Large payload FEC tests (~30s for 1-10MB, ~2min for 300MB) - no external deps
 test-large:
 	cargo test --test large_payload -- --ignored --nocapture
 
-# Full heavy suite (~5-10 min) - requires: anvil + node on PATH, bootstrap-artifacts.sh run
+# Large-payload stress suite
 test-heavy:
-	cargo test --test master_e2e --features dev-node -- --ignored --nocapture
-	cargo test --test native_prover_parity -- --ignored --nocapture
+	cargo test --test large_payload -- --ignored --nocapture
 
 # Lint (deny all warnings)
 clippy:

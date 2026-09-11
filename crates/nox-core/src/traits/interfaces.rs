@@ -76,8 +76,6 @@ pub trait IChainClient: Send + Sync {
     async fn simulate_tx(&self, to: &str, data: &[u8]) -> Result<Vec<u8>, InfrastructureError>;
 }
 
-pub use darkpool_crypto::IPoseidonHasher;
-
 /// No-op `IEventPublisher` that silently discards all events.
 pub struct NoopPublisher;
 
@@ -92,19 +90,4 @@ impl IEventPublisher for NoopPublisher {
     fn publish(&self, _event: NoxEvent) -> Result<usize, EventBusError> {
         Ok(0)
     }
-}
-
-#[async_trait]
-pub trait IProverService: Send + Sync {
-    async fn prove(
-        &self,
-        circuit_name: &str,
-        inputs: std::collections::HashMap<String, String>,
-    ) -> Result<ZKProofData, InfrastructureError>;
-}
-
-#[derive(Debug, Clone)]
-pub struct ZKProofData {
-    pub proof: Vec<u8>,
-    pub public_inputs: Vec<String>,
 }

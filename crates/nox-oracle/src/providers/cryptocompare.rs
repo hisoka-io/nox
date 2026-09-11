@@ -1,5 +1,6 @@
 use super::PriceProvider;
 use crate::error::ProviderError;
+use crate::types::PriceE8;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
@@ -56,7 +57,7 @@ impl CryptoCompareProvider {
 }
 
 #[derive(Deserialize)]
-struct CcResponse(HashMap<String, HashMap<String, f64>>);
+struct CcResponse(HashMap<String, HashMap<String, serde_json::Number>>);
 
 #[async_trait]
 impl PriceProvider for CryptoCompareProvider {
@@ -64,7 +65,10 @@ impl PriceProvider for CryptoCompareProvider {
         "cryptocompare"
     }
 
-    async fn get_prices(&self, assets: &[String]) -> Result<HashMap<String, f64>, ProviderError> {
+    async fn get_prices(
+        &self,
+        assets: &[String],
+    ) -> Result<HashMap<String, PriceE8>, ProviderError> {
         let symbols: Vec<&str> = assets
             .iter()
             .filter_map(|a| Self::asset_to_symbol(a))
@@ -106,7 +110,11 @@ impl PriceProvider for CryptoCompareProvider {
         for (symbol, currency_map) in &data.0 {
             if let Some(price) = currency_map.get("USD") {
                 if let Some(asset_id) = Self::symbol_to_asset(symbol) {
-                    prices.insert(asset_id.to_string(), *price);
+                    prices.insert(
+                        asset_id.to_string(),
+                        PriceE8::parse_decimal(&price.to_string())
+                            .map_err(|error| ProviderError::Parse(error.to_string()))?,
+                    );
                 }
             }
         }
@@ -116,6 +124,7 @@ impl PriceProvider for CryptoCompareProvider {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
@@ -138,8 +147,30 @@ mod tests {
         let assets = vec!["ethereum".to_string(), "bitcoin".to_string()];
         let prices = provider.get_prices(&assets).await.unwrap();
 
-        assert!((prices["ethereum"] - 2400.0).abs() < 0.01);
-        assert!((prices["bitcoin"] - 44000.0).abs() < 0.01);
+        assert_eq!(prices["ethereum"].get(), 240_000_000_000);
+        assert_eq!(prices["bitcoin"].get(), 4_400_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn preserves_decimal_lexeme_above_ieee_754_integer_precision() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/data/pricemulti"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(r#"{"ETH":{"USD":90071992.54740993}}"#, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let provider = CryptoCompareProvider::with_base_url(mock_server.uri());
+        let prices = provider
+            .get_prices(&["ethereum".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(prices["ethereum"].get(), 9_007_199_254_740_993);
     }
 
     #[tokio::test]

@@ -23,12 +23,12 @@ async fn health_check(State(state): State<PriceServerState>) -> (StatusCode, Str
         return (StatusCode::SERVICE_UNAVAILABLE, "No data yet".to_string());
     }
 
-    let now = Utc::now();
-    let staleness_limit = chrono::Duration::seconds(state.config.staleness_threshold_secs);
+    let now = Utc::now().timestamp().unsigned_abs();
 
-    let is_healthy = cache
-        .values()
-        .any(|entry| now.signed_duration_since(entry.last_updated) < staleness_limit);
+    let is_healthy = cache.values().any(|entry| {
+        now.saturating_sub(entry.observed_at_unix)
+            < state.config.staleness_threshold_secs.unsigned_abs()
+    });
 
     if is_healthy {
         (StatusCode::OK, "Healthy".to_string())
@@ -43,6 +43,7 @@ async fn get_prices(State(state): State<PriceServerState>) -> Json<HashMap<Strin
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use axum::body::Body;
@@ -53,14 +54,15 @@ mod tests {
     use tokio::sync::RwLock;
     use tower::ServiceExt;
 
-    fn make_state(entries: Vec<(&str, f64, chrono::DateTime<Utc>)>) -> PriceServerState {
+    fn make_state(entries: Vec<(&str, &str, u64)>) -> PriceServerState {
         let mut map = HashMap::new();
         for (asset, price, timestamp) in entries {
             map.insert(
                 asset.to_string(),
                 PriceEntry {
-                    price,
-                    last_updated: timestamp,
+                    price_e8: price.to_string(),
+                    observed_at_unix: timestamp,
+                    asset_id: asset.to_string(),
                     source: "test".to_string(),
                 },
             );
@@ -73,7 +75,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_fresh_data() {
-        let state = make_state(vec![("ethereum", 3000.0, Utc::now())]);
+        let state = make_state(vec![(
+            "ethereum",
+            "300000000000",
+            Utc::now().timestamp().unsigned_abs(),
+        )]);
         let app = router(state);
 
         let resp = app
@@ -89,8 +95,10 @@ mod tests {
     #[tokio::test]
     async fn test_health_stale_data() {
         // staleness_threshold_secs defaults to 300 (5 min). Set timestamp 10 min ago.
-        let stale_time = Utc::now() - Duration::seconds(600);
-        let state = make_state(vec![("ethereum", 3000.0, stale_time)]);
+        let stale_time = (Utc::now() - Duration::seconds(600))
+            .timestamp()
+            .unsigned_abs();
+        let state = make_state(vec![("ethereum", "300000000000", stale_time)]);
         let app = router(state);
 
         let resp = app
@@ -120,8 +128,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_prices_endpoint() {
-        let now = Utc::now();
-        let state = make_state(vec![("ethereum", 3000.0, now), ("bitcoin", 60000.0, now)]);
+        let now = Utc::now().timestamp().unsigned_abs();
+        let state = make_state(vec![
+            ("ethereum", "300000000000", now),
+            ("bitcoin", "6000000000000", now),
+        ]);
         let app = router(state);
 
         let resp = app
@@ -133,8 +144,8 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let prices: HashMap<String, PriceEntry> = serde_json::from_slice(&body).unwrap();
         assert_eq!(prices.len(), 2);
-        assert!((prices["ethereum"].price - 3000.0).abs() < f64::EPSILON);
-        assert!((prices["bitcoin"].price - 60000.0).abs() < f64::EPSILON);
+        assert_eq!(prices["ethereum"].price_e8, "300000000000");
+        assert_eq!(prices["bitcoin"].price_e8, "6000000000000");
     }
 
     #[tokio::test]
@@ -155,10 +166,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_mixed_fresh_and_stale() {
-        let stale_time = Utc::now() - Duration::seconds(600);
+        let stale_time = (Utc::now() - Duration::seconds(600))
+            .timestamp()
+            .unsigned_abs();
         let state = make_state(vec![
-            ("ethereum", 3000.0, stale_time), // stale
-            ("bitcoin", 60000.0, Utc::now()), // fresh
+            ("ethereum", "300000000000", stale_time),
+            (
+                "bitcoin",
+                "6000000000000",
+                Utc::now().timestamp().unsigned_abs(),
+            ),
         ]);
         let app = router(state);
 
