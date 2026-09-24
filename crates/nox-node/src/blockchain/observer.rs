@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 /// Storage key for persisting the last processed block number
-const LAST_BLOCK_KEY: &[u8] = b"chain_observer:last_block";
+pub(crate) const LAST_BLOCK_KEY: &[u8] = b"chain_observer:last_block";
 
 /// Maximum blocks per `eth_getLogs` call. Public RPC providers commonly cap the
 /// range (10k is the widely supported ceiling), and an unbounded catch-up after
