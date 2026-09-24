@@ -15,6 +15,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The node-local topology fingerprint is recomputed from the served node set, so replayed or duplicate
   registry events no longer drift it away from the chain.
 - Added `nox check-config` to validate a config (file + `NOX__*` env) and print its public identity.
+- `chain_start_block` is now scanned inclusively. The observer previously started at the block after it, so
+  registrations mined in the registry's deployment block were never seen.
 
 ## [0.1.0] - 2026-04-10
 
