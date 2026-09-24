@@ -20,6 +20,14 @@ pub(crate) const LAST_BLOCK_KEY: &[u8] = b"chain_observer:last_block";
 /// downtime would otherwise be rejected outright.
 const MAX_BLOCK_RANGE: u64 = 10_000;
 
+/// Cursor (last block treated as already scanned) available without an RPC
+/// call: the persisted one, else the block before `chain_start_block`. The
+/// start block itself must be scanned because the registry deployment and its
+/// first registrations can land in the same block. `None` = start from head.
+fn resume_cursor(persisted: Option<u64>, chain_start_block: u64) -> Option<u64> {
+    persisted.or_else(|| chain_start_block.checked_sub(1))
+}
+
 // Generate type-safe bindings for the specific events we care about
 abigen!(
     NoxRegistryContract,
@@ -115,14 +123,16 @@ impl ChainObserver {
         );
 
         // Resume from persisted block, or use chain_start_block, or start from latest
-        let mut last_block = if let Some(block) = self.load_last_block().await {
-            block
-        } else if self.chain_start_block > 0 {
-            info!(
-                "No persisted block. Using chain_start_block={} from config.",
-                self.chain_start_block
-            );
-            self.chain_start_block
+        let persisted = self.load_last_block().await;
+        let mut last_block = if let Some(cursor) = resume_cursor(persisted, self.chain_start_block)
+        {
+            if persisted.is_none() {
+                info!(
+                    "No persisted block. Using chain_start_block={} from config (inclusive).",
+                    self.chain_start_block
+                );
+            }
+            cursor
         } else {
             let mut block_num = None;
             for attempt in 1..=5u64 {
@@ -567,5 +577,29 @@ impl ChainObserver {
                 .get_or_create(&vec![("type".into(), "unpaused".into())])
                 .inc();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_cursor_wins_over_chain_start_block() {
+        assert_eq!(resume_cursor(Some(500), 100), Some(500));
+        assert_eq!(resume_cursor(Some(500), 0), Some(500));
+    }
+
+    #[test]
+    fn chain_start_block_is_scanned_inclusively() {
+        // The first range scanned starts at cursor + 1.
+        let cursor = resume_cursor(None, 312_333_820).unwrap();
+        assert_eq!(cursor + 1, 312_333_820);
+        assert_eq!(resume_cursor(None, 1), Some(0));
+    }
+
+    #[test]
+    fn zero_chain_start_block_starts_from_head() {
+        assert_eq!(resume_cursor(None, 0), None);
     }
 }
