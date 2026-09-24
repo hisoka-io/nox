@@ -17,6 +17,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Added `nox check-config` to validate a config (file + `NOX__*` env) and print its public identity.
 - `chain_start_block` is now scanned inclusively. The observer previously started at the block after it, so
   registrations mined in the registry's deployment block were never seen.
+- `/topology` no longer makes an RPC call per request. Its `block_number` is now the block the chain observer
+  has applied, held 16 blocks behind the scanned head but never before the latest registry log. That block
+  matches the served node set, and client RPCs that trail the node's RPC can serve it. The endpoint no longer
+  returns 503 when the RPC is down.
 
 ## [0.1.0] - 2026-04-10
 
