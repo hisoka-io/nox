@@ -1,5 +1,8 @@
 use crate::blockchain::executor::ChainExecutor;
 use crate::blockchain::observer::ChainObserver;
+use crate::blockchain::registry_scope::{
+    enforce_registry_scope, fetch_registry_fingerprint, log_registry_scope_outcome, registry_scope,
+};
 use crate::blockchain::tx_manager::TransactionManager;
 use crate::config::NoxConfig;
 use crate::infra::event_bus::TokioEventBus;
@@ -79,6 +82,29 @@ impl NoxNode {
                 return Err(anyhow::anyhow!(e));
             }
         };
+
+        // Must run before any persisted peer or cursor is read: a volume that
+        // followed another registry would otherwise resume its cursor and serve
+        // its node set.
+        let registry_configured =
+            config.registry_contract_address != "0x0000000000000000000000000000000000000000";
+        if registry_configured {
+            let scope = registry_scope(config.chain_id, &config.registry_contract_address)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let outcome = enforce_registry_scope(
+                db.as_ref(),
+                config.chain_id,
+                &config.registry_contract_address,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Registry scope check failed: {e}"))?;
+            log_registry_scope_outcome(
+                &outcome,
+                &scope,
+                config.chain_start_block,
+                !config.bootstrap_topology_urls.is_empty(),
+            );
+        }
 
         info!("Initializing Event Bus...");
         let event_bus = TokioEventBus::new(4096);
@@ -208,8 +234,24 @@ impl NoxNode {
                 "Attempting topology bootstrap from {} seed URL(s)...",
                 config.bootstrap_topology_urls.len()
             );
-            let bootstrap_result =
-                Self::bootstrap_topology(&config.bootstrap_topology_urls, &topology_manager).await;
+            // Seeds only prove self-consistency; pin them to this node's registry
+            // so a seed that follows another registry cannot inject its node set.
+            let seeds = &config.bootstrap_topology_urls;
+            let bootstrap_result = if registry_configured {
+                match fetch_registry_fingerprint(
+                    &config.eth_rpc_url,
+                    &config.registry_contract_address,
+                )
+                .await
+                {
+                    Ok(fingerprint) => {
+                        Self::bootstrap_topology(seeds, &topology_manager, Some(fingerprint)).await
+                    }
+                    Err(e) => Err(format!("cannot read registry topologyFingerprint(): {e}")),
+                }
+            } else {
+                Self::bootstrap_topology(seeds, &topology_manager, None).await
+            };
             match bootstrap_result {
                 Ok(count) => info!("Topology bootstrap succeeded: {} nodes loaded", count),
                 Err(e) => warn!(
@@ -690,6 +732,7 @@ impl NoxNode {
     async fn bootstrap_topology(
         seed_urls: &[String],
         topology_manager: &Arc<TopologyManager>,
+        registry_fingerprint: Option<[u8; 32]>,
     ) -> Result<usize, String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -708,30 +751,11 @@ impl NoxNode {
                     match resp.json::<TopologySnapshot>().await {
                         Ok(snapshot) => {
                             let node_count = snapshot.nodes.len();
-                            if node_count == 0 {
-                                last_error = format!("{url}: empty snapshot");
-                                warn!("Bootstrap seed {url} returned empty topology");
-                                continue;
-                            }
-                            let addresses: Vec<String> =
-                                snapshot.nodes.iter().map(|n| n.address.clone()).collect();
-                            let computed =
-                                TopologyManager::compute_topology_fingerprint(&addresses);
-                            let expected = match hex::decode(&snapshot.fingerprint) {
-                                Ok(bytes) => bytes,
-                                Err(e) => {
-                                    last_error = format!("{url}: invalid hex fingerprint: {e}");
-                                    warn!("{}", last_error);
-                                    continue;
-                                }
-                            };
-                            if computed.as_slice() != expected.as_slice() {
-                                last_error = format!(
-                                    "{url}: fingerprint mismatch (computed={}, received={})",
-                                    hex::encode(computed),
-                                    snapshot.fingerprint
-                                );
-                                warn!("{}", last_error);
+                            if let Err(reason) =
+                                verify_bootstrap_snapshot(&snapshot, registry_fingerprint)
+                            {
+                                last_error = format!("{url}: {reason}");
+                                warn!("Bootstrap seed rejected: {}", last_error);
                                 continue;
                             }
                             topology_manager.hydrate_from_snapshot(snapshot.nodes).await;
@@ -861,6 +885,40 @@ impl NoxNode {
     }
 }
 
+/// Accepts a seed snapshot only if it is non-empty, its fingerprint matches its
+/// own node list, and (when known) it matches the configured registry's
+/// on-chain `topologyFingerprint()`.
+fn verify_bootstrap_snapshot(
+    snapshot: &TopologySnapshot,
+    registry_fingerprint: Option<[u8; 32]>,
+) -> Result<(), String> {
+    if snapshot.nodes.is_empty() {
+        return Err("empty snapshot".to_string());
+    }
+    let addresses: Vec<String> = snapshot.nodes.iter().map(|n| n.address.clone()).collect();
+    let computed = TopologyManager::compute_topology_fingerprint(&addresses);
+    let received = hex::decode(snapshot.fingerprint.trim_start_matches("0x"))
+        .map_err(|e| format!("invalid hex fingerprint: {e}"))?;
+    if computed.as_slice() != received.as_slice() {
+        return Err(format!(
+            "fingerprint mismatch (computed={}, received={})",
+            hex::encode(computed),
+            snapshot.fingerprint
+        ));
+    }
+    if let Some(on_chain) = registry_fingerprint {
+        if computed != on_chain {
+            return Err(format!(
+                "snapshot fingerprint {} does not match registry topologyFingerprint() {} \
+                 (seed follows another registry or is stale)",
+                hex::encode(computed),
+                hex::encode(on_chain)
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn handle_topology_request(
     State(state): State<TopologyApiState>,
 ) -> Result<Json<TopologySnapshot>, (axum::http::StatusCode, String)> {
@@ -952,4 +1010,62 @@ fn permissive_cors_layer() -> CorsLayer {
         .allow_origin(tower_http::cors::Any)
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nox_core::models::topology::RelayerNode;
+
+    fn snapshot(addresses: &[&str]) -> TopologySnapshot {
+        let owned: Vec<String> = addresses.iter().map(ToString::to_string).collect();
+        TopologySnapshot {
+            nodes: owned
+                .iter()
+                .map(|address| {
+                    RelayerNode::new(
+                        address.clone(),
+                        "11".repeat(32),
+                        "/ip4/127.0.0.1/tcp/15000".to_string(),
+                        "0".to_string(),
+                        1,
+                    )
+                })
+                .collect(),
+            fingerprint: hex::encode(TopologyManager::compute_topology_fingerprint(&owned)),
+            timestamp: 0,
+            block_number: 0,
+            pow_difficulty: 0,
+            schema_version: 1,
+            liveness: Vec::new(),
+        }
+    }
+
+    const A: &str = "0x74486dc1ac551e5cd3f4eef80727cc9d50d3abe9";
+    const B: &str = "0x8c9fb3e9fe537067c8430480f80a4a5b9a12be1a";
+
+    #[test]
+    fn seed_snapshot_must_match_registry_fingerprint() {
+        let seed = snapshot(&[A, B]);
+        let matching = TopologyManager::compute_topology_fingerprint(&[A.into(), B.into()]);
+        let other_registry = TopologyManager::compute_topology_fingerprint(&[A.into()]);
+
+        assert!(verify_bootstrap_snapshot(&seed, None).is_ok());
+        assert!(verify_bootstrap_snapshot(&seed, Some(matching)).is_ok());
+        let error = verify_bootstrap_snapshot(&seed, Some(other_registry)).unwrap_err();
+        assert!(error.contains("does not match registry"), "{error}");
+    }
+
+    #[test]
+    fn seed_snapshot_must_be_self_consistent_and_non_empty() {
+        let mut drifted = snapshot(&[A, B]);
+        drifted.fingerprint = "14".repeat(32);
+        assert!(verify_bootstrap_snapshot(&drifted, None)
+            .unwrap_err()
+            .contains("fingerprint mismatch"));
+        assert_eq!(
+            verify_bootstrap_snapshot(&snapshot(&[]), None).unwrap_err(),
+            "empty snapshot"
+        );
+    }
 }
