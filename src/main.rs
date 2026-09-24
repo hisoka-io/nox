@@ -26,6 +26,9 @@ struct Args {
 #[derive(Subcommand, Debug)]
 enum Command {
     Keygen,
+    /// Load and validate the config (file + `NOX__*` env), print the public
+    /// identity it derives, and exit without starting the node.
+    CheckConfig,
 }
 
 #[tokio::main]
@@ -33,8 +36,10 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    if let Some(Command::Keygen) = args.command {
-        return run_keygen();
+    match args.command {
+        Some(Command::Keygen) => return run_keygen(),
+        Some(Command::CheckConfig) => return run_check_config(&args.config),
+        None => {}
     }
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -123,6 +128,95 @@ async fn main() -> anyhow::Result<()> {
     info!(" Configuration validated.");
 
     NoxNode::run(config).await
+}
+
+/// Prints only public values; private keys are parsed but never echoed.
+fn run_check_config(config_path: &str) -> anyhow::Result<()> {
+    use ethers::signers::{LocalWallet, Signer};
+    use x25519_dalek::PublicKey as X25519PublicKey;
+
+    // The loader treats the file as optional; a wrong mount would otherwise
+    // validate the built-in defaults instead of the operator's file.
+    if !std::path::Path::new(config_path).is_file() {
+        anyhow::bail!("config file {config_path} not found");
+    }
+    let config = NoxConfig::load(config_path).map_err(|e| anyhow::anyhow!("Config error: {e}"))?;
+    if let Err(errors) = config.validate() {
+        for e in &errors {
+            eprintln!("config error: {e}");
+        }
+        anyhow::bail!(
+            "Configuration validation failed with {} error(s)",
+            errors.len()
+        );
+    }
+
+    for (name, path) in [
+        ("db_path", &config.db_path),
+        ("p2p_identity_path", &config.p2p_identity_path),
+    ] {
+        if !std::path::Path::new(path).is_absolute() {
+            eprintln!(
+                "warning: {name} = {path:?} is relative; the container runs as UID 10001 \
+                 with no writable working directory, use a path under /var/lib/nox"
+            );
+        }
+    }
+
+    let sphinx_public = X25519PublicKey::from(&config.get_routing_key()?);
+    println!("config: {config_path}");
+    println!("node_role: {:?}", config.node_role);
+    println!("chain_id: {}", config.chain_id);
+    println!(
+        "registry_contract_address: {}",
+        config.registry_contract_address
+    );
+    println!("chain_start_block: {}", config.chain_start_block);
+    println!(
+        "bootstrap_topology_urls: {}",
+        config.bootstrap_topology_urls.len()
+    );
+    println!(
+        "sphinx_public_key: 0x{}",
+        hex::encode(sphinx_public.as_bytes())
+    );
+
+    if config.p2p_private_key.is_empty() {
+        println!(
+            "p2p_peer_id: <from {} at startup>",
+            config.p2p_identity_path
+        );
+    } else {
+        let mut seed = hex::decode(&config.p2p_private_key)
+            .map_err(|e| anyhow::anyhow!("p2p_private_key is not hex: {e}"))?;
+        let keypair = libp2p::identity::Keypair::ed25519_from_bytes(&mut seed)
+            .map_err(|e| anyhow::anyhow!("p2p_private_key is invalid: {e}"))?;
+        println!("p2p_peer_id: {}", keypair.public().to_peer_id());
+    }
+
+    if !config.eth_wallet_private_key.is_empty() {
+        let wallet: LocalWallet = config
+            .eth_wallet_private_key
+            .trim_start_matches("0x")
+            .parse()
+            .map_err(|e| anyhow::anyhow!("eth_wallet_private_key is invalid: {e}"))?;
+        println!("eth_address: {:#x}", wallet.address());
+    }
+
+    if config.node_role.is_exit_capable() {
+        println!(
+            "nox_entry_point_address: {}",
+            config.nox_entry_point_address
+        );
+        println!(
+            "nox_reward_pool_address: {}",
+            config.nox_reward_pool_address
+        );
+        println!("payment_adapters: {}", config.payment_adapters.len());
+        println!("tokens: {}", config.tokens.len());
+    }
+    println!("configuration OK");
+    Ok(())
 }
 
 fn run_keygen() -> anyhow::Result<()> {
