@@ -6,6 +6,7 @@ use nox_core::{
     events::NoxEvent,
     traits::{IEventPublisher, IStorageRepository, InfrastructureError},
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -26,6 +27,53 @@ const MAX_BLOCK_RANGE: u64 = 10_000;
 /// first registrations can land in the same block. `None` = start from head.
 fn resume_cursor(persisted: Option<u64>, chain_start_block: u64) -> Option<u64> {
     persisted.or_else(|| chain_start_block.checked_sub(1))
+}
+
+/// How far `/topology` reports behind the scanned block when no registry log is
+/// newer. Clients verify a snapshot with `eth_call` at its `block_number`, and
+/// providers trail each other by a few blocks: one that has not seen the block
+/// rejects the call ("unsupported block number"). 16 blocks is ~4s on Arbitrum.
+const TOPOLOGY_BLOCK_LAG: u64 = 16;
+
+/// The observer's chain position, shared with the topology API so `/topology`
+/// reports a `block_number` that matches the node set it serves, without an RPC
+/// call per request.
+#[derive(Debug, Default)]
+pub struct ObservedChain {
+    /// Every registry log up to and including this block has been published.
+    scanned_through: AtomicU64,
+    /// Newest block that carried a registry log, or the resume cursor (history
+    /// before it is unknown). The node set matches the registry at every block
+    /// from here through `scanned_through`.
+    last_registry_log: AtomicU64,
+}
+
+impl ObservedChain {
+    fn resume_at(&self, cursor: u64) {
+        self.last_registry_log.fetch_max(cursor, Ordering::AcqRel);
+        self.scanned_through.store(cursor, Ordering::Release);
+    }
+
+    /// Called before the log is published, so a node set that already contains
+    /// it is never reported at an older block.
+    fn record_registry_log(&self, block: u64) {
+        self.last_registry_log.fetch_max(block, Ordering::AcqRel);
+    }
+
+    fn scanned(&self, block: u64) {
+        self.scanned_through.store(block, Ordering::Release);
+    }
+
+    /// Block at which the served topology can be verified on-chain, or 0 while
+    /// the observer has no position (clients then verify at their own head).
+    pub fn topology_block(&self) -> u64 {
+        let scanned = self.scanned_through.load(Ordering::Acquire);
+        if scanned == 0 {
+            return 0;
+        }
+        let last_log = self.last_registry_log.load(Ordering::Acquire);
+        scanned.saturating_sub(TOPOLOGY_BLOCK_LAG).max(last_log)
+    }
 }
 
 // Generate type-safe bindings for the specific events we care about
@@ -57,6 +105,7 @@ pub struct ChainObserver {
     cancel_token: CancellationToken,
     /// Block to start scanning from on first boot (0 = use latest).
     chain_start_block: u64,
+    observed: Arc<ObservedChain>,
 }
 
 impl ChainObserver {
@@ -82,12 +131,20 @@ impl ChainObserver {
             metrics,
             cancel_token: CancellationToken::new(),
             chain_start_block: config.chain_start_block,
+            observed: Arc::default(),
         })
     }
 
     #[must_use]
     pub fn with_cancel_token(mut self, token: CancellationToken) -> Self {
         self.cancel_token = token;
+        self
+    }
+
+    /// Publishes the observer's position to `observed` (read by `/topology`).
+    #[must_use]
+    pub fn with_observed_chain(mut self, observed: Arc<ObservedChain>) -> Self {
+        self.observed = observed;
         self
     }
 
@@ -164,6 +221,8 @@ impl ChainObserver {
             }
         };
 
+        self.observed.resume_at(last_block);
+
         let contract =
             NoxRegistryContract::new(self.registry_address, Arc::new(self.provider.clone()));
 
@@ -219,12 +278,16 @@ impl ChainObserver {
                 match self.provider.get_logs(&filter).await {
                     Ok(logs) => {
                         for log in logs {
+                            self.observed.record_registry_log(
+                                log.block_number.map_or(chunk_end, |block| block.as_u64()),
+                            );
                             self.process_log(&contract, log).await;
                         }
                         // Only advance past a range that was actually scanned, so a
                         // failure can never silently skip registry events.
                         cursor = chunk_end;
                         self.metrics.chain_observer_last_block.set(cursor as i64);
+                        self.observed.scanned(cursor);
                         self.save_last_block(cursor).await;
                     }
                     Err(e) => {
@@ -601,5 +664,52 @@ mod tests {
     #[test]
     fn zero_chain_start_block_starts_from_head() {
         assert_eq!(resume_cursor(None, 0), None);
+    }
+
+    #[test]
+    fn topology_block_is_zero_until_the_observer_has_a_position() {
+        assert_eq!(ObservedChain::default().topology_block(), 0);
+    }
+
+    #[test]
+    fn topology_block_on_resume_is_the_cursor() {
+        // Registry history before a resumed cursor is unknown, so nothing older
+        // than the cursor is reported.
+        let chain = ObservedChain::default();
+        chain.resume_at(1_000);
+        assert_eq!(chain.topology_block(), 1_000);
+        chain.scanned(1_005);
+        assert_eq!(chain.topology_block(), 1_000);
+        chain.scanned(1_000 + TOPOLOGY_BLOCK_LAG + 50);
+        assert_eq!(chain.topology_block(), 1_050);
+    }
+
+    #[test]
+    fn topology_block_never_predates_the_last_registry_log() {
+        let chain = ObservedChain::default();
+        chain.resume_at(1_000);
+        chain.scanned(2_000);
+        assert_eq!(chain.topology_block(), 2_000 - TOPOLOGY_BLOCK_LAG);
+
+        chain.record_registry_log(1_995);
+        assert_eq!(chain.topology_block(), 1_995);
+        // Mid-chunk: the log is ahead of the last completed chunk.
+        chain.record_registry_log(2_100);
+        assert_eq!(chain.topology_block(), 2_100);
+        chain.scanned(2_200);
+        assert_eq!(chain.topology_block(), 2_200 - TOPOLOGY_BLOCK_LAG);
+        // Out-of-order logs never move it backwards.
+        chain.record_registry_log(1_500);
+        assert_eq!(chain.topology_block(), 2_200 - TOPOLOGY_BLOCK_LAG);
+    }
+
+    #[test]
+    fn topology_block_saturates_near_genesis() {
+        let chain = ObservedChain::default();
+        chain.resume_at(0);
+        chain.scanned(5);
+        assert_eq!(chain.topology_block(), 0);
+        chain.record_registry_log(3);
+        assert_eq!(chain.topology_block(), 3);
     }
 }
