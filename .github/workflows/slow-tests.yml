@@ -46,7 +46,7 @@ jobs:
         with:
           version: v1.3.2
       - name: Verify Anvil version
-        run: anvil --version | grep -F "anvil Version: 1.3.2"
+        run: 'anvil --version | grep -F "anvil Version: 1.3.2"'
       - name: Install Solidity 0.8.30
         run: |
           curl --fail --location --silent --show-error \

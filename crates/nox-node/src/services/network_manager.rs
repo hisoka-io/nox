@@ -55,15 +55,20 @@ impl TopologyManager {
         compute_topology_fingerprint(addresses)
     }
 
-    /// XOR is self-inverse, so this works for both registration and removal.
-    fn update_fingerprint(&self, address: &str) {
+    /// Recomputes the fingerprint from the current node set.
+    ///
+    /// Toggling one XOR term per event drifts as soon as an event is applied
+    /// twice (a chain replay over a bootstrapped or hydrated topology, or a
+    /// removal of an unknown node). Deriving it from `address_index` keeps it
+    /// equal to `XOR(keccak256(addr))` over exactly the nodes being served.
+    /// The write lock is held while computing so a concurrent mutation's own
+    /// recompute always lands last.
+    fn recompute_fingerprint(&self) {
         let mut fp = self.fingerprint.write();
-        *fp = xor_into_fingerprint(&fp, address);
-        debug!(
-            "Fingerprint updated (XOR {}): {}",
-            address,
-            hex::encode(*fp)
-        );
+        *fp = self.address_index.iter().fold([0u8; 32], |acc, entry| {
+            xor_into_fingerprint(&acc, entry.key())
+        });
+        debug!("Fingerprint recomputed: {}", hex::encode(*fp));
     }
 
     pub fn get_current_fingerprint(&self) -> [u8; 32] {
@@ -97,8 +102,7 @@ impl TopologyManager {
                         layer_node.layer = layer;
                         self.layers.entry(layer).or_default().push(layer_node);
                     }
-                    self.address_index.insert(addr_lower.clone(), node);
-                    self.update_fingerprint(&addr_lower);
+                    self.address_index.insert(addr_lower, node);
                     count += 1;
                 }
                 Err(e) => {
@@ -106,6 +110,7 @@ impl TopologyManager {
                 }
             }
         }
+        self.recompute_fingerprint();
         if count > 0 {
             let fp = hex::encode(self.get_current_fingerprint());
             info!("Hydrated topology from storage: {count} peers. Fingerprint: {fp}");
@@ -225,6 +230,7 @@ impl TopologyManager {
 
         self.address_index
             .insert(address.to_lowercase(), node.clone());
+        self.recompute_fingerprint();
 
         match serde_json::to_vec(&node) {
             Ok(bytes) => {
@@ -232,7 +238,6 @@ impl TopologyManager {
                 if let Err(e) = self.storage.put(key.as_bytes(), &bytes).await {
                     error!("Failed to persist peer {}: {:?}", address, e);
                 } else {
-                    self.update_fingerprint(&address.to_lowercase());
                     info!("Topology update: added peer {}", address);
                 }
             }
@@ -252,7 +257,7 @@ impl TopologyManager {
                     .retain(|n| n.address.to_lowercase() != addr_lower);
             }
             self.address_index.remove(&address.to_lowercase());
-            self.update_fingerprint(&address.to_lowercase());
+            self.recompute_fingerprint();
             info!("Topology update: removed peer {}", address);
         }
     }
@@ -404,11 +409,13 @@ impl TopologyManager {
     }
 
     /// Replace the entire topology from a verified snapshot. Recomputes fingerprint and persists.
+    ///
+    /// Persisted peers absent from the snapshot are deleted too, otherwise the
+    /// next restart would hydrate them again.
     pub async fn hydrate_from_snapshot(&self, nodes: Vec<RelayerNode>) {
         self.layers.clear();
         self.address_index.clear();
 
-        let mut addresses = Vec::with_capacity(nodes.len());
         for node in &nodes {
             for &layer in nox_core::models::topology::layers_for_role(node.role) {
                 let mut layer_node = node.clone();
@@ -420,11 +427,24 @@ impl TopologyManager {
             }
             self.address_index
                 .insert(node.address.to_lowercase(), node.clone());
-            addresses.push(node.address.clone());
         }
 
-        let fingerprint = Self::compute_topology_fingerprint(&addresses);
-        *self.fingerprint.write() = fingerprint;
+        self.recompute_fingerprint();
+        let fingerprint = self.get_current_fingerprint();
+
+        match self.storage.scan(b"peer:").await {
+            Ok(stored) => {
+                for (key, _) in stored {
+                    let address = String::from_utf8_lossy(&key["peer:".len()..]).to_lowercase();
+                    if !self.address_index.contains_key(&address) {
+                        if let Err(e) = self.storage.delete(&key).await {
+                            warn!("Failed to drop stale persisted peer {address}: {e:?}");
+                        }
+                    }
+                }
+            }
+            Err(e) => warn!("Failed to scan persisted peers during snapshot hydration: {e}"),
+        }
 
         let mut persisted = 0usize;
         for node in &nodes {
@@ -484,6 +504,138 @@ mod tests {
             manager.lookup_by_address(&address).unwrap().ingress_url,
             None
         );
+    }
+
+    const A: &str = "0x74486dc1ac551e5cd3f4eef80727cc9d50d3abe9";
+    const B: &str = "0x8c9fb3e9fe537067c8430480f80a4a5b9a12be1a";
+    const C: &str = "0x6774ca4baf6fff84f02898a3dee4299ed1f5ab4e";
+    const STALE: &str = "0xd6831d3bd6e1c768564f5815f2d7a34312bd3067";
+
+    fn manager_on(storage: Arc<SledRepository>) -> TopologyManager {
+        let bus = Arc::new(TokioEventBus::new(8));
+        let subscriber: Arc<dyn IEventSubscriber> = bus;
+        TopologyManager::new(storage, subscriber, None)
+    }
+
+    async fn register(manager: &TopologyManager, address: &str) {
+        manager
+            .handle_registration(
+                address.to_string(),
+                "11".repeat(32),
+                "/ip4/127.0.0.1/tcp/15000".to_string(),
+                "0".to_string(),
+                1,
+                Some(String::new()),
+                None,
+            )
+            .await;
+    }
+
+    fn expected(addresses: &[&str]) -> [u8; 32] {
+        let owned: Vec<String> = addresses.iter().map(ToString::to_string).collect();
+        TopologyManager::compute_topology_fingerprint(&owned)
+    }
+
+    fn snapshot_node(address: &str) -> RelayerNode {
+        RelayerNode::new(
+            address.to_string(),
+            "11".repeat(32),
+            "/ip4/127.0.0.1/tcp/15000".to_string(),
+            "0".to_string(),
+            1,
+        )
+    }
+
+    #[tokio::test]
+    async fn duplicate_registration_events_do_not_drift_fingerprint() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let manager = manager_on(storage);
+
+        for address in [A, B, C] {
+            register(&manager, address).await;
+        }
+        assert_eq!(manager.get_current_fingerprint(), expected(&[A, B, C]));
+
+        // A chain replay re-delivers a registration; an odd number of repeats
+        // is what flipped the old XOR-toggle fingerprint.
+        register(&manager, A).await;
+        assert_eq!(manager.get_current_fingerprint(), expected(&[A, B, C]));
+
+        // Casing differences must not create a second entry either.
+        register(&manager, &B.to_uppercase().replacen("0X", "0x", 1)).await;
+        assert_eq!(manager.get_all_nodes().len(), 3);
+        assert_eq!(manager.get_current_fingerprint(), expected(&[A, B, C]));
+    }
+
+    #[tokio::test]
+    async fn removals_of_unknown_or_already_removed_nodes_are_idempotent() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let manager = manager_on(storage);
+
+        register(&manager, A).await;
+        register(&manager, B).await;
+        manager.handle_removal(C.to_string()).await;
+        assert_eq!(manager.get_current_fingerprint(), expected(&[A, B]));
+
+        manager.handle_removal(A.to_string()).await;
+        manager.handle_removal(A.to_string()).await;
+        assert_eq!(manager.get_current_fingerprint(), expected(&[B]));
+
+        manager.handle_removal(B.to_string()).await;
+        assert_eq!(manager.get_current_fingerprint(), [0_u8; 32]);
+    }
+
+    /// The v0.2.5 production drift: restart hydrates persisted peers, then the
+    /// observer replays events that were already applied.
+    #[tokio::test]
+    async fn restart_hydration_then_replay_matches_chain_fingerprint() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        {
+            let first_boot = manager_on(storage.clone());
+            for address in [A, B, C] {
+                register(&first_boot, address).await;
+            }
+        }
+
+        let second_boot = manager_on(storage);
+        second_boot.hydrate_from_storage().await;
+        assert_eq!(second_boot.get_current_fingerprint(), expected(&[A, B, C]));
+
+        for address in [A, B, C] {
+            register(&second_boot, address).await;
+        }
+        second_boot.handle_removal(B.to_string()).await;
+        assert_eq!(second_boot.get_current_fingerprint(), expected(&[A, C]));
+    }
+
+    #[tokio::test]
+    async fn snapshot_hydration_replaces_persisted_peers_and_survives_replay() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        {
+            let old = manager_on(storage.clone());
+            register(&old, STALE).await;
+            register(&old, A).await;
+        }
+
+        let manager = manager_on(storage.clone());
+        manager.hydrate_from_storage().await;
+        manager
+            .hydrate_from_snapshot(vec![snapshot_node(A), snapshot_node(B)])
+            .await;
+        assert_eq!(manager.get_current_fingerprint(), expected(&[A, B]));
+
+        register(&manager, A).await;
+        register(&manager, B).await;
+        assert_eq!(manager.get_current_fingerprint(), expected(&[A, B]));
+
+        let restarted = manager_on(storage);
+        restarted.hydrate_from_storage().await;
+        assert!(restarted.lookup_by_address(STALE).is_none());
+        assert_eq!(restarted.get_current_fingerprint(), expected(&[A, B]));
     }
 
     #[tokio::test]
