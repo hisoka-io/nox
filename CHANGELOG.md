@@ -9,6 +9,18 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Added fixed-point profitability, committed settlement evidence, durable signed transaction recovery, and
   bounded quote reservations.
 - Removed the retired DarkPool crypto/client/prover crates and divergent deployment kit.
+- Persisted observer cursor, peers and sessions are now scoped to `(chain_id, registry)`; pointing an existing
+  data volume at another registry (or starting on an unscoped pre-release volume) drops them and replays from
+  `chain_start_block`. Seed snapshots must also match the registry's on-chain `topologyFingerprint()`.
+- The node-local topology fingerprint is recomputed from the served node set, so replayed or duplicate
+  registry events no longer drift it away from the chain.
+- Added `nox check-config` to validate a config (file + `NOX__*` env) and print its public identity.
+- `chain_start_block` is now scanned inclusively. The observer previously started at the block after it, so
+  registrations mined in the registry's deployment block were never seen.
+- `/topology` no longer makes an RPC call per request. Its `block_number` is now the block the chain observer
+  has applied, held 16 blocks behind the scanned head but never before the latest registry log. That block
+  matches the served node set, and client RPCs that trail the node's RPC can serve it. The endpoint no longer
+  returns 503 when the RPC is down.
 
 ## [0.1.0] - 2026-04-10
 

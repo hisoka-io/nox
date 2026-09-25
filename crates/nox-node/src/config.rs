@@ -275,7 +275,8 @@ pub struct NoxConfig {
     pub node_role: NodeRole,
     pub http: HttpConfig,
     pub block_poll_interval_secs: u64,
-    /// Block where `NoxRegistry` was deployed. 0 = start from latest.
+    /// Block where `NoxRegistry` was deployed; scanned inclusively on first boot.
+    /// 0 = start from latest.
     #[serde(default)]
     pub chain_start_block: u64,
     /// Falls back to `ChainObserver` replay if all seed URLs fail.
