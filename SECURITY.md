@@ -64,10 +64,8 @@ documented reachability, and an enforced control.
 | `RUSTSEC-2025-0134` | `ethers -> reqwest 0.11 -> rustls-pemfile` | Ethers Rustls features are disabled and production Ethers HTTP clients use HTTP/1 with native TLS | chain-transport | 2026-12-31 |
 | `RUSTSEC-2026-0258` | `ethers 2.0.14 -> reqwest 0.11 -> h2 0.3` | Every production Ethers HTTP provider is built with an HTTP/1-only client; Ethers' redundant Rustls feature is disabled | chain-transport | 2026-11-30 |
 | `RUSTSEC-2026-0119` | `libp2p -> hickory-proto 0.24` DNS name encoding | Peering addresses come from chain-verified Registry profiles or operator configuration; connection and request rates are bounded | networking | 2026-12-15 |
-| `RUSTSEC-2026-0105` | `libp2p -> multihash -> core2 0.4` | This is an unmaintained/yanked notice with no published exploit; packet, address, and connection bounds remain enforced | networking | 2026-12-15 |
 | Yanked `keccak 0.1.5` | Ethers signing, ABI, and hash dependencies | Cargo lock checksum is pinned; EIP-712, transaction identity, and cross-language hash vectors are tested | chain-transport | 2026-12-31 |
 | Yanked `spin 0.9.8` | `reed-solomon-erasure 6` synchronization | Fragment/shard counts and memory are bounded; FEC property, corruption, and recovery suites cover the path | protocol-wire | 2026-12-31 |
-| Yanked `core2 0.4.0` | Same libp2p multihash path as `RUSTSEC-2026-0105` | Same bounded networking controls; remove with the libp2p migration | networking | 2026-12-15 |
 
 Owners must migrate Ethers to Alloy, update libp2p and Reed-Solomon dependencies, and move the v1 bincode wire to a
 versioned replacement before the recorded deadlines. `scripts/check-rustsec-exceptions.sh` blocks expired advisory
