@@ -1,6 +1,8 @@
 //! Ethereum TX handler: simulate, profitability-check, and submit on-chain.
 
-use crate::blockchain::executor::{build_ethers_http1_provider, ChainExecutor};
+use crate::blockchain::executor::{
+    build_pinned_ethers_http1_provider, public_rpc_error, ChainExecutor,
+};
 use crate::blockchain::tx_manager::{SubmitError, TransactionManager};
 use crate::infra::storage::QuoteStoreError;
 use crate::price::client::FixedPriceSource;
@@ -898,22 +900,12 @@ impl EthereumHandler {
                     ServiceError::ProcessingFailed(format!("RPC URL blocked: {e}"))
                 })?;
 
-            // DNS rebinding: connect to resolved IP for HTTP (HTTPS needs hostname for TLS).
-            let provider_url = if validated_url.scheme() == "http" {
-                let mut ip_url = validated_url.clone();
-                if ip_url.set_host(Some(&resolved_ip.to_string())).is_ok() {
-                    ip_url.to_string()
-                } else {
-                    url.clone()
-                }
-            } else {
-                url.clone()
-            };
-
-            let user_provider =
-                build_ethers_http1_provider(provider_url.as_str()).map_err(|e| {
+            // Pinned to the validated address with redirects disabled, so neither
+            // DNS rebinding nor an upstream redirect can reach another host.
+            let user_provider = build_pinned_ethers_http1_provider(&validated_url, resolved_ip)
+                .map_err(|e| {
                     ServiceError::ProcessingFailed(format!(
-                        "Failed to create provider for {url}: {e}"
+                        "Failed to create provider for user-supplied RPC URL: {e}"
                     ))
                 })?;
 
@@ -939,7 +931,8 @@ impl EthereumHandler {
                 Ok(Err(e)) => {
                     warn!(packet_id, error = %e, "Custom URL broadcast rejected");
                     return Err(ServiceError::ProcessingFailed(format!(
-                        "Broadcast rejected: {e}"
+                        "Broadcast rejected: {}",
+                        public_rpc_error(&e)
                     )));
                 }
                 Err(_) => {
