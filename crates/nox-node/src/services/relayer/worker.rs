@@ -1,11 +1,11 @@
 use crate::telemetry::metrics::MetricsService;
 use async_channel::Receiver;
-use nox_core::traits::IMixStrategy;
+use nox_core::traits::{IMixStrategy, IReplayProtection};
 use nox_crypto::sphinx::{into_result, ProcessResult, SphinxError, SphinxHeader};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
-use tracing::warn;
+use tracing::{error, warn};
 use x25519_dalek::StaticSecret as X25519SecretKey;
 
 /// Shared via `Arc`; `StaticSecret` zeroes key material on drop via `zeroize`.
@@ -26,10 +26,18 @@ pub enum MixMessageKind {
     Exit { payload: Vec<u8> },
 }
 
+/// Replay protection used by a worker: the shared filter and the tag TTL.
+#[derive(Clone)]
+pub struct ReplayGuard {
+    pub db: Arc<dyn IReplayProtection>,
+    pub window_secs: u64,
+}
+
 pub struct WorkerStage {
     worker_rx: Receiver<(SphinxHeader, Vec<u8>, String)>,
     mix_tx: Sender<MixMessage>,
     node_sk: SharedNodeKey,
+    replay: ReplayGuard,
     mix_strategy: Arc<dyn IMixStrategy>,
     metrics: MetricsService,
 }
@@ -39,6 +47,7 @@ impl WorkerStage {
         worker_rx: Receiver<(SphinxHeader, Vec<u8>, String)>,
         mix_tx: Sender<MixMessage>,
         node_sk: SharedNodeKey,
+        replay: ReplayGuard,
         mix_strategy: Arc<dyn IMixStrategy>,
         metrics: MetricsService,
     ) -> Self {
@@ -46,8 +55,60 @@ impl WorkerStage {
             worker_rx,
             mix_tx,
             node_sk,
+            replay,
             mix_strategy,
             metrics,
+        }
+    }
+
+    fn record_sphinx_error(&self, pid: &str, e: &SphinxError) {
+        warn!("Sphinx processing failed for {}: {}", pid, e);
+        let reason = match e {
+            SphinxError::MacMismatch => "mac_fail",
+            SphinxError::Crypto(_) => "decrypt_fail",
+            _ => "malformed",
+        };
+        self.metrics
+            .sphinx_processing_errors_total
+            .get_or_create(&vec![("reason".to_string(), reason.to_string())])
+            .inc();
+    }
+
+    /// Checks and records the replay tag. Returns `true` if the packet may be processed.
+    async fn admit(&self, pid: &str, replay_tag: &[u8; 32]) -> bool {
+        match self
+            .replay
+            .db
+            .check_and_tag(replay_tag, self.replay.window_secs)
+            .await
+        {
+            Ok(true) => {
+                warn!("Duplicate packet detected: {}. Dropping.", pid);
+                self.metrics
+                    .ingest_dropped_total
+                    .get_or_create(&vec![("reason".to_string(), "replay".to_string())])
+                    .inc();
+                self.metrics
+                    .replay_checks_total
+                    .get_or_create(&vec![("result".to_string(), "duplicate".to_string())])
+                    .inc();
+                false
+            }
+            Ok(false) => {
+                self.metrics
+                    .replay_checks_total
+                    .get_or_create(&vec![("result".to_string(), "new".to_string())])
+                    .inc();
+                true
+            }
+            Err(e) => {
+                error!("Replay DB error for {}: {:?}.", pid, e);
+                self.metrics
+                    .ingest_dropped_total
+                    .get_or_create(&vec![("reason".to_string(), "replay_error".to_string())])
+                    .inc();
+                false
+            }
         }
     }
 
@@ -55,7 +116,20 @@ impl WorkerStage {
         while let Ok((header, body, pid)) = self.worker_rx.recv().await {
             let start = std::time::Instant::now();
 
-            match header.process(&self.node_sk, body) {
+            // The replay tag comes from the per-hop shared secret, so it is checked
+            // once the header has been verified.
+            let verified = match header.verify(&self.node_sk) {
+                Ok(verified) => verified,
+                Err(e) => {
+                    self.record_sphinx_error(&pid, &e);
+                    continue;
+                }
+            };
+            if !self.admit(&pid, &verified.replay_tag()).await {
+                continue;
+            }
+
+            match verified.process(body) {
                 Ok(output) => {
                     #[cfg(feature = "hop-metrics")]
                     let hop_timings = Some(output.1.clone());
@@ -94,18 +168,7 @@ impl WorkerStage {
                         return;
                     }
                 }
-                Err(e) => {
-                    warn!("Sphinx processing failed for {}: {}", pid, e);
-                    let reason = match &e {
-                        SphinxError::MacMismatch => "mac_fail",
-                        SphinxError::Crypto(_) => "decrypt_fail",
-                        _ => "malformed",
-                    };
-                    self.metrics
-                        .sphinx_processing_errors_total
-                        .get_or_create(&vec![("reason".to_string(), reason.to_string())])
-                        .inc();
-                }
+                Err(e) => self.record_sphinx_error(&pid, &e),
             }
         }
     }
@@ -120,6 +183,94 @@ mod tests {
     use nox_crypto::sphinx::{build_multi_hop_packet, PathHop, SphinxHeader};
     use tokio::sync::mpsc;
     use x25519_dalek::PublicKey as X25519PublicKey;
+
+    fn test_replay_guard() -> ReplayGuard {
+        ReplayGuard {
+            db: Arc::new(
+                crate::infra::persistence::rotational_bloom::RotationalBloomFilter::new(
+                    1000,
+                    0.001,
+                    Duration::from_mins(1),
+                ),
+            ),
+            window_secs: 60,
+        }
+    }
+
+    /// Runs one worker over `packets` and returns the packet IDs it emitted.
+    async fn run_worker(
+        sk: &X25519SecretKey,
+        packets: Vec<(SphinxHeader, Vec<u8>, String)>,
+    ) -> Vec<String> {
+        let (worker_tx, worker_rx) = bounded::<(SphinxHeader, Vec<u8>, String)>(16);
+        let (mix_tx, mut mix_rx) = mpsc::channel::<MixMessage>(16);
+        let worker = WorkerStage::new(
+            worker_rx,
+            mix_tx,
+            Arc::new(sk.clone()),
+            test_replay_guard(),
+            Arc::new(PoissonMixStrategy::new(1.0)),
+            MetricsService::new(),
+        );
+        for packet in packets {
+            worker_tx.send(packet).await.unwrap();
+        }
+        drop(worker_tx);
+        worker.run().await;
+
+        let mut emitted = Vec::new();
+        while let Ok(msg) = mix_rx.try_recv() {
+            emitted.push(msg.packet_id);
+        }
+        emitted
+    }
+
+    fn exit_packet(pk: X25519PublicKey) -> (SphinxHeader, Vec<u8>) {
+        let path = vec![PathHop {
+            public_key: pk,
+            address: "EXIT".into(),
+        }];
+        let packet = build_multi_hop_packet(&path, b"replay", 0).expect("Build failed");
+        let (header, body) = SphinxHeader::from_bytes(&packet).unwrap();
+        (header, body.to_vec())
+    }
+
+    #[tokio::test]
+    async fn test_worker_drops_duplicate_with_changed_nonce() {
+        let (sks, pks) = create_test_keys(1);
+        let (header, body) = exit_packet(pks[0]);
+        let mut renonced = header.clone();
+        renonced.nonce = renonced.nonce.wrapping_add(1);
+
+        let emitted = run_worker(
+            &sks[0],
+            vec![
+                (header.clone(), body.clone(), "first".into()),
+                (header, body.clone(), "same".into()),
+                (renonced, body, "renonced".into()),
+            ],
+        )
+        .await;
+        assert_eq!(emitted, vec!["first".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_worker_mac_failure_does_not_consume_replay_tag() {
+        let (sks, pks) = create_test_keys(1);
+        let (header, body) = exit_packet(pks[0]);
+        let mut forged = header.clone();
+        forged.mac[0] ^= 0x01;
+
+        let emitted = run_worker(
+            &sks[0],
+            vec![
+                (forged, body.clone(), "forged".into()),
+                (header, body, "genuine".into()),
+            ],
+        )
+        .await;
+        assert_eq!(emitted, vec!["genuine".to_string()]);
+    }
 
     fn create_test_keys(count: usize) -> (Vec<X25519SecretKey>, Vec<X25519PublicKey>) {
         let mut rng = rand::thread_rng();
@@ -166,6 +317,7 @@ mod tests {
             worker_rx,
             mix_tx,
             Arc::new(sks[0].clone()),
+            test_replay_guard(),
             mix_strategy,
             metrics,
         );
@@ -215,6 +367,7 @@ mod tests {
             worker_rx,
             mix_tx,
             Arc::new(sks[0].clone()),
+            test_replay_guard(),
             mix_strategy,
             metrics,
         );
@@ -266,6 +419,7 @@ mod tests {
             worker_rx,
             mix_tx,
             Arc::new(sks[0].clone()),
+            test_replay_guard(),
             mix_strategy,
             metrics,
         );
