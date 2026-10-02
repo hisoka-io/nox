@@ -4,6 +4,7 @@ use libp2p::StreamProtocol;
 use libp2p::{gossipsub, identify, ping, request_response, swarm::NetworkBehaviour};
 use serde::{Deserialize, Serialize};
 
+use super::admission::AdmissionGate;
 use nox_core::models::handshake::Handshake;
 use nox_core::models::topology::TopologySnapshot;
 
@@ -41,6 +42,9 @@ pub struct GossipMessage {
 
 #[derive(NetworkBehaviour)]
 pub struct NoxBehaviour {
+    /// First, so registry admission is decided before other behaviours set up
+    /// state for the connection.
+    pub admission: AdmissionGate,
     pub ping: ping::Behaviour,
     pub identify: identify::Behaviour,
     pub gossipsub: gossipsub::Behaviour,
@@ -52,6 +56,7 @@ impl NoxBehaviour {
     pub fn new(
         local_key: libp2p::identity::Keypair,
         config: &crate::config::NetworkConfig,
+        admission: AdmissionGate,
     ) -> Result<Self, String> {
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .heartbeat_interval(std::time::Duration::from_secs(config.gossip_heartbeat_secs))
@@ -89,6 +94,7 @@ impl NoxBehaviour {
         let connection_limits = connection_limits::Behaviour::new(limits);
 
         Ok(Self {
+            admission,
             ping,
             identify,
             gossipsub,
