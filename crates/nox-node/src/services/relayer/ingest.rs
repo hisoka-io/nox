@@ -1,19 +1,15 @@
-use crate::config::NoxConfig;
 use crate::telemetry::metrics::MetricsService;
 use async_channel::Sender;
-use nox_core::{
-    events::NoxEvent,
-    traits::{IEventSubscriber, IReplayProtection},
-};
+use nox_core::{events::NoxEvent, traits::IEventSubscriber};
 use nox_crypto::sphinx::SphinxHeader;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+/// Parses incoming packets and hands them to the workers. Replay checks run in
+/// the workers, after the header MAC is verified (see `WorkerStage`).
 pub struct IngestStage {
-    config: NoxConfig,
     bus_subscriber: Arc<dyn IEventSubscriber>,
-    replay_db: Arc<dyn IReplayProtection>,
     worker_tx: Sender<(SphinxHeader, Vec<u8>, String)>, // Header, Body, PacketID
     metrics: MetricsService,
     cancel_token: Option<CancellationToken>,
@@ -21,16 +17,12 @@ pub struct IngestStage {
 
 impl IngestStage {
     pub fn new(
-        config: NoxConfig,
         bus_subscriber: Arc<dyn IEventSubscriber>,
-        replay_db: Arc<dyn IReplayProtection>,
         worker_tx: Sender<(SphinxHeader, Vec<u8>, String)>,
         metrics: MetricsService,
     ) -> Self {
         Self {
-            config,
             bus_subscriber,
-            replay_db,
             worker_tx,
             metrics,
             cancel_token: None,
@@ -92,40 +84,6 @@ impl IngestStage {
             }
         };
 
-        let replay_tag = header.compute_replay_tag();
-        match self
-            .replay_db
-            .check_and_tag(&replay_tag, self.config.relayer.replay_window)
-            .await
-        {
-            Ok(true) => {
-                warn!("Duplicate packet detected: {}. Dropping.", packet_id);
-                self.metrics
-                    .ingest_dropped_total
-                    .get_or_create(&vec![("reason".to_string(), "replay".to_string())])
-                    .inc();
-                self.metrics
-                    .replay_checks_total
-                    .get_or_create(&vec![("result".to_string(), "duplicate".to_string())])
-                    .inc();
-                return;
-            }
-            Err(e) => {
-                error!("Replay DB error: {:?}.", e);
-                self.metrics
-                    .ingest_dropped_total
-                    .get_or_create(&vec![("reason".to_string(), "replay_error".to_string())])
-                    .inc();
-                return;
-            }
-            _ => {
-                self.metrics
-                    .replay_checks_total
-                    .get_or_create(&vec![("result".to_string(), "new".to_string())])
-                    .inc();
-            }
-        }
-
         // PoW is enforced at HTTP ingress, not here (Sphinx header transforms per hop).
         if let Err(e) = self
             .worker_tx
@@ -160,25 +118,12 @@ mod tests {
     async fn test_ingest_stops_on_cancellation() {
         let bus = TokioEventBus::new(64);
         let subscriber: Arc<dyn IEventSubscriber> = Arc::new(bus);
-        let replay_db: Arc<dyn IReplayProtection> = Arc::new(
-            crate::infra::persistence::rotational_bloom::RotationalBloomFilter::new(
-                1000,
-                0.01,
-                std::time::Duration::from_mins(1),
-            ),
-        );
         let (worker_tx, _worker_rx) = async_channel::bounded(16);
         let metrics = MetricsService::new();
         let token = CancellationToken::new();
 
-        let ingest = IngestStage::new(
-            NoxConfig::default(),
-            subscriber,
-            replay_db,
-            worker_tx,
-            metrics,
-        )
-        .with_cancel_token(token.clone());
+        let ingest =
+            IngestStage::new(subscriber, worker_tx, metrics).with_cancel_token(token.clone());
 
         let handle = tokio::spawn(async move {
             ingest.run().await;
