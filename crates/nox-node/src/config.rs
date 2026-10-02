@@ -134,6 +134,38 @@ impl Default for ConnectionFilterConfig {
     }
 }
 
+/// How the P2P layer treats peers whose libp2p identity is not in the registry.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PeerAdmissionMode {
+    /// No registry check; IP bans and subnet caps are only logged.
+    Off,
+    /// Count and log what `enforce` would refuse, refuse nothing.
+    Monitor,
+    /// Refuse connections and packets from peers outside the registry once the
+    /// node set has been verified against the chain and the startup grace
+    /// period has passed. Existing links to a peer that left the registry are
+    /// closed after the grace period.
+    #[default]
+    Enforce,
+}
+
+const fn default_peer_admission_grace_secs() -> u64 {
+    120
+}
+
+const fn default_topology_liveness_window_secs() -> u64 {
+    60
+}
+
+const fn default_cover_loop_timeout_secs() -> u64 {
+    60
+}
+
+const fn default_topology_reconcile_interval_secs() -> u64 {
+    300
+}
+
 #[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct NetworkConfig {
     pub max_connections: u32,
@@ -147,6 +179,16 @@ pub struct NetworkConfig {
     pub max_concurrent_streams: usize,
     pub rate_limit: RateLimitConfig,
     pub connection_filter: ConnectionFilterConfig,
+    #[serde(default)]
+    pub peer_admission: PeerAdmissionMode,
+    /// Delay after startup before enforcement starts, and how long a link to a
+    /// peer that left the registry is kept before it is closed.
+    #[serde(default = "default_peer_admission_grace_secs")]
+    pub peer_admission_grace_secs: u64,
+    /// A member counts as online in `/topology` liveness if it answered on P2P
+    /// (connection or ping) within this many seconds.
+    #[serde(default = "default_topology_liveness_window_secs")]
+    pub topology_liveness_window_secs: u64,
 }
 
 impl Default for NetworkConfig {
@@ -162,6 +204,9 @@ impl Default for NetworkConfig {
             max_concurrent_streams: 100,
             rate_limit: RateLimitConfig::default(),
             connection_filter: ConnectionFilterConfig::default(),
+            peer_admission: PeerAdmissionMode::default(),
+            peer_admission_grace_secs: default_peer_admission_grace_secs(),
+            topology_liveness_window_secs: default_topology_liveness_window_secs(),
         }
     }
 }
@@ -181,6 +226,9 @@ pub struct RelayerConfig {
     pub mix_delay_ms: f64,
     pub cover_traffic_rate: f64,
     pub drop_traffic_rate: f64,
+    /// A loop cover packet not back within this many seconds counts as lost.
+    #[serde(default = "default_cover_loop_timeout_secs")]
+    pub cover_loop_timeout_secs: u64,
     pub fragmentation: FragmentationConfig,
 }
 
@@ -219,6 +267,7 @@ impl Default for RelayerConfig {
             mix_delay_ms: 500.0,
             cover_traffic_rate: 0.05,
             drop_traffic_rate: 0.05,
+            cover_loop_timeout_secs: default_cover_loop_timeout_secs(),
             fragmentation: FragmentationConfig::default(),
         }
     }
@@ -356,6 +405,10 @@ pub struct NoxConfig {
     /// 0 = start from latest.
     #[serde(default)]
     pub chain_start_block: u64,
+    /// How often the node set is re-read from the registry and checked against
+    /// `topologyFingerprint()` and `relayerCount()`. 0 = disabled.
+    #[serde(default = "default_topology_reconcile_interval_secs")]
+    pub topology_reconcile_interval_secs: u64,
     /// Falls back to `ChainObserver` replay if all seed URLs fail.
     #[serde(default)]
     pub bootstrap_topology_urls: Vec<String>,
@@ -432,6 +485,10 @@ impl std::fmt::Debug for NoxConfig {
             .field("http", &self.http)
             .field("block_poll_interval_secs", &self.block_poll_interval_secs)
             .field("chain_start_block", &self.chain_start_block)
+            .field(
+                "topology_reconcile_interval_secs",
+                &self.topology_reconcile_interval_secs,
+            )
             .field("bootstrap_topology_urls", &self.bootstrap_topology_urls)
             .field("topology_api_port", &self.topology_api_port)
             .field("max_broadcast_tx_size", &self.max_broadcast_tx_size)
@@ -508,6 +565,7 @@ impl Default for NoxConfig {
 
             block_poll_interval_secs: 12,
             chain_start_block: 0,
+            topology_reconcile_interval_secs: default_topology_reconcile_interval_secs(),
 
             bootstrap_topology_urls: Vec::new(),
             topology_api_port: 0,

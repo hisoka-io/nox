@@ -100,6 +100,19 @@ pub enum NoxEvent {
         blinding_ns: u64,
         total_sphinx_ns: u64,
     },
+
+    /// A node's full profile, re-read from the registry after an on-chain
+    /// profile change (URL, ingress, metadata, key, role, stake or freeze).
+    RelayerProfileSynced {
+        address: String,
+        sphinx_key: String,
+        url: String,
+        ingress_url: Option<String>,
+        metadata_url: Option<String>,
+        stake: String,
+        role: u8,
+        frozen: bool,
+    },
 }
 
 #[cfg(test)]
@@ -237,6 +250,22 @@ mod tests {
             address: "0x1234".into(),
             amount: "500000".into(),
             slasher: "0x5678".into(),
+        };
+        assert_json_roundtrip(&event);
+        assert_bincode_roundtrip(&event);
+    }
+
+    #[test]
+    fn roundtrip_relayer_profile_synced() {
+        let event = NoxEvent::RelayerProfileSynced {
+            address: "0xabc".into(),
+            sphinx_key: "11".repeat(32),
+            url: "/ip4/1.2.3.4/tcp/9000".into(),
+            ingress_url: Some("https://nox.example".into()),
+            metadata_url: None,
+            stake: "0".into(),
+            role: 2,
+            frozen: true,
         };
         assert_json_roundtrip(&event);
         assert_bincode_roundtrip(&event);

@@ -65,6 +65,14 @@ pub struct MetricsService {
     pub cover_traffic_generated_total: Family<Vec<(String, String)>, Counter>,
     pub cover_traffic_errors_total: Family<Vec<(String, String)>, Counter>,
     pub cover_traffic_degraded: Family<Vec<(String, String)>, Gauge<i64, AtomicI64>>,
+    pub cover_loop_sent_total: Family<Vec<(String, String)>, Counter>,
+    pub cover_loop_returned_total: Family<Vec<(String, String)>, Counter>,
+    pub cover_loop_lost_total: Family<Vec<(String, String)>, Counter>,
+    pub cover_loop_outcomes_total: Family<Vec<(String, String)>, Counter>,
+    pub cover_loop_rtt_seconds: Histogram,
+    pub p2p_admission_total: Family<Vec<(String, String)>, Counter>,
+    pub topology_reconcile_total: Family<Vec<(String, String)>, Counter>,
+    pub topology_membership_verified: Gauge<i64, AtomicI64>,
     pub rpc_requests_total: Family<Vec<(String, String)>, Counter>,
     pub rpc_rate_limited_total: Counter,
     pub rpc_ssrf_blocks_total: Counter,
@@ -432,6 +440,62 @@ impl MetricsService {
             cover_traffic_degraded.clone(),
         );
 
+        let cover_loop_sent_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_cover_loop_sent_total",
+            "Self-addressed loop cover packets sent, by first and second hop address",
+            cover_loop_sent_total.clone(),
+        );
+
+        let cover_loop_returned_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_cover_loop_returned_total",
+            "Loop cover packets that came back to this node, by first and second hop address",
+            cover_loop_returned_total.clone(),
+        );
+
+        let cover_loop_lost_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_cover_loop_lost_total",
+            "Loop cover packets that did not come back in time, by first and second hop address",
+            cover_loop_lost_total.clone(),
+        );
+
+        let cover_loop_outcomes_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_cover_loop_outcomes_total",
+            "Loop cover packets by outcome (sent, returned, lost), across all paths",
+            cover_loop_outcomes_total.clone(),
+        );
+
+        let cover_loop_rtt_seconds = Histogram::new(exponential_buckets(0.05, 2.0, 12));
+        registry.register(
+            "nox_cover_loop_rtt_seconds",
+            "Round-trip time of returned loop cover packets",
+            cover_loop_rtt_seconds.clone(),
+        );
+
+        let p2p_admission_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_p2p_admission_total",
+            "P2P admission decisions for peers outside the registry, by stage and result",
+            p2p_admission_total.clone(),
+        );
+
+        let topology_reconcile_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_topology_reconcile_total",
+            "Registry reconcile runs by result",
+            topology_reconcile_total.clone(),
+        );
+
+        let topology_membership_verified = Gauge::<i64, AtomicI64>::default();
+        registry.register(
+            "nox_topology_membership_verified",
+            "1 while the node set matches the registry fingerprint and count, else 0",
+            topology_membership_verified.clone(),
+        );
+
         let rpc_requests_total = Family::<Vec<(String, String)>, Counter>::default();
         registry.register(
             "nox_rpc_requests_total",
@@ -599,6 +663,14 @@ impl MetricsService {
             cover_traffic_generated_total,
             cover_traffic_errors_total,
             cover_traffic_degraded,
+            cover_loop_sent_total,
+            cover_loop_returned_total,
+            cover_loop_lost_total,
+            cover_loop_outcomes_total,
+            cover_loop_rtt_seconds,
+            p2p_admission_total,
+            topology_reconcile_total,
+            topology_membership_verified,
             rpc_requests_total,
             rpc_rate_limited_total,
             rpc_ssrf_blocks_total,
@@ -758,6 +830,22 @@ impl MetricsService {
         m.insert(
             "coverErrors".into(),
             fc0(&self.cover_traffic_errors_total).into(),
+        );
+        m.insert(
+            "coverLoopSent".into(),
+            fc(&self.cover_loop_outcomes_total, &[("outcome", "sent")]).into(),
+        );
+        m.insert(
+            "coverLoopReturned".into(),
+            fc(&self.cover_loop_outcomes_total, &[("outcome", "returned")]).into(),
+        );
+        m.insert(
+            "coverLoopLost".into(),
+            fc(&self.cover_loop_outcomes_total, &[("outcome", "lost")]).into(),
+        );
+        m.insert(
+            "topologyMembershipVerified".into(),
+            self.topology_membership_verified.get().into(),
         );
 
         m.insert(
