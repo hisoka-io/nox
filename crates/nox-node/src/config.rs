@@ -173,6 +173,10 @@ pub struct RelayerConfig {
     pub replay_window: u64,
     /// Right-size based on expected packets per `replay_window`.
     pub bloom_capacity: usize,
+    /// How often (seconds) the replay filter is written to disk while it changes.
+    /// It is also written on rotation and on graceful shutdown. 0 = only those.
+    #[serde(default = "default_bloom_persist_interval_secs")]
+    pub bloom_persist_interval_secs: u64,
     /// 0.0 = disable mixing (instant forwarding via `NoMixStrategy`).
     pub mix_delay_ms: f64,
     pub cover_traffic_rate: f64,
@@ -200,6 +204,10 @@ impl Default for FragmentationConfig {
     }
 }
 
+fn default_bloom_persist_interval_secs() -> u64 {
+    60
+}
+
 impl Default for RelayerConfig {
     fn default() -> Self {
         Self {
@@ -207,6 +215,7 @@ impl Default for RelayerConfig {
             worker_count: num_cpus::get(),
             replay_window: 3600,
             bloom_capacity: 100_000,
+            bloom_persist_interval_secs: default_bloom_persist_interval_secs(),
             mix_delay_ms: 500.0,
             cover_traffic_rate: 0.05,
             drop_traffic_rate: 0.05,
