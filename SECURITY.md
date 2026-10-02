@@ -56,7 +56,7 @@ documented reachability, and an enforced control.
 | Advisory | Reachability | Compensating control | Migration owner | Deadline |
 | --- | --- | --- | --- | --- |
 | `RUSTSEC-2025-0141` | Bincode v1 encodes the versioned mixnet wire | Payload size/version limits and strict inner decoding are enforced; outer Sphinx padding has a dedicated zero-only decoder | protocol-wire | 2026-12-31 |
-| `RUSTSEC-2025-0057` | `ethers-providers -> hashers -> fxhash` internal request maps | RPC methods, payload sizes, concurrency, and timeouts are bounded | chain-transport | 2026-12-31 |
+| `RUSTSEC-2025-0057` | `ethers-providers -> hashers -> fxhash` internal request maps, and `sled 0.34 -> fxhash` in the node's local store | RPC methods, payload sizes, concurrency, and timeouts are bounded; sled hashes only its internal page ids, log offsets and tree names with it, never stored keys | chain-transport, storage | 2026-12-31 |
 | `RUSTSEC-2024-0384` | Ethers and libp2p runtime timing | Protocol expiry and money arithmetic use explicit chain or standard monotonic time, not this crate | networking | 2026-12-31 |
 | `RUSTSEC-2024-0436` | `libp2p -> netlink-packet-utils -> paste` proc macro | Build-time expansion only; no runtime input reaches the macro | networking | 2026-12-31 |
 | `RUSTSEC-2025-0009` | `ethers-providers -> jsonwebtoken -> ring 0.16` | Nox does not use the affected QUIC header protection or single-buffer 64 GiB AES paths; packet and response sizes are bounded | chain-transport | 2026-12-31 |
@@ -66,6 +66,8 @@ documented reachability, and an enforced control.
 | Yanked `keccak 0.1.5` | Ethers signing, ABI, and hash dependencies | Cargo lock checksum is pinned; EIP-712, transaction identity, and cross-language hash vectors are tested | chain-transport | 2026-12-31 |
 | Yanked `spin 0.9.8` | `reed-solomon-erasure 6` synchronization | Fragment/shard counts and memory are bounded; FEC property, corruption, and recovery suites cover the path | protocol-wire | 2026-12-31 |
 
-Owners must migrate Ethers to Alloy, update libp2p and Reed-Solomon dependencies, and move the v1 bincode wire to a
-versioned replacement before the recorded deadlines. `scripts/check-rustsec-exceptions.sh` blocks expired advisory
-exceptions. Expired yanked-package entries fail review and must not be extended without a new security assessment.
+Owners must migrate Ethers to Alloy, update libp2p and Reed-Solomon dependencies, replace sled as the node's local
+store, and move the v1 bincode wire to a versioned replacement before the recorded deadlines.
+`scripts/check-rustsec-exceptions.sh` blocks expired advisory exceptions and warns 30 days ahead; a weekly
+scheduled run reports new advisories and upcoming deadlines without waiting for a push. Expired yanked-package entries fail review and must not be extended
+without a new security assessment.
