@@ -1,10 +1,12 @@
 # Integration tests
 
-Tests excluded from `cargo test --workspace` because they need external processes or take a while.
+The root crate (`nox-mixnet`) owns every file in `tests/`. Some of them start Anvil or compile contracts with
+solc, so they need the prerequisites below.
 
 ## Quick reference
 
 ```bash
+make test-integration  # every tests/*.rs suite (needs Anvil and solc), a minute or two
 make test-http     # HTTP ingress pipeline
 make test-fec      # Reed-Solomon FEC
 make test-anvil    # paid execution and durable outbox
@@ -24,5 +26,13 @@ interpret an application protocol.
 
 ## CI
 
-`cargo test --workspace` plus focused payment, outbox, HTTP, and FEC gates run on every push. Large-payload and
-trace diagnostics run through `.github/workflows/slow-tests.yml`.
+On every push and pull request, `.github/workflows/ci.yml` runs:
+
+- **Test**: `cargo nextest run` over the subcrates, plus the HTTP, FEC, transaction plan and outbox suites;
+- **Integration Tests**: `cargo nextest run -p nox-mixnet --features dev-node`, which compiles and runs every
+  `tests/*.rs` file with Anvil 1.3.2 and solc 0.8.30 installed;
+- **Payment Trace Safety**: the committed payment evidence suite.
+
+Tests marked `#[ignore]` are skipped there. The large-payload stress cases and the Anvil trace diagnostics run
+nightly through `.github/workflows/slow-tests.yml`. A new slow or environment-dependent test should be
+`#[ignore = "<reason>"]` and added to that workflow rather than left out of CI.

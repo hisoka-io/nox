@@ -1,4 +1,4 @@
-.PHONY: check test test-http test-fec test-anvil test-heavy test-large clippy clean
+.PHONY: check test test-integration test-http test-fec test-anvil test-heavy test-large clippy clean
 
 # Standard CI suite (runs on every push)
 check:
@@ -6,6 +6,10 @@ check:
 
 test:
 	cargo test --workspace --features dev-node
+
+# Every root integration suite in tests/ (needs anvil 1.3.2 and solc 0.8.30), as CI runs it
+test-integration:
+	cargo nextest run -p nox-mixnet --features dev-node --no-fail-fast
 
 # HTTP ingress pipeline tests (ephemeral ports, no external deps, ~30s)
 test-http:
