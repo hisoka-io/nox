@@ -192,6 +192,7 @@ impl NoxNode {
                 config.response_prune_interval_secs,
                 metrics_service.clone(),
             )
+            .with_buffer_all_payloads(config.benchmark_mode)
             .with_cancel_token(shutdown_token.clone());
             join_set.spawn(async move {
                 router.run().await;

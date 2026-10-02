@@ -16,6 +16,11 @@ use nox_node::telemetry::metrics::MetricsService;
 use nox_node::TokioEventBus;
 use tokio_util::sync::CancellationToken;
 
+/// A deterministic 32-hex-character SURB ID.
+fn surb_hex(seed: u8) -> String {
+    hex::encode([seed; 16])
+}
+
 struct HttpTestHarness {
     entry_url: String,
     publisher: Arc<dyn IEventPublisher>,
@@ -108,7 +113,7 @@ async fn test_http_e2e_packet_injection_and_response_poll() {
         other => panic!("Expected PacketReceived, got {other:?}"),
     }
 
-    let test_request_id = "surb-response-e2e-42";
+    let test_request_id = &format!("reply-42-{}", surb_hex(42));
     let test_payload = vec![42, 43, 44, 45, 46];
     harness
         .publisher
@@ -128,40 +133,103 @@ async fn test_http_e2e_packet_injection_and_response_poll() {
     assert_eq!(response, test_payload);
 }
 
-/// Batch response retrieval.
+/// Batch response retrieval: a client claims exactly its own SURB responses.
 #[tokio::test]
 async fn test_http_e2e_batch_response_retrieval() {
     let harness = HttpTestHarness::start().await;
     let transport = HttpPacketTransport::new();
 
-    for i in 0..3 {
+    for i in 0..4u8 {
         harness
             .publisher
             .publish(NoxEvent::PayloadDecrypted {
-                packet_id: format!("batch-{i}"),
-                payload: vec![i as u8; 4],
+                packet_id: format!("reply-{i}-{}", surb_hex(i)),
+                payload: vec![0xA0 | i; 4],
             })
             .expect("publish PayloadDecrypted");
     }
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
+    let mine: Vec<String> = (0..3u8).map(surb_hex).collect();
     let responses = transport
-        .recv_responses_batch(&harness.entry_url)
+        .recv_responses_batch(&harness.entry_url, &mine)
         .await
-        .expect("batch fetch should succeed");
+        .expect("batch claim should succeed");
 
     assert_eq!(responses.len(), 3);
 
-    for i in 0..3 {
-        let expected_id = format!("batch-{i}");
+    for i in 0..3u8 {
+        let expected_id = format!("reply-{i}-{}", surb_hex(i));
         let found = responses
             .iter()
-            .any(|(id, data)| id == &expected_id && *data == vec![i as u8; 4]);
+            .any(|(id, data)| id == &expected_id && *data == vec![0xA0 | i; 4]);
         assert!(found, "missing response for {expected_id}");
     }
 
+    // The fourth response belongs to another client and stays buffered.
+    assert_eq!(harness.response_buffer.len(), 1);
+}
+
+/// Only SURB replies are buffered.
+#[tokio::test]
+async fn test_http_e2e_only_surb_replies_buffered() {
+    let harness = HttpTestHarness::start().await;
+    let transport = HttpPacketTransport::new();
+
+    let mut relayer_payload = nox_core::models::payloads::encode_payload(
+        &nox_core::models::payloads::RelayerPayload::Heartbeat {
+            id: 1,
+            timestamp: 2,
+        },
+    )
+    .expect("encode");
+    relayer_payload.resize(1024, 0);
+
+    harness
+        .publisher
+        .publish(NoxEvent::PayloadDecrypted {
+            packet_id: format!("reply-9-{}", surb_hex(9)),
+            payload: relayer_payload,
+        })
+        .expect("publish");
+    harness
+        .publisher
+        .publish(NoxEvent::PayloadDecrypted {
+            packet_id: "http-00000000deadbeef".to_string(),
+            payload: vec![0xA5; 64],
+        })
+        .expect("publish");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
     assert!(harness.response_buffer.is_empty());
+    let responses = transport
+        .recv_responses_batch(&harness.entry_url, &[surb_hex(9)])
+        .await
+        .expect("claim should succeed");
+    assert!(responses.is_empty());
+}
+
+/// The legacy batch endpoint answers 410.
+#[tokio::test]
+async fn test_http_e2e_pending_endpoint_removed() {
+    let harness = HttpTestHarness::start().await;
+    harness
+        .publisher
+        .publish(NoxEvent::PayloadDecrypted {
+            packet_id: format!("reply-1-{}", surb_hex(1)),
+            payload: vec![0xA5; 8],
+        })
+        .expect("publish");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{}/api/v1/responses/pending", harness.entry_url))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status().as_u16(), 410);
+    assert_eq!(harness.response_buffer.len(), 1);
 }
 
 /// Wrong-size packet is rejected with an error.
@@ -234,7 +302,7 @@ async fn test_http_e2e_batch_empty() {
     let transport = HttpPacketTransport::new();
 
     let responses = transport
-        .recv_responses_batch(&harness.entry_url)
+        .recv_responses_batch(&harness.entry_url, &[surb_hex(1)])
         .await
         .expect("batch fetch should succeed even when empty");
 
