@@ -2,6 +2,16 @@
 set -euo pipefail
 
 current_date=${NOX_SECURITY_POLICY_DATE:-$(date -u +%F)}
+warn_days=${NOX_SECURITY_WARN_DAYS:-30}
+warn_date=$(date -u -d "$current_date + $warn_days days" +%F)
+
+warn() {
+    if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+        echo "::warning title=RustSec exception::$1"
+    else
+        echo "warning: $1" >&2
+    fi
+}
 
 check_deadline() {
     local item=$1
@@ -14,6 +24,9 @@ check_deadline() {
     if [[ "$deadline" < "$current_date" ]]; then
         echo "$item exception expired on $deadline (owner: $owner)" >&2
         exit 1
+    fi
+    if [[ ! "$deadline" > "$warn_date" ]]; then
+        warn "$item exception expires on $deadline (owner: $owner)"
     fi
 }
 
