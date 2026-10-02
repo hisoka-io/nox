@@ -20,6 +20,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # .cargo/config.toml builds for the local CPU. Runners differ, so cached artifacts built with
+  # target-cpu=native can hit SIGILL on another runner. Pin a baseline every runner supports.
+  RUSTFLAGS: "-C target-cpu=x86-64-v2"
+
 jobs:
   anvil-tests:
     name: Anvil Tests
@@ -41,6 +46,8 @@ jobs:
       - name: Verify Rust version
         run: rustc --version | grep -F "rustc 1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          prefix-key: v1-rust
       - name: Install Foundry (anvil)
         uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
         with:
@@ -81,5 +88,7 @@ jobs:
       - name: Verify Rust version
         run: rustc --version | grep -F "rustc 1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          prefix-key: v1-rust
       - name: Run large-payload suite
         run: cargo test --test large_payload -- --ignored --nocapture
