@@ -195,6 +195,22 @@ allow_private_ips = false
 request_timeout_secs = 10
 max_response_bytes = 1048576      # 1 MB
 
+# ---
+# [ingress] -- Abuse controls for ingress_port (and CORS on metrics_port)
+# ---
+
+[ingress]
+# Token bucket per client IP (IPv6 per /64). 0 disables the limit.
+rate_limit_per_sec = 100
+rate_limit_burst = 400
+# Behind a local reverse proxy every connection comes from 127.0.0.1. Name the
+# header the proxy sets (its rightmost value is used), e.g. "x-forwarded-for".
+# Empty = loopback connections are left to the proxy's own limits.
+client_ip_header = ""
+# Browser origins allowed by CORS. Empty = any origin.
+# cors_allowed_origins = ["https://demo.example.org"]
+cors_allowed_origins = []
+
 [[payment_adapters]]
 address = "0x0000000000000000000000000000000000000000"
 fee_assets = ["0x0000000000000000000000000000000000000000"]

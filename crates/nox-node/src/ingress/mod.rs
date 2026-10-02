@@ -10,6 +10,7 @@
 //! - `GET /health` -- Health check
 
 pub mod http_server;
+pub mod policy;
 pub mod response_buffer;
 pub mod response_router;
 
