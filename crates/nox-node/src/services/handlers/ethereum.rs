@@ -125,6 +125,17 @@ impl PaidRejection {
     }
 }
 
+/// Rejection returned for the legacy `SubmitTransaction` surface, which exit nodes
+/// no longer execute. Clients must use `PaidTransactionV2`.
+#[must_use]
+pub fn legacy_submission_rejection() -> PaidRejection {
+    PaidRejection::Submission {
+        detail: BoundedDetail::from_public_message(
+            "legacy SubmitTransaction is disabled; use PaidTransactionV2",
+        ),
+    }
+}
+
 pub struct EthereumHandler {
     chain_executor: Arc<ChainExecutor>,
     tx_manager: Arc<TransactionManager>,
@@ -382,6 +393,8 @@ impl EthereumHandler {
         self.profit_calc.clear_tokens();
     }
 
+    /// In-process entry point for the legacy paid path. Not reachable from the
+    /// mixnet: exit nodes reject `SubmitTransaction` (see [`legacy_submission_rejection`]).
     pub async fn handle_paid_transaction(
         &self,
         packet_id: &str,
@@ -1410,17 +1423,15 @@ impl ServiceHandler for EthereumHandler {
         "ethereum"
     }
 
+    /// Paid execution is only reachable through `PaidTransactionV2`; a legacy
+    /// `SubmitTransaction` payload is rejected without simulation or submission.
     async fn handle(&self, packet_id: &str, payload: &RelayerPayload) -> Result<(), ServiceError> {
         match payload {
-            RelayerPayload::SubmitTransaction { to, data } => {
-                let _ = self
-                    .handle_paid_transaction(
-                        packet_id,
-                        Address::from(*to),
-                        Bytes::from(data.clone()),
-                    )
-                    .await;
-                Ok(())
+            RelayerPayload::SubmitTransaction { .. } => {
+                warn!(packet_id, "Legacy SubmitTransaction payload rejected");
+                Err(ServiceError::ProcessingFailed(
+                    legacy_submission_rejection().public_detail(),
+                ))
             }
             _ => Ok(()),
         }

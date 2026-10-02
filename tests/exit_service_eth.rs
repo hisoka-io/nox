@@ -148,6 +148,14 @@ fn make_surbs(count: usize) -> Vec<Surb> {
 async fn make_exit_service_with_eth(
     eth: Arc<EthereumHandler>,
 ) -> (ExitService, Arc<TokioEventBus>) {
+    let (svc, bus, _metrics) = make_exit_service_with_eth_and_metrics(eth).await;
+    (svc, bus)
+}
+
+/// Like `make_exit_service_with_eth`, also returning the exit service metrics.
+async fn make_exit_service_with_eth_and_metrics(
+    eth: Arc<EthereumHandler>,
+) -> (ExitService, Arc<TokioEventBus>, MetricsService) {
     let bus = Arc::new(TokioEventBus::new(256));
     let publisher: Arc<dyn IEventPublisher> = bus.clone();
     let subscriber: Arc<dyn IEventSubscriber> = bus.clone();
@@ -172,16 +180,24 @@ async fn make_exit_service_with_eth(
         http,
         echo,
         nox_node::config::FragmentationConfig::default(),
-        metrics,
+        metrics.clone(),
     )
     .with_publisher(publisher);
 
-    (svc, bus)
+    (svc, bus, metrics)
 }
 
-/// `SubmitTransaction` dispatched to Ethereum handler succeeds in mock mode.
+/// Value of the exit dispatch counter for one handler label.
+fn dispatched_count(metrics: &MetricsService, handler: &str) -> u64 {
+    metrics
+        .exit_payloads_dispatched_total
+        .get_or_create(&vec![("handler".to_string(), handler.to_string())])
+        .get()
+}
+
+/// A legacy `SubmitTransaction` payload is rejected and never reaches the Ethereum handler.
 #[tokio::test]
-async fn test_exit_service_submit_tx_dispatched_to_eth_handler() {
+async fn test_exit_service_rejects_legacy_submit_tx() {
     let price_server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/api/v3/ticker/price"))
@@ -192,7 +208,8 @@ async fn test_exit_service_submit_tx_dispatched_to_eth_handler() {
         .await;
 
     let eth = make_ethereum_handler(&price_server.uri()).await;
-    let (svc, bus) = make_exit_service_with_eth(eth).await;
+    let (svc, bus, metrics) = make_exit_service_with_eth_and_metrics(eth).await;
+    let mut rx = bus.subscribe();
 
     let cancel = tokio_util::sync::CancellationToken::new();
     let svc = svc.with_cancel_token(cancel.clone());
@@ -216,11 +233,21 @@ async fn test_exit_service_submit_tx_dispatched_to_eth_handler() {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     cancel.cancel();
+
+    assert_eq!(dispatched_count(&metrics, "legacy_rejected"), 1);
+    assert_eq!(dispatched_count(&metrics, "ethereum"), 0);
+    while let Ok(event) = rx.try_recv() {
+        assert!(
+            !matches!(event, NoxEvent::SendPacket { .. }),
+            "a rejected legacy payload must not emit packets"
+        );
+    }
 }
 
-/// `AnonymousRequest` wrapping `SubmitTransaction` sends a response via SURBs.
+/// `AnonymousRequest` wrapping legacy `SubmitTransaction` is rejected, and the
+/// rejection is still delivered via SURBs.
 #[tokio::test]
-async fn test_exit_service_anon_submit_tx_sends_response_via_surbs() {
+async fn test_exit_service_anon_submit_tx_replies_with_rejection() {
     let price_server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/api/v3/ticker/price"))
@@ -231,7 +258,7 @@ async fn test_exit_service_anon_submit_tx_sends_response_via_surbs() {
         .await;
 
     let eth = make_ethereum_handler(&price_server.uri()).await;
-    let (svc, bus) = make_exit_service_with_eth(eth).await;
+    let (svc, bus, metrics) = make_exit_service_with_eth_and_metrics(eth).await;
     let mut rx = bus.subscribe();
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -276,9 +303,11 @@ async fn test_exit_service_anon_submit_tx_sends_response_via_surbs() {
 
     assert!(
         got_send,
-        "Expected SendPacket (echo- prefix) for paid tx response"
+        "Expected SendPacket (echo- prefix) carrying the rejection"
     );
     cancel.cancel();
+    assert_eq!(dispatched_count(&metrics, "legacy_rejected"), 1);
+    assert_eq!(dispatched_count(&metrics, "ethereum"), 0);
 }
 
 #[tokio::test]
