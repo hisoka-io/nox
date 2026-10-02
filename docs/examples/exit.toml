@@ -3,13 +3,17 @@
 # Exit nodes execute on-chain transactions on behalf of clients.
 # Requires an ETH wallet with gas funds and access to contract addresses.
 #
-# Secrets should be provided via environment variables:
-#   NOX_ROUTING_PRIVATE_KEY=<32-byte hex X25519 secret key>
-#   NOX_ETH_WALLET_PRIVATE_KEY=<hex private key for on-chain TX signing>
+# Secrets should be provided via environment variables (`nox keygen` prints them):
+#   NOX__ROUTING_PRIVATE_KEY=<32-byte hex X25519 secret key>
+#   NOX__P2P_PRIVATE_KEY=<32-byte hex Ed25519 secret key>
+#   NOX__ETH_WALLET_PRIVATE_KEY=<hex private key for on-chain TX signing>
+#
+# For the public testnet, start from the hisoka-io/run-nox templates instead:
+# they carry the deployed addresses and are verified on chain before startup.
 
-eth_rpc_url = "https://mainnet.infura.io/v3/YOUR_KEY"
+eth_rpc_url = "https://arbitrum-sepolia-rpc.publicnode.com"
 oracle_url = "http://127.0.0.1:3000"
-chain_id = 1
+chain_id = 421614
 node_role = "exit"
 
 # Contract addresses (replace with deployed addresses)
