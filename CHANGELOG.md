@@ -21,6 +21,16 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   has applied, held 16 blocks behind the scanned head but never before the latest registry log. That block
   matches the served node set, and client RPCs that trail the node's RPC can serve it. The endpoint no longer
   returns 503 when the RPC is down.
+- Hardened exit requests to user-supplied RPC, broadcast and HTTP URLs. RPC error text returned to clients no
+  longer includes upstream transport details.
+- `/events` no longer streams `packet_processed`. Packet counts and latency remain available as aggregates on
+  `/metrics` and `/metrics/json`.
+- Added an `[ingress]` config section: a per-client-IP rate limit on the HTTP ingress (default 100 req/s, burst
+  400) and an optional CORS origin allowlist for the ingress and API ports (default: any origin).
+- Exit nodes reject the legacy `SubmitTransaction` payload and request; paid execution uses
+  `PaidTransactionV2`. A request with reply SURBs receives a `SUBMISSION` rejection.
+- Removed the unused AEAD encapsulation from `nox_crypto::SphinxPacket`; the type is now a fixed-size buffer.
+  Packet sizes are unchanged.
 
 ## [0.1.0] - 2026-04-10
 
