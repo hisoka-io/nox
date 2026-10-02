@@ -1,9 +1,19 @@
 # Changelog
 
-Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow the git tags
+(`v<version>`). The release process is in [docs/releasing.md](docs/releasing.md).
 
 ## [Unreleased]
 
+- Every crate and binary now reports the workspace version (`0.4.0-rc.2`) instead of `0.1.0`. This shows in
+  `nox --version`, the `x-nox-version` response header and the `nox_build_info` metric.
+- Bumped anyhow and rand past their unsoundness advisories, and multihash to 0.19.5, which drops the yanked
+  `core2` dependency.
+- Dropped libp2p's unused `dns` feature. The P2P transport never resolved DNS multiaddrs (peers are dialed by
+  `/ip4` address from the registry), so behaviour is unchanged and `hickory-proto` leaves the build.
+- Release images are built only after the full CI suite passes on the tagged commit, and only for tags whose
+  version matches the crates and has a changelog section. Each tag gets a GitHub release with these notes and
+  the image digest.
 - Replay tags are derived from the per-hop shared secret and checked in the workers after header
   verification. The replay filter is persisted every `relayer.bloom_persist_interval_secs` (default 60)
   and on graceful shutdown.
@@ -12,23 +22,6 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   endpoint `GET /api/v1/responses/pending` is retired (410 Gone) in favour of `/claim`.
 - `PacketTransport::recv_responses_batch` takes the SURB IDs to claim, and `HttpPacketTransport` uses
   `/api/v1/responses/claim`.
-- Replaced the embedded Howl wallet, prover, `gas_payment`, and RelayerMulticall stack with protocol-neutral
-  paid quote and EntryPoint execution types.
-- Added fixed-point profitability, committed settlement evidence, durable signed transaction recovery, and
-  bounded quote reservations.
-- Removed the retired DarkPool crypto/client/prover crates and divergent deployment kit.
-- Persisted observer cursor, peers and sessions are now scoped to `(chain_id, registry)`; pointing an existing
-  data volume at another registry (or starting on an unscoped pre-release volume) drops them and replays from
-  `chain_start_block`. Seed snapshots must also match the registry's on-chain `topologyFingerprint()`.
-- The node-local topology fingerprint is recomputed from the served node set, so replayed or duplicate
-  registry events no longer drift it away from the chain.
-- Added `nox check-config` to validate a config (file + `NOX__*` env) and print its public identity.
-- `chain_start_block` is now scanned inclusively. The observer previously started at the block after it, so
-  registrations mined in the registry's deployment block were never seen.
-- `/topology` no longer makes an RPC call per request. Its `block_number` is now the block the chain observer
-  has applied, held 16 blocks behind the scanned head but never before the latest registry log. That block
-  matches the served node set, and client RPCs that trail the node's RPC can serve it. The endpoint no longer
-  returns 503 when the RPC is down.
 - Hardened exit requests to user-supplied RPC, broadcast and HTTP URLs. RPC error text returned to clients no
   longer includes upstream transport details.
 - `/events` no longer streams `packet_processed`. Packet counts and latency remain available as aggregates on
@@ -69,6 +62,57 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Price server: one HTTP client with a descriptive User-Agent and a 10 s timeout, providers polled
   concurrently, Binance via `api.binance.us`, CryptoCompare only with `PRICE_CRYPTOCOMPARE_API_KEY`, and a
   price is published only when `PRICE_MIN_SOURCES` (default 2) providers agree.
+
+## [0.4.0-rc.1] - 2026-09-25
+
+Image: `ghcr.io/hisoka-io/nox:0.4.0-rc.1`.
+
+### Upgrade notes
+
+- The container now runs as the unprivileged user `nox` with UID:GID `10001:10001` (it ran as root before).
+  Writable volumes (`/var/lib/nox` and any log or state mounts) must be owned by `10001:10001` before the new
+  image starts, for example
+  `docker run --rm --user 0:0 --entrypoint /bin/chown <image> -R 10001:10001 <mount>`. Config files only need to
+  be readable.
+- Persisted chain state is scoped to `(chain_id, registry)`. Pointing a data volume at another registry, or
+  starting on an unscoped volume from an earlier release, drops the cursor, peers and sessions and replays the
+  registry from `chain_start_block`.
+- Seed topology snapshots are rejected unless they match the registry's on-chain `topologyFingerprint()`.
+
+### Changes
+
+- Replaced the embedded Howl wallet, prover, `gas_payment`, and RelayerMulticall stack with protocol-neutral
+  paid quote and EntryPoint execution types.
+- Added fixed-point profitability, committed settlement evidence, durable signed transaction recovery, and
+  bounded quote reservations.
+- Removed the retired DarkPool crypto/client/prover crates and divergent deployment kit.
+- Persisted observer cursor, peers and sessions are now scoped to `(chain_id, registry)`; pointing an existing
+  data volume at another registry (or starting on an unscoped pre-release volume) drops them and replays from
+  `chain_start_block`. Seed snapshots must also match the registry's on-chain `topologyFingerprint()`.
+- The node-local topology fingerprint is recomputed from the served node set, so replayed or duplicate
+  registry events no longer drift it away from the chain.
+- Added `nox check-config` to validate a config (file + `NOX__*` env) and print its public identity.
+- `chain_start_block` is now scanned inclusively. The observer previously started at the block after it, so
+  registrations mined in the registry's deployment block were never seen.
+- `/topology` no longer makes an RPC call per request. Its `block_number` is now the block the chain observer
+  has applied, held 16 blocks behind the scanned head but never before the latest registry log. That block
+  matches the served node set, and client RPCs that trail the node's RPC can serve it. The endpoint no longer
+  returns 503 when the RPC is down.
+- Bumped rustls to 0.23.45 (RUSTSEC-2026-0285).
+- The builder image moved to Rust 1.95.0.
+
+## [0.2.5] - 2026-08-01
+
+Image: `ghcr.io/hisoka-io/nox:0.2.5`.
+
+- The chain observer scans registry logs in bounded block ranges, so a node that was offline for a long time
+  catches up instead of failing on an oversized `eth_getLogs` request.
+- Storage failures that persist across retries mark the node's sled store as degraded and log once at ERROR,
+  instead of failing silently.
+- The fallback profitability path now records `cumulative_revenue_usd` and `cumulative_cost_usd` in micro-USD,
+  like the primary path. It under-reported by 10,000x before.
+- The root crate is published as `nox-mixnet` (the `nox` name is taken on crates.io). The binary is still `nox`.
+- The Docker image carries OCI source and license labels.
 
 ## [0.1.0] - 2026-04-10
 
