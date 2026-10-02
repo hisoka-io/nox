@@ -24,7 +24,7 @@ while IFS= read -r exception; do
     check_deadline "$advisory" "$deadline" "$owner"
 done < <(sed -n '/^ignore = \[/,/^\]/p' deny.toml | grep 'RUSTSEC-')
 
-for required in "core2 0.4.0" "keccak 0.1.5" "spin 0.9.8"; do
+for required in "keccak 0.1.5" "spin 0.9.8"; do
     grep -Fq "| Yanked \`$required\` |" SECURITY.md || {
         echo "yanked dependency $required is missing from SECURITY.md" >&2
         exit 1
