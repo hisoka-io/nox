@@ -116,6 +116,12 @@ Protocols: `/nox/packet/1` (Sphinx relay + handshake + topology), identify, ping
 
 DoS protection: token-bucket rate limiting (3 tiers: Unknown/Trusted/Penalized), max 1000 connections, /24 subnet filtering, graduated IP bans, session tickets for fast reconnection.
 
+Registry admission: a peer is a member when its libp2p identity appears as `/p2p/<peer id>` in a registered node's
+P2P URL; Noise authenticates that identity. In `enforce` mode (default) the node refuses connections and packets from
+non-members once a registry reconcile has confirmed its node set against `topologyFingerprint()` and
+`relayerCount()`, and closes links to peers that left the registry after `peer_admission_grace_secs`. Member
+addresses are exempt from IP bans and subnet caps. Replay tags are recorded only after a packet's header MAC verifies.
+
 ---
 
 ## Topology
@@ -125,8 +131,14 @@ DoS protection: token-bucket rate limiting (3 tiers: Unknown/Trusted/Penalized),
 canonically ordered Registry membership at one block plus a separate liveness record for every member. Clients verify
 the full fingerprint, count, profiles, roles, and derived layers against that block before using fresh online liveness
 to select routes. The client default liveness window is three minutes; future or older observations are ineligible.
-Frozen members remain in the authenticated membership set but are not route eligible. Node-local
-topology endpoints remain schema 1 diagnostics; the indexer owns the production liveness feed.
+Frozen members remain in the authenticated membership set but are not route eligible. Once the chain observer
+has a position, node `/topology` endpoints also serve schema 2, with liveness from the node's own P2P links (itself
+online; a member online if it answered within `topology_liveness_window_secs`). Without a position they serve schema 1.
+
+The node keeps its view current by re-reading a member's full registry profile after every profile event (URL,
+ingress, metadata, key, role, stake, freeze) and by a periodic reconcile that re-reads all members and compares the
+node set with the chain. Loop cover travels through one node in each of the other two layers and back to the sender;
+`nox_cover_loop_{sent,returned,lost}_total{first_hop,second_hop}` expose nodes that drop traffic.
 
 ---
 
@@ -152,6 +164,6 @@ See [SECURITY.md](../SECURITY.md) for the full threat model including five P0 ga
 
 **Protected against**: IP identification, content analysis, replay, packet flooding, sender-receiver linkability, key compromise (current packets), header tagging, MEV/front-running, relay payment linkability.
 
-**Partial**: Inter-node traffic analysis (server cover only), timing correlation (depends on traffic volume), Sybil attacks (staking but no handshake verification).
+**Partial**: Inter-node traffic analysis (server cover only), timing correlation (depends on traffic volume), Sybil attacks (staking; P2P peers must be registered).
 
 **Not protected**: Client activity observation (no client cover), past traffic decryption (no key rotation), body tagging (no SPRP cipher).

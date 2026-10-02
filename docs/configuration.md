@@ -67,6 +67,12 @@ configured gas buffer, and set quote and aggregate pending-gas ceilings above th
 
 ## Nested configuration
 
+### Registry reconciliation
+
+| Field | Default | Description |
+|---|---|---|
+| `topology_reconcile_interval_secs` | `300` | How often every member is re-read from the registry and the node set is checked against `topologyFingerprint()` and `relayerCount()`. 0 disables it, which also keeps P2P admission permissive |
+
 ### `[network]`
 
 | Field | Default | Description |
@@ -75,6 +81,9 @@ configured gas buffer, and set quote and aggregate pending-gas ceilings above th
 | `max_connections_per_peer` | `2` | Max per peer |
 | `ping_interval_secs` | `15` | Heartbeat interval |
 | `session_ttl_secs` | `86400` | Session ticket lifetime |
+| `peer_admission` | `"enforce"` | `enforce`, `monitor` or `off`. Enforce refuses peers outside the registry once membership is verified on-chain and the grace period has passed |
+| `peer_admission_grace_secs` | `120` | Delay after startup before enforcement, and how long a link to a peer that left the registry is kept |
+| `topology_liveness_window_secs` | `60` | A member is reported online in `/topology` if it answered on P2P within this window |
 
 ### `[network.rate_limit]`
 
@@ -106,6 +115,7 @@ Three reputation tiers: Unknown, Trusted, Penalized.
 | `mix_delay_ms` | `500.0` | Average Poisson delay (ms) |
 | `cover_traffic_rate` | `0.05` | Loop cover packets/sec |
 | `drop_traffic_rate` | `0.05` | Drop cover packets/sec |
+| `cover_loop_timeout_secs` | `60` | A loop cover packet not back within this time counts as lost |
 
 ### `[relayer.fragmentation]`
 
