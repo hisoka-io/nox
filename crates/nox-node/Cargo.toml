@@ -38,7 +38,7 @@ rand_distr = "0.4"
 x25519-dalek = { version = "2.0.0", features = ["static_secrets", "serde"] }
 zeroize = { workspace = true }
 ethers = { workspace = true }
-libp2p = { version = "0.53", features = ["tcp", "dns", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros", "tokio", "cbor"] }
+libp2p = { version = "0.53", features = ["tcp", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros", "tokio", "cbor"] }
 sled = "0.34"
 prometheus-client = "0.22"
 axum = { version = "0.7", features = ["ws"] }

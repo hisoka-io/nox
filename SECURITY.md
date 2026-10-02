@@ -63,7 +63,6 @@ documented reachability, and an enforced control.
 | `RUSTSEC-2025-0010` | Same Ethers JSON Web Token dependency path | No Nox runtime JWT call site; migrate the legacy Ethers provider rather than adopting another obsolete Ring line | chain-transport | 2026-12-31 |
 | `RUSTSEC-2025-0134` | `ethers -> reqwest 0.11 -> rustls-pemfile` | Ethers Rustls features are disabled and production Ethers HTTP clients use HTTP/1 with native TLS | chain-transport | 2026-12-31 |
 | `RUSTSEC-2026-0258` | `ethers 2.0.14 -> reqwest 0.11 -> h2 0.3` | Every production Ethers HTTP provider is built with an HTTP/1-only client; Ethers' redundant Rustls feature is disabled | chain-transport | 2026-11-30 |
-| `RUSTSEC-2026-0119` | `libp2p -> hickory-proto 0.24` DNS name encoding | Peering addresses come from chain-verified Registry profiles or operator configuration; connection and request rates are bounded | networking | 2026-12-15 |
 | Yanked `keccak 0.1.5` | Ethers signing, ABI, and hash dependencies | Cargo lock checksum is pinned; EIP-712, transaction identity, and cross-language hash vectors are tested | chain-transport | 2026-12-31 |
 | Yanked `spin 0.9.8` | `reed-solomon-erasure 6` synchronization | Fragment/shard counts and memory are bounded; FEC property, corruption, and recovery suites cover the path | protocol-wire | 2026-12-31 |
 
