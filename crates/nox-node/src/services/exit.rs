@@ -8,7 +8,6 @@ use crate::services::handlers::rpc::RpcHandler;
 use crate::services::handlers::traffic::TrafficHandler;
 use crate::services::response_packer::ResponsePacker;
 use crate::telemetry::metrics::MetricsService;
-use ethers::types::{Address, Bytes};
 use nox_core::events::NoxEvent;
 use nox_core::models::payloads::{
     decode_padded_relayer_payload_limited, decode_payload_limited, encode_payload, RelayerPayload,
@@ -550,18 +549,15 @@ impl ExitService {
             RelayerPayload::SubmitTransaction { .. } => {
                 self.metrics
                     .exit_payloads_dispatched_total
-                    .get_or_create(&vec![("handler".to_string(), "ethereum".to_string())])
+                    .get_or_create(&vec![(
+                        "handler".to_string(),
+                        "legacy_rejected".to_string(),
+                    )])
                     .inc();
-                if let Some(ref handler) = self.ethereum_handler {
-                    if let Err(e) = handler.handle(packet_id, &command).await {
-                        warn!("Ethereum handler failed for {}: {}", packet_id, e);
-                    }
-                } else {
-                    warn!(
-                        packet_id = %packet_id,
-                        "SubmitTransaction received but no Ethereum handler (simulation mode) -- dropping"
-                    );
-                }
+                warn!(
+                    packet_id = %packet_id,
+                    "Legacy SubmitTransaction payload rejected: paid execution requires PaidTransactionV2"
+                );
             }
             RelayerPayload::Dummy { .. } | RelayerPayload::Heartbeat { .. } => {
                 self.metrics
@@ -650,76 +646,49 @@ impl ExitService {
                             );
                         }
                     }
-                    Ok(ServiceRequest::SubmitTransaction { to, data }) => {
+                    Ok(ServiceRequest::SubmitTransaction { .. }) => {
                         self.metrics
                             .exit_payloads_dispatched_total
-                            .get_or_create(&vec![("handler".to_string(), "ethereum".to_string())])
+                            .get_or_create(&vec![(
+                                "handler".to_string(),
+                                "legacy_rejected".to_string(),
+                            )])
                             .inc();
-
-                        let Some(ref eth_handler) = self.ethereum_handler else {
-                            warn!(
-                                packet_id = %packet_id,
-                                "Paid SubmitTransaction received but no Ethereum handler (simulation mode) -- dropping"
-                            );
+                        warn!(
+                            packet_id = %packet_id,
+                            "Legacy SubmitTransaction request rejected: paid execution requires PaidTransactionV2"
+                        );
+                        if reply_surbs.is_empty() {
+                            return;
+                        }
+                        let Some(ref echo) = self.echo_handler else {
                             return;
                         };
-
-                        let to_addr = Address::from(to);
-                        info!(
-                            packet_id = %packet_id,
-                            to_raw = ?to,
-                            to_addr = ?to_addr,
-                            data_len = data.len(),
-                            "Exit: deserialized ServiceRequest::SubmitTransaction"
-                        );
-                        let data_bytes = Bytes::from(data);
-                        let tx_result = eth_handler
-                            .handle_paid_transaction(packet_id, to_addr, data_bytes)
-                            .await;
-
-                        if !reply_surbs.is_empty() {
-                            if let Some(ref echo) = self.echo_handler {
-                                let response_data = match &tx_result {
-                                    Ok(crate::services::handlers::ethereum::PaidOutcome::Submitted {
-                                        transaction_hash,
-                                        ..
-                                    }) => transaction_hash.as_bytes().to_vec(),
-                                    Err(rejection) => format!(
-                                        "tx_error:{}",
-                                        rejection.public_detail()
-                                    )
-                                    .into_bytes(),
-                                };
-                                let inner = match encode_payload(&ServiceRequest::Echo {
-                                    data: response_data,
-                                }) {
-                                    Ok(bytes) => bytes,
-                                    Err(e) => {
-                                        warn!(
-                                            packet_id = %packet_id,
-                                            error = %e,
-                                            "Failed to encode tx response for SURB delivery"
-                                        );
-                                        return;
-                                    }
-                                };
-                                let echo_payload =
-                                    RelayerPayload::AnonymousRequest { inner, reply_surbs };
-                                if let Err(e) = echo.handle(packet_id, &echo_payload).await {
-                                    warn!(
-                                        packet_id = %packet_id,
-                                        error = %e,
-                                        "Failed to send tx response via SURBs"
-                                    );
-                                }
+                        let response_data = format!(
+                            "tx_error:{}",
+                            crate::services::handlers::ethereum::legacy_submission_rejection()
+                                .public_detail()
+                        )
+                        .into_bytes();
+                        let inner = match encode_payload(&ServiceRequest::Echo {
+                            data: response_data,
+                        }) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                warn!(
+                                    packet_id = %packet_id,
+                                    error = %e,
+                                    "Failed to encode legacy submission rejection"
+                                );
+                                return;
                             }
-                        }
-
-                        if let Err(e) = tx_result {
+                        };
+                        let echo_payload = RelayerPayload::AnonymousRequest { inner, reply_surbs };
+                        if let Err(e) = echo.handle(packet_id, &echo_payload).await {
                             warn!(
                                 packet_id = %packet_id,
                                 error = %e,
-                                "Paid transaction handler failed"
+                                "Failed to send legacy submission rejection via SURBs"
                             );
                         }
                     }
