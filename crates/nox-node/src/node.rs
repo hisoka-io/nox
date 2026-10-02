@@ -31,7 +31,6 @@ use std::time::Duration;
 use tokio::signal;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tower_http::cors::CorsLayer;
 
 #[derive(Clone)]
 struct BenchAdminState {
@@ -134,6 +133,7 @@ impl NoxNode {
             bench_publisher,
             config.min_pow_difficulty,
             Some(observed_chain.clone()),
+            &config.ingress.cors_allowed_origins,
         );
 
         let start_epoch = std::time::SystemTime::now()
@@ -161,9 +161,10 @@ impl NoxNode {
                 long_poll_timeout: Duration::from_secs(30),
                 min_pow_difficulty: config.min_pow_difficulty,
             });
-            let ingress_router = IngressServer::router(ingress_state).layer(middleware::from_fn(
-                crate::telemetry::version::version_header,
-            ));
+            let ingress_router = IngressServer::router_with_policy(ingress_state, &config.ingress)
+                .layer(middleware::from_fn(
+                    crate::telemetry::version::version_header,
+                ));
             let ingress_port = config.ingress_port;
             let ingress_shutdown = shutdown_token.clone();
             join_set.spawn(async move {
@@ -171,9 +172,12 @@ impl NoxNode {
                 info!("HTTP Ingress: http://{}/api/v1/packets", addr);
                 match tokio::net::TcpListener::bind(addr).await {
                     Ok(listener) => {
-                        if let Err(e) = axum::serve(listener, ingress_router)
-                            .with_graceful_shutdown(ingress_shutdown.cancelled_owned())
-                            .await
+                        if let Err(e) = axum::serve(
+                            listener,
+                            ingress_router.into_make_service_with_connect_info::<SocketAddr>(),
+                        )
+                        .with_graceful_shutdown(ingress_shutdown.cancelled_owned())
+                        .await
                         {
                             error!("HTTP ingress server error: {}", e);
                         }
@@ -267,10 +271,11 @@ impl NoxNode {
             let topo_shutdown = shutdown_token.clone();
             let topo_observed_chain = observed_chain.clone();
             let topo_pow_difficulty = config.min_pow_difficulty;
+            let topo_cors_origins = config.ingress.cors_allowed_origins.clone();
             join_set.spawn(async move {
                 let app = Router::new()
                     .route("/topology", get(handle_topology_request))
-                    .layer(permissive_cors_layer())
+                    .layer(crate::ingress::policy::cors_layer(&topo_cors_origins))
                     .layer(middleware::from_fn(
                         crate::telemetry::version::version_header,
                     ))
@@ -798,10 +803,12 @@ impl NoxNode {
             None,
             0,
             None,
+            &[],
         )
     }
 
     /// Pass `Some(publisher)` to enable benchmark-only admin topology registration.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_metrics_with_admin(
         port: u16,
         bus_subscriber: Arc<dyn IEventSubscriber>,
@@ -810,6 +817,7 @@ impl NoxNode {
         bench_publisher: Option<Arc<dyn IEventPublisher>>,
         pow_difficulty: u32,
         observed_chain: Option<Arc<ObservedChain>>,
+        cors_allowed_origins: &[String],
     ) -> MetricsService {
         info!("Initializing Observability...");
         let metrics_service = MetricsService::new();
@@ -850,7 +858,7 @@ impl NoxNode {
             .route("/events", get(crate::telemetry::sse::handle_sse_events))
             .layer(axum::extract::Extension(node_id))
             .layer(axum::extract::Extension(sse_bus))
-            .layer(permissive_cors_layer())
+            .layer(crate::ingress::policy::cors_layer(cors_allowed_origins))
             .layer(middleware::from_fn(
                 crate::telemetry::version::version_header,
             ))
@@ -994,13 +1002,6 @@ async fn handle_admin_topology_register(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
         }
     }
-}
-
-fn permissive_cors_layer() -> CorsLayer {
-    CorsLayer::new()
-        .allow_origin(tower_http::cors::Any)
-        .allow_methods(tower_http::cors::Any)
-        .allow_headers(tower_http::cors::Any)
 }
 
 #[cfg(test)]
