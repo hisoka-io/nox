@@ -4,11 +4,15 @@
 # Relay nodes forward Sphinx packets but do not execute on-chain transactions.
 # No wallet key or chain execution infrastructure required.
 #
-# Secrets should be provided via environment variables:
-#   NOX_ROUTING_PRIVATE_KEY=<32-byte hex X25519 secret key>
+# Secrets should be provided via environment variables (`nox keygen` prints them):
+#   NOX__ROUTING_PRIVATE_KEY=<32-byte hex X25519 secret key>
+#   NOX__P2P_PRIVATE_KEY=<32-byte hex Ed25519 secret key>
+#
+# For the public testnet, start from the hisoka-io/run-nox templates instead:
+# they carry the deployed addresses and are verified on chain before startup.
 
-eth_rpc_url = "https://mainnet.infura.io/v3/YOUR_KEY"
-chain_id = 1
+eth_rpc_url = "https://arbitrum-sepolia-rpc.publicnode.com"
+chain_id = 421614
 node_role = "relay"
 
 # Registry contract for topology discovery
