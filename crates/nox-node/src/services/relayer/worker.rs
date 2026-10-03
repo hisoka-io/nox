@@ -180,7 +180,7 @@ impl WorkerStage {
                 true
             }
             Err(e) => {
-                error!("Replay DB error for {}: {:?}.", pid, e);
+                error!(error = ?e, "Replay DB error; packet dropped");
                 self.metrics
                     .ingest_dropped_total
                     .get_or_create(&vec![("reason".to_string(), "replay_error".to_string())])

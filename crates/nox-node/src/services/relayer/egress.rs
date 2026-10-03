@@ -55,7 +55,6 @@ impl EgressStage {
                         },
                     }) {
                         error!(
-                            packet_id = %msg.packet_id,
                             error = %e,
                             "Failed to publish SendPacket for forward -- packet dropped"
                         );
@@ -80,7 +79,6 @@ impl EgressStage {
                         delivery: msg.delivery,
                     }) {
                         error!(
-                            packet_id = %msg.packet_id,
                             error = %e,
                             "Failed to publish PayloadDecrypted -- exit payload dropped"
                         );

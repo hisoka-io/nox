@@ -658,6 +658,21 @@ impl ExitService {
             "Received fragment"
         );
 
+        // Clients never send FEC on the forward path; FEC is only used for
+        // responses packed by the exit. Accepting it here would let a planted
+        // fragment switch another sender's buffer to D-of-N completion.
+        if fragment.fec.is_some() {
+            self.metrics
+                .exit_reassembly_total
+                .get_or_create(&vec![("result".to_string(), "forward_fec".to_string())])
+                .inc();
+            debug!(
+                message_id = message_id,
+                "Fragment rejected: FEC is not accepted on the forward path"
+            );
+            return None;
+        }
+
         let reassembled_data = {
             let mut reassembler = self.reassembler.lock();
             match reassembler.add_fragment(fragment) {

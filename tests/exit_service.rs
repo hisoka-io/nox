@@ -282,6 +282,74 @@ async fn test_exit_service_service_response_ignored() {
     cancel.cancel();
 }
 
+/// Sends an echo request as a single forward fragment and reports whether the
+/// exit answered it.
+async fn single_fragment_echo_answered(with_fec: bool) -> bool {
+    let (svc, bus) = make_service();
+    let mut rx = bus.subscribe();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let svc = svc.with_cancel_token(cancel.clone());
+    tokio::spawn(async move { svc.run().await });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let inner = anon_request(
+        &ServiceRequest::Echo {
+            data: b"fragmented".to_vec(),
+        },
+        make_surbs(2),
+    );
+    // A well-formed 1-of-1 FEC header that would reassemble to the same bytes.
+    let fec = with_fec.then(|| nox_core::FecInfo {
+        data_shard_count: 1,
+        original_data_len: inner.len() as u64,
+    });
+    let payload = encode_payload(&RelayerPayload::Fragment {
+        frag: nox_core::protocol::fragmentation::Fragment {
+            message_id: 7,
+            sequence: 0,
+            total_fragments: 1,
+            fec,
+            data: inner,
+        },
+    })
+    .expect("encode fragment");
+
+    bus.publish(NoxEvent::PayloadDecrypted {
+        packet_id: "pkt-frag-1".to_string(),
+        payload,
+        reply_handle: None,
+        delivery: None,
+    })
+    .expect("publish");
+
+    let answered = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            match rx.recv().await {
+                Ok(NoxEvent::SendPacket { .. }) => return true,
+                Ok(_) => continue,
+                Err(_) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    cancel.cancel();
+    answered
+}
+
+/// A plain forward fragment is reassembled and dispatched.
+#[tokio::test]
+async fn test_exit_service_forward_fragment_dispatched() {
+    assert!(single_fragment_echo_answered(false).await);
+}
+
+/// FEC is only used on responses; the exit drops forward fragments that carry it.
+#[tokio::test]
+async fn test_exit_service_forward_fec_fragment_rejected() {
+    assert!(!single_fragment_echo_answered(true).await);
+}
+
 /// `NeedMoreSurbs` at the exit node is a routing anomaly -- silently dropped.
 #[tokio::test]
 async fn test_exit_service_need_more_surbs_ignored() {

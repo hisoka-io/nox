@@ -34,6 +34,9 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
   different contents, and returns `FragmentationError::DuplicateDataMismatch`. Exact duplicates (retransmits)
   remain a no-op. When two clients send concurrently with the same message ID to the same exit, both messages
   are dropped (previously their data could mix). New metric: `nox_reassembly_conflict_total`.
+- Exits accept FEC only on responses they pack themselves; a forward fragment carrying FEC metadata is dropped
+  and counted as `nox_exit_reassembly_total{result="forward_fec"}`. Published clients send forward fragments
+  without FEC.
 - Exit transaction records live in the dedicated `exit_outbox` sled tree (see upgrade notes), which keeps
   them apart from frequently rewritten default-tree keys.
 - The chain observer writes its scan position at most once per `chain_cursor_persist_interval_secs` (new
@@ -42,7 +45,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 - New metric `nox_storage_size_on_disk_bytes`, refreshed every 30 seconds. The six-hourly storage log line is
   named "Periodic sled flush", which matches what it does.
 - Per-request and per-packet details (hosts, URLs, RPC methods, packet, request and message IDs, transaction
-  hashes) are logged at debug level. The default `info` level keeps lifecycle and aggregate lines.
+  hashes) are logged at debug level, and relay error lines carry no packet ID. The default `info` level keeps
+  lifecycle and aggregate lines.
 
 ## [0.4.0-rc.3] - 2026-10-03
 

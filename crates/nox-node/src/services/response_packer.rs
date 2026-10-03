@@ -256,7 +256,7 @@ impl ResponsePacker {
         // FEC: RS GF(2^8) supports max 255 total shards; clamp or skip accordingly.
         let mut p = surbs.len() - d;
         let all_fragments = if p > 0 && d > 0 {
-            let max_parity = 255usize.saturating_sub(d);
+            let max_parity = fec::MAX_TOTAL_SHARDS.saturating_sub(d);
             if max_parity == 0 {
                 debug!(
                     request_id,
