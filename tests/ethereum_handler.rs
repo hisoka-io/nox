@@ -110,7 +110,7 @@ async fn test_mock_paid_tx_requires_committed_payment_evidence() {
 }
 
 #[tokio::test]
-async fn test_ethereum_handler_service_handler_submit_tx_payload() {
+async fn test_ethereum_handler_rejects_legacy_submit_tx_payload() {
     let mock_server = mock_price_server().await;
     let handler = make_handler(&mock_server.uri()).await;
 
@@ -121,7 +121,13 @@ async fn test_ethereum_handler_service_handler_submit_tx_payload() {
     };
 
     let result = handler.handle("test-packet-002", &payload).await;
-    assert!(result.is_ok(), "SubmitTransaction returned Err: {result:?}");
+    match result {
+        Err(ServiceError::ProcessingFailed(detail)) => {
+            assert!(detail.starts_with("SUBMISSION:"), "{detail}");
+            assert!(detail.contains("PaidTransactionV2"), "{detail}");
+        }
+        other => panic!("legacy SubmitTransaction must be rejected, got {other:?}"),
+    }
 }
 
 #[tokio::test]

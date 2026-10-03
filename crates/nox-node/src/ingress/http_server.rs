@@ -27,10 +27,11 @@ use nox_core::traits::interfaces::IEventPublisher;
 use nox_crypto::sphinx::packet::PACKET_SIZE;
 use nox_crypto::sphinx::SphinxHeader;
 use serde::Deserialize;
-use tower_http::cors::CorsLayer;
 use tracing::{debug, warn};
 
+use super::policy::{cors_layer, rate_limit, IngressRateLimiter};
 use super::response_buffer::ResponseBuffer;
+use crate::config::IngressConfig;
 use crate::telemetry::metrics::MetricsService;
 
 /// Shared state for the ingress HTTP server.
@@ -53,16 +54,29 @@ pub struct IngressState {
 pub struct IngressServer;
 
 impl IngressServer {
+    /// Router with the default ingress policy (see [`IngressConfig::default`]).
     pub fn router(state: Arc<IngressState>) -> Router {
-        Router::new()
+        Self::router_with_policy(state, &IngressConfig::default())
+    }
+
+    /// Router with a per-client rate limit and CORS policy. The rate limit keys on
+    /// the peer address, so serve it with
+    /// `into_make_service_with_connect_info::<SocketAddr>()`; without peer
+    /// information requests are not limited.
+    pub fn router_with_policy(state: Arc<IngressState>, policy: &IngressConfig) -> Router {
+        let mut router = Router::new()
             .route("/api/v1/packets", post(inject_packet))
             .route("/api/v1/responses/claim", post(claim_responses))
             .route("/api/v1/responses/stream", get(stream_responses))
             .route("/api/v1/ws", get(ws_upgrade))
             .route("/api/v1/responses/pending", get(fetch_pending))
             .route("/api/v1/responses/:request_id", get(poll_response))
-            .route("/health", get(health))
-            .layer(CorsLayer::permissive())
+            .route("/health", get(health));
+        if let Some(limiter) = IngressRateLimiter::from_config(policy, state.metrics.clone()) {
+            router = router.layer(axum::middleware::from_fn_with_state(limiter, rate_limit));
+        }
+        router
+            .layer(cors_layer(&policy.cors_allowed_origins))
             .with_state(state)
     }
 }

@@ -235,6 +235,74 @@ impl Default for HttpConfig {
     }
 }
 
+/// Default sustained requests per second one client IP may send to the HTTP ingress.
+pub const DEFAULT_INGRESS_RATE_LIMIT_PER_SEC: u32 = 100;
+/// Default number of requests one client IP may send in a burst above the sustained rate.
+pub const DEFAULT_INGRESS_RATE_LIMIT_BURST: u32 = 400;
+
+/// Abuse controls for the public HTTP ingress (`ingress_port`) and API (`metrics_port`).
+#[derive(Debug, Deserialize, Clone, Serialize)]
+#[serde(default)]
+pub struct IngressConfig {
+    /// Sustained requests per second allowed per client IP. 0 disables the limit.
+    pub rate_limit_per_sec: u32,
+    /// Requests per client IP allowed in a burst above the sustained rate.
+    pub rate_limit_burst: u32,
+    /// Header that carries the client IP when the ingress sits behind a local reverse
+    /// proxy (for example `x-forwarded-for` or `x-real-ip`). Only read for connections
+    /// from a loopback address; the rightmost value is used. Empty means loopback
+    /// connections are not limited here and the proxy is expected to limit them.
+    pub client_ip_header: String,
+    /// Browser origins allowed by CORS on the ingress and API ports, for example
+    /// `https://demo.nox.hisoka.io`. Empty allows any origin.
+    pub cors_allowed_origins: Vec<String>,
+}
+
+impl Default for IngressConfig {
+    fn default() -> Self {
+        Self {
+            rate_limit_per_sec: DEFAULT_INGRESS_RATE_LIMIT_PER_SEC,
+            rate_limit_burst: DEFAULT_INGRESS_RATE_LIMIT_BURST,
+            client_ip_header: String::new(),
+            cors_allowed_origins: Vec::new(),
+        }
+    }
+}
+
+impl IngressConfig {
+    /// Configuration errors, one message per invalid field.
+    #[must_use]
+    pub fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.rate_limit_per_sec > 0 && self.rate_limit_burst == 0 {
+            errors.push(
+                "ingress.rate_limit_burst must be at least 1 when ingress.rate_limit_per_sec is set"
+                    .to_string(),
+            );
+        }
+        if !self.client_ip_header.is_empty()
+            && axum::http::HeaderName::from_bytes(self.client_ip_header.as_bytes()).is_err()
+        {
+            errors.push(format!(
+                "ingress.client_ip_header is not a valid header name (got: \"{}\")",
+                self.client_ip_header
+            ));
+        }
+        for origin in &self.cors_allowed_origins {
+            let is_http_origin = (origin.starts_with("https://") || origin.starts_with("http://"))
+                && !origin.ends_with('/')
+                && axum::http::HeaderValue::from_str(origin).is_ok();
+            if !is_http_origin {
+                errors.push(format!(
+                    "ingress.cors_allowed_origins entry must be an origin such as \
+                     https://app.example.org without a trailing slash (got: \"{origin}\")"
+                ));
+            }
+        }
+        errors
+    }
+}
+
 #[derive(Deserialize, Clone, Serialize)]
 pub struct NoxConfig {
     pub eth_rpc_url: String,
@@ -287,6 +355,9 @@ pub struct NoxConfig {
     pub max_broadcast_tx_size: usize,
     /// 0 = disabled.
     pub ingress_port: u16,
+    /// Rate limit and CORS policy for the ingress and API ports.
+    #[serde(default)]
+    pub ingress: IngressConfig,
     pub response_prune_interval_secs: u64,
     pub nox_reward_pool_address: String,
     pub nox_entry_point_address: String,
@@ -356,6 +427,7 @@ impl std::fmt::Debug for NoxConfig {
             .field("topology_api_port", &self.topology_api_port)
             .field("max_broadcast_tx_size", &self.max_broadcast_tx_size)
             .field("ingress_port", &self.ingress_port)
+            .field("ingress", &self.ingress)
             .field(
                 "response_prune_interval_secs",
                 &self.response_prune_interval_secs,
@@ -434,6 +506,7 @@ impl Default for NoxConfig {
             max_broadcast_tx_size: 128 * 1024,
 
             ingress_port: 0,
+            ingress: IngressConfig::default(),
             response_prune_interval_secs: 60,
 
             nox_reward_pool_address: "0x0000000000000000000000000000000000000000".to_string(),
@@ -508,6 +581,8 @@ impl NoxConfig {
         if self.p2p_port == 0 {
             errors.push("p2p_port is 0".into());
         }
+
+        errors.extend(self.ingress.validation_errors());
 
         if self.chain_id == 0 && !self.benchmark_mode {
             errors.push("chain_id is 0 (must be set for production)".into());
@@ -779,6 +854,66 @@ mod tests {
             .iter()
             .any(|e| e.contains("registry_contract_address")
                 && e.contains("not a valid Ethereum address")));
+    }
+
+    #[test]
+    fn ingress_policy_defaults_are_valid_and_keep_any_origin() {
+        let ingress = IngressConfig::default();
+        assert!(ingress.validation_errors().is_empty());
+        assert!(ingress.cors_allowed_origins.is_empty());
+        assert_eq!(
+            ingress.rate_limit_per_sec,
+            DEFAULT_INGRESS_RATE_LIMIT_PER_SEC
+        );
+    }
+
+    #[test]
+    fn ingress_policy_rejects_malformed_values() {
+        let ingress = IngressConfig {
+            rate_limit_per_sec: 10,
+            rate_limit_burst: 0,
+            client_ip_header: "bad header".to_string(),
+            cors_allowed_origins: vec![
+                "https://demo.example".to_string(),
+                "https://demo.example/".to_string(),
+                "demo.example".to_string(),
+            ],
+        };
+        let errors = ingress.validation_errors();
+        assert_eq!(errors.len(), 4, "{errors:?}");
+        assert!(errors.iter().any(|e| e.contains("rate_limit_burst")));
+        assert!(errors.iter().any(|e| e.contains("client_ip_header")));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("\"https://demo.example/\"")));
+        assert!(errors.iter().any(|e| e.contains("\"demo.example\"")));
+    }
+
+    #[test]
+    fn ingress_policy_is_optional_in_config_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nox.toml");
+        std::fs::write(&path, "benchmark_mode = true\n").expect("write config");
+        let config = NoxConfig::load(path.to_str().expect("utf-8 path")).expect("load");
+        assert_eq!(
+            config.ingress.rate_limit_burst,
+            DEFAULT_INGRESS_RATE_LIMIT_BURST
+        );
+
+        std::fs::write(
+            &path,
+            "benchmark_mode = true\n[ingress]\ncors_allowed_origins = [\"https://demo.example\"]\n",
+        )
+        .expect("write config");
+        let config = NoxConfig::load(path.to_str().expect("utf-8 path")).expect("load");
+        assert_eq!(
+            config.ingress.cors_allowed_origins,
+            vec!["https://demo.example".to_string()]
+        );
+        assert_eq!(
+            config.ingress.rate_limit_per_sec,
+            DEFAULT_INGRESS_RATE_LIMIT_PER_SEC
+        );
     }
 
     #[test]

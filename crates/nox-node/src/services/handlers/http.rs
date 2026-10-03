@@ -200,7 +200,30 @@ impl HttpHandler {
 
         // DNS-pinned request: preserves TLS/SNI while preventing rebinding.
         let cache_key = (host.to_string(), resolved_ip);
-        let pinned_client = {
+        let cached_client = self.client_cache.lock().get(&cache_key).cloned();
+        let pinned_client = if let Some(client) = cached_client {
+            client
+        } else {
+            let client = match build_pinned_client(
+                host,
+                std::net::SocketAddr::new(resolved_ip, port),
+                Duration::from_secs(self.config.request_timeout_secs),
+            ) {
+                Ok(client) => client,
+                Err(e) => {
+                    warn!(request_id = request_id, error = %e, "Pinned HTTP client build failed");
+                    self.metrics
+                        .http_proxy_requests_total
+                        .get_or_create(&vec![("result".into(), "error".into())])
+                        .inc();
+                    return self.pack_error_response(
+                        request_id,
+                        500,
+                        "Exit HTTP client unavailable",
+                        surbs,
+                    );
+                }
+            };
             let mut cache = self.client_cache.lock();
             if cache.len() > 256 && !cache.contains_key(&cache_key) {
                 let keys: Vec<_> = cache.keys().take(128).cloned().collect();
@@ -208,22 +231,7 @@ impl HttpHandler {
                     cache.remove(&k);
                 }
             }
-            cache
-                .entry(cache_key)
-                .or_insert_with(|| {
-                    let socket_addr = std::net::SocketAddr::new(resolved_ip, port);
-                    Client::builder()
-                        .user_agent(USER_AGENT)
-                        .timeout(Duration::from_secs(self.config.request_timeout_secs))
-                        .redirect(reqwest::redirect::Policy::none())
-                        .resolve(host, socket_addr)
-                        .pool_max_idle_per_host(4)
-                        .pool_idle_timeout(Duration::from_secs(90))
-                        .tcp_keepalive(Duration::from_secs(30))
-                        .build()
-                        .unwrap_or_else(|_| Client::new())
-                })
-                .clone()
+            cache.entry(cache_key).or_insert(client).clone()
         };
 
         let req_method = method
@@ -687,6 +695,25 @@ impl ServiceHandler for HttpHandler {
     }
 }
 
+/// Client for one validated host: connects only to `pinned_addr`, never follows
+/// redirects and ignores proxy environment variables.
+fn build_pinned_client(
+    host: &str,
+    pinned_addr: std::net::SocketAddr,
+    timeout: Duration,
+) -> Result<Client, reqwest::Error> {
+    Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .resolve(host, pinned_addr)
+        .pool_max_idle_per_host(4)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_keepalive(Duration::from_secs(30))
+        .build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,5 +732,62 @@ mod tests {
 
         assert_eq!(decoded.status, 200);
         assert_eq!(decoded.body, b"Hello World");
+    }
+
+    async fn serve(router: axum::Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn pinned_client_returns_redirects_instead_of_following_them() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        let target = serve(axum::Router::new().route(
+            "/",
+            axum::routing::any(move || {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    "reached"
+                }
+            }),
+        ))
+        .await;
+        let location = format!("http://{target}/");
+        let redirector = serve(axum::Router::new().route(
+            "/",
+            axum::routing::any(move || {
+                let location = location.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::TEMPORARY_REDIRECT,
+                        [(axum::http::header::LOCATION, location)],
+                    )
+                }
+            }),
+        ))
+        .await;
+
+        let host = "exit-test.invalid";
+        let client =
+            build_pinned_client(host, redirector, Duration::from_secs(5)).expect("pinned client");
+        let response = client
+            .post(format!("http://{host}:{}/", redirector.port()))
+            .body("payload")
+            .send()
+            .await
+            .expect("request reaches the pinned address");
+
+        assert_eq!(response.status().as_u16(), 307);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 }

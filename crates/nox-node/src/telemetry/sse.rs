@@ -1,4 +1,7 @@
-//! SSE streaming endpoint (`GET /events`). Privacy-safe: no raw packet data or IDs.
+//! SSE streaming endpoint (`GET /events`). Privacy-safe: no raw packet data or IDs,
+//! and no per-packet events. Packet volumes and latency are only published as
+//! aggregates on `/metrics` and `/metrics/json`; a per-packet event would give any
+//! subscriber each packet's departure time and mixing delay.
 
 use axum::extract::Extension;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -33,10 +36,6 @@ enum SsePayload {
     },
     TopologyRemove {
         address: String,
-        node_id: String,
-    },
-    PacketProcessed {
-        duration_ms: u64,
         node_id: String,
     },
 }
@@ -85,14 +84,8 @@ fn to_sse(nox: &NoxEvent, node_id: &str) -> Option<Event> {
                 node_id: node_id.to_string(),
             },
         ),
-        NoxEvent::PacketProcessed { duration_ms, .. } => (
-            "packet_processed",
-            SsePayload::PacketProcessed {
-                duration_ms: *duration_ms,
-                node_id: node_id.to_string(),
-            },
-        ),
-        NoxEvent::PacketReceived { .. }
+        NoxEvent::PacketProcessed { .. }
+        | NoxEvent::PacketReceived { .. }
         | NoxEvent::SendPacket { .. }
         | NoxEvent::PayloadDecrypted { .. }
         | NoxEvent::HopTimingsRecorded { .. }
@@ -139,4 +132,36 @@ pub async fn handle_sse_events(
             .interval(Duration::from_secs(30))
             .text("ping"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn per_packet_events_are_not_streamed() {
+        let processed = NoxEvent::PacketProcessed {
+            packet_id: "pkt-1".to_string(),
+            duration_ms: 412,
+        };
+        assert!(to_sse(&processed, "node").is_none());
+
+        let received = NoxEvent::PacketReceived {
+            packet_id: "pkt-1".to_string(),
+            data: vec![0; 4],
+            size_bytes: 4,
+        };
+        assert!(to_sse(&received, "node").is_none());
+    }
+
+    #[test]
+    fn topology_and_peer_events_are_still_streamed() {
+        let connected = NoxEvent::PeerConnected {
+            peer_id: "peer".to_string(),
+        };
+        assert!(to_sse(&connected, "node").is_some());
+
+        let started = NoxEvent::NodeStarted { timestamp: 1 };
+        assert!(to_sse(&started, "node").is_some());
+    }
 }
