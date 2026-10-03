@@ -5,6 +5,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+## [0.4.0-rc.3] - 2026-10-03
+
+### Upgrade notes
+
+- Upgrade one node at a time; rc.2 and rc.3 nodes interoperate. Format 1 replies (all current clients) work unchanged, and clients only use format 2 when every hop on the route advertises `surb_v2`.
+
 ### Changes
 
 - SURB reply format 2. `Surb::new_v2` marks every hop of a return path with a flag covered by the header MAC.
