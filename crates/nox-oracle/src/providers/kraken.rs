@@ -6,6 +6,8 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 
+pub const DEFAULT_BASE_URL: &str = "https://api.kraken.com";
+
 /// Kraken public REST API price provider.
 /// No API key required. Works from US-based IPs.
 pub struct KrakenProvider {
@@ -22,18 +24,21 @@ impl Default for KrakenProvider {
 impl KrakenProvider {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            client: Client::new(),
-            base_url: "https://api.kraken.com".to_string(),
-        }
+        Self::with_client(
+            crate::http::default_provider_client(),
+            DEFAULT_BASE_URL.to_string(),
+        )
     }
 
     #[must_use]
     pub fn with_base_url(base_url: String) -> Self {
-        Self {
-            client: Client::new(),
-            base_url,
-        }
+        Self::with_client(crate::http::default_provider_client(), base_url)
+    }
+
+    /// Uses a caller-supplied client (see [`crate::http::provider_client`]).
+    #[must_use]
+    pub fn with_client(client: Client, base_url: String) -> Self {
+        Self { client, base_url }
     }
 
     fn asset_to_pair(asset: &str) -> Option<&'static str> {

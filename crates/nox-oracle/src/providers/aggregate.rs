@@ -6,14 +6,76 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+/// Minimum number of independent providers that must agree on an asset before its price
+/// is published. One source alone cannot be checked for outliers.
+pub const DEFAULT_MIN_SOURCES: usize = 2;
+
 pub struct AggregateProvider {
     providers: Vec<Arc<dyn PriceProvider>>,
+    min_sources: usize,
 }
 
 impl AggregateProvider {
+    /// Aggregates `providers` and requires [`DEFAULT_MIN_SOURCES`] agreeing sources per asset.
     #[must_use]
     pub fn new(providers: Vec<Arc<dyn PriceProvider>>) -> Self {
-        Self { providers }
+        Self {
+            providers,
+            min_sources: DEFAULT_MIN_SOURCES,
+        }
+    }
+
+    /// Overrides the per-asset source quorum. Values below 1 are treated as 1.
+    #[must_use]
+    pub fn with_min_sources(mut self, min_sources: usize) -> Self {
+        self.min_sources = min_sources.max(1);
+        self
+    }
+
+    #[must_use]
+    pub fn min_sources(&self) -> usize {
+        self.min_sources
+    }
+
+    #[must_use]
+    pub fn provider_count(&self) -> usize {
+        self.providers.len()
+    }
+
+    /// Queries every provider concurrently, so one slow upstream cannot delay the others.
+    async fn fetch_all(&self, assets: &[String]) -> Vec<(String, HashMap<String, PriceE8>)> {
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, provider) in self.providers.iter().enumerate() {
+            let provider = Arc::clone(provider);
+            let assets = assets.to_vec();
+            tasks.spawn(async move {
+                let result = provider.get_prices(&assets).await;
+                (index, provider.id(), result)
+            });
+        }
+        let mut results = Vec::with_capacity(self.providers.len());
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok((index, id, Ok(prices))) if !prices.is_empty() => {
+                    info!("Fetched prices from provider: {id}");
+                    results.push((index, id.to_string(), prices));
+                }
+                Ok((_, id, Ok(_))) => {
+                    warn!("Provider {id} returned empty prices");
+                }
+                Ok((_, id, Err(error))) => {
+                    warn!("Provider {id} failed: {error}");
+                }
+                Err(error) => {
+                    warn!("Provider task failed: {error}");
+                }
+            }
+        }
+        results.sort_by_key(|(index, _, _)| *index);
+        results
+            .into_iter()
+            .map(|(_, id, prices)| (id, prices))
+            .collect()
     }
 }
 
@@ -23,38 +85,25 @@ impl PriceProvider for AggregateProvider {
         "aggregate"
     }
 
-    /// Queries all providers, takes median per asset, rejects >50% outliers.
+    /// Queries all providers, takes the median per asset and rejects >50% outliers.
+    /// An asset is published only when at least `min_sources` providers agree on it.
     async fn get_prices(
         &self,
         assets: &[String],
     ) -> Result<HashMap<String, PriceE8>, ProviderError> {
-        let mut all_results: Vec<(String, HashMap<String, PriceE8>)> = Vec::new();
-
-        for provider in &self.providers {
-            match provider.get_prices(assets).await {
-                Ok(prices) if !prices.is_empty() => {
-                    info!("Fetched prices from provider: {}", provider.id());
-                    all_results.push((provider.id().to_string(), prices));
-                }
-                Ok(_) => {
-                    warn!("Provider {} returned empty prices", provider.id());
-                }
-                Err(e) => {
-                    warn!("Provider {} failed: {}", provider.id(), e);
-                }
-            }
-        }
+        let all_results = self.fetch_all(assets).await;
 
         if all_results.is_empty() {
             return Err(ProviderError::Other("All providers failed".to_string()));
         }
-
-        if all_results.len() == 1 {
-            return all_results
-                .into_iter()
-                .next()
-                .map(|(_, prices)| prices)
-                .ok_or_else(|| ProviderError::Other("No provider results".to_string()));
+        if all_results.len() < self.min_sources {
+            let healthy: Vec<&str> = all_results.iter().map(|(id, _)| id.as_str()).collect();
+            return Err(ProviderError::Other(format!(
+                "Insufficient price sources: {} healthy ({}), {} required",
+                all_results.len(),
+                healthy.join(","),
+                self.min_sources
+            )));
         }
 
         let mut aggregated: HashMap<String, PriceE8> = HashMap::new();
@@ -65,7 +114,14 @@ impl PriceProvider for AggregateProvider {
                 .filter_map(|(_, prices)| prices.get(asset).copied())
                 .collect();
 
-            if quotes.is_empty() {
+            if quotes.len() < self.min_sources {
+                if !quotes.is_empty() {
+                    warn!(
+                        "Only {} source(s) priced {asset}; {} required",
+                        quotes.len(),
+                        self.min_sources
+                    );
+                }
                 continue;
             }
 
@@ -98,7 +154,7 @@ impl PriceProvider for AggregateProvider {
                 .copied()
                 .collect();
 
-            if filtered.is_empty() {
+            if filtered.is_empty() || filtered.len() < self.min_sources {
                 warn!("No acceptable price quorum for {asset}");
             } else if filtered.len().is_multiple_of(2) {
                 let mid = filtered.len() / 2;
@@ -106,6 +162,13 @@ impl PriceProvider for AggregateProvider {
             } else {
                 aggregated.insert(asset.clone(), filtered[filtered.len() / 2]);
             }
+        }
+
+        if aggregated.is_empty() {
+            return Err(ProviderError::Other(format!(
+                "No asset reached a {}-source price quorum",
+                self.min_sources
+            )));
         }
 
         info!(
@@ -200,7 +263,7 @@ mod tests {
         p2_prices.insert("A".to_string(), PriceE8::parse_decimal("200").unwrap());
         let p2 = Arc::new(MockProvider::new("p2", false, p2_prices)); // Succeeds
 
-        let agg = AggregateProvider::new(vec![p1.clone(), p2.clone()]);
+        let agg = AggregateProvider::new(vec![p1.clone(), p2.clone()]).with_min_sources(1);
 
         let prices = agg.get_prices(&["A".to_string()]).await.unwrap();
 
@@ -286,7 +349,7 @@ mod tests {
     async fn test_single_provider_returns_directly() {
         let p1 = mock_with_prices("p1", &[("ETH", 42.0), ("BTC", 99.0)]);
 
-        let agg = AggregateProvider::new(vec![p1]);
+        let agg = AggregateProvider::new(vec![p1]).with_min_sources(1);
         let prices = agg
             .get_prices(&["ETH".to_string(), "BTC".to_string()])
             .await
@@ -367,5 +430,76 @@ mod tests {
 
         assert!(!prices.contains_key("fee"));
         assert_eq!(prices["native"].get(), 10_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn single_healthy_source_is_not_published_by_default() {
+        let failing = Arc::new(MockProvider::new("down", true, HashMap::new()));
+        let healthy = mock_with_prices("up", &[("ETH", 2500.0)]);
+
+        let agg = AggregateProvider::new(vec![failing, healthy]);
+        assert_eq!(agg.min_sources(), DEFAULT_MIN_SOURCES);
+        let error = agg.get_prices(&["ETH".to_string()]).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("Insufficient price sources"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn asset_priced_by_one_source_is_omitted() {
+        let p1 = mock_with_prices("p1", &[("ETH", 100.0), ("BTC", 50000.0)]);
+        let p2 = mock_with_prices("p2", &[("ETH", 102.0)]);
+
+        let agg = AggregateProvider::new(vec![p1, p2]);
+        let prices = agg
+            .get_prices(&["ETH".to_string(), "BTC".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(prices["ETH"].get(), 10_100_000_000);
+        assert!(!prices.contains_key("BTC"));
+    }
+
+    #[tokio::test]
+    async fn quorum_counts_sources_left_after_outlier_rejection() {
+        let p1 = mock_with_prices("p1", &[("ETH", 100.0), ("BTC", 50000.0)]);
+        let p2 = mock_with_prices("p2", &[("ETH", 1000.0), ("BTC", 50100.0)]);
+        let p3 = mock_with_prices("p3", &[("ETH", 5000.0), ("BTC", 49900.0)]);
+
+        let agg = AggregateProvider::new(vec![p1, p2, p3]);
+        let prices = agg
+            .get_prices(&["ETH".to_string(), "BTC".to_string()])
+            .await
+            .unwrap();
+
+        assert!(!prices.contains_key("ETH"));
+        assert_eq!(prices["BTC"].get(), 5_000_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn no_asset_reaching_quorum_is_an_error() {
+        let p1 = mock_with_prices("p1", &[("ETH", 100.0)]);
+        let p2 = mock_with_prices("p2", &[("BTC", 50000.0)]);
+
+        let agg = AggregateProvider::new(vec![p1, p2]);
+        let error = agg
+            .get_prices(&["ETH".to_string(), "BTC".to_string()])
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("quorum"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn min_sources_below_one_is_clamped() {
+        let p1 = mock_with_prices("p1", &[("ETH", 42.0)]);
+        let agg = AggregateProvider::new(vec![p1]).with_min_sources(0);
+        assert_eq!(agg.min_sources(), 1);
+        assert_eq!(agg.provider_count(), 1);
     }
 }
