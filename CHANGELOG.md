@@ -53,14 +53,13 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   chain position.
 - Loop cover returns to the sending node; `nox_cover_loop_{sent,returned,lost}_total` and
   `nox_cover_loop_rtt_seconds` report per-path delivery.
-- Exit payloads are dispatched through four bounded lanes (`[exit_workers]`: paid, quote, proxy, control)
-  instead of one at a time, so a slow proxied request no longer delays paid quotes and submissions.
-  Dropped payloads and bus lag are counted per lane and subscriber.
+- Exit payloads are dispatched through four bounded per-type lanes (`[exit_workers]`: paid, quote, proxy,
+  control). Dropped payloads and bus lag are counted per lane and subscriber.
 - A transaction sent from the exit wallet outside the node no longer pauses paid submission: the node
   re-reads the chain nonce before signing, classifies "nonce too low" and "replacement transaction
   underpriced", retires an outbox record whose nonce was mined by another transaction and releases its quote.
-- Paid quotes are refused while submission is paused, and checked against the reservation limits before any
-  RPC or oracle work; expired reservations are released on demand.
+- Paid quotes are refused while submission is paused. Quote admission checks reservation limits earlier, and
+  expired reservations are released on demand.
 - New metrics: `nox_paid_outcomes_total{kind,result,code}`, `nox_eth_submission_blocked`,
   `nox_eth_wallet_balance_gwei`, `nox_eth_wallet_balance_low`, `nox_quote_outstanding`,
   `nox_quote_pending_sponsored_gas`, `nox_quote_rolling_loss_gwei`, `nox_storage_degraded`,

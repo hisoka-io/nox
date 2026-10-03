@@ -227,9 +227,9 @@ client_ip_header = ""
 # cors_allowed_origins = ["https://demo.example.org"]
 cors_allowed_origins = []
 
-# Exit dispatch lanes: each has its own queue and concurrency limit, so slow proxy
-# requests cannot delay paid quotes and submissions. Payloads beyond queue_capacity
-# are dropped and counted in nox_exit_payloads_dropped_total.
+# Exit dispatch lanes: each payload type has its own queue and concurrency limit.
+# Payloads beyond queue_capacity are dropped and counted in
+# nox_exit_payloads_dropped_total.
 [exit_workers]
 paid_concurrency = 4
 quote_concurrency = 8

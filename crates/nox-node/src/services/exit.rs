@@ -420,35 +420,16 @@ impl ExitService {
         publisher: Arc<dyn IEventPublisher>,
     ) -> StashRemainingFn {
         Arc::new(move |request_id, state| {
-            // Held for the whole stash so a concurrent `ReplenishSurbs` either lands in the
-            // accumulator before this check or finds the pending state after it.
-            let mut accumulator = accumulator.lock();
-            let pre_surbs = accumulator.remove(&request_id);
-            if let Some(surbs) = pre_surbs {
-                if !surbs.is_empty() {
-                    match packer.pack_continuation(request_id, &state, surbs) {
-                        Ok(result) => {
-                            for packed in &result.packets {
-                                let _ = publisher.publish(NoxEvent::SendPacket {
-                                    packet_id: format!(
-                                        "preemptive-{}-{}",
-                                        request_id,
-                                        hex::encode(packed.surb_id)
-                                    ),
-                                    next_hop_peer_id: packed.first_hop.clone(),
-                                    data: packed.packet_bytes.clone(),
-                                });
-                            }
-                            if let Some(remaining) = result.remaining {
-                                pending.lock().insert(request_id, remaining);
-                            }
-                            return;
-                        }
-                        Err(_e) => {}
-                    }
-                }
-            }
-            pending.lock().insert(request_id, state);
+            continue_or_stash(
+                &pending,
+                &accumulator,
+                &packer,
+                publisher.as_ref(),
+                request_id,
+                state,
+                Vec::new(),
+                "preemptive",
+            );
         })
     }
 
@@ -628,25 +609,7 @@ impl ExitService {
     }
 
     fn prune_stale_replenishments(&self) {
-        let mut pending = self.pending_replenishments.lock();
-        if pending.len() > 100 {
-            let excess = pending.len() - 50;
-            let keys: Vec<u64> = pending.keys().take(excess).copied().collect();
-            for k in keys {
-                pending.remove(&k);
-            }
-            debug!(pruned = excess, "Pruned stale pending replenishments");
-        }
-
-        let mut acc = self.surb_accumulator.lock();
-        if acc.len() > 100 {
-            let excess = acc.len() - 50;
-            let keys: Vec<u64> = acc.keys().take(excess).copied().collect();
-            for k in keys {
-                acc.remove(&k);
-            }
-            debug!(pruned = excess, "Pruned stale SURB accumulator entries");
-        }
+        prune_replenishment_maps(&self.pending_replenishments, &self.surb_accumulator);
     }
 
     /// Decodes a decrypted payload and completes fragment reassembly. Returns the command to
@@ -1103,14 +1066,15 @@ impl ExitService {
                         }
                     }
                     Ok(ServiceRequest::ReplenishSurbs { request_id, surbs }) => {
-                        // Same lock order as the stash closure: accumulator, then pending.
-                        let (stashed, surbs) = {
+                        // Lock order everywhere: accumulator, then pending. Neither lock is
+                        // held while packing.
+                        let stashed = {
                             let mut acc = self.surb_accumulator.lock();
                             let stashed = self.pending_replenishments.lock().remove(&request_id);
-                            if stashed.is_some() {
+                            if let Some(state) = stashed {
                                 let mut all_surbs = acc.remove(&request_id).unwrap_or_default();
                                 all_surbs.extend(surbs);
-                                (stashed, all_surbs)
+                                Some((state, all_surbs))
                             } else {
                                 let count = surbs.len();
                                 acc.entry(request_id).or_default().extend(surbs);
@@ -1120,12 +1084,10 @@ impl ExitService {
                                     accumulated_surbs = count,
                                     "Pre-emptive ReplenishSurbs -- accumulated for future use"
                                 );
-                                (None, Vec::new())
+                                None
                             }
                         };
-                        if let Some(pending_state) = stashed {
-                            let all_surbs = surbs;
-
+                        if let Some((pending_state, all_surbs)) = stashed {
                             debug!(
                                 packet_id = %packet_id,
                                 request_id = request_id,
@@ -1135,45 +1097,16 @@ impl ExitService {
                                 original_total = pending_state.continuation.original_total_fragments,
                                 "Resuming partial response delivery with fresh SURBs (continuation)"
                             );
-                            match self.response_packer.pack_continuation(
+                            continue_or_stash(
+                                &self.pending_replenishments,
+                                &self.surb_accumulator,
+                                &self.response_packer,
+                                self.publisher.as_ref(),
                                 request_id,
-                                &pending_state,
+                                pending_state,
                                 all_surbs,
-                            ) {
-                                Ok(result) => {
-                                    for packed in &result.packets {
-                                        let _ = self.publisher.publish(NoxEvent::SendPacket {
-                                            packet_id: format!(
-                                                "replenish-{}-{}",
-                                                request_id,
-                                                hex::encode(packed.surb_id)
-                                            ),
-                                            next_hop_peer_id: packed.first_hop.clone(),
-                                            data: packed.packet_bytes.clone(),
-                                        });
-                                    }
-                                    if let Some(remaining) = result.remaining {
-                                        debug!(
-                                            request_id = request_id,
-                                            remaining_bytes = remaining.remaining_data.len(),
-                                            seq_offset =
-                                                remaining.continuation.fragments_already_sent,
-                                            "Replenishment partial -- re-stashing for next round"
-                                        );
-                                        self.pending_replenishments
-                                            .lock()
-                                            .insert(request_id, remaining);
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        packet_id = %packet_id,
-                                        request_id = request_id,
-                                        error = %e,
-                                        "Replenishment pack_continuation failed"
-                                    );
-                                }
-                            }
+                                "replenish",
+                            );
                         }
                     }
                     Err(e) => {
@@ -1209,6 +1142,91 @@ impl ExitService {
                 );
             }
         }
+    }
+}
+
+/// Sends as much of a pending response as the given and accumulated SURBs allow, then
+/// stashes what is left. Locks are taken in the order accumulator, then pending, and are not
+/// held while packing. SURBs that arrive while packing are picked up before stashing.
+#[allow(clippy::too_many_arguments)]
+fn continue_or_stash(
+    pending: &PendingReplenishments,
+    accumulator: &SurbAccumulator,
+    packer: &ResponsePacker,
+    publisher: &dyn IEventPublisher,
+    request_id: u64,
+    mut state: PendingResponseState,
+    mut surbs: Vec<Surb>,
+    label: &str,
+) {
+    loop {
+        if !surbs.is_empty() {
+            match packer.pack_continuation(request_id, &state, std::mem::take(&mut surbs)) {
+                Ok(result) => {
+                    for packed in &result.packets {
+                        let _ = publisher.publish(NoxEvent::SendPacket {
+                            packet_id: format!(
+                                "{label}-{request_id}-{}",
+                                hex::encode(packed.surb_id)
+                            ),
+                            next_hop_peer_id: packed.first_hop.clone(),
+                            data: packed.packet_bytes.clone(),
+                        });
+                    }
+                    match result.remaining {
+                        Some(remaining) => {
+                            debug!(
+                                request_id = request_id,
+                                remaining_bytes = remaining.remaining_data.len(),
+                                seq_offset = remaining.continuation.fragments_already_sent,
+                                "Partial response delivery -- stashing for next round"
+                            );
+                            state = remaining;
+                        }
+                        None => return,
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        request_id = request_id,
+                        error = %e,
+                        "Response continuation packing failed"
+                    );
+                }
+            }
+        }
+        let mut acc = accumulator.lock();
+        match acc.remove(&request_id) {
+            Some(more) if !more.is_empty() => surbs = more,
+            _ => {
+                pending.lock().insert(request_id, state);
+                return;
+            }
+        }
+    }
+}
+
+/// Caps both replenishment maps. The two locks are never held together.
+fn prune_replenishment_maps(pending: &PendingReplenishments, accumulator: &SurbAccumulator) {
+    {
+        let mut pending = pending.lock();
+        if pending.len() > 100 {
+            let excess = pending.len() - 50;
+            let keys: Vec<u64> = pending.keys().take(excess).copied().collect();
+            for k in keys {
+                pending.remove(&k);
+            }
+            debug!(pruned = excess, "Pruned stale pending replenishments");
+        }
+    }
+    let mut acc = accumulator.lock();
+    if acc.len() > 100 {
+        let excess = acc.len() - 50;
+        let keys: Vec<u64> = acc.keys().take(excess).copied().collect();
+        for k in keys {
+            acc.remove(&k);
+        }
+        debug!(pruned = excess, "Pruned stale SURB accumulator entries");
     }
 }
 
@@ -1379,6 +1397,83 @@ mod tests {
                 }),
                 ExitDispatch::Inline
             );
+        }
+    }
+
+    fn pending_state() -> PendingResponseState {
+        PendingResponseState {
+            remaining_data: vec![1; 64],
+            continuation: crate::services::response_packer::ContinuationState {
+                original_total_fragments: 2,
+                fragments_already_sent: 1,
+                original_data_len: 128,
+            },
+        }
+    }
+
+    #[test]
+    fn stash_without_surbs_keeps_the_pending_state() {
+        let pending = ExitService::new_pending_map();
+        let accumulator = ExitService::new_surb_accumulator();
+        accumulator.lock().insert(7, Vec::new());
+        let stash = ExitService::make_stash_closure(
+            pending.clone(),
+            accumulator.clone(),
+            Arc::new(ResponsePacker::new()),
+            nox_core::NoopPublisher::arc(),
+        );
+        stash(7, pending_state());
+        assert!(pending.lock().contains_key(&7));
+        assert!(!accumulator.lock().contains_key(&7));
+    }
+
+    #[test]
+    fn stash_and_prune_run_concurrently_without_blocking() {
+        let pending = ExitService::new_pending_map();
+        let accumulator = ExitService::new_surb_accumulator();
+        let stash = ExitService::make_stash_closure(
+            pending.clone(),
+            accumulator.clone(),
+            Arc::new(ResponsePacker::new()),
+            nox_core::NoopPublisher::arc(),
+        );
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let rounds = 20_000u64;
+
+        let mut threads = Vec::new();
+        for worker in 0..2u64 {
+            let stash = stash.clone();
+            let accumulator = accumulator.clone();
+            let done_tx = done_tx.clone();
+            threads.push(std::thread::spawn(move || {
+                for i in 0..rounds {
+                    let id = worker * rounds + i;
+                    accumulator.lock().insert(id + 1_000_000, Vec::new());
+                    stash(id, pending_state());
+                }
+                let _ = done_tx.send(());
+            }));
+        }
+        {
+            let pending = pending.clone();
+            let accumulator = accumulator.clone();
+            let done_tx = done_tx.clone();
+            threads.push(std::thread::spawn(move || {
+                for _ in 0..rounds {
+                    prune_replenishment_maps(&pending, &accumulator);
+                }
+                let _ = done_tx.send(());
+            }));
+        }
+        drop(done_tx);
+
+        for _ in 0..threads.len() {
+            done_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("stash and prune must not block each other");
+        }
+        for thread in threads {
+            thread.join().expect("worker thread panicked");
         }
     }
 }
