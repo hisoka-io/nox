@@ -1197,3 +1197,228 @@ async fn prepared_nonce_too_low_receipt_is_terminal_and_pruned() {
     assert_eq!(quote_counter(&repository, b"quote:outstanding").await, 0);
     assert_eq!(quote_counter(&repository, b"quote:pending-gas").await, 0);
 }
+
+fn small_plan() -> TransactionPlan {
+    TransactionPlan {
+        gas_limit: U256::from(21_000),
+        initial_fee_per_gas: U256::from(2_000_000_000_u64),
+        maximum_fee_per_gas: U256::from(3_000_000_000_u64),
+        chain_data_fee_native: U256::zero(),
+    }
+}
+
+/// Signs and mines a transaction from the exit wallet outside the transaction manager, the
+/// way an operator claim with the exit key does.
+async fn external_wallet_transaction(executor: &ChainExecutor, nonce: u64) {
+    let raw = executor
+        .sign_legacy_transaction(
+            Address::from_low_u64_be(99),
+            Bytes::new(),
+            U256::from(nonce),
+            U256::from(21_000),
+            U256::from(2_000_000_000_u64),
+        )
+        .await
+        .unwrap();
+    let hash = executor.broadcast_raw_signed_tx(&raw).await.unwrap();
+    wait_for_receipt(executor, hash).await;
+}
+
+async fn stored_v2(repository: &SledRepository, nonce: u64) -> PendingTransactionV2 {
+    let key = format!("tx:{nonce}");
+    let bytes = nox_core::IStorageRepository::get(repository, key.as_bytes())
+        .await
+        .unwrap()
+        .unwrap();
+    let DecodedTransaction::V2(record) = decode_stored_transaction(&bytes).unwrap() else {
+        panic!("record must use schema 2");
+    };
+    record
+}
+
+#[tokio::test]
+async fn external_wallet_transaction_does_not_wedge_next_submission() {
+    let (_anvil, executor) = anvil_executor().await;
+    let directory = tempfile::tempdir().unwrap();
+    let repository = Arc::new(SledRepository::new(directory.path()).unwrap());
+    let metrics = MetricsService::new();
+    let manager = TransactionManager::new(
+        executor.clone(),
+        repository.clone(),
+        metrics.clone(),
+        nox_node::config::DEFAULT_REPLACEMENT_STEP_BPS,
+    )
+    .await
+    .unwrap();
+
+    external_wallet_transaction(executor.as_ref(), 0).await;
+
+    let submitted = manager
+        .submit_planned(
+            [5; 32],
+            Address::from_low_u64_be(0x1234),
+            Bytes::new(),
+            small_plan(),
+        )
+        .await
+        .unwrap();
+    let receipt = wait_for_receipt(executor.as_ref(), submitted.transaction_hash).await;
+    assert_eq!(receipt.status, Some(1_u64.into()));
+    assert_eq!(
+        stored_v2(&repository, 1).await.status,
+        TxStatusV2::Submitted
+    );
+    assert!(!manager.is_submission_blocked());
+    assert_eq!(metrics.eth_submission_blocked.get(), 0);
+}
+
+#[tokio::test]
+async fn prepared_transaction_superseded_by_external_nonce_is_retired() {
+    let (_anvil, executor) = anvil_executor().await;
+    let prepared = signed_record(executor.as_ref(), TxStatusV2::Prepared).await;
+    external_wallet_transaction(executor.as_ref(), prepared.nonce).await;
+
+    let directory = tempfile::tempdir().unwrap();
+    let repository = Arc::new(SledRepository::new(directory.path()).unwrap());
+    let quote = quote_record(prepared.execution_id);
+    repository
+        .create_quote_durably(&quote, 1, 100_000, U256::from(1), 3_600, 1)
+        .await
+        .unwrap();
+    repository
+        .take_quote_durably(quote.execution_id, 2)
+        .await
+        .unwrap();
+    repository
+        .create_outbox_durably(prepared.execution_id, &prepared, 1)
+        .await
+        .unwrap();
+
+    let metrics = MetricsService::new();
+    let manager = TransactionManager::new(
+        executor.clone(),
+        repository.clone(),
+        metrics.clone(),
+        nox_node::config::DEFAULT_REPLACEMENT_STEP_BPS,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(stored_v2(&repository, 0).await.status, TxStatusV2::Failed);
+    assert_eq!(
+        repository
+            .load_quote(quote.execution_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        QuoteStatusV2::Rejected,
+    );
+    assert_eq!(quote_counter(&repository, b"quote:outstanding").await, 0);
+    assert_eq!(quote_counter(&repository, b"quote:pending-gas").await, 0);
+    assert!(!manager.is_submission_blocked());
+    assert_eq!(metrics.eth_tx_pending.get(), 0);
+    assert_eq!(
+        metrics
+            .eth_tx_outcomes_total
+            .get_or_create(&vec![
+                ("type".to_string(), "paid_v2".to_string()),
+                ("result".to_string(), "superseded".to_string()),
+            ])
+            .get(),
+        1
+    );
+
+    let submitted = manager
+        .submit_planned(
+            [6; 32],
+            Address::from_low_u64_be(0x1234),
+            Bytes::new(),
+            small_plan(),
+        )
+        .await
+        .unwrap();
+    wait_for_receipt(executor.as_ref(), submitted.transaction_hash).await;
+    assert_eq!(stored_v2(&repository, 1).await.execution_id, [6; 32]);
+}
+
+#[tokio::test]
+async fn nonce_consumed_at_broadcast_releases_quote_and_unblocks() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("eth_getTransactionCount"))
+        .and(body_string_contains("\"pending\""))
+        .respond_with(JsonRpcResult(serde_json::json!("0x0")))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("eth_getTransactionCount"))
+        .and(body_string_contains("\"latest\""))
+        .respond_with(JsonRpcResult(serde_json::json!("0x1")))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("eth_sendRawTransaction"))
+        .respond_with(JsonRpcError("nonce too low: next nonce 1, tx nonce 0"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("eth_getTransactionReceipt"))
+        .respond_with(JsonRpcResult(serde_json::Value::Null))
+        .mount(&server)
+        .await;
+    let mut config = NoxConfig::default();
+    config.eth_rpc_url = server.uri();
+    config.chain_id = 31_337;
+    config.eth_wallet_private_key =
+        "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string();
+    let executor = Arc::new(ChainExecutor::new(&config).await.unwrap());
+    let directory = tempfile::tempdir().unwrap();
+    let repository = Arc::new(SledRepository::new(directory.path()).unwrap());
+    let execution_id = [4; 32];
+    let quote = quote_record(execution_id);
+    repository
+        .create_quote_durably(&quote, 1, 100_000, U256::from(1), 3_600, 1)
+        .await
+        .unwrap();
+    repository
+        .take_quote_durably(execution_id, 2)
+        .await
+        .unwrap();
+    let metrics = MetricsService::new();
+    let manager = TransactionManager::new(
+        executor,
+        repository.clone(),
+        metrics.clone(),
+        nox_node::config::DEFAULT_REPLACEMENT_STEP_BPS,
+    )
+    .await
+    .unwrap();
+
+    let outcome = manager
+        .submit_planned(
+            execution_id,
+            Address::from_low_u64_be(12),
+            Bytes::new(),
+            small_plan(),
+        )
+        .await;
+
+    assert!(
+        matches!(outcome, Err(SubmitError::NonceConsumed { nonce: 0 })),
+        "unexpected outcome: {outcome:?}"
+    );
+    assert_eq!(stored_v2(&repository, 0).await.status, TxStatusV2::Failed);
+    assert_eq!(
+        repository
+            .load_quote(execution_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        QuoteStatusV2::Rejected,
+    );
+    assert_eq!(quote_counter(&repository, b"quote:outstanding").await, 0);
+    assert!(!manager.is_submission_blocked());
+    assert_eq!(metrics.eth_submission_blocked.get(), 0);
+}

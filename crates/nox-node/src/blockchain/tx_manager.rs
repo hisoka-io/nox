@@ -52,6 +52,21 @@ pub enum SubmitError {
         transaction_hash: H256,
         detail: String,
     },
+    /// The signed nonce was consumed by another transaction from the exit wallet. The outbox
+    /// record is retired and the transaction can never be mined.
+    #[error("transaction nonce {nonce} was consumed by another transaction from the exit wallet")]
+    NonceConsumed { nonce: u64 },
+}
+
+/// How a nonce conflict reported by the RPC was resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NonceConflict {
+    /// One of the stored hashes has a receipt.
+    Terminal(TxStatusV2),
+    /// The chain nonce moved past this transaction and none of its hashes was mined.
+    Superseded,
+    /// Not provable yet (for example, the conflicting transaction is still pending).
+    Unresolved,
 }
 
 pub struct TransactionManager {
@@ -69,6 +84,18 @@ impl TransactionManager {
     pub(crate) fn quote_storage(&self) -> Arc<SledRepository> {
         self.storage.clone()
     }
+
+    /// True while an unresolved outbox transaction pauses new paid submissions.
+    #[must_use]
+    pub fn is_submission_blocked(&self) -> bool {
+        self.submission_blocked.load(Ordering::SeqCst)
+    }
+
+    fn block_submissions(&self) {
+        self.submission_blocked.store(true, Ordering::SeqCst);
+        self.metrics.eth_submission_blocked.set(1);
+    }
+
     pub async fn new(
         executor: Arc<ChainExecutor>,
         storage: Arc<SledRepository>,
@@ -236,18 +263,141 @@ impl TransactionManager {
                         pending.remove(&transaction.nonce);
                         self.metrics.eth_tx_pending.set(pending.len() as i64);
                     } else {
-                        self.submission_blocked.store(true, Ordering::SeqCst);
+                        self.block_submissions();
                         warn!("prepared transaction nonce is consumed but no stored hash is confirmed");
                     }
                 }
                 Err(OutboxBroadcastError::Rejected { .. }) => {
-                    self.submission_blocked.store(true, Ordering::SeqCst);
+                    self.block_submissions();
                     warn!("prepared transaction received a pre-acceptance rejection; nonce remains reserved");
                 }
+                Err(
+                    error @ (OutboxBroadcastError::NonceTooLow
+                    | OutboxBroadcastError::ReplacementUnderpriced),
+                ) => match self.resolve_nonce_conflict(&transaction).await {
+                    NonceConflict::Terminal(status) => {
+                        transaction.status = status;
+                        transaction.last_update_at = unix_now()?;
+                        self.storage.persist_v2_durably(&transaction).await?;
+                        let mut pending = self.pending_txs.lock();
+                        pending.remove(&transaction.nonce);
+                        self.metrics.eth_tx_pending.set(pending.len() as i64);
+                    }
+                    NonceConflict::Superseded => {
+                        self.retire_superseded(transaction).await?;
+                        let mut nonce_guard = self.local_nonce.lock().await;
+                        self.resync_nonce_floor(&mut nonce_guard).await;
+                    }
+                    NonceConflict::Unresolved => {
+                        self.block_submissions();
+                        warn!(
+                            nonce = transaction.nonce,
+                            error = %error,
+                            "prepared transaction nonce is held by another transaction; waiting for it to settle"
+                        );
+                    }
+                },
             }
         }
         self.refresh_submission_block();
         Ok(())
+    }
+
+    /// Decides what a "nonce too low" or "replacement underpriced" answer means for a stored
+    /// transaction. Lookup failures leave the conflict unresolved, so nothing is retired on
+    /// incomplete evidence.
+    async fn resolve_nonce_conflict(&self, transaction: &PendingTransactionV2) -> NonceConflict {
+        match self.reconcile_hashes(transaction).await {
+            Ok(Some(status)) => return NonceConflict::Terminal(status),
+            Ok(None) => {}
+            Err(error) => {
+                warn!(nonce = transaction.nonce, error = %error, "nonce conflict receipt lookup failed");
+                return NonceConflict::Unresolved;
+            }
+        }
+        let confirmed = match self.executor.get_confirmed_nonce().await {
+            Ok(confirmed) => confirmed,
+            Err(error) => {
+                warn!(nonce = transaction.nonce, error = %error, "nonce conflict nonce lookup failed");
+                return NonceConflict::Unresolved;
+            }
+        };
+        if confirmed <= U256::from(transaction.nonce) {
+            return NonceConflict::Unresolved;
+        }
+        // The nonce is mined. Look again in case it was this transaction that just landed.
+        match self.reconcile_hashes(transaction).await {
+            Ok(Some(status)) => NonceConflict::Terminal(status),
+            Ok(None) => NonceConflict::Superseded,
+            Err(error) => {
+                warn!(nonce = transaction.nonce, error = %error, "nonce conflict receipt lookup failed");
+                NonceConflict::Unresolved
+            }
+        }
+    }
+
+    /// Retires a transaction whose nonce was mined by a different transaction from the same
+    /// wallet (for example a claim signed outside the node). It can never be mined, so its
+    /// quote is released without loss and the record leaves the pending set.
+    async fn retire_superseded(
+        &self,
+        mut transaction: PendingTransactionV2,
+    ) -> Result<(), InfrastructureError> {
+        warn!(
+            nonce = transaction.nonce,
+            "exit wallet nonce was used by another transaction; retiring the outbox record"
+        );
+        if let Some(quote) = self.storage.load_quote(transaction.execution_id).await? {
+            if quote.status != QuoteStatusV2::Outstanding {
+                self.storage
+                    .finalize_quote_durably(
+                        transaction.execution_id,
+                        QuoteStatusV2::Rejected,
+                        U256::zero(),
+                        unix_now()?,
+                    )
+                    .await?;
+            }
+        }
+        transaction.status = TxStatusV2::Failed;
+        transaction.last_update_at = unix_now()?;
+        self.storage.persist_v2_durably(&transaction).await?;
+        {
+            let mut pending = self.pending_txs.lock();
+            pending.remove(&transaction.nonce);
+            self.metrics.eth_tx_pending.set(pending.len() as i64);
+        }
+        self.metrics
+            .eth_tx_outcomes_total
+            .get_or_create(&vec![
+                ("type".into(), "paid_v2".into()),
+                ("result".into(), "superseded".into()),
+            ])
+            .inc();
+        Ok(())
+    }
+
+    /// Raises the local nonce to the chain's pending nonce when the wallet signed elsewhere.
+    /// Never lowers it, and keeps the local value when the chain cannot be read.
+    async fn resync_nonce_floor(&self, local_nonce: &mut u64) {
+        let chain_nonce = match self.executor.get_nonce().await {
+            Ok(nonce) if nonce <= U256::from(u64::MAX) => nonce.low_u64(),
+            Ok(_) => {
+                warn!("chain nonce exceeds u64; keeping local nonce");
+                return;
+            }
+            Err(error) => {
+                warn!(error = %error, "chain nonce lookup failed; keeping local nonce");
+                return;
+            }
+        };
+        if chain_nonce > *local_nonce {
+            warn!(
+                local_nonce = *local_nonce,
+                chain_nonce, "exit wallet nonce advanced outside the node; resynchronising"
+            );
+            *local_nonce = chain_nonce;
+        }
     }
 
     pub async fn submit_planned(
@@ -282,6 +432,7 @@ impl TransactionManager {
                 detail: "submission blocked by unresolved prepared transaction".to_string(),
             });
         }
+        self.resync_nonce_floor(&mut nonce_guard).await;
         let nonce = *nonce_guard;
         let raw_signed_tx = self
             .executor
@@ -346,7 +497,7 @@ impl TransactionManager {
         {
             Ok(hash) if hash == transaction_hash => hash,
             Ok(_) => {
-                self.submission_blocked.store(true, Ordering::SeqCst);
+                self.block_submissions();
                 return Err(SubmitError::AmbiguousBroadcast {
                     transaction_hash,
                     detail: "RPC returned a different transaction hash".to_string(),
@@ -354,10 +505,32 @@ impl TransactionManager {
             }
             Err(OutboxBroadcastError::AlreadyKnown) => transaction_hash,
             Err(
+                error @ (OutboxBroadcastError::NonceTooLow
+                | OutboxBroadcastError::ReplacementUnderpriced),
+            ) => {
+                if self.resolve_nonce_conflict(&record).await == NonceConflict::Superseded {
+                    if let Err(retire_error) = self.retire_superseded(record).await {
+                        self.block_submissions();
+                        return Err(SubmitError::AmbiguousBroadcast {
+                            transaction_hash,
+                            detail: retire_error.to_string(),
+                        });
+                    }
+                    self.resync_nonce_floor(&mut nonce_guard).await;
+                    self.refresh_submission_block();
+                    return Err(SubmitError::NonceConsumed { nonce });
+                }
+                self.block_submissions();
+                return Err(SubmitError::AmbiguousBroadcast {
+                    transaction_hash,
+                    detail: error.to_string(),
+                });
+            }
+            Err(
                 error @ (OutboxBroadcastError::Rejected { .. }
                 | OutboxBroadcastError::Uncertain { .. }),
             ) => {
-                self.submission_blocked.store(true, Ordering::SeqCst);
+                self.block_submissions();
                 return Err(SubmitError::AmbiguousBroadcast {
                     transaction_hash,
                     detail: error.to_string(),
@@ -370,7 +543,7 @@ impl TransactionManager {
             submitted.last_update_at = match unix_now() {
                 Ok(timestamp) => timestamp,
                 Err(error) => {
-                    self.submission_blocked.store(true, Ordering::SeqCst);
+                    self.block_submissions();
                     return Err(SubmitError::AmbiguousBroadcast {
                         transaction_hash,
                         detail: error.to_string(),
@@ -378,7 +551,7 @@ impl TransactionManager {
                 }
             };
             if let Err(error) = self.storage.persist_v2_durably(&submitted).await {
-                self.submission_blocked.store(true, Ordering::SeqCst);
+                self.block_submissions();
                 return Err(SubmitError::AmbiguousBroadcast {
                     transaction_hash,
                     detail: error.to_string(),
@@ -407,6 +580,34 @@ impl TransactionManager {
             if let Err(error) = self.monitor_once().await {
                 error!("transaction monitor failed: {error}");
             }
+            self.refresh_gauges().await;
+        }
+    }
+
+    /// Exports wallet balance and quote reservations. Failures only log.
+    async fn refresh_gauges(&self) {
+        match self.executor.check_gas_health().await {
+            Ok((balance, low)) => {
+                self.metrics
+                    .eth_wallet_balance_gwei
+                    .set(gwei_gauge(balance));
+                self.metrics.eth_wallet_balance_low.set(i64::from(low));
+            }
+            Err(error) => warn!(error = %error, "wallet balance lookup failed"),
+        }
+        match self.storage.quote_counters().await {
+            Ok(counters) => {
+                self.metrics
+                    .quote_outstanding
+                    .set(i64::try_from(counters.outstanding).unwrap_or(i64::MAX));
+                self.metrics
+                    .quote_pending_sponsored_gas
+                    .set(i64::try_from(counters.pending_sponsored_gas).unwrap_or(i64::MAX));
+                self.metrics
+                    .quote_rolling_loss_gwei
+                    .set(gwei_gauge(counters.rolling_loss_native));
+            }
+            Err(error) => warn!(error = %error, "quote counter lookup failed"),
         }
     }
 
@@ -551,7 +752,7 @@ impl TransactionManager {
         {
             Ok(hash) if hash == expected_hash => {}
             Ok(_) => {
-                self.submission_blocked.store(true, Ordering::SeqCst);
+                self.block_submissions();
                 return Err(InfrastructureError::Blockchain(
                     "replacement broadcast hash mismatch".to_string(),
                 ));
@@ -559,7 +760,9 @@ impl TransactionManager {
             Err(OutboxBroadcastError::AlreadyKnown) => {}
             Err(
                 error @ (OutboxBroadcastError::Rejected { .. }
-                | OutboxBroadcastError::Uncertain { .. }),
+                | OutboxBroadcastError::Uncertain { .. }
+                | OutboxBroadcastError::NonceTooLow
+                | OutboxBroadcastError::ReplacementUnderpriced),
             ) => {
                 if let Some(status) = self.reconcile_hashes(&transaction).await? {
                     transaction.status = status;
@@ -570,16 +773,23 @@ impl TransactionManager {
                     self.metrics.eth_tx_pending.set(pending.len() as i64);
                     return Ok(());
                 }
-                self.submission_blocked.store(true, Ordering::SeqCst);
+                self.block_submissions();
                 return Err(InfrastructureError::Blockchain(format!(
                     "replacement outcome remains unresolved: {error}"
                 )));
             }
         }
+        self.metrics
+            .eth_tx_outcomes_total
+            .get_or_create(&vec![
+                ("type".into(), "paid_v2".into()),
+                ("result".into(), "replaced".into()),
+            ])
+            .inc();
         transaction.status = TxStatusV2::Replaced;
         transaction.last_update_at = unix_now()?;
         if let Err(error) = self.storage.persist_v2_durably(&transaction).await {
-            self.submission_blocked.store(true, Ordering::SeqCst);
+            self.block_submissions();
             return Err(error);
         }
         self.pending_txs
@@ -600,6 +810,9 @@ impl TransactionManager {
         });
         self.submission_blocked
             .store(has_unresolved, Ordering::SeqCst);
+        self.metrics
+            .eth_submission_blocked
+            .set(i64::from(has_unresolved));
     }
 
     async fn reconcile_hashes(
@@ -632,6 +845,16 @@ impl TransactionManager {
                         )
                         .await?;
                 }
+                self.metrics
+                    .eth_tx_outcomes_total
+                    .get_or_create(&vec![
+                        ("type".into(), "paid_v2".into()),
+                        (
+                            "result".into(),
+                            if succeeded { "mined" } else { "reverted" }.into(),
+                        ),
+                    ])
+                    .inc();
                 return Ok(Some(if succeeded {
                     TxStatusV2::Mined
                 } else {
@@ -640,6 +863,16 @@ impl TransactionManager {
             }
         }
         Ok(None)
+    }
+}
+
+/// Wei to a gwei gauge value, saturating at `i64::MAX`.
+fn gwei_gauge(wei: U256) -> i64 {
+    let gwei = wei / U256::exp10(9);
+    if gwei > U256::from(i64::MAX.unsigned_abs()) {
+        i64::MAX
+    } else {
+        i64::try_from(gwei.low_u64()).unwrap_or(i64::MAX)
     }
 }
 

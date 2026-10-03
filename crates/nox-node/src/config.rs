@@ -361,6 +361,36 @@ impl IngressConfig {
     }
 }
 
+/// Exit dispatch lanes. Each lane has its own queue and concurrency limit, so slow proxy
+/// calls cannot hold up paid quotes and submissions, and a burst on one lane cannot starve
+/// another.
+#[derive(Debug, Deserialize, Clone, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ExitWorkerConfig {
+    /// Paid transaction submissions handled at once.
+    pub paid_concurrency: usize,
+    /// Paid quote requests handled at once.
+    pub quote_concurrency: usize,
+    /// HTTP, RPC and broadcast proxy requests handled at once.
+    pub proxy_concurrency: usize,
+    /// Echo, cover and other cheap payloads handled at once.
+    pub control_concurrency: usize,
+    /// Payloads that may wait per lane; further payloads are dropped and counted.
+    pub queue_capacity: usize,
+}
+
+impl Default for ExitWorkerConfig {
+    fn default() -> Self {
+        Self {
+            paid_concurrency: 4,
+            quote_concurrency: 8,
+            proxy_concurrency: 32,
+            control_concurrency: 16,
+            queue_capacity: 256,
+        }
+    }
+}
+
 #[derive(Deserialize, Clone, Serialize)]
 pub struct NoxConfig {
     pub eth_rpc_url: String,
@@ -400,6 +430,8 @@ pub struct NoxConfig {
 
     pub node_role: NodeRole,
     pub http: HttpConfig,
+    #[serde(default)]
+    pub exit_workers: ExitWorkerConfig,
     pub block_poll_interval_secs: u64,
     /// Block where `NoxRegistry` was deployed; scanned inclusively on first boot.
     /// 0 = start from latest.
@@ -483,6 +515,7 @@ impl std::fmt::Debug for NoxConfig {
             .field("benchmark_mode", &self.benchmark_mode)
             .field("node_role", &self.node_role)
             .field("http", &self.http)
+            .field("exit_workers", &self.exit_workers)
             .field("block_poll_interval_secs", &self.block_poll_interval_secs)
             .field("chain_start_block", &self.chain_start_block)
             .field(
@@ -562,6 +595,7 @@ impl Default for NoxConfig {
             benchmark_mode: false,
             node_role: NodeRole::default(),
             http: HttpConfig::default(),
+            exit_workers: ExitWorkerConfig::default(),
 
             block_poll_interval_secs: 12,
             chain_start_block: 0,
@@ -818,6 +852,32 @@ impl NoxConfig {
         }
         if self.relayer.worker_count == 0 {
             errors.push("relayer.worker_count is 0 (relay pipeline would stall)".into());
+        }
+        for (name, value) in [
+            (
+                "exit_workers.paid_concurrency",
+                self.exit_workers.paid_concurrency,
+            ),
+            (
+                "exit_workers.quote_concurrency",
+                self.exit_workers.quote_concurrency,
+            ),
+            (
+                "exit_workers.proxy_concurrency",
+                self.exit_workers.proxy_concurrency,
+            ),
+            (
+                "exit_workers.control_concurrency",
+                self.exit_workers.control_concurrency,
+            ),
+            (
+                "exit_workers.queue_capacity",
+                self.exit_workers.queue_capacity,
+            ),
+        ] {
+            if value == 0 {
+                errors.push(format!("{name} is 0 (exit lane would stall)"));
+            }
         }
 
         if self.block_poll_interval_secs == 0 && !self.benchmark_mode {

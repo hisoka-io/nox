@@ -353,3 +353,152 @@ async fn test_exit_service_multiple_echo_requests() {
     assert_eq!(count, N, "Expected {N} SendPacket events, got {count}");
     cancel.cancel();
 }
+
+/// Accepts TCP connections and never answers, so a proxied HTTP request hangs.
+async fn hanging_http_server() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind hanging server");
+    let address = listener.local_addr().expect("hanging server address");
+    let handle = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    (format!("http://{address}/slow"), handle)
+}
+
+fn make_service_with_lanes(
+    workers: nox_node::config::ExitWorkerConfig,
+) -> (ExitService, Arc<TokioEventBus>, MetricsService) {
+    let bus = make_bus();
+    let publisher: Arc<dyn IEventPublisher> = bus.clone();
+    let subscriber: Arc<dyn IEventSubscriber> = bus.clone();
+
+    let metrics = MetricsService::new();
+    let packer = Arc::new(ResponsePacker::new());
+    let echo = Arc::new(EchoHandler::new(packer.clone(), publisher.clone()));
+    let traffic = Arc::new(TrafficHandler {
+        metrics: metrics.clone(),
+    });
+    let http = Arc::new(nox_node::services::handlers::http::HttpHandler::new(
+        HttpConfig {
+            allow_private_ips: true,
+            request_timeout_secs: 30,
+            ..HttpConfig::default()
+        },
+        packer.clone(),
+        publisher.clone(),
+        metrics.clone(),
+    ));
+
+    let svc = ExitService::simulation(subscriber, traffic, http, echo, metrics.clone())
+        .with_publisher(publisher)
+        .with_worker_config(workers);
+
+    (svc, bus, metrics)
+}
+
+fn slow_http_request(url: &str) -> Vec<u8> {
+    anon_request(
+        &ServiceRequest::HttpRequest {
+            method: "GET".to_string(),
+            url: url.to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        },
+        make_surbs(2),
+    )
+}
+
+/// A proxied HTTP request that never answers must not hold up other exit payloads.
+#[tokio::test]
+async fn test_exit_service_slow_http_does_not_block_echo() {
+    let (url, server) = hanging_http_server().await;
+    let (svc, bus, _metrics) = make_service_with_lanes(Default::default());
+    let mut rx = bus.subscribe();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let svc = svc.with_cancel_token(cancel.clone());
+    tokio::spawn(async move { svc.run().await });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    bus.publish(NoxEvent::PayloadDecrypted {
+        packet_id: "pkt-slow-http".to_string(),
+        payload: slow_http_request(&url),
+    })
+    .expect("publish http");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    bus.publish(NoxEvent::PayloadDecrypted {
+        packet_id: "pkt-echo-after-http".to_string(),
+        payload: anon_request(
+            &ServiceRequest::Echo {
+                data: b"still here".to_vec(),
+            },
+            make_surbs(2),
+        ),
+    })
+    .expect("publish echo");
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match rx.recv().await {
+                Ok(NoxEvent::SendPacket { packet_id, .. }) if packet_id.starts_with("echo-") => {
+                    return;
+                }
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => panic!("channel closed"),
+            }
+        }
+    })
+    .await
+    .expect("echo was blocked behind the slow HTTP request");
+    cancel.cancel();
+    server.abort();
+}
+
+/// When a lane's workers and queue are full, further payloads are dropped and counted
+/// instead of stalling the bus loop.
+#[tokio::test]
+async fn test_exit_service_full_lane_drops_and_counts() {
+    let (url, server) = hanging_http_server().await;
+    let (svc, bus, metrics) = make_service_with_lanes(nox_node::config::ExitWorkerConfig {
+        proxy_concurrency: 1,
+        queue_capacity: 1,
+        ..Default::default()
+    });
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let svc = svc.with_cancel_token(cancel.clone());
+    tokio::spawn(async move { svc.run().await });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    for index in 0..3 {
+        bus.publish(NoxEvent::PayloadDecrypted {
+            packet_id: format!("pkt-slow-{index}"),
+            payload: slow_http_request(&url),
+        })
+        .expect("publish http");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let dropped = metrics
+        .exit_payloads_dropped_total
+        .get_or_create(&vec![
+            ("lane".to_string(), "proxy".to_string()),
+            ("reason".to_string(), "queue_full".to_string()),
+        ])
+        .get();
+    assert_eq!(dropped, 1, "one request in flight, one queued, one dropped");
+    assert_eq!(
+        metrics
+            .exit_lane_inflight
+            .get_or_create(&vec![("lane".to_string(), "proxy".to_string())])
+            .get(),
+        1
+    );
+    cancel.cancel();
+    server.abort();
+}
