@@ -168,6 +168,7 @@ ipv6_subnet_prefix_len = 48       # /48 for IPv6
 queue_size = 10000
 # worker_count defaults to num_cpus (omit to auto-detect)
 replay_window = 3600              # Replay tag TTL in seconds
+# bloom_persist_interval_secs = 60  # Write the replay filter to disk this often while it changes
 
 # Poisson mix delay (ms). Higher = more anonymity, more latency.
 # Set to 0.0 to disable mixing (instant forwarding).

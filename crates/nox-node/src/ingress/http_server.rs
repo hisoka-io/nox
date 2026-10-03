@@ -4,9 +4,12 @@
 //! - `POST /api/v1/packets` - Inject a raw Sphinx packet (body = raw bytes)
 //! - `POST /api/v1/responses/claim` - Claim responses by SURB ID (session-safe)
 //! - `GET /api/v1/responses/stream` - SSE stream for SURB responses (push-based)
-//! - `GET /api/v1/responses/pending` - Fetch all pending responses (deprecated)
+//! - `GET /api/v1/ws` - WebSocket stream for SURB responses
+//! - `GET /api/v1/responses/pending` - Removed; returns 410 Gone
 //! - `GET /api/v1/responses/:request_id` - Long-poll for a SURB response (30s timeout)
 //! - `GET /health` - Returns 200 OK
+//!
+//! SURB IDs are exactly 32 hex characters and match exactly.
 
 use std::collections::HashSet;
 use std::convert::Infallible;
@@ -30,7 +33,9 @@ use serde::Deserialize;
 use tracing::{debug, warn};
 
 use super::policy::{cors_layer, rate_limit, IngressRateLimiter};
-use super::response_buffer::ResponseBuffer;
+use super::response_buffer::{
+    parse_surb_id, surb_id_from_packet_id, ResponseBuffer, SurbId, SURB_ID_HEX_LEN,
+};
 use crate::config::IngressConfig;
 use crate::telemetry::metrics::MetricsService;
 
@@ -69,7 +74,7 @@ impl IngressServer {
             .route("/api/v1/responses/claim", post(claim_responses))
             .route("/api/v1/responses/stream", get(stream_responses))
             .route("/api/v1/ws", get(ws_upgrade))
-            .route("/api/v1/responses/pending", get(fetch_pending))
+            .route("/api/v1/responses/pending", get(pending_removed))
             .route("/api/v1/responses/:request_id", get(poll_response))
             .route("/health", get(health));
         if let Some(limiter) = IngressRateLimiter::from_config(policy, state.metrics.clone()) {
@@ -88,9 +93,25 @@ struct StreamQuery {
 
 #[derive(Deserialize)]
 struct ClaimRequest {
-    /// SURB ID hex strings to claim. The buffer matches `packet_id` entries
-    /// containing any of these substrings.
+    /// SURB IDs to claim, each exactly 32 hex characters.
     surb_ids: Vec<String>,
+}
+
+/// Parses every ID or names the first invalid one.
+fn parse_surb_ids(ids: &[String]) -> Result<Vec<SurbId>, String> {
+    ids.iter()
+        .enumerate()
+        .map(|(i, id)| {
+            parse_surb_id(id).ok_or_else(|| {
+                format!("surb_ids[{i}] must be exactly {SURB_ID_HEX_LEN} hex characters")
+            })
+        })
+        .collect()
+}
+
+/// Keeps the valid IDs, for streaming endpoints that have no error channel.
+fn valid_surb_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<SurbId> {
+    ids.into_iter().filter_map(parse_surb_id).collect()
 }
 
 /// `POST /api/v1/packets` -- Inject a raw Sphinx packet.
@@ -199,20 +220,45 @@ async fn inject_packet(State(state): State<Arc<IngressState>>, body: Bytes) -> i
     }
 }
 
+/// Valid SURB IDs from a WebSocket `subscribe`/`unsubscribe` message; malformed ones are ignored.
+fn ws_message_surb_ids(msg: &serde_json::Value) -> Vec<SurbId> {
+    valid_surb_ids(
+        msg.get("surb_ids")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str()),
+    )
+}
+
 /// `POST /api/v1/responses/claim` -- Claim SURB responses by SURB ID.
 ///
 /// The client sends a JSON body with `surb_ids` -- the hex-encoded SURB IDs
-/// it generated. Only responses whose `packet_id` contains a matching SURB ID
-/// are returned and removed from the buffer; all other responses remain.
-///
-/// This is the session-safe alternative to `/pending` for multi-client setups.
+/// it generated (32 hex characters each). Only responses for exactly those
+/// SURB IDs are returned and removed from the buffer; all others remain.
 ///
 /// Returns JSON array of `{"id": "...", "data": [bytes...]}`.
-/// Returns 204 No Content if no matching responses are found.
+/// Returns 204 No Content if no matching responses are found, and 400 if any
+/// SURB ID is malformed.
 async fn claim_responses(
     State(state): State<Arc<IngressState>>,
     Json(body): Json<ClaimRequest>,
 ) -> impl IntoResponse {
+    let surb_ids = match parse_surb_ids(&body.surb_ids) {
+        Ok(ids) => ids,
+        Err(message) => {
+            state
+                .metrics
+                .ingress_http_requests_total
+                .get_or_create(&vec![
+                    ("endpoint".to_string(), "claim".to_string()),
+                    ("status".to_string(), "rejected".to_string()),
+                ])
+                .inc();
+            return (StatusCode::BAD_REQUEST, message).into_response();
+        }
+    };
+
     state
         .metrics
         .ingress_http_requests_total
@@ -222,11 +268,11 @@ async fn claim_responses(
         ])
         .inc();
 
-    if body.surb_ids.is_empty() {
+    if surb_ids.is_empty() {
         return (StatusCode::NO_CONTENT, axum::Json(serde_json::Value::Null)).into_response();
     }
 
-    let responses = state.response_buffer.claim_by_surb_ids(&body.surb_ids);
+    let responses = state.response_buffer.claim_by_surb_ids(&surb_ids);
     if responses.is_empty() {
         return (StatusCode::NO_CONTENT, axum::Json(serde_json::Value::Null)).into_response();
     }
@@ -238,45 +284,28 @@ async fn claim_responses(
 
     debug!(
         count = items.len(),
-        surb_ids = body.surb_ids.len(),
+        surb_ids = surb_ids.len(),
         "HTTP ingress: delivering claimed responses"
     );
     (StatusCode::OK, axum::Json(serde_json::json!(items))).into_response()
 }
 
-/// `GET /api/v1/responses/pending` -- Fetch all pending SURB responses.
-///
-/// Returns JSON array of `{"id": "...", "data": [bytes...]}`.
-/// Returns 204 No Content if buffer is empty.
-///
-/// **Deprecated:** Prefer `POST /api/v1/responses/claim` with SURB IDs for
-/// multi-client safety. This endpoint drains ALL responses regardless of
-/// ownership -- use only in single-client-per-entry-node configurations.
-async fn fetch_pending(State(state): State<Arc<IngressState>>) -> impl IntoResponse {
+/// `GET /api/v1/responses/pending` -- Removed. Responses are claimed by SURB ID
+/// (`POST /api/v1/responses/claim`, `/api/v1/ws` or `/api/v1/responses/stream`).
+async fn pending_removed(State(state): State<Arc<IngressState>>) -> impl IntoResponse {
     state
         .metrics
         .ingress_http_requests_total
         .get_or_create(&vec![
             ("endpoint".to_string(), "pending".to_string()),
-            ("status".to_string(), "accepted".to_string()),
+            ("status".to_string(), "rejected".to_string()),
         ])
         .inc();
-
-    let responses = state.response_buffer.take_all();
-    if responses.is_empty() {
-        return (StatusCode::NO_CONTENT, axum::Json(serde_json::Value::Null)).into_response();
-    }
-
-    let items: Vec<serde_json::Value> = responses
-        .into_iter()
-        .map(|(id, data)| serde_json::json!({ "id": id, "data": data }))
-        .collect();
-
-    debug!(
-        count = items.len(),
-        "HTTP ingress: delivering batch responses"
-    );
-    (StatusCode::OK, axum::Json(serde_json::json!(items))).into_response()
+    (
+        StatusCode::GONE,
+        "GET /api/v1/responses/pending was removed; claim responses by SURB ID with \
+         POST /api/v1/responses/claim",
+    )
 }
 
 /// `GET /api/v1/responses/:request_id` -- Long-poll for a SURB response.
@@ -367,7 +396,7 @@ async fn ws_upgrade(
 }
 
 async fn ws_handler(mut socket: WebSocket, state: Arc<IngressState>) {
-    let mut subscribed: HashSet<String> = HashSet::new();
+    let mut subscribed: HashSet<SurbId> = HashSet::new();
     let poll_interval = Duration::from_millis(100);
     let ping_interval = Duration::from_secs(15);
     let timeout = Duration::from_mins(5);
@@ -394,15 +423,7 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<IngressState>) {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) {
                             let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                            let ids: Vec<String> = msg
-                                .get("surb_ids")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|v| v.as_str().map(String::from))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
+                            let ids = ws_message_surb_ids(&msg);
 
                             match msg_type {
                                 "subscribe" => {
@@ -430,10 +451,15 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<IngressState>) {
             continue;
         }
 
-        let ids_vec: Vec<String> = subscribed.iter().cloned().collect();
+        let ids_vec: Vec<SurbId> = subscribed.iter().copied().collect();
         let responses = state.response_buffer.claim_by_surb_ids(&ids_vec);
 
         for (id, data) in responses {
+            // Remove the consumed SURB ID from the subscription
+            if let Some(surb_id) = surb_id_from_packet_id(&id) {
+                subscribed.remove(&surb_id);
+            }
+
             let msg = serde_json::json!({
                 "type": "response",
                 "id": id,
@@ -442,13 +468,6 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<IngressState>) {
 
             if socket.send(Message::Text(msg.to_string())).await.is_err() {
                 return;
-            }
-
-            // Remove consumed SURB IDs from subscription
-            for sid in &ids_vec {
-                if id.contains(sid.as_str()) {
-                    subscribed.remove(sid);
-                }
             }
         }
     }
@@ -465,12 +484,7 @@ async fn stream_responses(
     State(state): State<Arc<IngressState>>,
     Query(query): Query<StreamQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let surb_ids: Vec<String> = query
-        .surb_ids
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let surb_ids = valid_surb_ids(query.surb_ids.split(',').map(str::trim));
 
     let buffer = state.response_buffer.clone();
 
@@ -487,7 +501,7 @@ async fn stream_responses(
         let start = Instant::now();
         let timeout = Duration::from_mins(1);
         let poll_interval = Duration::from_millis(100);
-        let mut remaining: Vec<String> = surb_ids;
+        let mut remaining: Vec<SurbId> = surb_ids;
 
         while !remaining.is_empty() && start.elapsed() < timeout {
             let responses = buffer.claim_by_surb_ids(&remaining);
@@ -496,7 +510,8 @@ async fn stream_responses(
                 let json = serde_json::json!({ "id": id, "data": data });
                 yield Ok(Event::default().data(json.to_string()));
 
-                remaining.retain(|sid| !id.contains(sid.as_str()));
+                let consumed = surb_id_from_packet_id(id);
+                remaining.retain(|sid| Some(*sid) != consumed);
             }
 
             if remaining.is_empty() {
@@ -615,27 +630,34 @@ mod tests {
         assert_eq!(body.as_ref(), &[1, 2, 3]);
     }
 
-    #[tokio::test]
-    async fn test_fetch_pending_empty() {
-        let state = test_state(false);
-        let app = IngressServer::router(state);
+    const SURB_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaa1122";
+    const SURB_B: &str = "cccccccccccccccccccccccccccc3344";
 
+    async fn claim(app: Router, ids: serde_json::Value) -> (StatusCode, Vec<serde_json::Value>) {
+        let body = serde_json::json!({ "surb_ids": ids });
         let req = Request::builder()
-            .method("GET")
-            .uri("/api/v1/responses/pending")
-            .body(Body::empty())
+            .method("POST")
+            .uri("/api/v1/responses/claim")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
-
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let items = serde_json::from_slice(&bytes).unwrap_or_default();
+        (status, items)
     }
 
     #[tokio::test]
-    async fn test_fetch_pending_returns_all() {
+    async fn test_pending_is_gone_and_leaves_buffer_intact() {
         let state = test_state(false);
-        state.response_buffer.store_response("r1", vec![1, 2]);
+        state
+            .response_buffer
+            .store_response(&format!("echo-1-{SURB_A}"), vec![1, 2]);
         state.response_buffer.store_response("r2", vec![3, 4]);
-        let app = IngressServer::router(state);
+        let app = IngressServer::router(Arc::clone(&state));
 
         let req = Request::builder()
             .method("GET")
@@ -644,11 +666,77 @@ mod tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::GONE);
+        assert_eq!(state.response_buffer.len(), 2);
+    }
 
-        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-        let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-        assert_eq!(items.len(), 2);
+    #[tokio::test]
+    async fn test_claim_rejects_malformed_surb_ids() {
+        let state = test_state(false);
+        state
+            .response_buffer
+            .store_response(&format!("reply-100-{SURB_A}"), vec![10]);
+        state
+            .response_buffer
+            .store_response(&format!("rpc-200-{SURB_B}"), vec![20]);
+
+        for bad in ["", "-", "rpc", "reply", "aabb1122", &SURB_A[1..]] {
+            let app = IngressServer::router(Arc::clone(&state));
+            let (status, _) = claim(app, serde_json::json!([bad])).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?} must be rejected");
+        }
+        let app = IngressServer::router(Arc::clone(&state));
+        let (status, _) = claim(app, serde_json::json!([SURB_A, "-"])).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        assert_eq!(state.response_buffer.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_claim_matches_whole_surb_id_only() {
+        let state = test_state(false);
+        state
+            .response_buffer
+            .store_response(&format!("reply-100-{SURB_A}"), vec![10]);
+        let app = IngressServer::router(Arc::clone(&state));
+
+        let mut near = SURB_A.to_string();
+        near.replace_range(31..32, "3");
+        let (status, _) = claim(app, serde_json::json!([near])).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(state.response_buffer.len(), 1);
+    }
+
+    #[test]
+    fn test_ws_subscription_ignores_malformed_ids() {
+        let msg = serde_json::json!({
+            "type": "subscribe",
+            "surb_ids": ["", "-", "rpc", "reply", 7, SURB_A],
+        });
+        assert_eq!(
+            ws_message_surb_ids(&msg),
+            vec![parse_surb_id(SURB_A).unwrap()]
+        );
+        assert!(ws_message_surb_ids(&serde_json::json!({ "type": "subscribe" })).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stream_ignores_malformed_ids() {
+        let state = test_state(false);
+        state
+            .response_buffer
+            .store_response(&format!("echo-100-{SURB_A}"), vec![10, 20]);
+        let app = IngressServer::router(Arc::clone(&state));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/responses/stream?surb_ids=-,rpc,echo")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("data:"));
+        assert_eq!(state.response_buffer.len(), 1);
     }
 
     #[tokio::test]
@@ -671,15 +759,15 @@ mod tests {
         let state = test_state(false);
         state
             .response_buffer
-            .store_response("echo-100-aabb1122", vec![10, 20]);
+            .store_response(&format!("echo-100-{SURB_A}"), vec![10, 20]);
         state
             .response_buffer
-            .store_response("rpc-200-ccdd3344", vec![30, 40]);
+            .store_response(&format!("rpc-200-{SURB_B}"), vec![30, 40]);
 
         let app = IngressServer::router(state);
         let req = Request::builder()
             .method("GET")
-            .uri("/api/v1/responses/stream?surb_ids=aabb1122")
+            .uri(format!("/api/v1/responses/stream?surb_ids={SURB_A}"))
             .body(Body::empty())
             .unwrap();
 
@@ -693,7 +781,7 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(
-            text.contains("aabb1122"),
+            text.contains(SURB_A),
             "SSE stream should contain the SURB ID"
         );
         assert!(
@@ -701,7 +789,7 @@ mod tests {
             "SSE stream should contain response data"
         );
         assert!(
-            !text.contains("ccdd3344"),
+            !text.contains(SURB_B),
             "SSE stream should not contain unmatched SURB"
         );
     }
@@ -751,26 +839,17 @@ mod tests {
         let state = test_state(false);
         state
             .response_buffer
-            .store_response("echo-100-aabb1122", vec![10, 20]);
+            .store_response(&format!("echo-100-{SURB_A}"), vec![10, 20]);
         state
             .response_buffer
-            .store_response("rpc-200-ccdd3344", vec![30, 40]);
+            .store_response(&format!("rpc-200-{SURB_B}"), vec![30, 40]);
         let app = IngressServer::router(state);
 
-        let body = serde_json::json!({ "surb_ids": ["aabb1122"] });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/responses/claim")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-        let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let (status, items) = claim(app, serde_json::json!([SURB_A])).await;
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], format!("echo-100-{SURB_A}"));
+        assert_eq!(items[0]["data"], serde_json::json!([10, 20]));
     }
 
     #[tokio::test]
@@ -778,7 +857,7 @@ mod tests {
         let state = test_state(false);
         state
             .response_buffer
-            .store_response("echo-100-aabb1122", vec![10]);
+            .store_response(&format!("echo-100-{SURB_A}"), vec![10]);
         let app = IngressServer::router(state);
 
         let body = serde_json::json!({ "surb_ids": [] });
@@ -798,19 +877,11 @@ mod tests {
         let state = test_state(false);
         state
             .response_buffer
-            .store_response("echo-100-aabb1122", vec![10]);
+            .store_response(&format!("echo-100-{SURB_A}"), vec![10]);
         let app = IngressServer::router(state);
 
-        let body = serde_json::json!({ "surb_ids": ["deadbeef"] });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/responses/claim")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let (status, _) = claim(app, serde_json::json!([SURB_B])).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
@@ -819,30 +890,22 @@ mod tests {
         // Client A's responses
         state
             .response_buffer
-            .store_response("echo-1-aaaa0001", vec![1]);
+            .store_response(&format!("echo-1-{SURB_A}"), vec![1]);
         // Client B's responses
         state
             .response_buffer
-            .store_response("echo-2-bbbb0002", vec![2]);
+            .store_response(&format!("echo-2-{SURB_B}"), vec![2]);
         let app = IngressServer::router(Arc::clone(&state));
 
         // Client A claims
-        let body = serde_json::json!({ "surb_ids": ["aaaa0001"] });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/responses/claim")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap();
-
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let (status, _) = claim(app, serde_json::json!([SURB_A])).await;
+        assert_eq!(status, StatusCode::OK);
 
         // Client B's response should still be in the buffer
         assert_eq!(state.response_buffer.len(), 1);
         assert!(state
             .response_buffer
-            .take_response("echo-2-bbbb0002")
+            .take_response(&format!("echo-2-{SURB_B}"))
             .is_some());
     }
 }

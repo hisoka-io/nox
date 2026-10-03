@@ -4,6 +4,14 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- Replay tags are derived from the per-hop shared secret and checked in the workers after header
+  verification. The replay filter is persisted every `relayer.bloom_persist_interval_secs` (default 60)
+  and on graceful shutdown.
+- The ingress response buffer is restricted to SURB replies. Responses are claimed by 32-hex-character
+  SURB ID on `/api/v1/responses/claim`, `/api/v1/ws` and `/api/v1/responses/stream`. The legacy batch
+  endpoint `GET /api/v1/responses/pending` is retired (410 Gone) in favour of `/claim`.
+- `PacketTransport::recv_responses_batch` takes the SURB IDs to claim, and `HttpPacketTransport` uses
+  `/api/v1/responses/claim`.
 - Replaced the embedded Howl wallet, prover, `gas_payment`, and RelayerMulticall stack with protocol-neutral
   paid quote and EntryPoint execution types.
 - Added fixed-point profitability, committed settlement evidence, durable signed transaction recovery, and

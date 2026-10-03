@@ -21,7 +21,7 @@ use self::{
     egress::EgressStage,
     ingest::IngestStage,
     mix_loop::MixStage,
-    worker::{MixMessage, WorkerStage},
+    worker::{MixMessage, ReplayGuard, WorkerStage},
 };
 
 pub struct RelayerService {
@@ -71,13 +71,8 @@ impl RelayerService {
 
         let mut handles = Vec::new();
 
-        let mut ingest = IngestStage::new(
-            self.config.clone(),
-            self.bus_subscriber.clone(),
-            self.replay_db.clone(),
-            worker_tx,
-            self.metrics.clone(),
-        );
+        let mut ingest =
+            IngestStage::new(self.bus_subscriber.clone(), worker_tx, self.metrics.clone());
         if let Some(token) = &self.cancel_token {
             ingest = ingest.with_cancel_token(token.clone());
         }
@@ -89,11 +84,16 @@ impl RelayerService {
                 .map_err(|e| RelayerError::RoutingKeyError(e.to_string()))?,
         );
 
+        let replay = ReplayGuard {
+            db: self.replay_db.clone(),
+            window_secs: self.config.relayer.replay_window,
+        };
         for _ in 0..self.config.relayer.worker_count {
             let worker = WorkerStage::new(
                 worker_rx.clone(),
                 mix_tx.clone(),
                 Arc::clone(&node_sk),
+                replay.clone(),
                 self.mix_strategy.clone(),
                 self.metrics.clone(),
             );

@@ -15,9 +15,12 @@ pub trait PacketTransport: Send + Sync {
         timeout: std::time::Duration,
     ) -> Result<Vec<u8>, InfrastructureError>;
 
+    /// Claims the buffered SURB responses for `surb_ids` (hex SURB IDs, 32
+    /// characters each) from the entry node. Returns `(packet_id, data)` pairs.
     async fn recv_responses_batch(
         &self,
         _entry_url: &str,
+        _surb_ids: &[String],
     ) -> Result<Vec<(String, Vec<u8>)>, InfrastructureError> {
         Ok(vec![])
     }

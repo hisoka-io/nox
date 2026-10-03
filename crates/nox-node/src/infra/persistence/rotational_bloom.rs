@@ -2,10 +2,12 @@ use async_trait::async_trait;
 use fastbloom::BloomFilter;
 use nox_core::traits::{IReplayProtection, InfrastructureError};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tokio::sync::{Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
 
 struct BloomFilterState {
     current: BloomFilter,
@@ -14,16 +16,28 @@ struct BloomFilterState {
     last_rotation_unix: u64,
 }
 
+/// Serializes snapshot writes and remembers the newest snapshot on disk, so an
+/// older snapshot that finishes late never overwrites a newer one.
+struct PersistState {
+    next_seq: AtomicU64,
+    written_seq: Mutex<u64>,
+    dirty: AtomicBool,
+}
+
 /// Dual-window bloom filter for replay protection with flat-file persistence.
 ///
 /// Rotates `current` -> `previous` on each interval; checks both for membership.
 /// Flat file avoids sled's blob leak. Downtime > 2x interval resets to empty.
+///
+/// The file is written on every rotation, by [`Self::run_persistence`] on a
+/// fixed interval while tags change, and once more on graceful shutdown.
 pub struct RotationalBloomFilter {
     state: Arc<RwLock<BloomFilterState>>,
     rotation_interval: Duration,
     capacity: usize,
     false_positive_rate: f64,
     persist_path: Option<PathBuf>,
+    persist: Arc<PersistState>,
 }
 
 impl RotationalBloomFilter {
@@ -44,6 +58,11 @@ impl RotationalBloomFilter {
             capacity,
             false_positive_rate,
             persist_path: None,
+            persist: Arc::new(PersistState {
+                next_seq: AtomicU64::new(0),
+                written_seq: Mutex::new(0),
+                dirty: AtomicBool::new(false),
+            }),
         }
     }
 
@@ -147,42 +166,116 @@ impl RotationalBloomFilter {
         Ok(())
     }
 
-    fn rotate_if_needed_inner(
-        state: &mut BloomFilterState,
-        interval: Duration,
-        capacity: usize,
-        fpr: f64,
-        persist_path: Option<&PathBuf>,
-    ) {
-        if state.last_rotation.elapsed() < interval {
+    /// Writes the current filter state to disk now, if persistence is enabled.
+    /// Returns `Ok(true)` when a snapshot was written.
+    pub async fn persist_now(&self) -> Result<bool, InfrastructureError> {
+        let Some(path) = self.persist_path.clone() else {
+            return Ok(false);
+        };
+        let (seq, bytes) = {
+            let state = self.state.read().await;
+            self.persist.dirty.store(false, Ordering::Release);
+            (self.next_snapshot_seq(), Self::snapshot(&state))
+        };
+        let result = write_snapshot(Arc::clone(&self.persist), path, seq, bytes).await;
+        if result.is_err() {
+            self.persist.dirty.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    /// Writes a snapshot only if a tag was recorded since the last one.
+    pub async fn persist_if_dirty(&self) -> Result<bool, InfrastructureError> {
+        if !self.persist.dirty.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        self.persist_now().await
+    }
+
+    /// Persists the filter every `interval` while it changes, and once more when
+    /// `cancel` fires, so a restart does not forget recently seen tags.
+    /// A zero `interval` keeps only the shutdown and rotation writes.
+    pub async fn run_persistence(self: Arc<Self>, interval: Duration, cancel: CancellationToken) {
+        if self.persist_path.is_none() {
+            return;
+        }
+        if interval.is_zero() {
+            cancel.cancelled().await;
+        } else {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        match self.persist_if_dirty().await {
+                            Ok(true) => debug!("Replay filter snapshot written"),
+                            Ok(false) => {}
+                            Err(e) => warn!("Replay filter periodic persist failed: {e}"),
+                        }
+                    }
+                    () = cancel.cancelled() => break,
+                }
+            }
+        }
+        match self.persist_now().await {
+            Ok(_) => info!("Replay filter persisted for shutdown"),
+            Err(e) => warn!("Replay filter shutdown persist failed: {e}"),
+        }
+    }
+
+    fn next_snapshot_seq(&self) -> u64 {
+        self.persist.next_seq.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn snapshot(state: &BloomFilterState) -> Vec<u8> {
+        serialize_to_file_format(state.last_rotation_unix, &state.current, &state.previous)
+    }
+
+    fn rotate_if_needed(&self, state: &mut BloomFilterState) {
+        if state.last_rotation.elapsed() < self.rotation_interval {
             return;
         }
 
-        let old_current = std::mem::replace(&mut state.current, fresh_bloom(capacity, fpr));
+        let old_current = std::mem::replace(
+            &mut state.current,
+            fresh_bloom(self.capacity, self.false_positive_rate),
+        );
         state.previous = old_current;
         state.last_rotation = Instant::now();
         state.last_rotation_unix = unix_now_secs();
 
-        if let Some(path) = persist_path {
-            let file_bytes =
-                serialize_to_file_format(state.last_rotation_unix, &state.current, &state.previous);
-            let path = path.clone();
+        if let Some(path) = self.persist_path.clone() {
+            let file_bytes = Self::snapshot(state);
+            let seq = self.next_snapshot_seq();
+            let persist = Arc::clone(&self.persist);
 
             tokio::spawn(async move {
-                if let Err(e) =
-                    tokio::task::spawn_blocking(move || atomic_write_file(&path, &file_bytes))
-                        .await
-                        .unwrap_or_else(|e| {
-                            Err(InfrastructureError::Database(format!(
-                                "spawn_blocking join error: {e}"
-                            )))
-                        })
-                {
+                if let Err(e) = write_snapshot(Arc::clone(&persist), path, seq, file_bytes).await {
+                    persist.dirty.store(true, Ordering::Release);
                     warn!("Replay filter persist failed: {e}");
                 }
             });
         }
     }
+}
+
+/// Writes `bytes` unless a newer snapshot (higher `seq`) is already on disk.
+async fn write_snapshot(
+    persist: Arc<PersistState>,
+    path: PathBuf,
+    seq: u64,
+    bytes: Vec<u8>,
+) -> Result<bool, InfrastructureError> {
+    let mut written = persist.written_seq.lock().await;
+    if seq <= *written {
+        return Ok(false);
+    }
+    tokio::task::spawn_blocking(move || atomic_write_file(&path, &bytes))
+        .await
+        .map_err(|e| InfrastructureError::Database(format!("spawn_blocking join error: {e}")))??;
+    *written = seq;
+    Ok(true)
 }
 
 #[async_trait]
@@ -193,31 +286,20 @@ impl IReplayProtection for RotationalBloomFilter {
         _ttl_seconds: u64, // Ignored -- handled by rotation window.
     ) -> Result<bool, InfrastructureError> {
         let mut state = self.state.write().await;
-        Self::rotate_if_needed_inner(
-            &mut state,
-            self.rotation_interval,
-            self.capacity,
-            self.false_positive_rate,
-            self.persist_path.as_ref(),
-        );
+        self.rotate_if_needed(&mut state);
 
         if state.current.contains(tag) || state.previous.contains(tag) {
             return Ok(true);
         }
 
         state.current.insert(tag);
+        self.persist.dirty.store(true, Ordering::Release);
         Ok(false)
     }
 
     async fn prune_expired(&self) -> Result<usize, InfrastructureError> {
         let mut state = self.state.write().await;
-        Self::rotate_if_needed_inner(
-            &mut state,
-            self.rotation_interval,
-            self.capacity,
-            self.false_positive_rate,
-            self.persist_path.as_ref(),
-        );
+        self.rotate_if_needed(&mut state);
         Ok(0)
     }
 }
@@ -463,6 +545,114 @@ mod tests {
 
         // persist_tag was in the previous rotation, should be detectable if within window
         // (The tag is in the "previous" filter of the rotated state)
+    }
+
+    fn persistent_filter(path: &Path) -> RotationalBloomFilter {
+        RotationalBloomFilter::new(1_000, 0.001, Duration::from_hours(1))
+            .with_file_persistence(path)
+    }
+
+    async fn restored_sees(path: &Path, tag: &[u8]) -> bool {
+        let restored = persistent_filter(path);
+        restored.restore_from_file().await.unwrap();
+        restored.check_and_tag(tag, 0).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_persist_now_survives_restart_without_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bloom.bin");
+        let filter = persistent_filter(&path);
+        filter
+            .check_and_tag(b"seen_before_restart", 0)
+            .await
+            .unwrap();
+
+        assert!(filter.persist_now().await.unwrap());
+        assert!(restored_sees(&path, b"seen_before_restart").await);
+        assert!(!restored_sees(&path, b"never_seen").await);
+    }
+
+    #[tokio::test]
+    async fn test_persist_if_dirty_skips_unchanged_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bloom.bin");
+        let filter = persistent_filter(&path);
+
+        assert!(!filter.persist_if_dirty().await.unwrap());
+        assert!(!path.exists());
+
+        filter.check_and_tag(b"tag", 0).await.unwrap();
+        assert!(filter.persist_if_dirty().await.unwrap());
+        assert!(!filter.persist_if_dirty().await.unwrap());
+
+        // A replayed tag does not change the filter.
+        filter.check_and_tag(b"tag", 0).await.unwrap();
+        assert!(!filter.persist_if_dirty().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_run_persistence_writes_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bloom.bin");
+        let filter = Arc::new(persistent_filter(&path));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(
+            Arc::clone(&filter).run_persistence(Duration::from_hours(1), cancel.clone()),
+        );
+
+        filter.check_and_tag(b"tag_at_shutdown", 0).await.unwrap();
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(restored_sees(&path, b"tag_at_shutdown").await);
+    }
+
+    #[tokio::test]
+    async fn test_run_persistence_writes_periodically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bloom.bin");
+        let filter = Arc::new(persistent_filter(&path));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(
+            Arc::clone(&filter).run_persistence(Duration::from_millis(20), cancel.clone()),
+        );
+
+        filter.check_and_tag(b"periodic_tag", 0).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(restored_sees(&path, b"periodic_tag").await);
+
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_older_snapshot_never_overwrites_newer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bloom.bin");
+        let persist = Arc::new(PersistState {
+            next_seq: AtomicU64::new(0),
+            written_seq: Mutex::new(0),
+            dirty: AtomicBool::new(false),
+        });
+
+        assert!(
+            write_snapshot(Arc::clone(&persist), path.clone(), 2, vec![2])
+                .await
+                .unwrap()
+        );
+        assert!(
+            !write_snapshot(Arc::clone(&persist), path.clone(), 1, vec![1])
+                .await
+                .unwrap()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), vec![2]);
     }
 
     #[test]
