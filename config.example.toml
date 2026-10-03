@@ -1,11 +1,11 @@
 # NOX Configuration Example
 #
-# Loads: defaults -> this file -> env vars (NOX_ prefix).
+# Loads: defaults -> this file -> env vars (NOX__ prefix, two underscores).
 # Later values override earlier ones. See docs/configuration.md.
 #
-# For nested fields, use NOX_ prefix with __ separator:
-#   NOX_NETWORK__MAX_CONNECTIONS=500
-#   NOX_RELAYER__MIX_DELAY_MS=200.0
+# For nested fields, __ also separates the section:
+#   NOX__NETWORK__MAX_CONNECTIONS=500
+#   NOX__RELAYER__MIX_DELAY_MS=200.0
 #
 # Use env vars for secrets in production.
 
@@ -46,11 +46,11 @@ nox_entry_point_address = "0x0000000000000000000000000000000000000000"
 # ---
 
 # X25519 routing key (hex-encoded, 32 bytes)
-# Set via: NOX_ROUTING_PRIVATE_KEY=<hex>
+# Set via: NOX__ROUTING_PRIVATE_KEY=<hex>
 routing_private_key = ""
 
 # Ed25519 P2P identity key (hex-encoded)
-# Set via: NOX_P2P_PRIVATE_KEY=<hex>
+# Set via: NOX__P2P_PRIVATE_KEY=<hex>
 # If empty, generates ephemeral or loads from p2p_identity_path
 p2p_private_key = ""
 
@@ -58,7 +58,7 @@ p2p_private_key = ""
 p2p_identity_path = "./data/p2p_id.key"
 
 # Secp256k1 wallet key for TX execution (exit/full nodes only)
-# Set via: NOX_ETH_WALLET_PRIVATE_KEY=<hex>
+# Set via: NOX__ETH_WALLET_PRIVATE_KEY=<hex>
 eth_wallet_private_key = ""
 
 # ---
