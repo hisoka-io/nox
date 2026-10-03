@@ -93,6 +93,7 @@ fn to_sse(nox: &NoxEvent, node_id: &str) -> Option<Event> {
         | NoxEvent::RelayerRoleUpdated { .. }
         | NoxEvent::RelayerUrlUpdated { .. }
         | NoxEvent::RelayerSlashed { .. }
+        | NoxEvent::RelayerProfileSynced { .. }
         | NoxEvent::RegistryPaused { .. }
         | NoxEvent::RegistryUnpaused { .. } => return None,
     };
