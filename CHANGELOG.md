@@ -39,6 +39,20 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `PaidTransactionV2`. A request with reply SURBs receives a `SUBMISSION` rejection.
 - Removed the unused AEAD encapsulation from `nox_crypto::SphinxPacket`; the type is now a fixed-size buffer.
   Packet sizes are unchanged.
+- P2P admission follows the registry: peers are matched to registered nodes by the libp2p identity in their
+  P2P URL. `network.peer_admission` (`enforce` by default, `monitor`, `off`) refuses non-members once the node
+  set is verified on-chain and `network.peer_admission_grace_secs` has passed, and closes links to peers that
+  left the registry. Once enforcement is live, banned or over-limit
+  addresses are refused before the handshake; member addresses are exempt.
+- Registry profile events (ingress/metadata URL, stake, freeze, slash, key, role, URL) re-read the node's full
+  profile. Frozen nodes stay in the served membership but are not routed through. A periodic reconcile
+  (`topology_reconcile_interval_secs`, default 300) repairs updates lost on the event bus.
+- The topology manager is the only writer of persisted peers, and layers are derived from address and role
+  on load, so `/topology` no longer serves stale layers after a restart.
+- `/topology` serves schema 2 with per-member liveness from the node's P2P links when the observer has a
+  chain position.
+- Loop cover returns to the sending node; `nox_cover_loop_{sent,returned,lost}_total` and
+  `nox_cover_loop_rtt_seconds` report per-path delivery.
 
 ## [0.1.0] - 2026-04-10
 

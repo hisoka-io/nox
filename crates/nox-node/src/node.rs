@@ -3,6 +3,7 @@ use crate::blockchain::observer::{ChainObserver, ObservedChain};
 use crate::blockchain::registry_scope::{
     enforce_registry_scope, fetch_registry_fingerprint, log_registry_scope_outcome, registry_scope,
 };
+use crate::blockchain::registry_sync::RegistryReconciler;
 use crate::blockchain::tx_manager::TransactionManager;
 use crate::config::NoxConfig;
 use crate::infra::event_bus::TokioEventBus;
@@ -42,6 +43,7 @@ struct TopologyApiState {
     topology: Arc<TopologyManager>,
     pow_difficulty: u32,
     observed_chain: Option<Arc<ObservedChain>>,
+    liveness_window_secs: u64,
 }
 use tracing::{error, info, warn};
 
@@ -134,6 +136,7 @@ impl NoxNode {
             config.min_pow_difficulty,
             Some(observed_chain.clone()),
             &config.ingress.cors_allowed_origins,
+            config.network.topology_liveness_window_secs,
         );
 
         let start_epoch = std::time::SystemTime::now()
@@ -273,6 +276,7 @@ impl NoxNode {
             let topo_observed_chain = observed_chain.clone();
             let topo_pow_difficulty = config.min_pow_difficulty;
             let topo_cors_origins = config.ingress.cors_allowed_origins.clone();
+            let topo_liveness_window = config.network.topology_liveness_window_secs;
             join_set.spawn(async move {
                 let app = Router::new()
                     .route("/topology", get(handle_topology_request))
@@ -284,6 +288,7 @@ impl NoxNode {
                         topology: topo_api_tm,
                         pow_difficulty: topo_pow_difficulty,
                         observed_chain: Some(topo_observed_chain),
+                        liveness_window_secs: topo_liveness_window,
                     });
                 let addr = SocketAddr::from(([0, 0, 0, 0], topo_api_port));
                 info!("Public topology API: http://{}/topology", addr);
@@ -310,6 +315,7 @@ impl NoxNode {
             bus_publisher.clone(),
             metrics_service.clone(),
         )
+        .with_loop_returns(bus_subscriber.clone())
         .with_cancel_token(shutdown_token.clone());
         join_set.spawn(async move {
             traffic_shaping.run().await;
@@ -376,6 +382,7 @@ impl NoxNode {
         let metrics_chain = metrics_service.clone();
         let observer_shutdown = shutdown_token.clone();
         let observer_chain = observed_chain.clone();
+        let observer_resync = topology_manager.resync_signal();
         join_set.spawn(async move {
             if config_chain.registry_contract_address
                 == "0x0000000000000000000000000000000000000000"
@@ -395,12 +402,32 @@ impl NoxNode {
                     observer
                         .with_cancel_token(observer_shutdown)
                         .with_observed_chain(observer_chain)
+                        .with_resync_signal(observer_resync)
                         .start()
                         .await;
                 }
                 Err(e) => error!("Chain Observer failed: {}", e),
             }
         });
+
+        if registry_configured && config.topology_reconcile_interval_secs > 0 {
+            match RegistryReconciler::new(
+                &config,
+                topology_manager.clone(),
+                observed_chain.clone(),
+                metrics_service.clone(),
+            ) {
+                Ok(reconciler) => {
+                    let reconciler = reconciler.with_cancel_token(shutdown_token.clone());
+                    join_set.spawn(async move {
+                        reconciler.run().await;
+                    });
+                }
+                Err(e) => error!("Registry reconciler failed to start: {}", e),
+            }
+        } else {
+            warn!("Registry reconciler disabled; P2P admission will not enforce membership.");
+        }
 
         {
             let compaction_db = db.clone();
@@ -816,6 +843,7 @@ impl NoxNode {
             0,
             None,
             &[],
+            crate::config::NetworkConfig::default().topology_liveness_window_secs,
         )
     }
 
@@ -830,6 +858,7 @@ impl NoxNode {
         pow_difficulty: u32,
         observed_chain: Option<Arc<ObservedChain>>,
         cors_allowed_origins: &[String],
+        liveness_window_secs: u64,
     ) -> MetricsService {
         info!("Initializing Observability...");
         let metrics_service = MetricsService::new();
@@ -878,6 +907,7 @@ impl NoxNode {
                 topology: topology_manager,
                 pow_difficulty,
                 observed_chain,
+                liveness_window_secs,
             });
 
         if let Some(publisher) = bench_publisher {
@@ -945,28 +975,22 @@ fn verify_bootstrap_snapshot(
 }
 
 async fn handle_topology_request(State(state): State<TopologyApiState>) -> Json<TopologySnapshot> {
-    let nodes = state.topology.get_all_nodes();
-    let fingerprint = state.topology.get_current_fingerprint();
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs());
     // The block the observer has applied, not the RPC head: the head can be
-    // ahead of both the node set and the client's own RPC. Read after the node
-    // set, since the observer records a log's block before publishing it.
-    let block_number = state
-        .observed_chain
-        .as_ref()
-        .map_or(0, |chain| chain.topology_block());
+    // ahead of both the node set and the client's own RPC. `snapshot` reads it
+    // after the node set, since the observer records a log's block before
+    // publishing it.
+    let observed_chain = state.observed_chain.clone();
+    let block_number = move || observed_chain.map_or(0, |chain| chain.topology_block());
 
-    Json(TopologySnapshot {
-        nodes,
-        fingerprint: hex::encode(fingerprint),
-        timestamp,
+    Json(state.topology.snapshot(
         block_number,
-        pow_difficulty: state.pow_difficulty,
-        schema_version: 1,
-        liveness: Vec::new(),
-    })
+        state.pow_difficulty,
+        timestamp,
+        state.liveness_window_secs,
+    ))
 }
 
 #[derive(serde::Deserialize)]

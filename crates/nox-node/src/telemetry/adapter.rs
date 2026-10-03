@@ -43,6 +43,7 @@ impl MetricsAdapter {
                         NoxEvent::RelayerRoleUpdated { .. } => "relayer_role_updated",
                         NoxEvent::RelayerUrlUpdated { .. } => "relayer_url_updated",
                         NoxEvent::RelayerSlashed { .. } => "relayer_slashed",
+                        NoxEvent::RelayerProfileSynced { .. } => "relayer_profile_synced",
                         NoxEvent::RegistryPaused { .. } => "registry_paused",
                         NoxEvent::RegistryUnpaused { .. } => "registry_unpaused",
                     };

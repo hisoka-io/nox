@@ -3,11 +3,11 @@ use crate::infra::persistence::peer_registry::PeerRegistry;
 use crate::telemetry::metrics::MetricsService;
 use nox_core::{
     events::NoxEvent,
-    models::topology::RelayerNode,
     traits::{IEventPublisher, IEventSubscriber, IStorageRepository, InfrastructureError},
 };
 
 use super::{
+    admission::{AdmissionGate, PeerAdmission},
     behaviour::{NoxBehaviour, NoxBehaviourEvent, SphinxPacket, SystemMessage},
     connection_filter::ConnectionFilter,
     rate_limiter::{PeerRateLimiter, RateLimitResult},
@@ -15,6 +15,7 @@ use super::{
 
 use dashmap::DashMap;
 use futures::StreamExt;
+use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use libp2p::{identity, noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
 use rand::RngCore;
 use std::str::FromStr;
@@ -93,7 +94,8 @@ pub struct P2PService {
     storage: Arc<dyn IStorageRepository>,
     metrics: MetricsService,
     rate_limiter: PeerRateLimiter,
-    connection_filter: ConnectionFilter,
+    connection_filter: Arc<ConnectionFilter>,
+    admission: Arc<PeerAdmission>,
     peer_addresses: Arc<DashMap<PeerId, Multiaddr>>,
     peer_health: Arc<DashMap<PeerId, PeerHealth>>,
     /// `Relaxed` ordering: monotonic counter, eventual consistency sufficient for metrics.
@@ -103,6 +105,7 @@ pub struct P2PService {
     listening_tx: Option<oneshot::Sender<(PeerId, Multiaddr)>>,
     topology_manager: Arc<crate::services::network_manager::TopologyManager>,
     topology_request_timestamps: Arc<DashMap<PeerId, Instant>>,
+    liveness_window_secs: u64,
     cancel_token: Option<CancellationToken>,
 }
 
@@ -125,6 +128,18 @@ impl P2PService {
         };
         let local_peer_id = PeerId::from(local_key.public());
         info!(peer_id = %local_peer_id, "Local Peer Identity initialized");
+        topology_manager.set_local_peer_id(local_peer_id);
+
+        let connection_filter = Arc::new(ConnectionFilter::with_config(
+            config.network.connection_filter.clone(),
+        ));
+        let admission = Arc::new(PeerAdmission::new(
+            &config.network,
+            topology_manager.clone(),
+            connection_filter.clone(),
+            metrics.clone(),
+        ));
+        let gate_policy = admission.clone();
 
         let swarm = SwarmBuilder::with_existing_identity(local_key)
             .with_tokio()
@@ -135,8 +150,12 @@ impl P2PService {
             )
             .map_err(|e| InfrastructureError::Network(format!("Transport setup failed: {e}")))?
             .with_behaviour(|key| {
-                NoxBehaviour::new(key.clone(), &config.network)
-                    .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
+                NoxBehaviour::new(
+                    key.clone(),
+                    &config.network,
+                    AdmissionGate::new(gate_policy.clone()),
+                )
+                .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
             })
             .map_err(|e| InfrastructureError::Network(format!("Behaviour setup failed: {e:?}")))?
             .with_swarm_config(|c| {
@@ -164,9 +183,8 @@ impl P2PService {
             storage,
             metrics,
             rate_limiter: PeerRateLimiter::with_config(config.network.rate_limit.clone()),
-            connection_filter: ConnectionFilter::with_config(
-                config.network.connection_filter.clone(),
-            ),
+            connection_filter,
+            admission,
             peer_addresses: Arc::new(DashMap::new()),
             peer_health: Arc::new(DashMap::new()),
             rate_limited_count: std::sync::atomic::AtomicU64::new(0),
@@ -175,6 +193,7 @@ impl P2PService {
             listening_tx: None,
             topology_manager,
             topology_request_timestamps: Arc::new(DashMap::new()),
+            liveness_window_secs: config.network.topology_liveness_window_secs,
             cancel_token: None,
         };
 
@@ -238,11 +257,41 @@ impl P2PService {
                     self.session_cache.retain(|_, state| state.created_at.elapsed() < ttl);
                     self.topology_request_timestamps
                         .retain(|_, ts| ts.elapsed() < Duration::from_mins(10));
+                    self.enforce_membership();
+                    self.ensure_member_links();
                 }
                 () = cancel.cancelled() => {
                     info!("P2P Service shutting down (cancellation token).");
                     break;
                 }
+            }
+        }
+    }
+
+    /// Closes links to peers that have been outside the registry for longer
+    /// than the admission grace period (e.g. a node that deregistered).
+    fn enforce_membership(&mut self) {
+        let connected: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
+        for peer in self.admission.sweep(connected) {
+            if self.swarm.disconnect_peer_id(peer).is_err() {
+                debug!(peer = %peer, "disconnect_peer_id failed -- peer may already be gone");
+            }
+        }
+    }
+
+    /// Dials registered members this node has no link to, so liveness reflects
+    /// the whole registry and routes do not depend on the other side dialing.
+    fn ensure_member_links(&mut self) {
+        for (peer, addr) in self.topology_manager.member_dial_targets() {
+            if self.swarm.is_connected(&peer) {
+                continue;
+            }
+            let opts = DialOpts::peer_id(peer)
+                .condition(PeerCondition::DisconnectedAndNotDialing)
+                .addresses(vec![addr])
+                .build();
+            if let Err(e) = self.swarm.dial(opts) {
+                debug!(peer = %peer, error = %e, "Member dial skipped");
             }
         }
     }
@@ -262,23 +311,11 @@ impl P2PService {
     async fn handle_bus_event(&mut self, event: NoxEvent) {
         match event {
             NoxEvent::RelayerRegistered {
-                url,
-                address,
-                sphinx_key,
-                stake,
-                role,
-                ingress_url,
-                metadata_url,
+                url, address, role, ..
             } => {
+                // TopologyManager is the only writer of persisted peers; here
+                // the event only triggers a dial.
                 info!(address = %address, url = %url, role = role, "New Peer Discovered");
-
-                let mut node =
-                    RelayerNode::new(address.clone(), sphinx_key, url.clone(), stake, role);
-                node.ingress_url = ingress_url;
-                node.metadata_url = metadata_url;
-                if let Err(e) = self.peer_registry.save_peer(&node).await {
-                    warn!(error = %e, "Failed to persist peer to registry");
-                }
 
                 if let Ok(addr) = url.parse::<Multiaddr>() {
                     if let Err(e) = self.dial(addr) {
@@ -348,10 +385,8 @@ impl P2PService {
                 local_addr,
                 ..
             } => {
-                if !self.connection_filter.is_allowed(&send_back_addr) {
-                    debug!(addr = %send_back_addr, "Rejecting connection from filtered IP");
-                    return;
-                }
+                // Filtering happens in the admission gate, which can refuse the
+                // connection; this event is only a notification.
                 debug!(
                     from = %send_back_addr,
                     local = %local_addr,
@@ -366,6 +401,7 @@ impl P2PService {
 
                 self.peer_addresses.insert(peer_id, remote_addr.clone());
                 self.connection_filter.register_connection(&remote_addr);
+                self.topology_manager.record_peer_seen(peer_id, unix_now());
 
                 if let Err(e) = self.event_bus.publish(NoxEvent::PeerConnected {
                     peer_id: peer_id.to_string(),
@@ -378,12 +414,20 @@ impl P2PService {
                     .inc();
             }
             libp2p::swarm::SwarmEvent::ConnectionClosed {
-                peer_id, endpoint, ..
+                peer_id,
+                endpoint,
+                num_established,
+                ..
             } => {
                 let remote_addr = endpoint.get_remote_address();
-                debug!(peer = %peer_id, "Connection closed");
+                debug!(peer = %peer_id, remaining = num_established, "Connection closed");
 
                 self.connection_filter.unregister_connection(remote_addr);
+                if num_established > 0 {
+                    // Another connection to this peer is still open.
+                    return;
+                }
+                self.topology_manager.record_peer_gone(&peer_id);
                 self.peer_addresses.remove(&peer_id);
                 self.rate_limiter.remove_peer(&peer_id);
                 self.peer_health.remove(&peer_id);
@@ -429,6 +473,10 @@ impl P2PService {
                         } else {
                             packet.id.clone()
                         };
+                        if !self.admission.allow_packet(&peer) {
+                            debug!(packet_id = %log_id, peer = %peer, "Dropping packet from peer outside the registry");
+                            return;
+                        }
                         match self.rate_limiter.check(&peer) {
                             RateLimitResult::Allowed => {
                                 debug!(packet_id = %log_id, peer = %peer, "Packet received");
@@ -486,7 +534,9 @@ impl P2PService {
                                 if self.rate_limiter.should_disconnect(&peer) {
                                     self.metrics.p2p_rate_limit_disconnects_total.inc();
                                     if let Some(addr) = self.peer_addresses.get(&peer) {
-                                        self.connection_filter.ban_ip(&addr);
+                                        if self.admission.may_ban(&addr) {
+                                            self.connection_filter.ban_ip(&addr);
+                                        }
                                     }
                                     if self.swarm.disconnect_peer_id(peer).is_err() {
                                         debug!(peer = %peer, "disconnect_peer_id failed -- peer may already be gone");
@@ -644,21 +694,13 @@ impl P2PService {
 
                         if allowed {
                             self.topology_request_timestamps.insert(peer, now);
-                            let nodes = self.topology_manager.get_all_nodes();
-                            let fingerprint = self.topology_manager.get_current_fingerprint();
-                            let timestamp = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            let snapshot = nox_core::models::topology::TopologySnapshot {
-                                nodes,
-                                fingerprint: hex::encode(fingerprint),
-                                timestamp,
-                                block_number: 0,
-                                pow_difficulty: 0,
-                                schema_version: 1,
-                                liveness: Vec::new(),
-                            };
+                            // No chain position here, so this stays schema v1.
+                            let snapshot = self.topology_manager.snapshot(
+                                || 0,
+                                0,
+                                unix_now(),
+                                self.liveness_window_secs,
+                            );
                             debug!(peer = %peer, nodes = snapshot.nodes.len(), "Serving topology request");
                             if self
                                 .swarm
@@ -706,6 +748,7 @@ impl P2PService {
                         health.last_rtt = rtt;
                         health.last_ping = Instant::now();
                         health.ping_count += 1;
+                        self.topology_manager.record_peer_seen(peer, unix_now());
 
                         // rtt_secs intentionally computed for future metrics integration
                         let _ = rtt_secs;
@@ -1040,6 +1083,12 @@ impl P2PService {
     }
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// Load or generate a P2P Ed25519 identity key (hex-encoded seed on disk).
 fn load_or_generate_p2p_key(identity_path: &str) -> Result<identity::Keypair, InfrastructureError> {
     let id_path = std::path::Path::new(identity_path);
@@ -1090,6 +1139,7 @@ mod tests {
     use crate::infra::{event_bus::TokioEventBus, storage::SledRepository};
 
     use super::*;
+    use nox_core::models::topology::RelayerNode;
     use tempfile::tempdir;
 
     #[tokio::test]
