@@ -115,6 +115,7 @@ pub struct MetricsService {
     pub response_pack_total: Family<Vec<(String, String)>, Counter>,
     pub exit_payloads_dispatched_total: Family<Vec<(String, String)>, Counter>,
     pub exit_reassembly_total: Family<Vec<(String, String)>, Counter>,
+    pub reassembly_conflict_total: Counter,
     pub exit_reassembler_pending: Gauge<i64, AtomicI64>,
     pub topology_nodes: Family<Vec<(String, String)>, Gauge<i64, AtomicI64>>,
     pub topology_bootstrap_total: Family<Vec<(String, String)>, Counter>,
@@ -713,6 +714,13 @@ impl MetricsService {
             exit_reassembly_total.clone(),
         );
 
+        let reassembly_conflict_total = Counter::default();
+        registry.register(
+            "nox_reassembly_conflict_total",
+            "Reassembly buffers discarded after a conflicting fragment",
+            reassembly_conflict_total.clone(),
+        );
+
         let exit_reassembler_pending = Gauge::<i64, AtomicI64>::default();
         registry.register(
             "nox_exit_reassembler_pending",
@@ -859,6 +867,7 @@ impl MetricsService {
             response_pack_total,
             exit_payloads_dispatched_total,
             exit_reassembly_total,
+            reassembly_conflict_total,
             exit_reassembler_pending,
             topology_nodes,
             topology_bootstrap_total,
