@@ -7,8 +7,8 @@
 //!
 //! Enforcement only starts once the startup grace period has passed and the
 //! registry reconciler has confirmed the node set against the chain; until then
-//! (and in `monitor` mode) decisions are counted and logged only. Members are
-//! never subject to IP bans or subnet caps.
+//! (and in `monitor` mode) decisions, including IP bans and subnet caps, are
+//! counted and logged only. Members are never subject to IP bans or subnet caps.
 
 use crate::config::{NetworkConfig, PeerAdmissionMode};
 use crate::network::connection_filter::ConnectionFilter;
@@ -142,7 +142,9 @@ impl PeerAdmission {
 
     /// IP bans and subnet caps for a not yet authenticated inbound connection.
     /// Addresses registered by members are exempt so a member is never locked
-    /// out by a ban earned under load.
+    /// out by a ban earned under load. Like peer admission, refusals only start
+    /// once enforcement is live, so a cold start with an empty topology cannot
+    /// lock out members.
     #[must_use]
     pub fn allow_inbound_address(&self, remote: &Multiaddr) -> bool {
         if remote_ip(remote).is_some_and(|ip| self.topology.is_member_ip(&ip)) {
@@ -151,12 +153,12 @@ impl PeerAdmission {
         if self.filter.is_allowed(remote) {
             return true;
         }
-        if self.mode == PeerAdmissionMode::Enforce {
+        if self.enforcing() {
             self.record("address", "denied");
             false
         } else {
             debug!(addr = %remote, "Connection filter would refuse address (not enforced)");
-            if self.mode == PeerAdmissionMode::Monitor {
+            if self.mode != PeerAdmissionMode::Off {
                 self.record("address", "would_deny");
             }
             true
@@ -424,15 +426,26 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let topology = topology_with_member(&dir).await;
         let filter = Arc::new(ConnectionFilter::new());
-        let config = NetworkConfig::default();
-        let admission =
-            PeerAdmission::new(&config, topology, filter.clone(), MetricsService::new());
+        let config = NetworkConfig {
+            peer_admission_grace_secs: 0,
+            ..NetworkConfig::default()
+        };
+        let admission = PeerAdmission::new(
+            &config,
+            topology.clone(),
+            filter.clone(),
+            MetricsService::new(),
+        );
 
         let member = addr("10.1.2.3");
         let stranger = addr("10.200.0.1");
         filter.ban_ip(&member);
         filter.ban_ip(&stranger);
 
+        // Not verified yet: bans are only counted.
+        assert!(admission.allow_inbound_address(&stranger));
+
+        topology.set_membership_verified(true);
         assert!(admission.allow_inbound_address(&member));
         assert!(!admission.may_ban(&member));
         assert!(!admission.allow_inbound_address(&stranger));

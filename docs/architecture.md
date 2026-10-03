@@ -119,8 +119,8 @@ DoS protection: token-bucket rate limiting (3 tiers: Unknown/Trusted/Penalized),
 Registry admission: a peer is a member when its libp2p identity appears as `/p2p/<peer id>` in a registered node's
 P2P URL; Noise authenticates that identity. In `enforce` mode (default) the node refuses connections and packets from
 non-members once a registry reconcile has confirmed its node set against `topologyFingerprint()` and
-`relayerCount()`, and closes links to peers that left the registry after `peer_admission_grace_secs`. Member
-addresses are exempt from IP bans and subnet caps. Replay tags are recorded only after a packet's header MAC verifies.
+`relayerCount()`, and closes links to peers that left the registry after `peer_admission_grace_secs`. IP bans and subnet
+caps are refused from the same point; member addresses are exempt from both.
 
 ---
 
