@@ -166,6 +166,10 @@ const fn default_topology_reconcile_interval_secs() -> u64 {
     300
 }
 
+const fn default_chain_cursor_persist_interval_secs() -> u64 {
+    60
+}
+
 #[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct NetworkConfig {
     pub max_connections: u32,
@@ -474,6 +478,12 @@ pub struct NoxConfig {
     #[serde(default)]
     pub exit_workers: ExitWorkerConfig,
     pub block_poll_interval_secs: u64,
+    /// Minimum time between writes of the chain observer's scan cursor. The
+    /// cursor is also written on graceful shutdown. After a crash the observer
+    /// re-scans at most this much chain history, and replaying registry events
+    /// is idempotent. 0 = write after every scanned range.
+    #[serde(default = "default_chain_cursor_persist_interval_secs")]
+    pub chain_cursor_persist_interval_secs: u64,
     /// Block where `NoxRegistry` was deployed; scanned inclusively on first boot.
     /// 0 = start from latest.
     #[serde(default)]
@@ -558,6 +568,10 @@ impl std::fmt::Debug for NoxConfig {
             .field("http", &self.http)
             .field("exit_workers", &self.exit_workers)
             .field("block_poll_interval_secs", &self.block_poll_interval_secs)
+            .field(
+                "chain_cursor_persist_interval_secs",
+                &self.chain_cursor_persist_interval_secs,
+            )
             .field("chain_start_block", &self.chain_start_block)
             .field(
                 "topology_reconcile_interval_secs",
@@ -639,6 +653,7 @@ impl Default for NoxConfig {
             exit_workers: ExitWorkerConfig::default(),
 
             block_poll_interval_secs: 12,
+            chain_cursor_persist_interval_secs: default_chain_cursor_persist_interval_secs(),
             chain_start_block: 0,
             topology_reconcile_interval_secs: default_topology_reconcile_interval_secs(),
 
