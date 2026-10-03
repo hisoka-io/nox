@@ -1,6 +1,6 @@
 [package]
 name = "nox-node"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 rust-version = "1.95"
 authors = ["Hisoka IO"]
@@ -14,9 +14,9 @@ dev-node = []
 hop-metrics = ["nox-crypto/hop-metrics"]
 
 [dependencies]
-nox-core = { path = "../nox-core", version = "0.1.0" }
+nox-core = { path = "../nox-core", version = "0.4.0-rc.2" }
 
-nox-crypto = { path = "../nox-crypto", version = "0.1.0" }
+nox-crypto = { path = "../nox-crypto", version = "0.4.0-rc.2" }
 
 tokio = { version = "1.36", features = ["full", "tracing"] }
 futures = "0.3"
@@ -38,7 +38,7 @@ rand_distr = "0.4"
 x25519-dalek = { version = "2.0.0", features = ["static_secrets", "serde"] }
 zeroize = { workspace = true }
 ethers = { workspace = true }
-libp2p = { version = "0.53", features = ["tcp", "dns", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros", "tokio", "cbor"] }
+libp2p = { version = "0.53", features = ["tcp", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros", "tokio", "cbor"] }
 sled = "0.34"
 prometheus-client = "0.22"
 axum = { version = "0.7", features = ["ws"] }

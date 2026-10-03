@@ -23,6 +23,9 @@ cargo clippy --workspace -- -D warnings
 cargo test --workspace
 ```
 
+User-visible changes also add a line under `## [Unreleased]` in `CHANGELOG.md`, with any operator action under
+`### Upgrade notes`. Releases are described in [docs/releasing.md](docs/releasing.md).
+
 ## Code standards
 
 CI enforces:

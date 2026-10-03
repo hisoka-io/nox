@@ -10,6 +10,9 @@ members = [
     "crates/nox-sim",
 ]
 
+[workspace.package]
+version = "0.4.0-rc.2"
+
 [workspace.dependencies]
 tokio = { version = "1.36", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -51,7 +54,7 @@ manual_let_else = "allow"
 
 [package]
 name = "nox-mixnet"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 rust-version = "1.95"
 authors = ["Hisoka IO"]
@@ -86,20 +89,20 @@ x25519-dalek = { version = "2.0.0", features = ["static_secrets", "serde"] }
 parking_lot = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
 ethers = { version = "2.0", default-features = false, features = ["ws", "ipc", "openssl", "abigen"] }
-libp2p = { version = "0.53", features = ["tcp", "dns", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros", "tokio", "cbor"] }
+libp2p = { version = "0.53", features = ["tcp", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros", "tokio", "cbor"] }
 axum = "0.7"
 tempfile = "3.10"
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
-nox-node = { path = "crates/nox-node", version = "0.1.0" }
+nox-node = { path = "crates/nox-node", version = "0.4.0-rc.2" }
 
-nox-oracle = { path = "crates/nox-oracle", version = "0.1.0" }
+nox-oracle = { path = "crates/nox-oracle", version = "0.4.0-rc.2" }
 
 [dev-dependencies]
-nox-core = { path = "crates/nox-core", version = "0.1.0" }
+nox-core = { path = "crates/nox-core", version = "0.4.0-rc.2" }
 
-nox-crypto = { path = "crates/nox-crypto", version = "0.1.0" }
+nox-crypto = { path = "crates/nox-crypto", version = "0.4.0-rc.2" }
 
-nox-client = { path = "crates/nox-client", version = "0.1.0" }
+nox-client = { path = "crates/nox-client", version = "0.4.0-rc.2" }
 
 mockall = "0.12"
 sha2 = { workspace = true }

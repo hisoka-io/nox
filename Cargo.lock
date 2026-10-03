@@ -998,15 +998,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
-name = "core2"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b49ba7ef1ad6107f8824dbe97de947cbaac53c44e7f9756a1fba0d37c1eec505"
-dependencies = [
- "memchr",
-]
-
-[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3693,11 +3684,10 @@ dependencies = [
 
 [[package]]
 name = "multihash"
-version = "0.19.3"
+version = "0.19.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b430e7953c29dd6a09afc29ff0bb69c6e306329ee6794700aee27b76a1aea8d"
+checksum = "577c63b00ad74d57e8c9aa870b5fccebf2fd64a308a5aee9f1bb88e4aea19447"
 dependencies = [
- "core2",
  "unsigned-varint 0.8.0",
 ]
 
@@ -3843,7 +3833,7 @@ checksum = "38bf9645c8b145698bb0b18a4637dcacbc421ea49bef2317e4fd8065a387cf21"
 
 [[package]]
 name = "nox-client"
-version = "0.1.0"
+version = "0.4.0-rc.2"
 dependencies = [
  "async-trait",
  "bincode",
@@ -3869,7 +3859,7 @@ dependencies = [
 
 [[package]]
 name = "nox-core"
-version = "0.1.0"
+version = "0.4.0-rc.2"
 dependencies = [
  "async-trait",
  "bincode",
@@ -3891,7 +3881,7 @@ dependencies = [
 
 [[package]]
 name = "nox-crypto"
-version = "0.1.0"
+version = "0.4.0-rc.2"
 dependencies = [
  "blake3",
  "chacha20",
@@ -3915,7 +3905,7 @@ dependencies = [
 
 [[package]]
 name = "nox-mixnet"
-version = "0.1.0"
+version = "0.4.0-rc.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3956,7 +3946,7 @@ dependencies = [
 
 [[package]]
 name = "nox-node"
-version = "0.1.0"
+version = "0.4.0-rc.2"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -4002,7 +3992,7 @@ dependencies = [
 
 [[package]]
 name = "nox-oracle"
-version = "0.1.0"
+version = "0.4.0-rc.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -4020,7 +4010,7 @@ dependencies = [
 
 [[package]]
 name = "nox-sim"
-version = "0.1.0"
+version = "0.4.0-rc.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -4054,7 +4044,7 @@ dependencies = [
 
 [[package]]
 name = "nox-test-infra"
-version = "0.1.0"
+version = "0.4.0-rc.2"
 dependencies = [
  "ethers",
  "serde",

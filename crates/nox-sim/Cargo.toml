@@ -1,6 +1,6 @@
 [package]
 name = "nox-sim"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 rust-version = "1.95"
 authors = ["Hisoka IO"]
@@ -31,7 +31,7 @@ rand = "0.8"
 x25519-dalek = { version = "2.0.0", features = ["static_secrets", "serde"] }
 parking_lot = "0.12"
 ethers = { workspace = true }
-libp2p = { version = "0.53", features = ["tcp", "dns", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros", "tokio", "cbor"] }
+libp2p = { version = "0.53", features = ["tcp", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros", "tokio", "cbor"] }
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 axum = "0.7"
 reqwest = { version = "0.12", features = ["json"] }
@@ -39,15 +39,15 @@ tempfile = "3.10"
 toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 zeroize = { workspace = true }
-nox-core = { path = "../nox-core", version = "0.1.0" }
+nox-core = { path = "../nox-core", version = "0.4.0-rc.2" }
 
-nox-crypto = { path = "../nox-crypto", version = "0.1.0" }
+nox-crypto = { path = "../nox-crypto", version = "0.4.0-rc.2" }
 
-nox-client = { path = "../nox-client", version = "0.1.0" }
+nox-client = { path = "../nox-client", version = "0.4.0-rc.2" }
 
-nox-node = { path = "../nox-node", version = "0.1.0" }
+nox-node = { path = "../nox-node", version = "0.4.0-rc.2" }
 
-nox-test-infra = { path = "../nox-test-infra", version = "0.1.0" }
+nox-test-infra = { path = "../nox-test-infra", version = "0.4.0-rc.2" }
 
 [lints]
 workspace = true
