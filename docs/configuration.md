@@ -131,37 +131,33 @@ Three reputation tiers: Unknown, Trusted, Penalized.
 
 ## Environment variables
 
-All config fields can be set via `NOX_` prefix. Nested fields use `__` as separator:
+Environment variables override the TOML file. The prefix is `NOX__` (two underscores), and `__` also separates
+nested fields. A variable with a single underscore, such as `NOX_CHAIN_ID`, is ignored.
 
 ```bash
-# Flat fields
-NOX_ETH_RPC_URL=https://mainnet.infura.io/v3/KEY
-NOX_CHAIN_ID=1
-NOX_P2P_PORT=9000
-NOX_NODE_ROLE=exit
-NOX_ROUTING_PRIVATE_KEY=<32-byte hex>
-NOX_ETH_WALLET_PRIVATE_KEY=<32-byte hex>
-NOX_REGISTRY_CONTRACT_ADDRESS=0x...
-NOX_NOX_ENTRY_POINT_ADDRESS=0x...
-NOX_NOX_REWARD_POOL_ADDRESS=0x...
-NOX_INGRESS_PORT=8080
-NOX_METRICS_PORT=9090
-NOX_BENCHMARK_MODE=true
+# Secrets (`nox keygen` prints these lines)
+NOX__ROUTING_PRIVATE_KEY=<32-byte hex>
+NOX__P2P_PRIVATE_KEY=<32-byte hex>
+NOX__ETH_WALLET_PRIVATE_KEY=<32-byte hex>      # exit and full nodes
+
+# Flat fields (public testnet values; see hisoka-io/run-nox for the full deployment)
+NOX__ETH_RPC_URL=https://arbitrum-sepolia-rpc.publicnode.com
+NOX__CHAIN_ID=421614
+NOX__NODE_ROLE=relay
+NOX__P2P_PORT=15000
+NOX__METRICS_PORT=15001                        # must be p2p_port + 1 on the public network
 
 # Nested fields
-NOX_NETWORK__MAX_CONNECTIONS=2000
-NOX_NETWORK__RATE_LIMIT__RATE_UNKNOWN=150
-NOX_RELAYER__QUEUE_SIZE=20000
-NOX_RELAYER__WORKER_COUNT=8
-NOX_RELAYER__MIX_DELAY_MS=250.0
-NOX_RELAYER__COVER_TRAFFIC_RATE=0.1
-NOX_RELAYER__FRAGMENTATION__TIMEOUT_SECONDS=600
-NOX_HTTP__ALLOW_PRIVATE_IPS=false
-NOX_HTTP__MAX_RESPONSE_BYTES=2097152
-
-# Bootstrap topology
-NOX_BOOTSTRAP_TOPOLOGY_URLS='["http://seed1:8080/topology","http://seed2:8080/topology"]'
+NOX__NETWORK__MAX_CONNECTIONS=2000
+NOX__NETWORK__RATE_LIMIT__RATE_UNKNOWN=150
+NOX__RELAYER__QUEUE_SIZE=20000
+NOX__RELAYER__MIX_DELAY_MS=250.0
+NOX__HTTP__ALLOW_PRIVATE_IPS=false
 ```
+
+List fields such as `bootstrap_topology_urls`, `tokens` and `payment_adapters` cannot be set from the environment;
+set them in the TOML file. Run `nox --config config.toml check-config` to see the role, chain, registry and public
+identity that result from the file and the environment together.
 
 ### Non-config environment variables
 

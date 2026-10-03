@@ -22,20 +22,25 @@ cargo test --workspace
 
 ## Run a node
 
+To join the public testnet on Arbitrum Sepolia, use the operator kit,
+[hisoka-io/run-nox](https://github.com/hisoka-io/run-nox). It pins the release image and the deployment manifest,
+ships relay and exit templates with the deployed contract addresses, verifies them on chain before startup, and
+documents registration.
+
+To run a source build against such a config:
+
 ```bash
-cargo run --release -- --config config.toml
+# Keys plus the public values for registration (build output goes to stderr)
+cargo run --release --bin nox -- keygen > .env
+set -a; . ./.env; set +a
+# Prints the role, chain, registry and public identity derived from config + env
+cargo run --release --bin nox -- --config config.toml check-config
+cargo run --release --bin nox -- --config config.toml
 ```
 
-Or with environment variables:
-
-```bash
-NOX_ETH_RPC_URL=https://mainnet.infura.io/v3/YOUR_KEY \
-NOX_ROUTING_PRIVATE_KEY=<hex> \
-NOX_ETH_WALLET_PRIVATE_KEY=<hex> \
-NOX_CHAIN_ID=1 \
-NOX_NODE_ROLE=exit \
-cargo run --release
-```
+Environment variables override the TOML file. They use the `NOX__` prefix (two underscores), and `__` separates
+nested fields, for example `NOX__CHAIN_ID=421614` or `NOX__NETWORK__MAX_CONNECTIONS=2000`. Variables with a
+single underscore (`NOX_CHAIN_ID`) are ignored. See [configuration](configuration.md#environment-variables).
 
 ## Testing
 
