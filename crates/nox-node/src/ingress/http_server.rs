@@ -121,7 +121,7 @@ fn valid_surb_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<SurbId> {
 async fn inject_packet(State(state): State<Arc<IngressState>>, body: Bytes) -> impl IntoResponse {
     // Validate size
     if body.len() != PACKET_SIZE {
-        warn!(
+        debug!(
             size = body.len(),
             expected = PACKET_SIZE,
             "Rejected packet: wrong size"
@@ -164,7 +164,7 @@ async fn inject_packet(State(state): State<Arc<IngressState>>, body: Bytes) -> i
                 }
             }
             Err(e) => {
-                warn!(error = %e, "HTTP ingress: invalid Sphinx header");
+                debug!(error = %e, "HTTP ingress: invalid Sphinx header");
                 state
                     .metrics
                     .ingress_http_requests_total

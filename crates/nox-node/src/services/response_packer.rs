@@ -7,7 +7,7 @@ use nox_core::protocol::fec::{self, FecError, FecInfo};
 use nox_core::protocol::fragmentation::{Fragment, FragmentationError, FRAGMENT_OVERHEAD};
 use nox_crypto::sphinx::surb::{Surb, SurbError};
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::debug;
 
 pub use nox_core::protocol::fragmentation::SURB_PAYLOAD_SIZE;
 
@@ -258,7 +258,7 @@ impl ResponsePacker {
         let all_fragments = if p > 0 && d > 0 {
             let max_parity = 255usize.saturating_sub(d);
             if max_parity == 0 {
-                info!(
+                debug!(
                     request_id,
                     data_shards = d,
                     "Skipping FEC: data shards exceed RS GF(2^8) limit of 255"
@@ -274,7 +274,7 @@ impl ResponsePacker {
                 fragments
             } else {
                 if p > max_parity {
-                    info!(
+                    debug!(
                         request_id,
                         data_shards = d,
                         requested_parity = p,
@@ -296,7 +296,7 @@ impl ResponsePacker {
                         frags
                     }
                     Err(e) => {
-                        warn!(
+                        debug!(
                             request_id,
                             error = %e,
                             "FEC encoding failed, falling back to data-only fragments"
