@@ -604,13 +604,8 @@ impl MixnetClient {
         let rest = packet_id.strip_prefix("reply-")?;
         let last_dash = rest.rfind('-')?;
         let hex_part = &rest[last_dash + 1..];
-        if hex_part.len() != 32 {
-            return None;
-        }
         let mut id = [0u8; 16];
-        for i in 0..16 {
-            id[i] = u8::from_str_radix(&hex_part[i * 2..i * 2 + 2], 16).ok()?;
-        }
+        hex::decode_to_slice(hex_part, &mut id).ok()?;
         Some(id)
     }
 
@@ -621,7 +616,9 @@ impl MixnetClient {
                 sequence = fragment.sequence,
                 total = fragment.total_fragments,
                 data_shards = fec.data_shard_count,
-                parity_shards = fragment.total_fragments - fec.data_shard_count,
+                parity_shards = fragment
+                    .total_fragments
+                    .saturating_sub(fec.data_shard_count),
                 is_parity = fragment.sequence >= fec.data_shard_count,
                 "Received FEC-protected fragment"
             );
@@ -1779,6 +1776,17 @@ mod tests {
     fn test_extract_surb_id_invalid_hex() {
         let id = MixnetClient::extract_surb_id("reply-1234-ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ");
         assert!(id.is_none());
+    }
+
+    #[test]
+    fn test_extract_surb_id_non_ascii_returns_none() {
+        // 32 bytes of multi-byte UTF-8: slicing by byte offset would split a character.
+        let suffix = "\u{e9}".repeat(16);
+        assert_eq!(suffix.len(), 32);
+        assert!(MixnetClient::extract_surb_id(&format!("reply-1-{suffix}")).is_none());
+        let mixed = format!("a{}", "\u{20ac}".repeat(10)) + "b";
+        assert_eq!(mixed.len(), 32);
+        assert!(MixnetClient::extract_surb_id(&format!("reply-1-{mixed}")).is_none());
     }
 
     #[test]

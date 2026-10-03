@@ -1,6 +1,6 @@
 //! Single Use Reply Blocks (SURBs) for anonymous bidirectional mixnet communication.
 
-use super::lioness::{lioness_decrypt, lioness_encrypt, LionessKeys};
+use super::lioness::{lioness_decrypt, lioness_encrypt, LionessKeys, MIN_BODY_SIZE};
 use super::packet::{PacketError, SphinxPacket};
 use super::{
     apply_stream_cipher, compute_mac, delivery_id_from_shared_secret, derive_keys, PathHop,
@@ -72,6 +72,9 @@ pub enum SurbError {
 
     #[error("Reply tag check failed")]
     TagMismatch,
+
+    #[error("Reply body too short: {len} bytes, minimum {min}")]
+    BodyTooShort { len: usize, min: usize },
 }
 
 /// A Single Use Reply Block. Contains a pre-computed return-path header and payload encryption keys.
@@ -353,6 +356,12 @@ impl SurbRecovery {
 
     /// Decrypts a reply by peeling onion layers then decrypting the inner payload.
     pub fn decrypt(&self, encrypted_body: &[u8]) -> Result<Vec<u8>, SurbError> {
+        if encrypted_body.len() < MIN_BODY_SIZE {
+            return Err(SurbError::BodyTooShort {
+                len: encrypted_body.len(),
+                min: MIN_BODY_SIZE,
+            });
+        }
         let mut body = encrypted_body.to_vec();
 
         // Undo each relay's lioness_decrypt with lioness_encrypt (Lioness is NOT self-inverse)
@@ -467,6 +476,30 @@ mod tests {
         lioness_decrypt(&recovery.payload_keys, &mut test_body);
 
         assert_eq!(test_body, original);
+    }
+
+    #[test]
+    fn test_decrypt_short_body_returns_error() {
+        let (path, _secret_keys) = generate_test_path(3);
+        let (_surb, recovery) = Surb::new(&path, rand::random(), 0).expect("SURB construction");
+        let (_surb_v2, recovery_v2) = Surb::new_v2(&path, 0).expect("SURB construction");
+
+        for len in 0..MIN_BODY_SIZE {
+            let body = vec![0x42u8; len];
+            for r in [&recovery, &recovery_v2] {
+                assert!(
+                    matches!(
+                        r.decrypt(&body),
+                        Err(SurbError::BodyTooShort { len: l, min: MIN_BODY_SIZE }) if l == len
+                    ),
+                    "body of {len} bytes must be rejected"
+                );
+            }
+        }
+
+        // From the minimum size on, decrypt runs the cipher and returns a result.
+        let at_min = recovery.decrypt(&[0x42u8; MIN_BODY_SIZE]);
+        assert!(!matches!(at_min, Err(SurbError::BodyTooShort { .. })));
     }
 
     #[test]
