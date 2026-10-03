@@ -9,7 +9,7 @@ use nox_core::{
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -29,6 +29,56 @@ const MAX_BLOCK_RANGE: u64 = 10_000;
 /// first registrations can land in the same block. `None` = start from head.
 fn resume_cursor(persisted: Option<u64>, chain_start_block: u64) -> Option<u64> {
     persisted.or_else(|| chain_start_block.checked_sub(1))
+}
+
+/// Decides when the scan cursor is written to storage.
+///
+/// Writing it after every poll rewrites the storage page that holds it every
+/// few seconds. A cursor that trails the scan only means the next start
+/// re-scans those blocks, and replaying registry events converges to the same
+/// topology (registrations upsert, removals delete, profile events re-read the
+/// registry), so the cursor is written at most once per `interval`, plus once
+/// on shutdown.
+#[derive(Debug)]
+struct CursorPersistence {
+    interval: Duration,
+    /// Last block written to storage (or loaded from it).
+    persisted: Option<u64>,
+    last_write: Option<Instant>,
+    /// Last block whose registry logs have all been processed.
+    scanned: Option<u64>,
+}
+
+impl CursorPersistence {
+    fn new(interval: Duration, persisted: Option<u64>) -> Self {
+        Self {
+            interval,
+            persisted,
+            last_write: None,
+            scanned: None,
+        }
+    }
+
+    /// Records a completed scan through `block` and returns the block to write
+    /// now, if a write is due.
+    fn scanned_through(&mut self, block: u64, now: Instant) -> Option<u64> {
+        self.scanned = Some(block);
+        let due = self
+            .last_write
+            .is_none_or(|at| now.saturating_duration_since(at) >= self.interval);
+        (due && self.unsaved().is_some()).then_some(block)
+    }
+
+    fn written(&mut self, block: u64, now: Instant) {
+        self.persisted = Some(block);
+        self.last_write = Some(now);
+    }
+
+    /// Scanned block that is newer than the stored cursor.
+    fn unsaved(&self) -> Option<u64> {
+        self.scanned
+            .filter(|scanned| self.persisted.is_none_or(|persisted| persisted < *scanned))
+    }
 }
 
 /// How far `/topology` reports behind the scanned block when no registry log is
@@ -164,6 +214,7 @@ pub struct ChainObserver {
     publisher: Arc<dyn IEventPublisher>,
     storage: Arc<dyn IStorageRepository>,
     poll_interval: Duration,
+    cursor_persist_interval: Duration,
     metrics: MetricsService,
     cancel_token: CancellationToken,
     /// Block to start scanning from on first boot (0 = use latest).
@@ -193,6 +244,7 @@ impl ChainObserver {
             publisher,
             storage,
             poll_interval: Duration::from_secs(config.block_poll_interval_secs),
+            cursor_persist_interval: Duration::from_secs(config.chain_cursor_persist_interval_secs),
             metrics,
             cancel_token: CancellationToken::new(),
             chain_start_block: config.chain_start_block,
@@ -239,11 +291,34 @@ impl ChainObserver {
         }
     }
 
-    /// Persist the last processed block to storage.
-    async fn save_last_block(&self, block: u64) {
+    /// Persist the last processed block to storage. Returns whether it was written.
+    async fn save_last_block(&self, block: u64) -> bool {
         let bytes = block.to_be_bytes();
-        if let Err(e) = self.storage.put(LAST_BLOCK_KEY, &bytes).await {
-            warn!("Failed to persist last block {}: {}", block, e);
+        match self.storage.put(LAST_BLOCK_KEY, &bytes).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Failed to persist last block {}: {}", block, e);
+                false
+            }
+        }
+    }
+
+    /// Writes the cursor if the persistence interval has elapsed.
+    async fn checkpoint(&self, cursor: &mut CursorPersistence, block: u64) {
+        if let Some(due) = cursor.scanned_through(block, Instant::now()) {
+            if self.save_last_block(due).await {
+                cursor.written(due, Instant::now());
+            }
+        }
+    }
+
+    /// Writes the newest scanned block if the stored cursor trails it.
+    async fn persist_unsaved(&self, cursor: &mut CursorPersistence) {
+        if let Some(block) = cursor.unsaved() {
+            if self.save_last_block(block).await {
+                cursor.written(block, Instant::now());
+                debug!(block, "Chain observer cursor written on shutdown");
+            }
         }
     }
 
@@ -255,6 +330,12 @@ impl ChainObserver {
 
         // Resume from persisted block, or use chain_start_block, or start from latest
         let persisted = self.load_last_block().await;
+        let mut cursor = CursorPersistence::new(self.cursor_persist_interval, persisted);
+        self.run(persisted, &mut cursor).await;
+        self.persist_unsaved(&mut cursor).await;
+    }
+
+    async fn run(&self, persisted: Option<u64>, persistence: &mut CursorPersistence) {
         let mut last_block = if let Some(cursor) = resume_cursor(persisted, self.chain_start_block)
         {
             if persisted.is_none() {
@@ -362,7 +443,7 @@ impl ChainObserver {
                         cursor = chunk_end;
                         self.metrics.chain_observer_last_block.set(cursor as i64);
                         self.observed.scanned(cursor);
-                        self.save_last_block(cursor).await;
+                        self.checkpoint(persistence, cursor).await;
                     }
                     Err(e) => {
                         error!(
@@ -679,6 +760,83 @@ impl ChainObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_is_written_at_most_once_per_interval() {
+        let start = Instant::now();
+        let interval = Duration::from_mins(1);
+        let mut cursor = CursorPersistence::new(interval, Some(100));
+
+        // The first completed scan is written straight away.
+        assert_eq!(cursor.scanned_through(110, start), Some(110));
+        cursor.written(110, start);
+
+        // Every poll inside the interval only advances the in-memory position.
+        for (offset, block) in [(5, 115), (30, 140), (59, 170)] {
+            assert_eq!(
+                cursor.scanned_through(block, start + Duration::from_secs(offset)),
+                None
+            );
+        }
+        assert_eq!(cursor.unsaved(), Some(170));
+
+        // The next scan after the interval writes the newest block.
+        assert_eq!(cursor.scanned_through(175, start + interval), Some(175));
+        cursor.written(175, start + interval);
+        assert_eq!(cursor.unsaved(), None);
+        assert_eq!(
+            cursor.scanned_through(180, start + interval + Duration::from_secs(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn cursor_already_stored_is_not_rewritten() {
+        let start = Instant::now();
+        let mut cursor = CursorPersistence::new(Duration::from_mins(1), Some(500));
+        assert_eq!(cursor.unsaved(), None);
+        assert_eq!(cursor.scanned_through(500, start), None);
+        assert_eq!(cursor.unsaved(), None);
+    }
+
+    #[test]
+    fn zero_interval_writes_every_scan() {
+        let start = Instant::now();
+        let mut cursor = CursorPersistence::new(Duration::ZERO, None);
+        for block in 1..=3 {
+            assert_eq!(cursor.scanned_through(block, start), Some(block));
+            cursor.written(block, start);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_writes_the_unsaved_cursor() {
+        use crate::infra::{event_bus::TokioEventBus, storage::SledRepository};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let mut config = NoxConfig::default();
+        config.eth_rpc_url = "http://127.0.0.1:1".to_string();
+        config.chain_cursor_persist_interval_secs = 3_600;
+        let observer = ChainObserver::new(
+            &config,
+            "0x1111111111111111111111111111111111111111",
+            Arc::new(TokioEventBus::new(16)),
+            storage.clone(),
+            MetricsService::new(),
+        )
+        .expect("observer");
+
+        let mut cursor = CursorPersistence::new(observer.cursor_persist_interval, None);
+        observer.checkpoint(&mut cursor, 1_000).await;
+        observer.checkpoint(&mut cursor, 1_010).await;
+        observer.checkpoint(&mut cursor, 1_020).await;
+        assert_eq!(observer.load_last_block().await, Some(1_000));
+
+        observer.persist_unsaved(&mut cursor).await;
+        assert_eq!(observer.load_last_block().await, Some(1_020));
+        assert_eq!(cursor.unsaved(), None);
+    }
 
     #[test]
     fn persisted_cursor_wins_over_chain_start_block() {

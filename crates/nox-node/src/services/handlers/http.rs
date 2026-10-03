@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::debug;
 use url::Url;
 
 const USER_AGENT: &str = "Nox-Proxy/1.0";
@@ -157,7 +157,7 @@ impl HttpHandler {
         let resolved_ip = match security::resolve_hostname(host, port).await {
             Ok(ip) => ip,
             Err(e) => {
-                warn!(request_id = request_id, error = %e, "DNS resolution failed");
+                debug!(request_id = request_id, error = %e, "DNS resolution failed");
                 return self.pack_error_response(
                     request_id,
                     502,
@@ -168,7 +168,7 @@ impl HttpHandler {
         };
 
         if let Err(e) = security::is_ip_allowed(resolved_ip, self.config.allow_private_ips) {
-            warn!(request_id = request_id, error = %e, "SSRF check blocked request");
+            debug!(request_id = request_id, error = %e, "SSRF check blocked request");
             self.metrics
                 .http_proxy_requests_total
                 .get_or_create(&vec![("result".into(), "ssrf_blocked".into())])
@@ -182,7 +182,7 @@ impl HttpHandler {
         }
 
         if let Err(e) = security::is_domain_allowed(host, &self.config.allowed_domains) {
-            warn!(request_id = request_id, error = %e, "Domain whitelist blocked request");
+            debug!(request_id = request_id, error = %e, "Domain whitelist blocked request");
             return self.pack_error_response(
                 request_id,
                 403,
@@ -191,7 +191,7 @@ impl HttpHandler {
             );
         }
 
-        info!(
+        debug!(
             request_id = request_id,
             method = %method,
             host = %host,
@@ -212,7 +212,7 @@ impl HttpHandler {
             ) {
                 Ok(client) => client,
                 Err(e) => {
-                    warn!(request_id = request_id, error = %e, "Pinned HTTP client build failed");
+                    debug!(request_id = request_id, error = %e, "Pinned HTTP client build failed");
                     self.metrics
                         .http_proxy_requests_total
                         .get_or_create(&vec![("result".into(), "error".into())])
@@ -256,7 +256,7 @@ impl HttpHandler {
         let response = match req_builder.send().await {
             Ok(resp) => resp,
             Err(e) => {
-                warn!(request_id = request_id, error = %e, "HTTP request failed");
+                debug!(request_id = request_id, error = %e, "HTTP request failed");
                 self.metrics
                     .http_proxy_requests_total
                     .get_or_create(&vec![("result".into(), "error".into())])
@@ -321,7 +321,7 @@ impl HttpHandler {
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    warn!(request_id = request_id, error = %e, "Failed to read response body chunk");
+                    debug!(request_id = request_id, error = %e, "Failed to read response body chunk");
                     return self.pack_error_response(
                         request_id,
                         502,
@@ -388,7 +388,7 @@ impl HttpHandler {
         let total_serialized = prefix_without_body.len() + 8 + body_len + truncated_byte.len();
         let total_fragments = total_serialized.div_ceil(usable) as u32;
 
-        info!(
+        debug!(
             request_id,
             body_len,
             total_fragments,
@@ -490,7 +490,7 @@ impl HttpHandler {
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    warn!(request_id, error = %e, "Streaming body read failed");
+                    debug!(request_id, error = %e, "Streaming body read failed");
                     break;
                 }
             }
@@ -517,7 +517,7 @@ impl HttpHandler {
         if let Some(distress) = distress_surb {
             let fragments_remaining = total_fragments - sequence;
             if fragments_remaining > 0 {
-                info!(
+                debug!(
                     request_id,
                     packets_dispatched,
                     fragments_remaining,
@@ -571,7 +571,7 @@ impl HttpHandler {
             .get_or_create(&vec![("result".into(), "success".into())])
             .inc();
 
-        info!(
+        debug!(
             request_id,
             packets_dispatched, total_fragments, "Streaming response complete"
         );
@@ -653,7 +653,7 @@ impl ServiceHandler for HttpHandler {
                                     reply_handle: packet.reply_handle(),
                                     origin: PacketOrigin::Originated,
                                 }) {
-                                    warn!(
+                                    debug!(
                                         request_id = request_id,
                                         error = %e,
                                         "Failed to publish HTTP response SendPacket -- reply lost"
@@ -680,7 +680,7 @@ impl ServiceHandler for HttpHandler {
                             }
                         }
 
-                        info!(
+                        debug!(
                             request_id = request_id,
                             "HTTP response packets dispatched to network"
                         );

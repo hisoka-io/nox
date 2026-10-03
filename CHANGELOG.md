@@ -5,6 +5,49 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+## [0.4.0-rc.4] - 2026-10-03
+
+### Upgrade notes
+
+- Upgrade one node at a time; rc.3 and rc.4 nodes and all published clients interoperate. The wire, fragment,
+  FEC and SURB formats are unchanged.
+- On its first start, each node moves its `outbox:*` and `tx:*` records from sled's default tree into a dedicated
+  `exit_outbox` tree. Each record moves in its own transaction, so the move is crash-safe, and later starts find
+  nothing to move. One INFO line reports the counts. Nonce, quote, peer, session and chain observer state stay in
+  the default tree.
+- Downgrading to rc.3: rc.3 reads transaction records from the default tree only, so after a downgrade it sees
+  none of the moved records, including those written before the upgrade. Nonce and quote replay state carry over
+  unchanged. Before downgrading an exit, wait until `nox_eth_tx_pending` is 0 so every paid transaction is
+  mined or failed; a transaction still in flight would leave a nonce gap that holds back later paid
+  transactions until the node runs rc.4 again. Re-upgrading restores every record, and where rc.3 wrote the
+  same key its newer copy is kept.
+
+### Changes
+
+- FEC and fragment decoding on exits and clients checks shard counts, shard lengths and the declared message
+  length against the shards received before allocating, and rejects inconsistent input with
+  `FecError::OriginalLengthOutOfRange`, `EmptyShardData`, `NonUniformShards` or `TooManyShards`. Valid messages
+  decode to the same bytes as before. The shard limit is exported as `nox_core::protocol::fec::MAX_TOTAL_SHARDS`.
+- `SurbRecovery::decrypt` rejects reply bodies shorter than 33 bytes with `SurbError::BodyTooShort`, and the
+  client's SURB ID parsing returns `None` for malformed IDs.
+- Reassembly discards a message's buffer when a fragment arrives for an already buffered sequence with
+  different contents, and returns `FragmentationError::DuplicateDataMismatch`. Exact duplicates (retransmits)
+  remain a no-op. When two clients send concurrently with the same message ID to the same exit, both messages
+  are dropped (previously their data could mix). New metric: `nox_reassembly_conflict_total`.
+- Exits accept FEC only on responses they pack themselves; a forward fragment carrying FEC metadata is dropped
+  and counted as `nox_exit_reassembly_total{result="forward_fec"}`. Published clients send forward fragments
+  without FEC.
+- Exit transaction records live in the dedicated `exit_outbox` sled tree (see upgrade notes), which keeps
+  them apart from frequently rewritten default-tree keys.
+- The chain observer writes its scan position at most once per `chain_cursor_persist_interval_secs` (new
+  top-level config key, default 60; 0 writes after every scanned range) and on graceful shutdown. After a
+  crash it re-scans up to that much history, and registry events replay safely.
+- New metric `nox_storage_size_on_disk_bytes`, refreshed every 30 seconds. The six-hourly storage log line is
+  named "Periodic sled flush", which matches what it does.
+- Per-request and per-packet details (hosts, URLs, RPC methods, packet, request and message IDs, transaction
+  hashes) are logged at debug level, and relay error lines carry no packet ID. The default `info` level keeps
+  lifecycle and aggregate lines.
+
 ## [0.4.0-rc.3] - 2026-10-03
 
 ### Upgrade notes

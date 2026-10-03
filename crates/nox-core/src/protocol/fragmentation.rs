@@ -50,7 +50,11 @@ pub enum FragmentationError {
     #[error("Internal logic error: {0}")]
     InternalError(String),
 
-    #[error("Duplicate fragment seq={sequence} for message {message_id} with different data")]
+    /// A fragment arrived for a sequence already buffered, with different data or metadata.
+    /// The whole reassembly buffer for `message_id` has been discarded.
+    #[error(
+        "Conflicting fragment seq={sequence} for message {message_id}: reassembly buffer discarded"
+    )]
     DuplicateDataMismatch { message_id: u64, sequence: u32 },
 
     #[error("Invalid FEC metadata: {reason}")]
@@ -421,16 +425,22 @@ impl Reassembler {
         let message_id = fragment.message_id;
         let fragment_size = fragment.size();
 
-        // Early duplicate detection before ensure_capacity() to avoid evicting valid sessions
-        if let Some(buffer) = self.buffers.get(&message_id) {
+        // Duplicate handling runs before ensure_capacity() so a duplicate never evicts a session.
+        // An exact duplicate (retransmit, FEC) is a no-op. A different fragment for a buffered
+        // sequence means someone else is writing to this message ID: the whole buffer is
+        // discarded so planted fragments can never be completed into a message.
+        if let Some(buffer) = self.buffers.get_mut(&message_id) {
             if buffer.has_sequence(fragment.sequence) {
-                let buffer = self.buffers.get_mut(&message_id).ok_or_else(|| {
-                    FragmentationError::InternalError(
-                        "Buffer vanished during duplicate check".to_string(),
-                    )
-                })?;
-                buffer.add(fragment)?;
-                return Ok(None);
+                if buffer.fragments.get(&fragment.sequence) == Some(&fragment) {
+                    buffer.last_activity = Instant::now();
+                    return Ok(None);
+                }
+                let sequence = fragment.sequence;
+                self.discard(message_id);
+                return Err(FragmentationError::DuplicateDataMismatch {
+                    message_id,
+                    sequence,
+                });
             }
         }
 
@@ -471,6 +481,15 @@ impl Reassembler {
             self.evict_oldest();
         }
         Ok(())
+    }
+
+    /// Removes the buffer for `message_id` and releases its bytes.
+    fn discard(&mut self, message_id: u64) {
+        if let Some(buffer) = self.buffers.remove(&message_id) {
+            self.total_buffered_bytes = self
+                .total_buffered_bytes
+                .saturating_sub(buffer.buffered_bytes);
+        }
     }
 
     fn evict_oldest(&mut self) {
@@ -1037,5 +1056,239 @@ mod tests {
             result.is_err(),
             "expected error on inconsistent FEC metadata, got Ok"
         );
+    }
+
+    #[test]
+    fn test_exact_duplicate_is_noop() {
+        let fragmenter = Fragmenter::new();
+        let mut reassembler = Reassembler::new(ReassemblerConfig::default());
+        let original: Vec<u8> = (0..3000).map(|i| (i % 251) as u8).collect();
+        let fragments = fragmenter.fragment(7, &original, 1000).unwrap();
+
+        reassembler.add_fragment(fragments[0].clone()).unwrap();
+        let bytes_before = reassembler.buffered_bytes();
+        assert!(reassembler
+            .add_fragment(fragments[0].clone())
+            .unwrap()
+            .is_none());
+        assert_eq!(reassembler.buffered_bytes(), bytes_before);
+        assert_eq!(reassembler.message_progress(7).map(|p| p.0), Some(1));
+
+        let mut result = None;
+        for frag in fragments.into_iter().skip(1) {
+            result = reassembler.add_fragment(frag).unwrap().or(result);
+        }
+        assert_eq!(result, Some(original));
+    }
+
+    #[test]
+    fn test_conflicting_fragment_discards_buffer() {
+        let fragmenter = Fragmenter::new();
+        let mut reassembler = Reassembler::new(ReassemblerConfig::default());
+        let victim: Vec<u8> = vec![0xAA; 3000];
+        let victim_frags = fragmenter.fragment(9, &victim, 1000).unwrap();
+        let total = victim_frags[0].total_fragments;
+
+        // Victim delivers sequences 0 and 1.
+        reassembler.add_fragment(victim_frags[0].clone()).unwrap();
+        reassembler.add_fragment(victim_frags[1].clone()).unwrap();
+        assert!(reassembler.has_message(9));
+
+        // Attacker sends different data for sequence 1: whole buffer goes.
+        let planted = Fragment::new(9, total, 1, vec![0xBB; 979]).unwrap();
+        let err = reassembler.add_fragment(planted).unwrap_err();
+        assert_eq!(
+            err,
+            FragmentationError::DuplicateDataMismatch {
+                message_id: 9,
+                sequence: 1
+            }
+        );
+        assert!(!reassembler.has_message(9));
+        assert_eq!(reassembler.buffered_bytes(), 0);
+        assert_eq!(reassembler.pending_count(), 0);
+
+        // The victim's last fragment starts a new buffer that cannot complete with the
+        // victim's earlier (discarded) fragments.
+        let last = victim_frags.last().cloned().unwrap();
+        assert!(reassembler.add_fragment(last).unwrap().is_none());
+        assert_eq!(reassembler.message_progress(9), Some((1, total)));
+    }
+
+    #[test]
+    fn test_conflicting_total_on_buffered_sequence_discards_buffer() {
+        let mut reassembler = Reassembler::new(ReassemblerConfig::default());
+        reassembler
+            .add_fragment(Fragment::new(5, 4, 0, vec![1, 2, 3]).unwrap())
+            .unwrap();
+        let err = reassembler
+            .add_fragment(Fragment::new(5, 6, 0, vec![1, 2, 3]).unwrap())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            FragmentationError::DuplicateDataMismatch {
+                message_id: 5,
+                sequence: 0
+            }
+        ));
+        assert!(!reassembler.has_message(5));
+    }
+
+    #[test]
+    fn test_conflict_does_not_touch_other_messages() {
+        let mut reassembler = Reassembler::new(ReassemblerConfig::default());
+        reassembler
+            .add_fragment(Fragment::new(1, 3, 0, vec![1; 10]).unwrap())
+            .unwrap();
+        reassembler
+            .add_fragment(Fragment::new(2, 3, 0, vec![2; 10]).unwrap())
+            .unwrap();
+        let bytes_two = reassembler.buffered_bytes() / 2;
+        assert!(reassembler
+            .add_fragment(Fragment::new(1, 3, 0, vec![9; 10]).unwrap())
+            .is_err());
+        assert!(!reassembler.has_message(1));
+        assert!(reassembler.has_message(2));
+        assert_eq!(reassembler.buffered_bytes(), bytes_two);
+    }
+
+    #[test]
+    fn test_fec_huge_original_len_rejected_without_panic() {
+        let mut reassembler = Reassembler::new(ReassemblerConfig::default());
+        let fec = FecInfo {
+            data_shard_count: 2,
+            original_data_len: u64::MAX,
+        };
+        let mut result = Ok(None);
+        for seq in 0..2 {
+            result = reassembler.add_fragment(Fragment {
+                message_id: 11,
+                total_fragments: 3,
+                sequence: seq,
+                data: vec![0x55; 64],
+                fec: Some(fec.clone()),
+            });
+        }
+        assert!(matches!(
+            result,
+            Err(FragmentationError::FecDecodeFailed(_))
+        ));
+        assert!(!reassembler.has_message(11));
+        assert_eq!(reassembler.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn test_fec_mismatched_shard_sizes_rejected_without_panic() {
+        let mut reassembler = Reassembler::new(ReassemblerConfig::default());
+        let fec = FecInfo {
+            data_shard_count: 2,
+            original_data_len: 10,
+        };
+        reassembler
+            .add_fragment(Fragment {
+                message_id: 12,
+                total_fragments: 4,
+                sequence: 0,
+                data: vec![1; 8],
+                fec: Some(fec.clone()),
+            })
+            .unwrap();
+        let result = reassembler.add_fragment(Fragment {
+            message_id: 12,
+            total_fragments: 4,
+            sequence: 3,
+            data: vec![2; 5],
+            fec: Some(fec),
+        });
+        assert!(matches!(
+            result,
+            Err(FragmentationError::FecDecodeFailed(_))
+        ));
+    }
+
+    #[test]
+    fn test_fec_zero_data_shards_rejected() {
+        let mut reassembler = Reassembler::new(ReassemblerConfig::default());
+        let result = reassembler.add_fragment(Fragment {
+            message_id: 13,
+            total_fragments: 2,
+            sequence: 0,
+            data: vec![1; 8],
+            fec: Some(FecInfo {
+                data_shard_count: 0,
+                original_data_len: 8,
+            }),
+        });
+        assert!(matches!(result, Err(FragmentationError::InvalidFec { .. })));
+        assert!(!reassembler.has_message(13));
+    }
+
+    /// Random malformed fragment streams (huge lengths, zero/oversized shard counts, mixed
+    /// sizes, conflicting duplicates, FEC/non-FEC mixes) must never panic, and the buffered
+    /// byte count must stay consistent.
+    #[test]
+    fn test_fuzz_malformed_fragments_never_panic() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(0x0167_0167);
+        let mut reassembler = Reassembler::new(ReassemblerConfig {
+            max_buffer_bytes: 256 * 1024,
+            max_concurrent_messages: 8,
+            ..ReassemblerConfig::default()
+        });
+        for _ in 0..20_000 {
+            let message_id = rng.gen_range(0..6);
+            let total_fragments = match rng.gen_range(0..5) {
+                0 => 0,
+                1 => rng.gen_range(1..4),
+                2 => rng.gen_range(1..300),
+                3 => MAX_FRAGMENTS_PER_MESSAGE,
+                _ => rng.gen(),
+            };
+            let sequence = if total_fragments > 0 && rng.gen_bool(0.9) {
+                rng.gen_range(0..total_fragments.min(8))
+            } else {
+                rng.gen()
+            };
+            let len = match rng.gen_range(0..4) {
+                0 => 0,
+                1 => 16,
+                2 => rng.gen_range(1..64),
+                _ => rng.gen_range(1..2048),
+            };
+            let data: Vec<u8> = (0..len).map(|_| rng.gen_range(0..3)).collect();
+            let fec = if rng.gen_bool(0.7) {
+                Some(FecInfo {
+                    data_shard_count: match rng.gen_range(0..4) {
+                        0 => 0,
+                        1 => rng.gen_range(1..4),
+                        2 => total_fragments,
+                        _ => rng.gen(),
+                    },
+                    original_data_len: match rng.gen_range(0..4) {
+                        0 => u64::MAX,
+                        1 => rng.gen(),
+                        2 => rng.gen_range(0..64),
+                        _ => 32,
+                    },
+                })
+            } else {
+                None
+            };
+            let frag = Fragment {
+                message_id,
+                total_fragments,
+                sequence,
+                data,
+                fec,
+            };
+            if let Ok(Some(out)) = reassembler.add_fragment(frag) {
+                assert!(out.len() <= 8 * 2048);
+            }
+            if reassembler.pending_count() == 0 {
+                assert_eq!(reassembler.buffered_bytes(), 0);
+            }
+        }
     }
 }

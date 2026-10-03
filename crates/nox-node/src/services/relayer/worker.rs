@@ -6,7 +6,7 @@ use nox_crypto::sphinx::{into_result, ProcessResult, SphinxError, SphinxHeader};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 use x25519_dalek::StaticSecret as X25519SecretKey;
 
 /// Shared via `Arc`; `StaticSecret` zeroes key material on drop via `zeroize`.
@@ -140,7 +140,7 @@ impl WorkerStage {
     }
 
     fn record_sphinx_error(&self, pid: &str, e: &SphinxError) {
-        warn!("Sphinx processing failed for {}: {}", pid, e);
+        debug!("Sphinx processing failed for {}: {}", pid, e);
         let reason = match e {
             SphinxError::MacMismatch => "mac_fail",
             SphinxError::Crypto(_) => "decrypt_fail",
@@ -161,7 +161,7 @@ impl WorkerStage {
             .await
         {
             Ok(true) => {
-                warn!("Duplicate packet detected: {}. Dropping.", pid);
+                debug!("Duplicate packet detected: {}. Dropping.", pid);
                 self.metrics
                     .ingest_dropped_total
                     .get_or_create(&vec![("reason".to_string(), "replay".to_string())])
@@ -180,7 +180,7 @@ impl WorkerStage {
                 true
             }
             Err(e) => {
-                error!("Replay DB error for {}: {:?}.", pid, e);
+                error!(error = ?e, "Replay DB error; packet dropped");
                 self.metrics
                     .ingest_dropped_total
                     .get_or_create(&vec![("reason".to_string(), "replay_error".to_string())])

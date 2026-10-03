@@ -72,6 +72,7 @@ configured gas buffer, and set quote and aggregate pending-gas ceilings above th
 | Field | Default | Description |
 |---|---|---|
 | `topology_reconcile_interval_secs` | `300` | How often every member is re-read from the registry and the node set is checked against `topologyFingerprint()` and `relayerCount()`. 0 disables it, which also keeps P2P admission permissive |
+| `chain_cursor_persist_interval_secs` | `60` | Minimum time between writes of the chain observer's scan cursor; the cursor is also written on graceful shutdown. After a crash the observer re-scans up to this much history, and registry events are safe to replay. 0 writes it after every scanned range |
 
 ### `[network]`
 

@@ -6,6 +6,9 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// GF(2^8) Reed-Solomon supports at most 255 shards (data + parity).
+pub const MAX_TOTAL_SHARDS: usize = 255;
+
 /// FEC parameters carried on every fragment (12 bytes). Present on all fragments
 /// because any could be dropped and the reassembler needs these from whichever arrives first.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,6 +61,16 @@ pub enum FecError {
 
     #[error("Shard array length {got} does not match expected {expected} (data + parity)")]
     ShardCountMismatch { expected: usize, got: usize },
+
+    #[error(
+        "original_data_len {original_data_len} exceeds the {max} bytes carried by {data_shards} data shards of {shard_len} bytes"
+    )]
+    OriginalLengthOutOfRange {
+        original_data_len: u64,
+        max: u64,
+        data_shards: usize,
+        shard_len: usize,
+    },
 }
 
 /// Generate parity shards from uniform-length data shards using Reed-Solomon.
@@ -74,7 +87,7 @@ pub fn encode_parity_shards(
     }
 
     let total = data_shards.len() + parity_count;
-    if total > 255 {
+    if total > MAX_TOTAL_SHARDS {
         return Err(FecError::TooManyShards {
             data: data_shards.len(),
             parity: parity_count,
@@ -134,8 +147,59 @@ pub fn pad_to_uniform(data_chunks: &[Vec<u8>]) -> Result<(Vec<Vec<u8>>, usize), 
     Ok((padded, shard_size))
 }
 
+/// Checks that every present shard is non-empty and the same length, and returns that length.
+/// Returns `None` when no shard is present.
+fn uniform_shard_len(shards: &[Option<Vec<u8>>]) -> Result<Option<usize>, FecError> {
+    let mut expected: Option<usize> = None;
+    for (index, shard) in shards.iter().enumerate() {
+        let Some(data) = shard else { continue };
+        if data.is_empty() {
+            return Err(FecError::EmptyShardData);
+        }
+        match expected {
+            None => expected = Some(data.len()),
+            Some(len) if len != data.len() => {
+                return Err(FecError::NonUniformShards {
+                    expected: len,
+                    index,
+                    got: data.len(),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(expected)
+}
+
+/// Bounds `original_data_len` by the bytes the data shards actually carry, so the output
+/// allocation never exceeds the received data.
+fn bounded_output_len(
+    data_shard_count: usize,
+    shard_len: usize,
+    original_data_len: u64,
+) -> Result<usize, FecError> {
+    let max = u64::try_from(data_shard_count)
+        .ok()
+        .zip(u64::try_from(shard_len).ok())
+        .and_then(|(d, len)| d.checked_mul(len))
+        .unwrap_or(u64::MAX);
+    let out_of_range = || FecError::OriginalLengthOutOfRange {
+        original_data_len,
+        max,
+        data_shards: data_shard_count,
+        shard_len,
+    };
+    if original_data_len > max {
+        return Err(out_of_range());
+    }
+    usize::try_from(original_data_len).map_err(|_| out_of_range())
+}
+
 /// Reconstruct original data from a (possibly incomplete) set of D+P shard slots.
 /// Fast path if all data shards present; RS reconstruction otherwise.
+///
+/// Inputs may come from an untrusted peer: shard counts, shard lengths and
+/// `original_data_len` are validated before any allocation, and every failure is a typed error.
 pub fn decode_shards(
     shards: &mut [Option<Vec<u8>>],
     data_shard_count: usize,
@@ -163,43 +227,50 @@ pub fn decode_shards(
         });
     }
 
-    let all_data_present = shards[..data_shard_count].iter().all(Option::is_some);
-    if all_data_present {
-        let mut result = Vec::with_capacity(original_data_len as usize);
-        for shard in &shards[..data_shard_count] {
-            if let Some(data) = shard.as_ref() {
-                result.extend_from_slice(data);
-            }
-        }
-        result.truncate(original_data_len as usize);
-        return Ok(result);
-    }
-
-    if parity_count == 0 {
+    let Some(shard_len) = uniform_shard_len(shards)? else {
         return Err(FecError::InsufficientShards {
             available,
             required: data_shard_count,
         });
+    };
+    let output_len = bounded_output_len(data_shard_count, shard_len, original_data_len)?;
+
+    let all_data_present = shards[..data_shard_count].iter().all(Option::is_some);
+    if !all_data_present {
+        if parity_count == 0 {
+            return Err(FecError::InsufficientShards {
+                available,
+                required: data_shard_count,
+            });
+        }
+        if total_shards > MAX_TOTAL_SHARDS {
+            return Err(FecError::TooManyShards {
+                data: data_shard_count,
+                parity: parity_count,
+                total: total_shards,
+            });
+        }
+
+        let rs = ReedSolomon::new(data_shard_count, parity_count)
+            .map_err(|e| FecError::EncoderCreationFailed(e.to_string()))?;
+
+        rs.reconstruct(shards)
+            .map_err(|e| FecError::ReconstructionFailed(e.to_string()))?;
     }
 
-    let rs = ReedSolomon::new(data_shard_count, parity_count)
-        .map_err(|e| FecError::EncoderCreationFailed(e.to_string()))?;
-
-    rs.reconstruct(shards)
-        .map_err(|e| FecError::ReconstructionFailed(e.to_string()))?;
-
-    let mut result = Vec::with_capacity(original_data_len as usize);
+    let mut result = Vec::with_capacity(output_len);
     for shard in &shards[..data_shard_count] {
-        match shard.as_ref() {
-            Some(data) => result.extend_from_slice(data),
-            None => {
-                return Err(FecError::ReconstructionFailed(
-                    "RS reconstruction did not fill all data shards".to_string(),
-                ));
-            }
+        let Some(data) = shard.as_ref() else {
+            return Err(FecError::ReconstructionFailed(
+                "RS reconstruction did not fill all data shards".to_string(),
+            ));
+        };
+        let remaining = output_len - result.len();
+        result.extend_from_slice(&data[..data.len().min(remaining)]);
+        if result.len() == output_len {
+            break;
         }
     }
-    result.truncate(original_data_len as usize);
 
     Ok(result)
 }
@@ -490,5 +561,173 @@ mod tests {
         shards[5] = None;
         let recovered = decode_shards(&mut shards, d, original.len() as u64).unwrap();
         assert_eq!(recovered, original);
+    }
+
+    fn encoded_shards(original: &[u8], shard_size: usize, parity: usize) -> Vec<Option<Vec<u8>>> {
+        let data_shards = make_data_shards(original, shard_size);
+        let parity = encode_parity_shards(&data_shards, parity).unwrap();
+        data_shards
+            .iter()
+            .chain(parity.iter())
+            .map(|s| Some(s.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn test_huge_original_len_fast_path_rejected() {
+        let mut shards = encoded_shards(&[7u8; 100], 50, 1);
+        let result = decode_shards(&mut shards, 2, u64::MAX);
+        assert!(matches!(
+            result,
+            Err(FecError::OriginalLengthOutOfRange {
+                original_data_len: u64::MAX,
+                max: 100,
+                data_shards: 2,
+                shard_len: 50,
+            })
+        ));
+    }
+
+    #[test]
+    fn test_huge_original_len_rs_path_rejected() {
+        let mut shards = encoded_shards(&[7u8; 100], 50, 1);
+        shards[0] = None;
+        let result = decode_shards(&mut shards, 2, 1 << 40);
+        assert!(matches!(
+            result,
+            Err(FecError::OriginalLengthOutOfRange { max: 100, .. })
+        ));
+    }
+
+    #[test]
+    fn test_original_len_one_past_capacity_rejected() {
+        let mut shards = encoded_shards(&[7u8; 100], 50, 1);
+        assert!(matches!(
+            decode_shards(&mut shards, 2, 101),
+            Err(FecError::OriginalLengthOutOfRange { .. })
+        ));
+        let mut shards = encoded_shards(&[7u8; 100], 50, 1);
+        assert_eq!(decode_shards(&mut shards, 2, 100).unwrap(), vec![7u8; 100]);
+    }
+
+    #[test]
+    fn test_zero_data_shards_rejected() {
+        let mut shards = vec![Some(vec![1u8; 8]); 3];
+        assert!(matches!(
+            decode_shards(&mut shards, 0, 8),
+            Err(FecError::EmptyDataShards)
+        ));
+        let mut empty: Vec<Option<Vec<u8>>> = Vec::new();
+        assert!(matches!(
+            decode_shards(&mut empty, 0, 0),
+            Err(FecError::EmptyDataShards)
+        ));
+    }
+
+    #[test]
+    fn test_more_data_shards_than_slots_rejected() {
+        let mut shards = vec![Some(vec![1u8; 8]); 3];
+        assert!(matches!(
+            decode_shards(&mut shards, 4, 8),
+            Err(FecError::ShardCountMismatch {
+                expected: 4,
+                got: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn test_mismatched_shard_sizes_fast_path_rejected() {
+        let mut shards = vec![Some(vec![1u8; 8]), Some(vec![2u8; 3]), None];
+        assert!(matches!(
+            decode_shards(&mut shards, 2, 11),
+            Err(FecError::NonUniformShards {
+                expected: 8,
+                index: 1,
+                got: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn test_mismatched_parity_size_rs_path_rejected() {
+        let mut shards = encoded_shards(&[9u8; 64], 16, 2);
+        shards[1] = None;
+        if let Some(parity) = shards[4].as_mut() {
+            parity.push(0);
+        }
+        assert!(matches!(
+            decode_shards(&mut shards, 4, 64),
+            Err(FecError::NonUniformShards { index: 4, .. })
+        ));
+    }
+
+    #[test]
+    fn test_empty_shard_rejected() {
+        let mut shards = vec![Some(Vec::new()), Some(Vec::new())];
+        assert!(matches!(
+            decode_shards(&mut shards, 2, 0),
+            Err(FecError::EmptyShardData)
+        ));
+    }
+
+    #[test]
+    fn test_too_many_shards_rs_path_rejected() {
+        let mut shards: Vec<Option<Vec<u8>>> = vec![Some(vec![0u8; 4]); 300];
+        shards[0] = None;
+        assert!(matches!(
+            decode_shards(&mut shards, 200, 800),
+            Err(FecError::TooManyShards { total: 300, .. })
+        ));
+    }
+
+    #[test]
+    fn test_large_data_shard_count_fast_path_bounded() {
+        let mut shards: Vec<Option<Vec<u8>>> = vec![Some(vec![3u8; 2]); 9_500];
+        let out = decode_shards(&mut shards, 9_500, 19_000).unwrap();
+        assert_eq!(out.len(), 19_000);
+        let mut shards: Vec<Option<Vec<u8>>> = vec![Some(vec![3u8; 2]); 9_500];
+        assert!(matches!(
+            decode_shards(&mut shards, 9_500, 19_001),
+            Err(FecError::OriginalLengthOutOfRange { max: 19_000, .. })
+        ));
+    }
+
+    /// Random malformed shard sets: decode must return (never panic) and any output must
+    /// fit within the bytes the data shards carry.
+    #[test]
+    fn test_fuzz_malformed_shards_never_panic() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(0x00F0_EC0D);
+        for _ in 0..3_000 {
+            let total: usize = rng.gen_range(0..40);
+            let mut shards: Vec<Option<Vec<u8>>> = (0..total)
+                .map(|_| {
+                    if rng.gen_bool(0.25) {
+                        None
+                    } else {
+                        let len = if rng.gen_bool(0.8) {
+                            16
+                        } else {
+                            rng.gen_range(0..32)
+                        };
+                        Some((0..len).map(|_| rng.gen()).collect())
+                    }
+                })
+                .collect();
+            let data_shard_count = rng.gen_range(0..=total + 2);
+            let original_data_len = match rng.gen_range(0..4) {
+                0 => rng.gen(),
+                1 => u64::MAX,
+                2 => rng.gen_range(0..1_024),
+                _ => (data_shard_count as u64) * 16,
+            };
+            if let Ok(out) = decode_shards(&mut shards, data_shard_count, original_data_len) {
+                assert!(out.len() as u64 <= original_data_len);
+                assert!(out.len() <= data_shard_count * 32);
+            }
+        }
     }
 }

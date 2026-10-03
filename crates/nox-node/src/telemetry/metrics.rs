@@ -92,6 +92,7 @@ pub struct MetricsService {
     pub quote_pending_sponsored_gas: Gauge<i64, AtomicI64>,
     pub quote_rolling_loss_gwei: Gauge<i64, AtomicI64>,
     pub storage_degraded: Gauge<i64, AtomicI64>,
+    pub storage_size_on_disk_bytes: Gauge<i64, AtomicI64>,
     pub exit_payloads_dropped_total: Family<Vec<(String, String)>, Counter>,
     pub exit_lane_inflight: Family<Vec<(String, String)>, Gauge<i64, AtomicI64>>,
     pub event_bus_subscriber_lag_total: Family<Vec<(String, String)>, Counter>,
@@ -115,6 +116,7 @@ pub struct MetricsService {
     pub response_pack_total: Family<Vec<(String, String)>, Counter>,
     pub exit_payloads_dispatched_total: Family<Vec<(String, String)>, Counter>,
     pub exit_reassembly_total: Family<Vec<(String, String)>, Counter>,
+    pub reassembly_conflict_total: Counter,
     pub exit_reassembler_pending: Gauge<i64, AtomicI64>,
     pub topology_nodes: Family<Vec<(String, String)>, Gauge<i64, AtomicI64>>,
     pub topology_bootstrap_total: Family<Vec<(String, String)>, Counter>,
@@ -558,6 +560,13 @@ impl MetricsService {
             storage_degraded.clone(),
         );
 
+        let storage_size_on_disk_bytes = Gauge::<i64, AtomicI64>::default();
+        registry.register(
+            "nox_storage_size_on_disk_bytes",
+            "Bytes the sled database occupies on disk, log file plus blob files",
+            storage_size_on_disk_bytes.clone(),
+        );
+
         let exit_payloads_dropped_total = Family::<Vec<(String, String)>, Counter>::default();
         registry.register(
             "nox_exit_payloads_dropped",
@@ -713,6 +722,13 @@ impl MetricsService {
             exit_reassembly_total.clone(),
         );
 
+        let reassembly_conflict_total = Counter::default();
+        registry.register(
+            "nox_reassembly_conflict_total",
+            "Reassembly buffers discarded after a conflicting fragment",
+            reassembly_conflict_total.clone(),
+        );
+
         let exit_reassembler_pending = Gauge::<i64, AtomicI64>::default();
         registry.register(
             "nox_exit_reassembler_pending",
@@ -837,6 +853,7 @@ impl MetricsService {
             quote_pending_sponsored_gas,
             quote_rolling_loss_gwei,
             storage_degraded,
+            storage_size_on_disk_bytes,
             exit_payloads_dropped_total,
             exit_lane_inflight,
             event_bus_subscriber_lag_total,
@@ -859,6 +876,7 @@ impl MetricsService {
             response_pack_total,
             exit_payloads_dispatched_total,
             exit_reassembly_total,
+            reassembly_conflict_total,
             exit_reassembler_pending,
             topology_nodes,
             topology_bootstrap_total,

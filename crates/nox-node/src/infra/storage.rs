@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use ethers::types::U256;
-use sled::Db;
+use sled::transaction::{ConflictableTransactionError, TransactionError, Transactional};
+use sled::{Db, Tree};
 use std::{
     path::Path,
     sync::{
@@ -102,6 +103,101 @@ const RETRY_BACKOFF_MS: [u64; 3] = [100, 500, 2000];
 /// Shared flag describing whether the storage layer is failing writes.
 pub type DegradedFlag = Arc<AtomicBool>;
 
+/// Name of the sled tree holding the exit transaction outbox (`outbox:*`) and
+/// the per-nonce transaction records (`tx:*`).
+///
+/// Signed transaction records are tens of kilobytes each. Kept in the default
+/// tree, they shared a leaf with small, frequently rewritten keys such as the
+/// chain observer cursor, which pushed that leaf past sled's inline page limit
+/// so every rewrite of it produced a new blob file. A dedicated tree keeps
+/// those records in leaves that change only when a transaction does.
+pub const OUTBOX_TREE: &[u8] = b"exit_outbox";
+
+/// Key prefixes stored in [`OUTBOX_TREE`] instead of the default tree.
+pub const OUTBOX_KEY_PREFIXES: [&[u8]; 2] = [b"outbox:", b"tx:"];
+
+/// True for keys that live in [`OUTBOX_TREE`].
+#[must_use]
+pub fn is_outbox_key(key: &[u8]) -> bool {
+    OUTBOX_KEY_PREFIXES
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
+}
+
+/// Records moved from the default tree into [`OUTBOX_TREE`] by one startup migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OutboxMigration {
+    /// `outbox:*` records moved.
+    pub outbox_records: usize,
+    /// `tx:*` records moved.
+    pub transaction_records: usize,
+    /// Moved records that replaced a record already in [`OUTBOX_TREE`] under the
+    /// same key. Only possible after a downgrade wrote to the default tree.
+    pub replaced: usize,
+}
+
+impl OutboxMigration {
+    #[must_use]
+    pub fn moved(&self) -> usize {
+        self.outbox_records.saturating_add(self.transaction_records)
+    }
+}
+
+/// Moves every `outbox:*` and `tx:*` record from the default tree into the
+/// outbox tree.
+///
+/// Each key moves in its own transaction across both trees, so a crash leaves
+/// every record in exactly one tree and the next start finishes the job. A
+/// second run finds nothing to move. When a key exists in both trees (a
+/// downgraded binary wrote it to the default tree after an earlier move), the
+/// default-tree copy is the newer write and replaces the outbox copy.
+pub fn migrate_outbox_records(
+    default_tree: &Tree,
+    outbox: &Tree,
+) -> Result<OutboxMigration, InfrastructureError> {
+    let mut report = OutboxMigration::default();
+    for prefix in OUTBOX_KEY_PREFIXES {
+        let keys = default_tree
+            .scan_prefix(prefix)
+            .keys()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                InfrastructureError::Database(format!(
+                    "outbox migration: scanning {} keys in the default tree failed: {error}",
+                    String::from_utf8_lossy(prefix)
+                ))
+            })?;
+        for key in keys {
+            let moved = (default_tree, outbox)
+                .transaction(|(default_tx, outbox_tx)| {
+                    let Some(value) = default_tx.remove(&key)? else {
+                        return Ok(None);
+                    };
+                    let previous = outbox_tx.insert(&key, value)?;
+                    Ok::<_, ConflictableTransactionError<()>>(Some(previous.is_some()))
+                })
+                .map_err(|error: TransactionError<()>| {
+                    InfrastructureError::Database(format!(
+                        "outbox migration: moving key {} failed: {error:?}",
+                        String::from_utf8_lossy(&key)
+                    ))
+                })?;
+            let Some(replaced) = moved else {
+                continue;
+            };
+            if key.starts_with(b"outbox:") {
+                report.outbox_records = report.outbox_records.saturating_add(1);
+            } else {
+                report.transaction_records = report.transaction_records.saturating_add(1);
+            }
+            if replaced {
+                report.replaced = report.replaced.saturating_add(1);
+            }
+        }
+    }
+    Ok(report)
+}
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum CreateOutboxResult {
@@ -138,6 +234,8 @@ pub fn decode_stored_transaction(bytes: &[u8]) -> Result<DecodedTransaction, Inf
 #[derive(Clone)]
 pub struct SledRepository {
     db: Db,
+    /// [`OUTBOX_TREE`]: every `outbox:*` and `tx:*` record.
+    outbox: Tree,
     /// Set once an IO error survives every retry. sled cannot rebuild its
     /// allocator in-process after a disk-full condition, so once this latches the
     /// node needs a restart to recover; surfacing it stops the failure from being
@@ -152,9 +250,32 @@ pub struct SledRepository {
 
 impl SledRepository {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, InfrastructureError> {
-        let db = sled::open(path).map_err(|e| InfrastructureError::Database(e.to_string()))?;
+        let path = path.as_ref();
+        let db = sled::open(path).map_err(|e| {
+            InfrastructureError::Database(format!("open sled at {}: {e}", path.display()))
+        })?;
+        let outbox = db.open_tree(OUTBOX_TREE).map_err(|e| {
+            InfrastructureError::Database(format!(
+                "open sled tree {}: {e}",
+                String::from_utf8_lossy(OUTBOX_TREE)
+            ))
+        })?;
+        let migration = migrate_outbox_records(&db, &outbox)?;
+        if migration.moved() > 0 {
+            db.flush().map_err(|e| {
+                InfrastructureError::Database(format!("flush after outbox migration: {e}"))
+            })?;
+            info!(
+                outbox_records = migration.outbox_records,
+                transaction_records = migration.transaction_records,
+                replaced = migration.replaced,
+                "Moved exit outbox records into the {} tree",
+                String::from_utf8_lossy(OUTBOX_TREE)
+            );
+        }
         Ok(Self {
             db,
+            outbox,
             degraded: Arc::new(AtomicBool::new(false)),
             outbox_degraded: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -663,6 +784,7 @@ impl SledRepository {
             ));
         }
         let db = self.db.clone();
+        let outbox = self.outbox.clone();
         let record = record.clone();
         let existing = tokio::task::spawn_blocking(move || {
             let outbox_key = format!("outbox:{}", hex::encode(execution_id));
@@ -674,17 +796,17 @@ impl SledRepository {
             let bytes = serde_json::to_vec(&stored).map_err(|error| {
                 InfrastructureError::Database(format!("serialize v2 outbox record failed: {error}"))
             })?;
-            let transaction_result = db.transaction(|tree| {
-                if let Some(existing) = tree.get(outbox_key.as_bytes())? {
-                    return Ok::<_, sled::transaction::ConflictableTransactionError<()>>(Some(
-                        existing.to_vec(),
-                    ));
-                }
-                tree.insert(outbox_key.as_bytes(), bytes.as_slice())?;
-                tree.insert(tx_key.as_bytes(), bytes.as_slice())?;
-                tree.insert(b"nonce:local", &next_nonce.to_le_bytes())?;
-                Ok(None)
-            });
+            let default_tree: &Tree = &db;
+            let transaction_result =
+                (default_tree, &outbox).transaction(|(default_tx, outbox_tx)| {
+                    if let Some(existing) = outbox_tx.get(outbox_key.as_bytes())? {
+                        return Ok::<_, ConflictableTransactionError<()>>(Some(existing.to_vec()));
+                    }
+                    outbox_tx.insert(outbox_key.as_bytes(), bytes.as_slice())?;
+                    outbox_tx.insert(tx_key.as_bytes(), bytes.as_slice())?;
+                    default_tx.insert(b"nonce:local", &next_nonce.to_le_bytes())?;
+                    Ok(None)
+                });
             transaction_result.map_err(|error| {
                 InfrastructureError::Database(format!("atomic outbox creation failed: {error:?}"))
             })
@@ -714,7 +836,7 @@ impl SledRepository {
                 "durable outbox is degraded; restart after restoring storage".to_string(),
             ));
         }
-        let db = self.db.clone();
+        let outbox = self.outbox.clone();
         let record = record.clone();
         tokio::task::spawn_blocking(move || {
             let outbox_key = format!("outbox:{}", hex::encode(record.execution_id));
@@ -726,14 +848,15 @@ impl SledRepository {
             .map_err(|error| {
                 InfrastructureError::Database(format!("serialize v2 record failed: {error}"))
             })?;
-            db.transaction(|tree| {
-                tree.insert(outbox_key.as_bytes(), bytes.as_slice())?;
-                tree.insert(tx_key.as_bytes(), bytes.as_slice())?;
-                Ok::<_, sled::transaction::ConflictableTransactionError<()>>(())
-            })
-            .map_err(|error| {
-                InfrastructureError::Database(format!("atomic v2 update failed: {error:?}"))
-            })?;
+            outbox
+                .transaction(|tree| {
+                    tree.insert(outbox_key.as_bytes(), bytes.as_slice())?;
+                    tree.insert(tx_key.as_bytes(), bytes.as_slice())?;
+                    Ok::<_, ConflictableTransactionError<()>>(())
+                })
+                .map_err(|error| {
+                    InfrastructureError::Database(format!("atomic v2 update failed: {error:?}"))
+                })?;
             Ok(())
         })
         .await
@@ -816,23 +939,83 @@ impl SledRepository {
         }
     }
 
-    /// Flush and scan to trigger GC on old log segments. Call periodically.
+    /// Flushes buffered writes to disk and logs the default tree's entry count
+    /// at DEBUG.
+    ///
+    /// This does not compact or garbage-collect anything: sled 0.34 has no
+    /// compaction API. Rewritten pages are reclaimed by sled's own segment
+    /// cleaner, and a blob file is removed only when the segment that last
+    /// referenced it is reclaimed. Watch `nox_storage_size_on_disk_bytes` for
+    /// growth.
     pub async fn compact(&self) -> Result<(), InfrastructureError> {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
             db.flush().map_err(|e| {
-                InfrastructureError::Database(format!("Sled flush before compact failed: {e}"))
+                InfrastructureError::Database(format!("Sled periodic flush failed: {e}"))
             })?;
-            // sled 0.34 doesn't have an explicit compact() method on Db.
-            // The best we can do is flush + iterate to trigger GC on old segments.
-            // Force GC by scanning all entries (triggers internal page cache eviction).
             let count = db.len();
-            tracing::debug!(entries = count, "Sled compaction: scanned all entries");
+            tracing::debug!(entries = count, "Sled periodic flush complete");
             Ok(())
         })
         .await
         .map_err(|e| InfrastructureError::Database(format!("spawn_blocking join error: {e}")))?
     }
+}
+
+impl SledRepository {
+    /// Bytes sled occupies on disk: the log file plus every blob file.
+    pub async fn size_on_disk(&self) -> Result<u64, InfrastructureError> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            db.size_on_disk().map_err(|e| {
+                InfrastructureError::Database(format!("Sled size_on_disk failed: {e}"))
+            })
+        })
+        .await
+        .map_err(|e| InfrastructureError::Database(format!("spawn_blocking join error: {e}")))?
+    }
+
+    /// Tree that stores `key`.
+    fn tree_for(&self, key: &[u8]) -> &Tree {
+        if is_outbox_key(key) {
+            &self.outbox
+        } else {
+            &self.db
+        }
+    }
+}
+
+/// Which trees a prefix scan has to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanScope {
+    Default,
+    Outbox,
+    Both,
+}
+
+fn scan_scope(prefix: &[u8]) -> ScanScope {
+    if is_outbox_key(prefix) {
+        ScanScope::Outbox
+    } else if OUTBOX_KEY_PREFIXES
+        .iter()
+        .any(|outbox_prefix| outbox_prefix.starts_with(prefix))
+    {
+        ScanScope::Both
+    } else {
+        ScanScope::Default
+    }
+}
+
+fn collect_prefix(
+    tree: &Tree,
+    prefix: &[u8],
+    results: &mut Vec<(Vec<u8>, Vec<u8>)>,
+) -> Result<(), InfrastructureError> {
+    for item in tree.scan_prefix(prefix) {
+        let (k, v) = item.map_err(|e| InfrastructureError::Database(e.to_string()))?;
+        results.push((k.to_vec(), v.to_vec()));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -842,7 +1025,9 @@ impl IStorageRepository for SledRepository {
         let key = key.to_vec();
         tokio::task::spawn_blocking(move || {
             repo.with_retry("get", || {
-                repo.db.get(&key).map(|opt| opt.map(|ivec| ivec.to_vec()))
+                repo.tree_for(&key)
+                    .get(&key)
+                    .map(|opt| opt.map(|ivec| ivec.to_vec()))
             })
         })
         .await
@@ -854,7 +1039,11 @@ impl IStorageRepository for SledRepository {
         let key = key.to_vec();
         let value = value.to_vec();
         tokio::task::spawn_blocking(move || {
-            repo.with_retry("put", || repo.db.insert(&key, value.as_slice()).map(|_| ()))
+            repo.with_retry("put", || {
+                repo.tree_for(&key)
+                    .insert(&key, value.as_slice())
+                    .map(|_| ())
+            })
         })
         .await
         .map_err(|e| InfrastructureError::Database(format!("spawn_blocking join error: {e}")))?
@@ -864,7 +1053,7 @@ impl IStorageRepository for SledRepository {
         let repo = self.clone();
         let key = key.to_vec();
         tokio::task::spawn_blocking(move || {
-            repo.with_retry("exists", || repo.db.contains_key(&key))
+            repo.with_retry("exists", || repo.tree_for(&key).contains_key(&key))
         })
         .await
         .map_err(|e| InfrastructureError::Database(format!("spawn_blocking join error: {e}")))?
@@ -874,7 +1063,7 @@ impl IStorageRepository for SledRepository {
         let repo = self.clone();
         let key = key.to_vec();
         tokio::task::spawn_blocking(move || {
-            repo.with_retry("delete", || repo.db.remove(&key).map(|_| ()))
+            repo.with_retry("delete", || repo.tree_for(&key).remove(&key).map(|_| ()))
         })
         .await
         .map_err(|e| InfrastructureError::Database(format!("spawn_blocking join error: {e}")))?
@@ -882,12 +1071,18 @@ impl IStorageRepository for SledRepository {
 
     async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, InfrastructureError> {
         let db = self.db.clone();
+        let outbox = self.outbox.clone();
         let prefix = prefix.to_vec();
         tokio::task::spawn_blocking(move || {
             let mut results = Vec::new();
-            for item in db.scan_prefix(&prefix) {
-                let (k, v) = item.map_err(|e| InfrastructureError::Database(e.to_string()))?;
-                results.push((k.to_vec(), v.to_vec()));
+            match scan_scope(&prefix) {
+                ScanScope::Default => collect_prefix(&db, &prefix, &mut results)?,
+                ScanScope::Outbox => collect_prefix(&outbox, &prefix, &mut results)?,
+                ScanScope::Both => {
+                    collect_prefix(&db, &prefix, &mut results)?;
+                    collect_prefix(&outbox, &prefix, &mut results)?;
+                    results.sort_by(|left, right| left.0.cmp(&right.0));
+                }
             }
             Ok(results)
         })
@@ -1223,5 +1418,254 @@ mod tests {
             repo.quote_counters().await.unwrap(),
             counters(3, 4_000, 7, Some(50))
         );
+    }
+
+    /// Signed transaction record of the size seen on the live fleet: the
+    /// `raw_signed_tx` bytes serialise as a JSON number array of about 66 KB.
+    fn large_v2_record(seed: u8, nonce: u64) -> PendingTransactionV2 {
+        PendingTransactionV2 {
+            execution_id: [seed; 32],
+            to: "0x1111111111111111111111111111111111111111".to_string(),
+            data_hash: [seed; 32],
+            nonce,
+            gas_limit: "21000".to_string(),
+            gas_price: "1".to_string(),
+            maximum_fee_per_gas: "1".to_string(),
+            raw_signed_tx: vec![200_u8; 16_500],
+            tx_hash: format!("0x{}", hex::encode([seed; 32])),
+            prior_transaction_hashes: Vec::new(),
+            replacement_attempts: 0,
+            first_sent_at: 1,
+            last_update_at: 1,
+            status: nox_core::TxStatusV2::Mined,
+        }
+    }
+
+    fn stored_bytes(record: &PendingTransactionV2) -> Vec<u8> {
+        serde_json::to_vec(&StoredTransactionV2 {
+            schema: 2,
+            transaction: record.clone(),
+        })
+        .unwrap()
+    }
+
+    const CURSOR_KEY: &[u8] = b"chain_observer:last_block";
+
+    #[tokio::test]
+    async fn migration_moves_outbox_records_and_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let first = large_v2_record(0xaa, 1);
+        let second = large_v2_record(0xbb, 2);
+        let outbox_first = format!("outbox:{}", hex::encode(first.execution_id));
+        let outbox_second = format!("outbox:{}", hex::encode(second.execution_id));
+        {
+            // The rc.3 layout: everything in the default tree.
+            let db = sled::open(dir.path()).unwrap();
+            db.insert(outbox_first.as_bytes(), stored_bytes(&first))
+                .unwrap();
+            db.insert(outbox_second.as_bytes(), stored_bytes(&second))
+                .unwrap();
+            db.insert(b"tx:1", stored_bytes(&first)).unwrap();
+            db.insert(b"tx:2", stored_bytes(&second)).unwrap();
+            db.insert(b"nonce:local", &3_u64.to_le_bytes()).unwrap();
+            db.insert(CURSOR_KEY, &500_u64.to_be_bytes()).unwrap();
+            db.insert(b"quote:nonce", &4_u64.to_le_bytes()).unwrap();
+            db.flush().unwrap();
+        }
+
+        let repo = SledRepository::new(dir.path()).unwrap();
+        for prefix in OUTBOX_KEY_PREFIXES {
+            assert_eq!(repo.db.scan_prefix(prefix).count(), 0);
+        }
+        assert_eq!(
+            repo.outbox.get(outbox_first.as_bytes()).unwrap().unwrap(),
+            stored_bytes(&first)
+        );
+        assert_eq!(
+            repo.outbox.get(b"tx:2").unwrap().unwrap(),
+            stored_bytes(&second)
+        );
+        for key in [b"nonce:local".as_slice(), CURSOR_KEY, b"quote:nonce"] {
+            assert!(repo.db.contains_key(key).unwrap(), "{key:?} moved");
+            assert!(!repo.outbox.contains_key(key).unwrap(), "{key:?} copied");
+        }
+
+        // The repository API reads the moved records from their new tree.
+        assert_eq!(repo.scan(b"tx:").await.unwrap().len(), 2);
+        assert!(repo.exists(b"tx:1").await.unwrap());
+        assert_eq!(
+            repo.load_outbox_by_execution(first.execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .nonce,
+            1
+        );
+
+        // A second run finds nothing to move, in-process and across a reopen.
+        assert_eq!(
+            migrate_outbox_records(&repo.db, &repo.outbox).unwrap(),
+            OutboxMigration::default()
+        );
+        drop(repo);
+        let reopened = SledRepository::new(dir.path()).unwrap();
+        assert_eq!(reopened.outbox.len(), 4);
+        assert_eq!(
+            migrate_outbox_records(&reopened.db, &reopened.outbox).unwrap(),
+            OutboxMigration::default()
+        );
+        assert_eq!(reopened.scan(b"tx:").await.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn migration_reports_counts_and_keeps_the_newer_default_tree_copy() {
+        let dir = tempdir().unwrap();
+        let db = sled::open(dir.path()).unwrap();
+        let outbox = db.open_tree(OUTBOX_TREE).unwrap();
+        outbox.insert(b"tx:7", b"older".as_slice()).unwrap();
+        db.insert(b"tx:7", b"newer".as_slice()).unwrap();
+        db.insert(b"tx:8", b"other".as_slice()).unwrap();
+        db.insert(b"outbox:aa", b"record".as_slice()).unwrap();
+
+        let report = migrate_outbox_records(&db, &outbox).unwrap();
+        assert_eq!(
+            report,
+            OutboxMigration {
+                outbox_records: 1,
+                transaction_records: 2,
+                replaced: 1,
+            }
+        );
+        assert_eq!(report.moved(), 3);
+        assert_eq!(outbox.get(b"tx:7").unwrap().unwrap(), b"newer".as_slice());
+        assert!(db.get(b"tx:7").unwrap().is_none());
+        assert_eq!(
+            migrate_outbox_records(&db, &outbox).unwrap(),
+            OutboxMigration::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_routes_outbox_keys_to_their_tree() {
+        let repo = test_repo();
+        repo.put(b"tx:4", b"record").await.unwrap();
+        repo.put(b"outbox:cc", b"record").await.unwrap();
+        repo.put(b"peer:a", b"node").await.unwrap();
+        assert!(repo.db.get(b"tx:4").unwrap().is_none());
+        assert!(repo.outbox.get(b"tx:4").unwrap().is_some());
+        assert!(repo.outbox.get(b"peer:a").unwrap().is_none());
+
+        assert_eq!(repo.scan(b"tx:").await.unwrap().len(), 1);
+        assert_eq!(repo.scan(b"peer:").await.unwrap().len(), 1);
+        // A prefix that spans both trees returns one ordered key space.
+        let everything: Vec<Vec<u8>> = repo
+            .scan(b"")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(
+            everything,
+            vec![b"outbox:cc".to_vec(), b"peer:a".to_vec(), b"tx:4".to_vec()]
+        );
+        assert_eq!(repo.scan(b"t").await.unwrap().len(), 1);
+
+        repo.delete(b"tx:4").await.unwrap();
+        assert!(!repo.exists(b"tx:4").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn durable_outbox_writes_never_touch_the_default_tree() {
+        let repo = test_repo();
+        let first = large_v2_record(0x01, 0);
+        let second = large_v2_record(0x02, 1);
+        assert!(matches!(
+            repo.create_outbox_durably(first.execution_id, &first, 1)
+                .await
+                .unwrap(),
+            CreateOutboxResult::Created
+        ));
+        assert!(matches!(
+            repo.create_outbox_durably(second.execution_id, &second, 2)
+                .await
+                .unwrap(),
+            CreateOutboxResult::Created
+        ));
+        repo.persist_v2_durably(&second).await.unwrap();
+        repo.put(CURSOR_KEY, &1_u64.to_be_bytes()).await.unwrap();
+
+        for prefix in OUTBOX_KEY_PREFIXES {
+            assert_eq!(repo.db.scan_prefix(prefix).count(), 0);
+        }
+        assert_eq!(repo.outbox.len(), 4);
+        // The nonce floor is written in the same transaction, to the default tree.
+        assert_eq!(
+            repo.db.get(b"nonce:local").unwrap().unwrap(),
+            2_u64.to_le_bytes().as_slice()
+        );
+        // The cursor's tree now holds only small keys.
+        let default_tree_bytes: usize = repo
+            .db
+            .iter()
+            .map(|item| item.map(|(key, value)| key.len() + value.len()).unwrap())
+            .sum();
+        assert!(
+            default_tree_bytes < 1_024,
+            "default tree holds {default_tree_bytes} bytes"
+        );
+        assert!(matches!(
+            repo.create_outbox_durably(first.execution_id, &first, 3)
+                .await
+                .unwrap(),
+            CreateOutboxResult::Existing(_)
+        ));
+    }
+
+    fn blob_count(dir: &Path) -> usize {
+        std::fs::read_dir(dir.join("blobs")).map_or(0, |entries| entries.count())
+    }
+
+    async fn rewrite_cursor(repo: &SledRepository, writes: u64) {
+        for block in 0..writes {
+            repo.put(CURSOR_KEY, &block.to_be_bytes()).await.unwrap();
+            repo.db.flush_async().await.unwrap();
+        }
+    }
+
+    /// Two large outbox records next to the cursor produced a new blob file on
+    /// every consolidation of the cursor's leaf. With the records in their own
+    /// tree, rewriting the cursor writes no blobs.
+    #[tokio::test]
+    async fn cursor_rewrites_do_not_create_blobs_next_to_outbox_records() {
+        const WRITES: u64 = 60;
+
+        let legacy_dir = tempdir().unwrap();
+        let legacy = SledRepository::new(legacy_dir.path()).unwrap();
+        for record in [large_v2_record(0x01, 0), large_v2_record(0x02, 1)] {
+            let key = format!("outbox:{}", hex::encode(record.execution_id));
+            legacy
+                .db
+                .insert(key.as_bytes(), stored_bytes(&record))
+                .unwrap();
+        }
+        legacy.db.flush_async().await.unwrap();
+        let legacy_before = blob_count(legacy_dir.path());
+        rewrite_cursor(&legacy, WRITES).await;
+        assert!(
+            blob_count(legacy_dir.path()) > legacy_before,
+            "the rc.3 layout no longer reproduces blob growth; this test needs a new baseline"
+        );
+
+        let dir = tempdir().unwrap();
+        let repo = SledRepository::new(dir.path()).unwrap();
+        for record in [large_v2_record(0x01, 0), large_v2_record(0x02, 1)] {
+            repo.create_outbox_durably(record.execution_id, &record, record.nonce + 1)
+                .await
+                .unwrap();
+        }
+        let before = blob_count(dir.path());
+        rewrite_cursor(&repo, WRITES).await;
+        assert_eq!(blob_count(dir.path()), before);
     }
 }

@@ -150,7 +150,8 @@ impl NoxNode {
 
         let process_monitor =
             crate::telemetry::process::ProcessMonitor::new(metrics_service.clone(), start_epoch)
-                .with_storage_degraded_flag(db.degraded_flag());
+                .with_storage_degraded_flag(db.degraded_flag())
+                .with_storage_size_source(db.as_ref().clone());
         process_monitor.record_build_info(
             env!("CARGO_PKG_VERSION"),
             &format!("{:?}", config.node_role),
@@ -441,11 +442,10 @@ impl NoxNode {
                 loop {
                     tokio::select! {
                         () = tokio::time::sleep(COMPACTION_INTERVAL) => {
-                            info!("Running periodic sled compaction...");
                             if let Err(e) = compaction_db.compact().await {
-                                warn!("Sled compaction failed: {e}");
+                                warn!("Periodic sled flush failed: {e}");
                             } else {
-                                info!("Sled compaction completed.");
+                                info!("Periodic sled flush completed.");
                             }
                         }
                         () = compaction_shutdown.cancelled() => {
