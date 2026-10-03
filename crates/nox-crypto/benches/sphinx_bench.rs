@@ -6,7 +6,8 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use nox_crypto::sphinx::{
-    build_multi_hop_packet, into_result, PathHop, ProcessResult, SphinxHeader,
+    build_multi_hop_packet, into_result, replay_tag_from_shared_secret, PathHop, ProcessResult,
+    SphinxHeader,
 };
 use rand::{rngs::OsRng, RngCore};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519SecretKey};
@@ -127,29 +128,30 @@ fn bench_packet_serialization(c: &mut Criterion) {
     group.finish();
 }
 
-// Existing: Replay tag computation (blake3 hash over header)
+// Replay tag derivation (Blake3 over the shared secret) and full header verification
 
 fn bench_compute_replay_tag(c: &mut Criterion) {
     let mut group = c.benchmark_group("Sphinx_ReplayTag");
 
-    let mut rng = OsRng;
-    let mut routing_info = [0u8; 400];
-    let mut mac = [0u8; 32];
-    rng.fill_bytes(&mut routing_info);
-    rng.fill_bytes(&mut mac);
-
-    let ephemeral_sk = X25519SecretKey::random_from_rng(OsRng);
-    let ephemeral_key = X25519PublicKey::from(&ephemeral_sk);
-
-    let header = SphinxHeader {
-        ephemeral_key,
-        routing_info,
-        mac,
-        nonce: 123456789,
-    };
-
+    let mut shared_secret = [0u8; 32];
+    OsRng.fill_bytes(&mut shared_secret);
     group.bench_function("blake3_replay_tag", |b| {
-        b.iter(|| black_box(&header).compute_replay_tag())
+        b.iter(|| replay_tag_from_shared_secret(black_box(&shared_secret)))
+    });
+
+    let my_sk = X25519SecretKey::random_from_rng(OsRng);
+    let path = vec![PathHop {
+        public_key: X25519PublicKey::from(&my_sk),
+        address: "exit".to_string(),
+    }];
+    let packet_bytes = build_multi_hop_packet(&path, &[0u8; 64], 0).expect("Build failed");
+    let (header, _) = SphinxHeader::from_bytes(&packet_bytes).expect("Failed to parse");
+    group.bench_function("verify_and_tag", |b| {
+        b.iter(|| {
+            black_box(&header)
+                .verify(black_box(&my_sk))
+                .map(|verified| verified.replay_tag())
+        })
     });
     group.finish();
 }

@@ -314,7 +314,12 @@ impl MixnetClient {
                 }
                 _ = http_poll_interval.tick(), if self.transport.is_some() => {
                     if let (Some(transport), Some(url)) = (&self.transport, &self.entry_url) {
-                        match transport.recv_responses_batch(url).await {
+                        let surb_ids: Vec<String> =
+                            self.surb_registry.read().keys().map(hex::encode).collect();
+                        if surb_ids.is_empty() {
+                            continue;
+                        }
+                        match transport.recv_responses_batch(url, &surb_ids).await {
                             Ok(responses) if responses.len() > 10 => {
                                 self.handle_responses_parallel(responses).await;
                             }

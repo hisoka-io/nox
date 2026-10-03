@@ -35,7 +35,7 @@ ECDH + key blinding account for ~95% of per-hop cost. Symmetric ops are negligib
 
 ### Replay protection
 
-Blake3 tag over `(ephemeral_key, mac, nonce)`. Checked against a rotational Bloom filter (10M capacity, 0.1% FP, 1-hour window). Tags are per-hop because key blinding changes the ephemeral key.
+Blake3 tag derived from the per-hop ECDH shared secret, checked after the header MAC verifies and before the body is decrypted. Checked against a rotational Bloom filter (`bloom_capacity`, 0.1% FP, `replay_window`). Tags are per-hop because key blinding changes the ephemeral key. The filter is written to `bloom.bin` on rotation, every `bloom_persist_interval_secs` while it changes, and on graceful shutdown.
 
 ### Padding
 
@@ -52,12 +52,13 @@ PacketReceived
      |
      v
  IngestStage ──> WorkerStage (x N) ──> MixStage ──> EgressStage
- replay check     Sphinx peel           DelayQueue    SendPacket
- PoW verify       route/exit classify   Poisson       or ExitPayload
+ parse header     ECDH + MAC verify     DelayQueue    SendPacket
+                  replay check          Poisson       or ExitPayload
+                  Sphinx peel
 ```
 
-- **Ingest**: Parse header, check replay bloom, verify PoW. Drops on full queue (backpressure).
-- **Workers**: N parallel instances on a MPMC channel. ECDH + MAC + decrypt + key blind.
+- **Ingest**: Parse header. Drops on full queue (backpressure). `PoW` is verified at HTTP ingress.
+- **Workers**: N parallel instances on a MPMC channel. ECDH + MAC, replay check, then decrypt + key blind.
 - **Mix**: Poisson delay queue (`tokio_util::time::DelayQueue`). λ = 1/avg_delay_ms.
 - **Egress**: Publishes `SendPacket` (forward) or `PayloadDecrypted` (exit) to the event bus.
 
@@ -73,7 +74,8 @@ The client pre-computes a return path as a SURB. The exit node wraps its respons
 2. **Client attaches SURBs to request**: Multiple SURBs for fragmented responses + FEC parity.
 3. **Exit encapsulates**: Pad, encrypt with SURB's payload key, build Sphinx packet from pre-computed header.
 4. **Response traverses mixnet**: Indistinguishable from forward traffic.
-5. **Client decrypts**: Peel each layer with stored keys, decrypt final payload, remove padding.
+5. **Entry buffers the reply**: The last hop of the return path is the client's entry node. It buffers the still-encrypted reply under its `packet_id` (`{handler}-{request_id}-{surb_id_hex}`).
+6. **Client claims and decrypts**: The client claims its replies by exact SURB ID (`POST /api/v1/responses/claim`, `GET /api/v1/ws` or `GET /api/v1/responses/stream`; each SURB ID is 32 hex characters), peels each layer with stored keys, decrypts the final payload and removes padding.
 
 ---
 

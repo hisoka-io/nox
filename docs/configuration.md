@@ -100,6 +100,9 @@ Three reputation tiers: Unknown, Trusted, Penalized.
 |---|---|---|
 | `queue_size` | `10000` | Pipeline channel capacity |
 | `worker_count` | `num_cpus` | Sphinx peeling workers |
+| `replay_window` | `3600` | Replay filter rotation window (seconds) |
+| `bloom_capacity` | `100000` | Replay filter capacity per window |
+| `bloom_persist_interval_secs` | `60` | How often the replay filter is written to disk while it changes (also written on rotation and graceful shutdown; `0` = only those) |
 | `mix_delay_ms` | `500.0` | Average Poisson delay (ms) |
 | `cover_traffic_rate` | `0.05` | Loop cover packets/sec |
 | `drop_traffic_rate` | `0.05` | Drop cover packets/sec |

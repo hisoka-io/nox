@@ -131,23 +131,50 @@ pub fn into_result(output: ProcessOutput) -> ProcessResult {
         output
     }
 }
-impl SphinxHeader {
-    /// Blake3 hash of (`ephemeral_key`, `mac`, `nonce`) for replay detection.
-    #[must_use]
-    pub fn compute_replay_tag(&self) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(self.ephemeral_key.as_bytes());
-        hasher.update(&self.mac);
-        hasher.update(&self.nonce.to_le_bytes());
-        *hasher.finalize().as_bytes()
-    }
 
-    /// Process a Sphinx packet at this hop: ECDH, MAC verify, decrypt routing + body, blind key.
-    pub fn process(
-        &self,
-        node_sk: &X25519SecretKey,
-        body: Vec<u8>,
-    ) -> Result<ProcessOutput, SphinxError> {
+/// Domain separator for replay tags derived from the per-hop shared secret.
+const REPLAY_TAG_CONTEXT: &str = "nox sphinx v1 replay tag";
+
+/// Replay tag for one hop, derived from the ECDH shared secret.
+///
+/// The tag depends only on what this hop derives from the packet, so every
+/// copy of a packet that the hop would process the same way gets the same tag.
+#[must_use]
+pub fn replay_tag_from_shared_secret(shared_secret: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key(REPLAY_TAG_CONTEXT, shared_secret)
+}
+
+/// A header whose MAC has been verified for this hop, holding the per-hop keys
+/// needed to finish processing. Created by [`SphinxHeader::verify`].
+pub struct VerifiedHeader<'a> {
+    header: &'a SphinxHeader,
+    rho: [u8; 32],
+    pi: [u8; 32],
+    blinding_factor: Scalar,
+    replay_tag: [u8; 32],
+    #[cfg(feature = "hop-metrics")]
+    total_start: std::time::Instant,
+    #[cfg(feature = "hop-metrics")]
+    ecdh_ns: u64,
+    #[cfg(feature = "hop-metrics")]
+    key_derive_ns: u64,
+    #[cfg(feature = "hop-metrics")]
+    mac_verify_ns: u64,
+}
+
+impl Drop for VerifiedHeader<'_> {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.rho.zeroize();
+        self.pi.zeroize();
+    }
+}
+
+impl SphinxHeader {
+    /// Verify this header for the hop holding `node_sk`: ECDH, key derivation
+    /// and MAC check. The result exposes the hop's replay tag, so a node can
+    /// drop duplicates before decrypting the body.
+    pub fn verify(&self, node_sk: &X25519SecretKey) -> Result<VerifiedHeader<'_>, SphinxError> {
         #[cfg(feature = "hop-metrics")]
         let total_start = std::time::Instant::now();
 
@@ -178,14 +205,51 @@ impl SphinxHeader {
         #[cfg(feature = "hop-metrics")]
         let mac_verify_ns = t2.elapsed().as_nanos() as u64;
 
+        Ok(VerifiedHeader {
+            header: self,
+            rho,
+            pi,
+            blinding_factor,
+            replay_tag: replay_tag_from_shared_secret(shared_secret.as_bytes()),
+            #[cfg(feature = "hop-metrics")]
+            total_start,
+            #[cfg(feature = "hop-metrics")]
+            ecdh_ns,
+            #[cfg(feature = "hop-metrics")]
+            key_derive_ns,
+            #[cfg(feature = "hop-metrics")]
+            mac_verify_ns,
+        })
+    }
+
+    /// Process a Sphinx packet at this hop: ECDH, MAC verify, decrypt routing + body, blind key.
+    pub fn process(
+        &self,
+        node_sk: &X25519SecretKey,
+        body: Vec<u8>,
+    ) -> Result<ProcessOutput, SphinxError> {
+        self.verify(node_sk)?.process(body)
+    }
+}
+
+impl VerifiedHeader<'_> {
+    /// Replay tag for this hop. Equal for every copy of the same packet at the
+    /// same hop, whatever its `PoW` nonce.
+    #[must_use]
+    pub fn replay_tag(&self) -> [u8; 32] {
+        self.replay_tag
+    }
+
+    /// Finish processing: decrypt routing info and body, blind the key for the next hop.
+    pub fn process(self, body: Vec<u8>) -> Result<ProcessOutput, SphinxError> {
         #[cfg(feature = "hop-metrics")]
         let t3 = std::time::Instant::now();
 
         let mut extended_routing = [0u8; ROUTING_INFO_SIZE + SHIFT_SIZE];
-        extended_routing[..ROUTING_INFO_SIZE].copy_from_slice(&self.routing_info);
+        extended_routing[..ROUTING_INFO_SIZE].copy_from_slice(&self.header.routing_info);
 
         // Zero nonce is safe: rho is unique per hop, so each (key, nonce) pair is used exactly once.
-        apply_stream_cipher(&rho, &[0u8; 12], &mut extended_routing);
+        apply_stream_cipher(&self.rho, &[0u8; 12], &mut extended_routing);
 
         let decrypted_routing: [u8; ROUTING_INFO_SIZE] = extended_routing[..ROUTING_INFO_SIZE]
             .try_into()
@@ -209,7 +273,7 @@ impl SphinxHeader {
                 lioness::MIN_BODY_SIZE
             )));
         }
-        let lioness_keys = lioness::LionessKeys::from_pi(&pi);
+        let lioness_keys = lioness::LionessKeys::from_pi(&self.pi);
         lioness::lioness_decrypt(&lioness_keys, &mut processed_body);
 
         #[cfg(feature = "hop-metrics")]
@@ -243,8 +307,8 @@ impl SphinxHeader {
             #[cfg(feature = "hop-metrics")]
             let t5 = std::time::Instant::now();
 
-            let point = MontgomeryPoint(self.ephemeral_key.to_bytes());
-            let blinded_point = point * blinding_factor;
+            let point = MontgomeryPoint(self.header.ephemeral_key.to_bytes());
+            let blinded_point = point * self.blinding_factor;
             let next_ephemeral_key = X25519PublicKey::from(blinded_point.to_bytes());
 
             #[cfg(feature = "hop-metrics")]
@@ -270,13 +334,13 @@ impl SphinxHeader {
 
         #[cfg(feature = "hop-metrics")]
         {
-            let total_sphinx_ns = total_start.elapsed().as_nanos() as u64;
+            let total_sphinx_ns = self.total_start.elapsed().as_nanos() as u64;
             Ok((
                 result,
                 HopTimings {
-                    ecdh_ns,
-                    key_derive_ns,
-                    mac_verify_ns,
+                    ecdh_ns: self.ecdh_ns,
+                    key_derive_ns: self.key_derive_ns,
+                    mac_verify_ns: self.mac_verify_ns,
                     routing_decrypt_ns,
                     body_decrypt_ns,
                     blinding_ns,
@@ -288,7 +352,9 @@ impl SphinxHeader {
         #[cfg(not(feature = "hop-metrics"))]
         Ok(result)
     }
+}
 
+impl SphinxHeader {
     pub fn from_bytes(bytes: &[u8]) -> Result<(Self, &[u8]), SphinxError> {
         if bytes.len() < HEADER_SIZE {
             return Err(SphinxError::InvalidSize);
@@ -935,29 +1001,113 @@ mod tests {
         assert_ne!(ct_a, ct_b);
     }
 
+    fn single_hop_packet() -> (X25519SecretKey, Vec<u8>) {
+        let mut rng = rand::thread_rng();
+        let sk = X25519SecretKey::random_from_rng(&mut rng);
+        let path = vec![PathHop {
+            public_key: X25519PublicKey::from(&sk),
+            address: "EXIT".into(),
+        }];
+        let packet = build_multi_hop_packet(&path, b"replay", 0).expect("build packet");
+        (sk, packet)
+    }
+
     #[test]
     fn test_replay_tag_uniqueness() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-
         let mut tags = std::collections::HashSet::new();
         for _ in 0..20 {
-            let mut routing_info = [0u8; ROUTING_INFO_SIZE];
-            rng.fill(&mut routing_info[..]);
-            let mut mac = [0u8; MAC_SIZE];
-            rng.fill(&mut mac[..]);
-            let nonce: u64 = rng.gen();
-
-            let header = SphinxHeader {
-                ephemeral_key: X25519PublicKey::from(&X25519SecretKey::random_from_rng(&mut rng)),
-                routing_info,
-                mac,
-                nonce,
-            };
-            let tag = header.compute_replay_tag();
+            let (sk, packet) = single_hop_packet();
+            let (header, _) = SphinxHeader::from_bytes(&packet).expect("parse");
+            let tag = header.verify(&sk).expect("verify").replay_tag();
             tags.insert(tag);
         }
         assert_eq!(tags.len(), 20);
+    }
+
+    #[test]
+    fn test_replay_tag_ignores_pow_nonce() {
+        let (sk, packet) = single_hop_packet();
+        let (header, _) = SphinxHeader::from_bytes(&packet).expect("parse");
+        let original = header.verify(&sk).expect("verify").replay_tag();
+
+        for nonce in [1u64, 2, 0xDEAD_BEEF, u64::MAX] {
+            let mut mutated = header.clone();
+            mutated.nonce = nonce;
+            let verified = mutated
+                .verify(&sk)
+                .expect("nonce is not covered by the MAC");
+            assert_eq!(
+                verified.replay_tag(),
+                original,
+                "nonce {nonce} changed the tag"
+            );
+        }
+    }
+
+    #[test]
+    fn test_replay_tag_stable_across_key_encodings() {
+        let (sk, packet) = single_hop_packet();
+        let (header, _) = SphinxHeader::from_bytes(&packet).expect("parse");
+        let original = header.verify(&sk).expect("verify").replay_tag();
+
+        let mut key_bytes = header.ephemeral_key.to_bytes();
+        key_bytes[31] ^= 0x80;
+        let mut mutated = header.clone();
+        mutated.ephemeral_key = X25519PublicKey::from(key_bytes);
+        let verified = mutated.verify(&sk).expect("same shared secret, same MAC");
+        assert_eq!(verified.replay_tag(), original);
+    }
+
+    #[test]
+    fn test_replay_tag_differs_per_hop() {
+        let (sks, pks) = {
+            let mut rng = rand::thread_rng();
+            let sks: Vec<X25519SecretKey> = (0..2)
+                .map(|_| X25519SecretKey::random_from_rng(&mut rng))
+                .collect();
+            let pks: Vec<X25519PublicKey> = sks.iter().map(X25519PublicKey::from).collect();
+            (sks, pks)
+        };
+        let path = vec![
+            PathHop {
+                public_key: pks[0],
+                address: "hop_1".into(),
+            },
+            PathHop {
+                public_key: pks[1],
+                address: "EXIT".into(),
+            },
+        ];
+        let packet = build_multi_hop_packet(&path, b"two hops", 0).expect("build packet");
+        let (header, body) = SphinxHeader::from_bytes(&packet).expect("parse");
+        let verified = header.verify(&sks[0]).expect("verify hop 0");
+        let first_tag = verified.replay_tag();
+
+        let ProcessResult::Forward {
+            next_packet,
+            processed_body,
+            ..
+        } = into_result(verified.process(body.to_vec()).expect("process hop 0"))
+        else {
+            panic!("expected forward at hop 0");
+        };
+        let second = next_packet.verify(&sks[1]).expect("verify hop 1");
+        assert_ne!(first_tag, second.replay_tag());
+        assert!(matches!(
+            into_result(second.process(processed_body).expect("process hop 1")),
+            ProcessResult::Exit { .. }
+        ));
+    }
+
+    #[test]
+    fn test_verify_rejects_wrong_key_before_body_work() {
+        let (_, packet) = single_hop_packet();
+        let (header, _) = SphinxHeader::from_bytes(&packet).expect("parse");
+        let other = X25519SecretKey::random_from_rng(rand::thread_rng());
+        assert!(matches!(
+            header.verify(&other),
+            Err(SphinxError::MacMismatch)
+        ));
     }
 
     /// HEADER_SIZE must match the actual wire size -- SURB parsing depends on it.

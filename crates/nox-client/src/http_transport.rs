@@ -1,4 +1,4 @@
-//! HTTP-based `PacketTransport`: POST packets to entry nodes, GET long-poll for SURB responses.
+//! HTTP-based `PacketTransport`: POST packets to entry nodes, claim SURB responses by SURB ID.
 
 use async_trait::async_trait;
 use nox_core::traits::interfaces::InfrastructureError;
@@ -125,23 +125,42 @@ impl PacketTransport for HttpPacketTransport {
     async fn recv_responses_batch(
         &self,
         entry_url: &str,
+        surb_ids: &[String],
     ) -> Result<Vec<(String, Vec<u8>)>, InfrastructureError> {
-        let url = format!("{entry_url}/api/v1/responses/pending");
+        if surb_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let url = format!("{entry_url}/api/v1/responses/claim");
 
-        let resp =
-            self.client.get(&url).send().await.map_err(|e| {
-                InfrastructureError::Network(format!("HTTP batch fetch failed: {e}"))
+        let resp = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "surb_ids": surb_ids }))
+            .send()
+            .await
+            .map_err(|e| {
+                InfrastructureError::Network(format!("HTTP response claim failed: {e}"))
             })?;
 
-        if resp.status().as_u16() == 204 {
+        let status = resp.status();
+        if status.as_u16() == 204 {
             return Ok(vec![]);
+        }
+        if !status.is_success() {
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "<no body>".to_string());
+            return Err(InfrastructureError::Network(format!(
+                "Response claim rejected by {url}: HTTP {status} -- {body}"
+            )));
         }
 
         let items: Vec<BatchResponseItem> = resp.json().await.map_err(|e| {
-            InfrastructureError::Network(format!("Failed to parse batch response JSON: {e}"))
+            InfrastructureError::Network(format!("Failed to parse claimed responses JSON: {e}"))
         })?;
 
-        debug!(count = items.len(), "Fetched batch SURB responses via HTTP");
+        debug!(count = items.len(), "Claimed SURB responses via HTTP");
         Ok(items.into_iter().map(|item| (item.id, item.data)).collect())
     }
 }

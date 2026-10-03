@@ -192,6 +192,7 @@ impl NoxNode {
                 config.response_prune_interval_secs,
                 metrics_service.clone(),
             )
+            .with_buffer_all_payloads(config.benchmark_mode)
             .with_cancel_token(shutdown_token.clone());
             join_set.spawn(async move {
                 router.run().await;
@@ -338,10 +339,21 @@ impl NoxNode {
             info!(
                 capacity = config.relayer.bloom_capacity,
                 path = %bloom_path.display(),
+                persist_interval_secs = config.relayer.bloom_persist_interval_secs,
                 "Replay filter initialized (flat file persistence)"
             );
 
-            Arc::new(filter)
+            let filter = Arc::new(filter);
+            let persist_filter = Arc::clone(&filter);
+            let persist_interval =
+                std::time::Duration::from_secs(config.relayer.bloom_persist_interval_secs);
+            let persist_shutdown = shutdown_token.clone();
+            join_set.spawn(async move {
+                persist_filter
+                    .run_persistence(persist_interval, persist_shutdown)
+                    .await;
+            });
+            filter
         };
         let relayer_service = RelayerService::new(
             config.clone(),

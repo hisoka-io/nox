@@ -1,7 +1,7 @@
 //! Relayer Pipeline Stage Benchmarks
 //!
 //! Measures per-stage overhead of the 4-stage relayer pipeline:
-//!   Ingest (parse + replay check) → Worker (Sphinx process) →
+//!   Ingest (parse) → Worker (verify + replay check + Sphinx process) →
 //!   Mix (DelayQueue insert/expire) → Egress (event bus publish)
 //!
 //! These benchmarks isolate pipeline orchestration costs that are
@@ -38,7 +38,8 @@ fn build_packet_pool(path: &[PathHop], payload: &[u8], pool_size: usize) -> Vec<
 // Stage 1: Ingest - SphinxHeader::from_bytes + replay tag computation
 
 fn bench_ingest_parse(c: &mut Criterion) {
-    let (_sks, pks) = create_test_keys(3);
+    let (sks, pks) = create_test_keys(3);
+    let node_sk = &sks[0];
     let path: Vec<PathHop> = pks
         .iter()
         .enumerate()
@@ -65,12 +66,15 @@ fn bench_ingest_parse(c: &mut Criterion) {
         })
     });
 
-    // Benchmark replay tag computation (Blake3 hash)
+    // Benchmark header verification + replay tag derivation (ECDH, MAC, Blake3)
     {
         let (header, _body) = SphinxHeader::from_bytes(&packets[0]).expect("parse");
         group.bench_function("replay_tag_compute", |b| {
             b.iter(|| {
-                let tag = black_box(&header).compute_replay_tag();
+                let tag = black_box(&header)
+                    .verify(black_box(node_sk))
+                    .expect("verify")
+                    .replay_tag();
                 black_box(tag)
             })
         });
@@ -90,7 +94,8 @@ fn bench_ingest_parse(c: &mut Criterion) {
             .iter()
             .map(|pkt| {
                 let (h, _) = SphinxHeader::from_bytes(pkt).unwrap();
-                h.compute_replay_tag()
+                let tag = h.verify(node_sk).unwrap().replay_tag();
+                tag
             })
             .collect();
 
@@ -129,14 +134,16 @@ fn bench_ingest_parse(c: &mut Criterion) {
         let counter_c = counter.clone();
         let bloom_c = bloom.clone();
         let pkts = Arc::new(fresh_packets);
+        let sk = Arc::new(node_sk.clone());
         group.bench_function("full_ingest_path", |b| {
             b.to_async(&rt).iter(|| {
                 let idx = counter_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let pkt = pkts[idx % pkts.len()].clone();
                 let bl = bloom_c.clone();
+                let sk = sk.clone();
                 async move {
                     let (header, _body) = SphinxHeader::from_bytes(&pkt).unwrap();
-                    let tag = header.compute_replay_tag();
+                    let tag = header.verify(&sk).unwrap().replay_tag();
                     let result = bl.check_and_tag(&tag, 3600).await;
                     black_box(result)
                 }
@@ -501,11 +508,11 @@ fn bench_full_pipeline_pass(c: &mut Criterion) {
                 // Ingest
                 let (header, body) = SphinxHeader::from_bytes(&pkt).unwrap();
                 let body = body.to_vec();
-                let tag = header.compute_replay_tag();
-                let _ = bl.check_and_tag(&tag, 3600).await;
 
                 // Worker
-                let output = header.process(&sk, body).unwrap();
+                let verified = header.verify(&sk).unwrap();
+                let _ = bl.check_and_tag(&verified.replay_tag(), 3600).await;
+                let output = verified.process(body).unwrap();
                 let result = nox_crypto::sphinx::into_result(output);
 
                 // Egress
