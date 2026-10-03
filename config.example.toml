@@ -149,8 +149,9 @@ session_ttl_secs = 86400          # 24 hours
 
 # Registry admission: "enforce" refuses peers whose libp2p identity is not in a
 # registered node's P2P URL, once the node set is verified against the chain
-# and the grace period after startup has passed. "monitor" only counts, "off"
-# disables the check (and keeps IP bans advisory).
+# and the grace period after startup has passed; IP bans and subnet caps are
+# refused from the same point. "monitor" only counts, "off" disables the check
+# (and keeps IP bans advisory).
 peer_admission = "enforce"
 peer_admission_grace_secs = 120   # startup delay, and how long a link to a deregistered peer is kept
 topology_liveness_window_secs = 60  # /topology reports a member online if seen on P2P within this window

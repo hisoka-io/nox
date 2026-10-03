@@ -58,11 +58,11 @@ impl ObservedChain {
 
     /// Called before the log is published, so a node set that already contains
     /// it is never reported at an older block.
-    fn record_registry_log(&self, block: u64) {
+    pub(crate) fn record_registry_log(&self, block: u64) {
         self.last_registry_log.fetch_max(block, Ordering::AcqRel);
     }
 
-    fn scanned(&self, block: u64) {
+    pub(crate) fn scanned(&self, block: u64) {
         self.scanned_through.store(block, Ordering::Release);
     }
 

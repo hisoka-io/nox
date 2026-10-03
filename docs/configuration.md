@@ -81,7 +81,7 @@ configured gas buffer, and set quote and aggregate pending-gas ceilings above th
 | `max_connections_per_peer` | `2` | Max per peer |
 | `ping_interval_secs` | `15` | Heartbeat interval |
 | `session_ttl_secs` | `86400` | Session ticket lifetime |
-| `peer_admission` | `"enforce"` | `enforce`, `monitor` or `off`. Enforce refuses peers outside the registry once membership is verified on-chain and the grace period has passed |
+| `peer_admission` | `"enforce"` | `enforce`, `monitor` or `off`. Enforce refuses peers outside the registry, and banned or over-limit addresses, once membership is verified on-chain and the grace period has passed |
 | `peer_admission_grace_secs` | `120` | Delay after startup before enforcement, and how long a link to a peer that left the registry is kept |
 | `topology_liveness_window_secs` | `60` | A member is reported online in `/topology` if it answered on P2P within this window |
 

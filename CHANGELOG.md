@@ -42,7 +42,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - P2P admission follows the registry: peers are matched to registered nodes by the libp2p identity in their
   P2P URL. `network.peer_admission` (`enforce` by default, `monitor`, `off`) refuses non-members once the node
   set is verified on-chain and `network.peer_admission_grace_secs` has passed, and closes links to peers that
-  left the registry. IP bans and subnet caps are checked before the handshake; member addresses are exempt.
+  left the registry. Once enforcement is live, banned or over-limit
+  addresses are refused before the handshake; member addresses are exempt.
 - Registry profile events (ingress/metadata URL, stake, freeze, slash, key, role, URL) re-read the node's full
   profile. Frozen nodes stay in the served membership but are not routed through. A periodic reconcile
   (`topology_reconcile_interval_secs`, default 300) repairs updates lost on the event bus.
@@ -52,7 +53,6 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   chain position.
 - Loop cover returns to the sending node; `nox_cover_loop_{sent,returned,lost}_total` and
   `nox_cover_loop_rtt_seconds` report per-path delivery.
-- Replay tags are recorded after header authentication.
 
 ## [0.1.0] - 2026-04-10
 
