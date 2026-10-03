@@ -64,9 +64,13 @@ async fn test_end_to_end_echo_wiring() {
         NoxEvent::SendPacket {
             packet_id,
             data: p_data,
+            reply_handle,
+            origin,
             ..
         } => {
-            assert!(packet_id.starts_with("echo-"));
+            let handle = reply_handle.expect("reply carries its SURB handle");
+            assert_eq!(packet_id, nox_core::models::wire_id::reply_wire_id(&handle));
+            assert_eq!(origin, nox_core::models::wire_id::PacketOrigin::Originated);
             assert!(!p_data.is_empty());
         }
         _ => panic!("Wrong event type"),

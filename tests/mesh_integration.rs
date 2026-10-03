@@ -93,6 +93,8 @@ fn wire_forwarding(nodes: &[TestNode]) -> Vec<tokio::task::JoinHandle<()>> {
                             next_hop_peer_id,
                             data,
                             packet_id,
+                            reply_handle,
+                            ..
                         }) => {
                             if let Some(target_bus) = routing.get(&next_hop_peer_id) {
                                 let pub_target: Arc<dyn IEventPublisher> = target_bus.clone();
@@ -101,6 +103,8 @@ fn wire_forwarding(nodes: &[TestNode]) -> Vec<tokio::task::JoinHandle<()>> {
                                     packet_id,
                                     data,
                                     size_bytes: size,
+                                    reply_handle,
+                                    prev_peer: None,
                                 });
                             }
                         }
@@ -177,6 +181,8 @@ async fn test_3_hop_packet_delivery() {
             packet_id: "test-3hop-1".to_string(),
             data: packet,
             size_bytes: size,
+            reply_handle: None,
+            prev_peer: None,
         })
         .expect("inject packet");
 
@@ -217,6 +223,8 @@ async fn test_concurrent_packets_no_cross_contamination() {
                 packet_id: format!("concurrent-{i}"),
                 data: packet,
                 size_bytes: size,
+                reply_handle: None,
+                prev_peer: None,
             })
             .expect("inject");
     }
@@ -266,6 +274,8 @@ async fn test_2_hop_path_delivery() {
             packet_id: "test-2hop".to_string(),
             data: packet,
             size_bytes: size,
+            reply_handle: None,
+            prev_peer: None,
         })
         .expect("inject");
 
@@ -301,6 +311,8 @@ async fn test_1_hop_single_node_exit() {
             packet_id: "test-1hop".to_string(),
             data: packet,
             size_bytes: size,
+            reply_handle: None,
+            prev_peer: None,
         })
         .expect("inject");
 

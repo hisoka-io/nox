@@ -544,6 +544,15 @@ impl TopologyManager {
             .map(|entry| entry.value().clone())
     }
 
+    /// Registry role of the member registered with this libp2p identity.
+    #[must_use]
+    pub fn role_for_peer(&self, peer: &PeerId) -> Option<u8> {
+        let address = self.member_address_for_peer(peer)?;
+        self.address_index
+            .get(&address)
+            .map(|entry| entry.value().role)
+    }
+
     #[must_use]
     pub fn is_frozen(&self, address: &str) -> bool {
         self.frozen.contains_key(&address.to_lowercase())

@@ -15,6 +15,8 @@ fn make_mix_message(kind: MixMessageKind, delay: Duration) -> MixMessage {
         kind,
         delay,
         packet_id: "test-pkt".to_string(),
+        reply_handle: None,
+        prev_peer: None,
         original_processing_start: Instant::now(),
         #[cfg(feature = "hop-metrics")]
         hop_timings: None,

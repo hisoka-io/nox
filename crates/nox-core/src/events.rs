@@ -1,3 +1,4 @@
+use crate::models::wire_id::{PacketOrigin, ReplyHandle};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -6,21 +7,38 @@ pub enum NoxEvent {
         timestamp: u64,
     },
 
+    /// A Sphinx packet to process. `packet_id` is node-local; it is only
+    /// equal to the identifier on the wire in passthrough mode.
     PacketReceived {
         packet_id: String,
         data: Vec<u8>,
         size_bytes: usize,
+        /// Reply handle read from the inbound wire identifier, if any.
+        #[serde(default)]
+        reply_handle: Option<ReplyHandle>,
+        /// Libp2p peer ID of the sender, for packets received over P2P.
+        #[serde(default)]
+        prev_peer: Option<String>,
     },
 
+    /// A Sphinx packet for the network layer, which picks the wire identifier.
     SendPacket {
         next_hop_peer_id: String,
         packet_id: String,
         data: Vec<u8>,
+        /// Reply handle the packet may carry to the next hop.
+        #[serde(default)]
+        reply_handle: Option<ReplyHandle>,
+        #[serde(default)]
+        origin: PacketOrigin,
     },
 
     PayloadDecrypted {
         packet_id: String,
         payload: Vec<u8>,
+        /// Reply handle the packet arrived with, if any.
+        #[serde(default)]
+        reply_handle: Option<ReplyHandle>,
     },
 
     PeerConnected {
@@ -146,6 +164,8 @@ mod tests {
             packet_id: "pkt-001".into(),
             data: vec![0xDE, 0xAD, 0xBE, 0xEF],
             size_bytes: 4,
+            reply_handle: Some([7u8; 16]),
+            prev_peer: Some("12D3KooWprev".into()),
         };
         assert_json_roundtrip(&event);
         assert_bincode_roundtrip(&event);
@@ -157,6 +177,10 @@ mod tests {
             next_hop_peer_id: "peer-abc".into(),
             packet_id: "pkt-002".into(),
             data: vec![1, 2, 3],
+            reply_handle: Some([9u8; 16]),
+            origin: PacketOrigin::Relayed {
+                prev_peer: Some("12D3KooWprev".into()),
+            },
         };
         assert_json_roundtrip(&event);
         assert_bincode_roundtrip(&event);
@@ -167,6 +191,7 @@ mod tests {
         let event = NoxEvent::PayloadDecrypted {
             packet_id: "pkt-003".into(),
             payload: b"hello world".to_vec(),
+            reply_handle: None,
         };
         assert_json_roundtrip(&event);
         assert_bincode_roundtrip(&event);
@@ -316,6 +341,31 @@ mod tests {
     }
 
     #[test]
+    fn packet_events_without_new_fields_decode_with_defaults() {
+        let json = r#"{"SendPacket":{"next_hop_peer_id":"p","packet_id":"x","data":[1]}}"#;
+        let event: NoxEvent = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(
+            event,
+            NoxEvent::SendPacket {
+                next_hop_peer_id: "p".into(),
+                packet_id: "x".into(),
+                data: vec![1],
+                reply_handle: None,
+                origin: PacketOrigin::Originated,
+            }
+        );
+        let json = r#"{"PayloadDecrypted":{"packet_id":"x","payload":[]}}"#;
+        let event: NoxEvent = serde_json::from_str(json).expect("deserialize");
+        assert!(matches!(
+            event,
+            NoxEvent::PayloadDecrypted {
+                reply_handle: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn all_variants_covered() {
         // Compile-time exhaustiveness check: if a variant is added to NoxEvent
         // without a test, this match will fail to compile.
@@ -325,15 +375,20 @@ mod tests {
                 packet_id: String::new(),
                 data: vec![],
                 size_bytes: 0,
+                reply_handle: None,
+                prev_peer: None,
             },
             NoxEvent::SendPacket {
                 next_hop_peer_id: String::new(),
                 packet_id: String::new(),
                 data: vec![],
+                reply_handle: None,
+                origin: PacketOrigin::Originated,
             },
             NoxEvent::PayloadDecrypted {
                 packet_id: String::new(),
                 payload: vec![],
+                reply_handle: None,
             },
             NoxEvent::PeerConnected {
                 peer_id: String::new(),

@@ -12,6 +12,7 @@ use nox_core::events::NoxEvent;
 use nox_core::models::payloads::{
     decode_payload_limited, RelayerPayload, RpcResponse, ServiceRequest,
 };
+use nox_core::models::wire_id::{reply_wire_id, PacketOrigin};
 use nox_core::traits::service::{ServiceError, ServiceHandler};
 use nox_core::traits::IEventPublisher;
 use nox_crypto::sphinx::surb::Surb;
@@ -877,8 +878,10 @@ impl ServiceHandler for RpcHandler {
                         for packet in &pack_result.packets {
                             if let Err(e) = self.publisher.publish(NoxEvent::SendPacket {
                                 next_hop_peer_id: packet.first_hop.clone(),
-                                packet_id: format!("rpc-{}-{}", id, hex::encode(packet.surb_id)),
+                                packet_id: reply_wire_id(&packet.surb_id),
                                 data: packet.packet_bytes.clone(),
+                                reply_handle: Some(packet.surb_id),
+                                origin: PacketOrigin::Originated,
                             }) {
                                 warn!(
                                     request_id = id,

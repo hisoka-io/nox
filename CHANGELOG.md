@@ -5,6 +5,13 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+- Packet identifiers are assigned independently at each hop. Replies carry only `reply-0-{surb_id}` towards
+  the entry node, and the claim, WebSocket and SSE endpoints return that identifier. Earlier identifier
+  formats are still accepted from peers, so mixed-version meshes keep working. Benchmark harnesses can keep
+  identifiers unchanged across hops with `relayer.wire_ids = "passthrough"` (requires `benchmark_mode`).
+  New metrics: `nox_wire_ids_total{kind}` and `nox_wire_handle_dropped_total{reason}`.
+- `nox_mesh_server` takes `--wire-ids`, `--roles`, `--legacy-binary` and `--legacy-nodes`, and
+  `scripts/compat-mesh/run.sh` runs a published client release against mixed-version local meshes.
 - Every crate and binary now reports the workspace version (`0.4.0-rc.2`) instead of `0.1.0`. This shows in
   `nox --version`, the `x-nox-version` response header and the `nox_build_info` metric.
 - Bumped anyhow and rand past their unsoundness advisories, and multihash to 0.19.5, which drops the yanked

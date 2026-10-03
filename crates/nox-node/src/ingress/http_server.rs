@@ -189,6 +189,8 @@ async fn inject_packet(State(state): State<Arc<IngressState>>, body: Bytes) -> i
         packet_id: packet_id.clone(),
         data: body.to_vec(),
         size_bytes: body.len(),
+        reply_handle: None,
+        prev_peer: None,
     }) {
         Ok(_) => {
             debug!(packet_id = %packet_id, "HTTP ingress: packet accepted");
@@ -559,6 +561,113 @@ mod tests {
             long_poll_timeout: Duration::from_secs(30),
             min_pow_difficulty: 0,
         })
+    }
+
+    /// Files one reply through the `ResponseRouter`, the way a reply arriving
+    /// over P2P is filed, and returns the ingress state that serves it.
+    async fn state_with_routed_reply(surb: [u8; 16], data: Vec<u8>) -> Arc<IngressState> {
+        use crate::infra::event_bus::TokioEventBus;
+        use crate::ingress::response_router::ResponseRouter;
+        use nox_core::traits::interfaces::IEventSubscriber;
+
+        let state = test_state(false);
+        let bus = TokioEventBus::new(16);
+        let publisher: Arc<dyn IEventPublisher> = Arc::new(bus.clone());
+        let subscriber: Arc<dyn IEventSubscriber> = Arc::new(bus);
+        let router = ResponseRouter::new(
+            subscriber,
+            state.response_buffer.clone(),
+            60,
+            MetricsService::new(),
+        );
+        let handle = tokio::spawn(async move { router.run().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        publisher
+            .publish(NoxEvent::PayloadDecrypted {
+                packet_id: "5f0e3c1d2b4a69788796a5b4c3d2e1f0".into(),
+                payload: data,
+                reply_handle: Some(surb),
+            })
+            .unwrap();
+        for _ in 0..50 {
+            if !state.response_buffer.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.abort();
+        state
+    }
+
+    #[tokio::test]
+    async fn test_claim_returns_reply_0_id_for_routed_reply() {
+        let surb = [0x11u8; 16];
+        let state = state_with_routed_reply(surb, vec![7, 8]).await;
+        let app = IngressServer::router(state);
+        let (status, items) = claim(app, serde_json::json!([hex::encode(surb)])).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], format!("reply-0-{}", hex::encode(surb)));
+        assert_eq!(items[0]["data"], serde_json::json!([7, 8]));
+    }
+
+    #[tokio::test]
+    async fn test_stream_returns_reply_0_id_for_routed_reply() {
+        let surb = [0x22u8; 16];
+        let state = state_with_routed_reply(surb, vec![9]).await;
+        let app = IngressServer::router(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/api/v1/responses/stream?surb_ids={}",
+                hex::encode(surb)
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains(&format!("\"id\":\"reply-0-{}\"", hex::encode(surb))),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ws_returns_reply_0_id_for_routed_reply() {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let surb = [0x33u8; 16];
+        let state = state_with_routed_reply(surb, vec![5, 6]).await;
+        let app = IngressServer::router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/ws"))
+            .await
+            .unwrap();
+        let subscribe = serde_json::json!({ "type": "subscribe", "surb_ids": [hex::encode(surb)] });
+        ws.send(WsMessage::Text(subscribe.to_string()))
+            .await
+            .unwrap();
+        let text = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(WsMessage::Text(text))) => return text,
+                    Some(Ok(_)) => {}
+                    other => panic!("websocket closed: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("response over websocket");
+        let msg: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(msg["type"], "response");
+        assert_eq!(msg["id"], format!("reply-0-{}", hex::encode(surb)));
+        assert_eq!(msg["data"], serde_json::json!([5, 6]));
+        server.abort();
     }
 
     #[tokio::test]

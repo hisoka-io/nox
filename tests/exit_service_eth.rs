@@ -228,6 +228,7 @@ async fn test_exit_service_rejects_legacy_submit_tx() {
     bus.publish(NoxEvent::PayloadDecrypted {
         packet_id: "pkt-submit-1".to_string(),
         payload: payload_bytes,
+        reply_handle: None,
     })
     .expect("publish");
 
@@ -284,13 +285,18 @@ async fn test_exit_service_anon_submit_tx_replies_with_rejection() {
     bus.publish(NoxEvent::PayloadDecrypted {
         packet_id: "pkt-anon-submit".to_string(),
         payload: payload_bytes,
+        reply_handle: None,
     })
     .expect("publish");
 
     let got_send = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             match rx.recv().await {
-                Ok(NoxEvent::SendPacket { packet_id, .. }) if packet_id.starts_with("echo-") => {
+                Ok(NoxEvent::SendPacket {
+                    packet_id,
+                    reply_handle: Some(handle),
+                    ..
+                }) if packet_id == nox_core::models::wire_id::reply_wire_id(&handle) => {
                     return true;
                 }
                 Ok(_) => continue,
@@ -355,6 +361,7 @@ async fn paid_quote_without_reply_surb_does_not_reserve_capacity() {
     bus.publish(NoxEvent::PayloadDecrypted {
         packet_id: "quote-without-surb".to_string(),
         payload: encode_payload(&payload).expect("outer"),
+        reply_handle: None,
     })
     .expect("publish");
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -403,13 +410,18 @@ async fn test_exit_service_broadcast_tx_sends_response_via_surbs() {
     bus.publish(NoxEvent::PayloadDecrypted {
         packet_id: "pkt-broadcast".to_string(),
         payload: payload_bytes,
+        reply_handle: None,
     })
     .expect("publish");
 
     let got_send = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             match rx.recv().await {
-                Ok(NoxEvent::SendPacket { packet_id, .. }) if packet_id.starts_with("echo-") => {
+                Ok(NoxEvent::SendPacket {
+                    packet_id,
+                    reply_handle: Some(handle),
+                    ..
+                }) if packet_id == nox_core::models::wire_id::reply_wire_id(&handle) => {
                     return true;
                 }
                 Ok(_) => continue,
@@ -468,6 +480,7 @@ async fn test_exit_service_simulation_mode_drops_submit_tx() {
     bus.publish(NoxEvent::PayloadDecrypted {
         packet_id: "pkt-sim-drop".to_string(),
         payload: payload_bytes,
+        reply_handle: None,
     })
     .expect("publish");
 

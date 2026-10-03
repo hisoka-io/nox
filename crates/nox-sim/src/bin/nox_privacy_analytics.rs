@@ -527,6 +527,7 @@ async fn spawn_bench_node(id: usize, mix_delay_ms: f64, bus_capacity: usize) -> 
     let config = {
         let mut c = NoxConfig::default();
         c.benchmark_mode = true;
+        c.relayer.wire_ids = nox_node::config::WireIdMode::Passthrough;
         c.p2p_listen_addr = "127.0.0.1".into();
         c.p2p_port = 0;
         c.db_path = dir.path().to_str().unwrap_or_default().into();
@@ -1020,6 +1021,8 @@ async fn run_timing_correlation(cfg: &AnalyticsConfig, raw_pairs: bool) -> Resul
                 packet_id: pkt_id.clone(),
                 data: packet_bytes,
                 size_bytes: pkt_size,
+                reply_handle: None,
+                prev_peer: None,
             });
 
             let result = tokio::time::timeout(Duration::from_secs(30), rx).await;
@@ -1192,6 +1195,8 @@ async fn run_entropy(
                     packet_id: pkt_id.clone(),
                     data: packet_bytes,
                     size_bytes: pkt_size,
+                    reply_handle: None,
+                    prev_peer: None,
                 });
 
                 let result = tokio::time::timeout(Duration::from_secs(30), rx).await;
@@ -1702,6 +1707,7 @@ async fn run_cover_traffic(
             for node in &nodes {
                 let mut config = NoxConfig::default();
                 config.benchmark_mode = true;
+                config.relayer.wire_ids = nox_node::config::WireIdMode::Passthrough;
                 config.relayer.cover_traffic_rate = cover_rate;
                 config.relayer.drop_traffic_rate = cover_rate;
 
@@ -1796,6 +1802,8 @@ async fn run_cover_traffic(
                     packet_id: packet_id.clone(),
                     data: packet_bytes,
                     size_bytes: 0,
+                    reply_handle: None,
+                    prev_peer: None,
                 });
 
                 match tokio::time::timeout(Duration::from_secs(30), rx).await {
@@ -1999,6 +2007,8 @@ async fn run_unlinkability(
                     packet_id: pkt_id.clone(),
                     data: packet_bytes,
                     size_bytes: pkt_size,
+                    reply_handle: None,
+                    prev_peer: None,
                 });
 
                 let result = tokio::time::timeout(Duration::from_secs(30), rx).await;
@@ -2170,6 +2180,8 @@ async fn run_attack_sim(cfg: &AnalyticsConfig, rounds: usize) -> Result<BenchRes
                     packet_id: pkt_id.clone(),
                     data: packet_bytes,
                     size_bytes: pkt_size,
+                    reply_handle: None,
+                    prev_peer: None,
                 });
 
                 // Short timeout -- most valid packets complete in <1s; corrupted ones fail immediately
@@ -2425,6 +2437,8 @@ async fn measure_sender_entropy(
                 packet_id: pkt_id.clone(),
                 data: packet_bytes,
                 size_bytes: pkt_size,
+                reply_handle: None,
+                prev_peer: None,
             });
 
             let result = tokio::time::timeout(Duration::from_secs(30), rx).await;
@@ -2789,6 +2803,8 @@ async fn run_entropy_vs_users(cfg: &AnalyticsConfig, user_counts: &[usize]) -> R
                     packet_id: pkt_id.clone(),
                     data: packet_bytes,
                     size_bytes: pkt_size,
+                    reply_handle: None,
+                    prev_peer: None,
                 });
 
                 let result = tokio::time::timeout(Duration::from_secs(30), rx).await;
@@ -2931,6 +2947,7 @@ async fn run_entropy_vs_cover(
             for node in &nodes {
                 let mut config = NoxConfig::default();
                 config.benchmark_mode = true;
+                config.relayer.wire_ids = nox_node::config::WireIdMode::Passthrough;
                 config.relayer.cover_traffic_rate = cover_rate_pps / nodes.len() as f64;
                 config.relayer.drop_traffic_rate = cover_rate_pps / nodes.len() as f64;
 
@@ -3004,6 +3021,8 @@ async fn run_entropy_vs_cover(
                     packet_id: pkt_id.clone(),
                     data: packet_bytes,
                     size_bytes: pkt_size,
+                    reply_handle: None,
+                    prev_peer: None,
                 });
 
                 let result = tokio::time::timeout(Duration::from_secs(30), rx).await;
@@ -3485,6 +3504,8 @@ async fn run_traffic_levels(
                     packet_id: pkt_id.clone(),
                     data: packet_bytes,
                     size_bytes: pkt_size,
+                    reply_handle: None,
+                    prev_peer: None,
                 });
 
                 let result = tokio::time::timeout(Duration::from_secs(30), rx).await;
@@ -3675,6 +3696,7 @@ async fn run_cover_analysis(
             for node in &nodes {
                 let mut config = NoxConfig::default();
                 config.benchmark_mode = true;
+                config.relayer.wire_ids = nox_node::config::WireIdMode::Passthrough;
                 config.relayer.cover_traffic_rate = cover_rate;
                 config.relayer.drop_traffic_rate = cover_rate;
 
@@ -3764,6 +3786,8 @@ async fn run_cover_analysis(
                     packet_id: packet_id.clone(),
                     data: packet_bytes,
                     size_bytes: 0,
+                    reply_handle: None,
+                    prev_peer: None,
                 });
 
                 match tokio::time::timeout(Duration::from_secs(30), rx).await {

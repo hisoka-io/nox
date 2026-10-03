@@ -101,6 +101,8 @@ async fn test_relayer_pipeline_flow() {
         packet_id: "test_pkt_1".to_string(),
         data: packet_data,
         size_bytes: 123,
+        reply_handle: None,
+        prev_peer: None,
     };
     tx.send(event).unwrap();
 

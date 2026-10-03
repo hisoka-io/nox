@@ -1,8 +1,9 @@
-use crate::config::NoxConfig;
+use crate::config::{NoxConfig, WireIdMode};
 use crate::infra::persistence::peer_registry::PeerRegistry;
 use crate::telemetry::metrics::MetricsService;
 use nox_core::{
     events::NoxEvent,
+    models::wire_id::parse_legacy_handle,
     traits::{IEventPublisher, IEventSubscriber, IStorageRepository, InfrastructureError},
 };
 
@@ -11,6 +12,7 @@ use super::{
     behaviour::{NoxBehaviour, NoxBehaviourEvent, SphinxPacket, SystemMessage},
     connection_filter::ConnectionFilter,
     rate_limiter::{PeerRateLimiter, RateLimitResult},
+    wire_ids::{choose_wire_id, fresh_wire_id},
 };
 
 use dashmap::DashMap;
@@ -106,6 +108,7 @@ pub struct P2PService {
     topology_manager: Arc<crate::services::network_manager::TopologyManager>,
     topology_request_timestamps: Arc<DashMap<PeerId, Instant>>,
     liveness_window_secs: u64,
+    wire_ids: crate::config::WireIdMode,
     cancel_token: Option<CancellationToken>,
 }
 
@@ -194,6 +197,7 @@ impl P2PService {
             topology_manager,
             topology_request_timestamps: Arc::new(DashMap::new()),
             liveness_window_secs: config.network.topology_liveness_window_secs,
+            wire_ids: config.relayer.wire_ids,
             cancel_token: None,
         };
 
@@ -329,6 +333,8 @@ impl P2PService {
                 next_hop_peer_id,
                 packet_id,
                 data,
+                reply_handle,
+                origin,
             } => {
                 let peer_id_opt = if let Ok(pid) = PeerId::from_str(&next_hop_peer_id) {
                     Some(pid)
@@ -344,24 +350,38 @@ impl P2PService {
                 };
 
                 if let Some(peer) = peer_id_opt {
+                    let topology = &self.topology_manager;
+                    let choice = choose_wire_id(
+                        self.wire_ids,
+                        &packet_id,
+                        reply_handle.as_ref(),
+                        &origin,
+                        |prev| {
+                            PeerId::from_str(prev)
+                                .ok()
+                                .and_then(|p| topology.role_for_peer(&p))
+                        },
+                    );
+                    self.metrics
+                        .wire_ids_total
+                        .get_or_create(&vec![("kind".into(), choice.kind.as_label().into())])
+                        .inc();
+                    if let Some(reason) = choice.dropped {
+                        self.metrics
+                            .wire_handle_dropped_total
+                            .get_or_create(&vec![("reason".into(), reason.as_label().into())])
+                            .inc();
+                    }
                     let sphinx_packet = SphinxPacket {
-                        id: packet_id.clone(),
+                        id: choice.wire_id,
                         data,
                     };
                     let message = SystemMessage::Packet(sphinx_packet);
 
-                    let request_id = self
-                        .swarm
+                    self.swarm
                         .behaviour_mut()
                         .direct_message
                         .send_request(&peer, message);
-
-                    debug!(
-                        packet_id = %packet_id,
-                        peer = %peer,
-                        request_id = %request_id,
-                        "Outbound Packet sent"
-                    );
                 } else {
                     warn!(next_hop = %next_hop_peer_id, "Could not resolve PeerID for next hop");
                 }
@@ -467,26 +487,25 @@ impl P2PService {
             }) => {
                 match request {
                     SystemMessage::Packet(packet) => {
-                        // Truncate untrusted packet IDs to prevent log flooding
-                        let log_id = if packet.id.len() > 16 {
-                            packet.id[..16].to_string()
-                        } else {
-                            packet.id.clone()
-                        };
                         if !self.admission.allow_packet(&peer) {
-                            debug!(packet_id = %log_id, peer = %peer, "Dropping packet from peer outside the registry");
+                            debug!(peer = %peer, "Dropping packet from peer outside the registry");
                             return;
                         }
                         match self.rate_limiter.check(&peer) {
                             RateLimitResult::Allowed => {
-                                debug!(packet_id = %log_id, peer = %peer, "Packet received");
+                                let reply_handle = parse_legacy_handle(&packet.id);
+                                let local_id = match self.wire_ids {
+                                    WireIdMode::PerHop => fresh_wire_id(),
+                                    WireIdMode::Passthrough => packet.id,
+                                };
                                 if let Err(e) = self.event_bus.publish(NoxEvent::PacketReceived {
-                                    packet_id: packet.id,
+                                    packet_id: local_id,
                                     size_bytes: packet.data.len(),
                                     data: packet.data,
+                                    reply_handle,
+                                    prev_peer: Some(peer.to_string()),
                                 }) {
                                     error!(
-                                        packet_id = %log_id,
                                         peer = %peer,
                                         error = %e,
                                         "Failed to publish PacketReceived -- inbound Sphinx packet dropped"

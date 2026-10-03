@@ -39,6 +39,7 @@ pub fn generate_node_config(
     p2p_private_key_hex: &str,
     mix_delay_ms: f64,
     eth_rpc_url: &str,
+    wire_ids: nox_node::config::WireIdMode,
 ) -> Result<(PathBuf, String)> {
     let node_dir = data_dir.join(format!("node_{id}"));
     std::fs::create_dir_all(&node_dir)?;
@@ -63,6 +64,7 @@ pub fn generate_node_config(
     config.relayer.mix_delay_ms = mix_delay_ms;
     config.relayer.cover_traffic_rate = 0.0;
     config.relayer.drop_traffic_rate = 0.0;
+    config.relayer.wire_ids = wire_ids;
     // Generous limits for benchmark/stress-test workloads
     config.http.max_response_bytes = 128 * 1024 * 1024;
     config.http.request_timeout_secs = 120;
@@ -230,6 +232,51 @@ pub async fn register_topology_with_role(
     Ok(())
 }
 
+/// How the nodes of a [`ProcessMesh`] are set up.
+#[derive(Debug, Clone)]
+pub struct MeshOptions {
+    /// Packet identifier mode written into every node's config.
+    pub wire_ids: nox_node::config::WireIdMode,
+    /// Registry role of each node (1 = relay, 2 = exit, 3 = full). Nodes
+    /// without an entry are full nodes.
+    pub roles: Vec<u8>,
+    /// Another `nox` binary (for example an earlier release) and the node
+    /// indices that run it.
+    pub alternate_binary: Option<(PathBuf, Vec<usize>)>,
+}
+
+impl MeshOptions {
+    /// Benchmark harnesses follow one packet across nodes by its identifier.
+    #[must_use]
+    pub fn benchmark() -> Self {
+        Self {
+            wire_ids: nox_node::config::WireIdMode::Passthrough,
+            roles: Vec::new(),
+            alternate_binary: None,
+        }
+    }
+
+    /// Registry role of node `id`.
+    #[must_use]
+    pub fn role(&self, id: usize) -> u8 {
+        self.roles.get(id).copied().unwrap_or(3)
+    }
+
+    fn binary_for<'a>(&'a self, id: usize, default: &'a Path) -> &'a Path {
+        match &self.alternate_binary {
+            Some((path, nodes)) if nodes.contains(&id) => path,
+            _ => default,
+        }
+    }
+}
+
+/// Registry address used for mesh node `id`: a valid 20-byte hex address, so
+/// that client releases which validate topology snapshots accept the mesh.
+#[must_use]
+pub fn mesh_node_address(id: usize) -> String {
+    format!("0x{:040x}", 0xb0_0000 + id)
+}
+
 /// A mesh of N real `nox` processes with wired topology.
 pub struct ProcessMesh {
     pub nodes: Vec<NoxProcess>,
@@ -237,6 +284,8 @@ pub struct ProcessMesh {
 }
 
 impl ProcessMesh {
+    /// Benchmark mesh: packet identifiers pass through unchanged, so a packet
+    /// injected at one node can be polled for at another.
     #[allow(clippy::too_many_arguments)]
     pub async fn build(
         node_count: usize,
@@ -248,6 +297,34 @@ impl ProcessMesh {
         mix_delay_ms: f64,
         eth_rpc_url: &str,
     ) -> Result<Self> {
+        Self::build_with_options(
+            node_count,
+            nox_binary,
+            data_dir,
+            base_port,
+            startup_timeout,
+            mesh_settle,
+            mix_delay_ms,
+            eth_rpc_url,
+            &MeshOptions::benchmark(),
+        )
+        .await
+    }
+
+    /// Mesh with explicit identifier mode, roles and binaries.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn build_with_options(
+        node_count: usize,
+        nox_binary: &Path,
+        data_dir: &Path,
+        base_port: u16,
+        startup_timeout: Duration,
+        mesh_settle: Duration,
+        mix_delay_ms: f64,
+        eth_rpc_url: &str,
+        options: &MeshOptions,
+    ) -> Result<Self> {
+        let wire_ids = options.wire_ids;
         if data_dir.exists() {
             std::fs::remove_dir_all(data_dir)?;
         }
@@ -300,6 +377,7 @@ impl ProcessMesh {
                 &p2p_secret_hex,
                 mix_delay_ms,
                 eth_rpc_url,
+                wire_ids,
             )?;
 
             let data_path = data_dir.join(format!("node_{i}"));
@@ -318,7 +396,8 @@ impl ProcessMesh {
         info!("Spawning {node_count} nox processes...");
         let mut nodes = Vec::with_capacity(node_count);
         for info in &node_infos {
-            let child = spawn_nox_process(info.id, nox_binary, &info.config_path).await?;
+            let binary = options.binary_for(info.id, nox_binary);
+            let child = spawn_nox_process(info.id, binary, &info.config_path).await?;
             nodes.push(NoxProcess {
                 id: info.id,
                 child,
@@ -355,7 +434,7 @@ impl ProcessMesh {
 
         info!("Registering topology ({node_count}x{node_count} entries)...");
         for target in &nodes {
-            let target_addr = format!("0xBenchNode{}", target.id);
+            let target_addr = mesh_node_address(target.id);
             let target_sphinx = hex::encode(target.sphinx_public_key.as_bytes());
             let target_p2p = format!(
                 "/ip4/127.0.0.1/tcp/{}/p2p/{}",
@@ -364,13 +443,14 @@ impl ProcessMesh {
             let target_ingress = format!("http://127.0.0.1:{}", target.ingress_port);
 
             for source in &nodes {
-                if let Err(e) = register_topology(
+                if let Err(e) = register_topology_with_role(
                     &http_client,
                     source.metrics_port,
                     &target_addr,
                     &target_sphinx,
                     &target_p2p,
                     Some(&target_ingress),
+                    options.role(target.id),
                 )
                 .await
                 {

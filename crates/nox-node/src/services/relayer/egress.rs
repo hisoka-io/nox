@@ -1,6 +1,6 @@
 use super::worker::{MixMessage, MixMessageKind};
 use crate::telemetry::metrics::MetricsService;
-use nox_core::{events::NoxEvent, traits::IEventPublisher};
+use nox_core::{events::NoxEvent, models::wire_id::PacketOrigin, traits::IEventPublisher};
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 use tracing::{error, info, warn};
@@ -36,10 +36,6 @@ impl EgressStage {
 
             match msg.kind {
                 MixMessageKind::Forward { next_hop, packet } => {
-                    info!(
-                        "Forwarding packet {} to next hop: {}.",
-                        msg.packet_id, next_hop
-                    );
                     self.metrics
                         .packets_forwarded
                         .get_or_create(&vec![("type".to_string(), "mix".to_string())])
@@ -53,6 +49,10 @@ impl EgressStage {
                         next_hop_peer_id: next_hop,
                         packet_id: msg.packet_id.clone(),
                         data: packet,
+                        reply_handle: msg.reply_handle,
+                        origin: PacketOrigin::Relayed {
+                            prev_peer: msg.prev_peer.clone(),
+                        },
                     }) {
                         error!(
                             packet_id = %msg.packet_id,
@@ -69,7 +69,6 @@ impl EgressStage {
                     }
                 }
                 MixMessageKind::Exit { payload } => {
-                    info!("Packet {} reached exit destination.", msg.packet_id);
                     self.metrics
                         .egress_routed_total
                         .get_or_create(&vec![("type".to_string(), "exit".to_string())])
@@ -77,6 +76,7 @@ impl EgressStage {
                     if let Err(e) = self.event_bus.publish(NoxEvent::PayloadDecrypted {
                         packet_id: msg.packet_id.clone(),
                         payload,
+                        reply_handle: msg.reply_handle,
                     }) {
                         error!(
                             packet_id = %msg.packet_id,

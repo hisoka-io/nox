@@ -13,6 +13,7 @@ use nox_core::models::payloads::{
     decode_padded_relayer_payload_limited, decode_payload_limited, encode_payload, RelayerPayload,
     ServiceRequest,
 };
+use nox_core::models::wire_id::{reply_wire_id, PacketOrigin};
 use nox_core::protocol::fragmentation::{
     Fragment, Reassembler, ReassemblerConfig, MAX_MESSAGE_SIZE,
 };
@@ -428,7 +429,6 @@ impl ExitService {
                 request_id,
                 state,
                 Vec::new(),
-                "preemptive",
             );
         })
     }
@@ -467,7 +467,7 @@ impl ExitService {
             tokio::select! {
                 event_result = rx.recv() => {
                     match event_result {
-                        Ok(NoxEvent::PayloadDecrypted { packet_id, payload }) => {
+                        Ok(NoxEvent::PayloadDecrypted { packet_id, payload, .. }) => {
                             if let Some(command) = self.decode_command(&packet_id, &payload).await {
                                 self.route(&lanes, packet_id, command).await;
                             }
@@ -1105,7 +1105,6 @@ impl ExitService {
                                 request_id,
                                 pending_state,
                                 all_surbs,
-                                "replenish",
                             );
                         }
                     }
@@ -1157,7 +1156,6 @@ fn continue_or_stash(
     request_id: u64,
     mut state: PendingResponseState,
     mut surbs: Vec<Surb>,
-    label: &str,
 ) {
     loop {
         if !surbs.is_empty() {
@@ -1165,12 +1163,11 @@ fn continue_or_stash(
                 Ok(result) => {
                     for packed in &result.packets {
                         let _ = publisher.publish(NoxEvent::SendPacket {
-                            packet_id: format!(
-                                "{label}-{request_id}-{}",
-                                hex::encode(packed.surb_id)
-                            ),
+                            packet_id: reply_wire_id(&packed.surb_id),
                             next_hop_peer_id: packed.first_hop.clone(),
                             data: packed.packet_bytes.clone(),
+                            reply_handle: Some(packed.surb_id),
+                            origin: PacketOrigin::Originated,
                         });
                     }
                     match result.remaining {

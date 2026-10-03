@@ -1,4 +1,5 @@
 use crate::config::NoxConfig;
+use crate::network::wire_ids::fresh_wire_id;
 use crate::services::network_manager::TopologyManager;
 use crate::telemetry::metrics::MetricsService;
 use dashmap::DashMap;
@@ -7,6 +8,7 @@ use nox_core::models::payloads::{
     decode_padded_relayer_payload_limited, encode_payload, RelayerPayload,
 };
 use nox_core::models::topology::RelayerNode;
+use nox_core::models::wire_id::PacketOrigin;
 use nox_core::traits::{IEventPublisher, IEventSubscriber};
 use nox_crypto::sphinx::{build_multi_hop_packet, PathHop};
 use rand::seq::SliceRandom;
@@ -438,12 +440,14 @@ impl TrafficShapingService {
         }
         let (hop1, packet) = self.build_path_and_packet(true).await?;
 
-        let pid = uuid::Uuid::new_v4().to_string();
+        let pid = fresh_wire_id();
 
         self.bus.publish(NoxEvent::SendPacket {
             next_hop_peer_id: hop1.address.clone(),
             packet_id: pid,
             data: packet,
+            reply_handle: None,
+            origin: PacketOrigin::Originated,
         })?;
 
         debug!("Sent Loop Cover Packet via {}", hop1.address);
@@ -486,8 +490,10 @@ impl TrafficShapingService {
         );
         self.bus.publish(NoxEvent::SendPacket {
             next_hop_peer_id: first.url.clone(),
-            packet_id: uuid::Uuid::new_v4().to_string(),
+            packet_id: fresh_wire_id(),
             data: packet,
+            reply_handle: None,
+            origin: PacketOrigin::Originated,
         })?;
         debug!("Sent self-addressed loop cover via {}", first.address);
         Ok(())
@@ -496,12 +502,14 @@ impl TrafficShapingService {
     async fn generate_drop_packet(&self) -> anyhow::Result<()> {
         let (hop1, packet) = self.build_path_and_packet(false).await?;
 
-        let pid = uuid::Uuid::new_v4().to_string();
+        let pid = fresh_wire_id();
 
         self.bus.publish(NoxEvent::SendPacket {
             next_hop_peer_id: hop1.address.clone(),
             packet_id: pid,
             data: packet,
+            reply_handle: None,
+            origin: PacketOrigin::Originated,
         })?;
 
         debug!("Sent Drop Cover Packet via {}", hop1.address);

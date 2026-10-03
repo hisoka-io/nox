@@ -9,7 +9,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use anyhow::Result;
 use clap::Parser;
-use nox_sim::process_mesh::{find_nox_binary, ProcessMesh};
+use nox_node::config::WireIdMode;
+use nox_sim::process_mesh::{find_nox_binary, MeshOptions, ProcessMesh};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -54,6 +55,31 @@ struct Cli {
     /// Anvil RPC port. Nodes will connect to `http://127.0.0.1:<port>`.
     #[arg(long, default_value_t = 8545)]
     anvil_port: u16,
+
+    /// Packet identifier mode: `per_hop` (production behaviour) or `passthrough`.
+    #[arg(long, default_value = "per_hop", value_parser = parse_wire_ids)]
+    wire_ids: WireIdMode,
+
+    /// Comma-separated registry role per node (1 = relay, 2 = exit, 3 = full).
+    /// Nodes past the end of the list are full nodes.
+    #[arg(long, value_delimiter = ',')]
+    roles: Vec<u8>,
+
+    /// A second nox binary, such as an earlier release, for mixed-version meshes.
+    #[arg(long, requires = "legacy_nodes")]
+    legacy_binary: Option<String>,
+
+    /// Comma-separated node indices that run `--legacy-binary`.
+    #[arg(long, value_delimiter = ',', requires = "legacy_binary")]
+    legacy_nodes: Vec<usize>,
+}
+
+fn parse_wire_ids(value: &str) -> Result<WireIdMode, String> {
+    match value {
+        "per_hop" => Ok(WireIdMode::PerHop),
+        "passthrough" => Ok(WireIdMode::Passthrough),
+        other => Err(format!("unknown wire id mode: {other}")),
+    }
 }
 
 /// Connection info for a single node.
@@ -68,6 +94,7 @@ struct NodeInfo {
     p2p_multiaddr: String,
     layer: u8,
     role: u8,
+    legacy: bool,
 }
 
 /// Top-level connection info for the mesh.
@@ -93,7 +120,21 @@ async fn main() -> Result<()> {
 
     let data_dir = PathBuf::from(&cli.data_dir);
     let anvil_rpc_url = format!("http://127.0.0.1:{}", cli.anvil_port);
-    let mut mesh = ProcessMesh::build(
+    let legacy_binary = match &cli.legacy_binary {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            anyhow::ensure!(path.exists(), "legacy binary not found: {}", path.display());
+            info!("Nodes {:?} run {}", cli.legacy_nodes, path.display());
+            Some((path, cli.legacy_nodes.clone()))
+        }
+        None => None,
+    };
+    let options = MeshOptions {
+        wire_ids: cli.wire_ids,
+        roles: cli.roles.clone(),
+        alternate_binary: legacy_binary,
+    };
+    let mut mesh = ProcessMesh::build_with_options(
         cli.nodes,
         &nox_binary,
         &data_dir,
@@ -102,6 +143,7 @@ async fn main() -> Result<()> {
         Duration::from_secs(cli.mesh_settle_secs),
         cli.mix_delay_ms,
         &anvil_rpc_url,
+        &options,
     )
     .await?;
 
@@ -120,7 +162,11 @@ async fn main() -> Result<()> {
                 peer_id: n.peer_id.to_string(),
                 p2p_multiaddr: multiaddr,
                 layer: (n.id % 3) as u8,
-                role: 3,
+                role: options.role(n.id),
+                legacy: options
+                    .alternate_binary
+                    .as_ref()
+                    .is_some_and(|(_, ids)| ids.contains(&n.id)),
             }
         })
         .collect();

@@ -339,6 +339,7 @@ async fn spawn_dashboard_node(
         c.relayer.drop_traffic_rate = 0.02;
         c.relayer.mix_delay_ms = mix_delay_ms;
         c.benchmark_mode = true; // Enables mock ChainExecutor for exit nodes
+        c.relayer.wire_ids = nox_node::config::WireIdMode::Passthrough;
         c
     };
 
@@ -868,8 +869,16 @@ fn create_wired_client(
         let mut rx = sub.subscribe();
         loop {
             match rx.recv().await {
-                Ok(NoxEvent::PayloadDecrypted { packet_id, payload }) => {
-                    let _ = response_tx.send((packet_id, payload)).await;
+                Ok(NoxEvent::PayloadDecrypted {
+                    packet_id,
+                    payload,
+                    reply_handle,
+                }) => {
+                    // Replies are identified by their handle, as at a real entry node.
+                    let id = reply_handle
+                        .as_ref()
+                        .map_or(packet_id, nox_core::models::wire_id::reply_wire_id);
+                    let _ = response_tx.send((id, payload)).await;
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {

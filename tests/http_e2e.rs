@@ -113,13 +113,14 @@ async fn test_http_e2e_packet_injection_and_response_poll() {
         other => panic!("Expected PacketReceived, got {other:?}"),
     }
 
-    let test_request_id = &format!("reply-42-{}", surb_hex(42));
+    let test_request_id = &format!("reply-0-{}", surb_hex(42));
     let test_payload = vec![42, 43, 44, 45, 46];
     harness
         .publisher
         .publish(NoxEvent::PayloadDecrypted {
-            packet_id: test_request_id.clone(),
+            packet_id: "0123456789abcdef0123456789abcdef".to_string(),
             payload: test_payload.clone(),
+            reply_handle: Some([42; 16]),
         })
         .expect("publish PayloadDecrypted");
 
@@ -143,8 +144,9 @@ async fn test_http_e2e_batch_response_retrieval() {
         harness
             .publisher
             .publish(NoxEvent::PayloadDecrypted {
-                packet_id: format!("reply-{i}-{}", surb_hex(i)),
+                packet_id: format!("{i:032x}"),
                 payload: vec![0xA0 | i; 4],
+                reply_handle: Some([i; 16]),
             })
             .expect("publish PayloadDecrypted");
     }
@@ -160,7 +162,7 @@ async fn test_http_e2e_batch_response_retrieval() {
     assert_eq!(responses.len(), 3);
 
     for i in 0..3u8 {
-        let expected_id = format!("reply-{i}-{}", surb_hex(i));
+        let expected_id = format!("reply-0-{}", surb_hex(i));
         let found = responses
             .iter()
             .any(|(id, data)| id == &expected_id && *data == vec![0xA0 | i; 4]);
@@ -191,6 +193,7 @@ async fn test_http_e2e_only_surb_replies_buffered() {
         .publish(NoxEvent::PayloadDecrypted {
             packet_id: format!("reply-9-{}", surb_hex(9)),
             payload: relayer_payload,
+            reply_handle: Some([9; 16]),
         })
         .expect("publish");
     harness
@@ -198,6 +201,16 @@ async fn test_http_e2e_only_surb_replies_buffered() {
         .publish(NoxEvent::PayloadDecrypted {
             packet_id: "http-00000000deadbeef".to_string(),
             payload: vec![0xA5; 64],
+            reply_handle: None,
+        })
+        .expect("publish");
+    // A local ID shaped like a reply ID carries no handle.
+    harness
+        .publisher
+        .publish(NoxEvent::PayloadDecrypted {
+            packet_id: format!("reply-9-{}", surb_hex(9)),
+            payload: vec![0xA5; 64],
+            reply_handle: None,
         })
         .expect("publish");
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -219,6 +232,7 @@ async fn test_http_e2e_pending_endpoint_removed() {
         .publish(NoxEvent::PayloadDecrypted {
             packet_id: format!("reply-1-{}", surb_hex(1)),
             payload: vec![0xA5; 8],
+            reply_handle: Some([1; 16]),
         })
         .expect("publish");
     tokio::time::sleep(Duration::from_millis(200)).await;

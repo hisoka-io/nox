@@ -252,6 +252,7 @@ async fn spawn_mock_node(id: usize) -> anyhow::Result<VirtualNode> {
     let config = {
         let mut c = NoxConfig::default();
         c.benchmark_mode = true; // ENABLE MOCK MODE
+        c.relayer.wire_ids = nox_node::config::WireIdMode::Passthrough;
         c.p2p_port = 0;
         c.db_path = dir
             .path()

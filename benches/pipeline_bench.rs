@@ -296,6 +296,8 @@ fn bench_worker_process(c: &mut Criterion) {
                     kind,
                     delay,
                     packet_id: String::new(),
+                    reply_handle: None,
+                    prev_peer: None,
                     original_processing_start: start,
                     #[cfg(feature = "hop-metrics")]
                     hop_timings: None,
@@ -383,6 +385,8 @@ fn bench_egress_publish(c: &mut Criterion) {
                     next_hop_peer_id: String::from("peer_abc"),
                     packet_id: String::new(),
                     data: packet_data.clone(),
+                    reply_handle: None,
+                    origin: nox_core::models::wire_id::PacketOrigin::Originated,
                 };
                 let result = bus.publish(black_box(event));
                 black_box(result)
@@ -402,6 +406,7 @@ fn bench_egress_publish(c: &mut Criterion) {
                 let event = NoxEvent::PayloadDecrypted {
                     packet_id: String::new(),
                     payload: payload_data.clone(),
+                    reply_handle: None,
                 };
                 let result = bus.publish(black_box(event));
                 black_box(result)
@@ -442,6 +447,8 @@ fn bench_egress_publish(c: &mut Criterion) {
                         next_hop_peer_id: String::from("peer_abc"),
                         packet_id: String::new(),
                         data: payload.clone(),
+                        reply_handle: None,
+                        origin: nox_core::models::wire_id::PacketOrigin::Originated,
                     };
                     let result = bus.publish(black_box(event));
                     black_box(result)
@@ -528,12 +535,15 @@ fn bench_full_pipeline_pass(c: &mut Criterion) {
                             next_hop_peer_id: next_hop,
                             packet_id: String::new(),
                             data,
+                            reply_handle: None,
+                            origin: nox_core::models::wire_id::PacketOrigin::Originated,
                         });
                     }
                     nox_crypto::sphinx::ProcessResult::Exit { payload } => {
                         let _ = ev.publish(NoxEvent::PayloadDecrypted {
                             packet_id: String::new(),
                             payload,
+                            reply_handle: None,
                         });
                     }
                 }

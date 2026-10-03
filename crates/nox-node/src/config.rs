@@ -230,6 +230,22 @@ pub struct RelayerConfig {
     #[serde(default = "default_cover_loop_timeout_secs")]
     pub cover_loop_timeout_secs: u64,
     pub fragmentation: FragmentationConfig,
+    /// How packet identifiers are chosen for the next hop.
+    #[serde(default)]
+    pub wire_ids: WireIdMode,
+}
+
+/// How a node picks the identifier it sends with each packet.
+#[derive(Debug, Deserialize, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WireIdMode {
+    /// A fresh random identifier for every hop. Replies keep only their
+    /// `reply-0-{surb id}` handle on the way back to the entry node.
+    #[default]
+    PerHop,
+    /// Identifiers travel unchanged from hop to hop. Lets benchmark harnesses
+    /// follow one packet across nodes. Requires `benchmark_mode`.
+    Passthrough,
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize)]
@@ -269,6 +285,7 @@ impl Default for RelayerConfig {
             drop_traffic_rate: 0.05,
             cover_loop_timeout_secs: default_cover_loop_timeout_secs(),
             fragmentation: FragmentationConfig::default(),
+            wire_ids: WireIdMode::default(),
         }
     }
 }
@@ -640,6 +657,10 @@ impl NoxConfig {
 
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+
+        if self.relayer.wire_ids == WireIdMode::Passthrough && !self.benchmark_mode {
+            errors.push("relayer.wire_ids = \"passthrough\" requires benchmark_mode = true".into());
+        }
 
         if !self.benchmark_mode {
             if self.routing_private_key.is_empty() {
@@ -1090,6 +1111,36 @@ mod tests {
             "Valid production config should pass: {:?}",
             result
         );
+    }
+
+    #[test]
+    fn passthrough_wire_ids_require_benchmark_mode() {
+        let mut config = NoxConfig::default();
+        assert_eq!(config.relayer.wire_ids, WireIdMode::PerHop);
+        config.relayer.wire_ids = WireIdMode::Passthrough;
+        config.benchmark_mode = false;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("wire_ids")));
+
+        config.benchmark_mode = true;
+        let errors = config.validate().err().unwrap_or_default();
+        assert!(!errors.iter().any(|e| e.contains("wire_ids")));
+    }
+
+    #[test]
+    fn wire_ids_parse_from_toml() {
+        let relayer: RelayerConfig = config::Config::builder()
+            .add_source(config::File::from_str(
+                "queue_size = 1\nworker_count = 1\nreplay_window = 1\nbloom_capacity = 1\n\
+             mix_delay_ms = 0.0\ncover_traffic_rate = 0.0\ndrop_traffic_rate = 0.0\n\
+             wire_ids = \"passthrough\"\n[fragmentation]\nmax_pending_bytes = 1\n\
+             max_concurrent_messages = 1\ntimeout_seconds = 1\nprune_interval_seconds = 1\n",
+                config::FileFormat::Toml,
+            ))
+            .build()
+            .and_then(config::Config::try_deserialize)
+            .expect("parse");
+        assert_eq!(relayer.wire_ids, WireIdMode::Passthrough);
     }
 
     #[test]

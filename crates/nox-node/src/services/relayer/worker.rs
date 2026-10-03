@@ -1,5 +1,6 @@
 use crate::telemetry::metrics::MetricsService;
 use async_channel::Receiver;
+use nox_core::models::wire_id::ReplyHandle;
 use nox_core::traits::{IMixStrategy, IReplayProtection};
 use nox_crypto::sphinx::{into_result, ProcessResult, SphinxError, SphinxHeader};
 use std::sync::Arc;
@@ -11,11 +12,38 @@ use x25519_dalek::StaticSecret as X25519SecretKey;
 /// Shared via `Arc`; `StaticSecret` zeroes key material on drop via `zeroize`.
 type SharedNodeKey = Arc<X25519SecretKey>;
 
+/// Node-local facts about an inbound packet, carried through the pipeline.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PacketMeta {
+    /// Node-local packet ID.
+    pub packet_id: String,
+    /// Reply handle read from the inbound wire identifier.
+    pub reply_handle: Option<ReplyHandle>,
+    /// Libp2p peer ID of the sender, for packets received over P2P.
+    pub prev_peer: Option<String>,
+}
+
+impl PacketMeta {
+    /// Metadata for a packet with only a local ID.
+    #[must_use]
+    pub fn local(packet_id: impl Into<String>) -> Self {
+        Self {
+            packet_id: packet_id.into(),
+            reply_handle: None,
+            prev_peer: None,
+        }
+    }
+}
+
 /// Message sent from Worker to Mix Stage
 pub struct MixMessage {
     pub kind: MixMessageKind,
     pub delay: Duration,
     pub packet_id: String,
+    /// Reply handle the packet arrived with.
+    pub reply_handle: Option<ReplyHandle>,
+    /// Libp2p peer ID of the node the packet came from.
+    pub prev_peer: Option<String>,
     pub original_processing_start: std::time::Instant,
     #[cfg(feature = "hop-metrics")]
     pub hop_timings: Option<nox_crypto::sphinx::HopTimings>,
@@ -34,7 +62,7 @@ pub struct ReplayGuard {
 }
 
 pub struct WorkerStage {
-    worker_rx: Receiver<(SphinxHeader, Vec<u8>, String)>,
+    worker_rx: Receiver<(SphinxHeader, Vec<u8>, PacketMeta)>,
     mix_tx: Sender<MixMessage>,
     node_sk: SharedNodeKey,
     replay: ReplayGuard,
@@ -44,7 +72,7 @@ pub struct WorkerStage {
 
 impl WorkerStage {
     pub fn new(
-        worker_rx: Receiver<(SphinxHeader, Vec<u8>, String)>,
+        worker_rx: Receiver<(SphinxHeader, Vec<u8>, PacketMeta)>,
         mix_tx: Sender<MixMessage>,
         node_sk: SharedNodeKey,
         replay: ReplayGuard,
@@ -113,7 +141,8 @@ impl WorkerStage {
     }
 
     pub async fn run(self) {
-        while let Ok((header, body, pid)) = self.worker_rx.recv().await {
+        while let Ok((header, body, meta)) = self.worker_rx.recv().await {
+            let pid = meta.packet_id;
             let start = std::time::Instant::now();
 
             // The replay tag comes from the per-hop shared secret, so it is checked
@@ -158,6 +187,8 @@ impl WorkerStage {
                         kind,
                         delay,
                         packet_id: pid.clone(),
+                        reply_handle: meta.reply_handle,
+                        prev_peer: meta.prev_peer.clone(),
                         original_processing_start: start,
                         #[cfg(feature = "hop-metrics")]
                         hop_timings,
@@ -202,7 +233,7 @@ mod tests {
         sk: &X25519SecretKey,
         packets: Vec<(SphinxHeader, Vec<u8>, String)>,
     ) -> Vec<String> {
-        let (worker_tx, worker_rx) = bounded::<(SphinxHeader, Vec<u8>, String)>(16);
+        let (worker_tx, worker_rx) = bounded::<(SphinxHeader, Vec<u8>, PacketMeta)>(16);
         let (mix_tx, mut mix_rx) = mpsc::channel::<MixMessage>(16);
         let worker = WorkerStage::new(
             worker_rx,
@@ -212,8 +243,11 @@ mod tests {
             Arc::new(PoissonMixStrategy::new(1.0)),
             MetricsService::new(),
         );
-        for packet in packets {
-            worker_tx.send(packet).await.unwrap();
+        for (header, body, pid) in packets {
+            worker_tx
+                .send((header, body, PacketMeta::local(pid)))
+                .await
+                .unwrap();
         }
         drop(worker_tx);
         worker.run().await;
@@ -308,7 +342,7 @@ mod tests {
         let (header, body) = SphinxHeader::from_bytes(&packet).unwrap();
 
         // Setup worker channels
-        let (worker_tx, worker_rx) = bounded::<(SphinxHeader, Vec<u8>, String)>(10);
+        let (worker_tx, worker_rx) = bounded::<(SphinxHeader, Vec<u8>, PacketMeta)>(10);
         let (mix_tx, mut mix_rx) = mpsc::channel::<MixMessage>(10);
         let mix_strategy = Arc::new(PoissonMixStrategy::new(1.0));
 
@@ -324,7 +358,15 @@ mod tests {
 
         // Send packet to worker
         worker_tx
-            .send((header, body.to_vec(), "test_pid".into()))
+            .send((
+                header,
+                body.to_vec(),
+                PacketMeta {
+                    packet_id: "test_pid".into(),
+                    reply_handle: Some([3u8; 16]),
+                    prev_peer: Some("prev".into()),
+                },
+            ))
             .await
             .unwrap();
         drop(worker_tx); // Close channel to allow worker to exit
@@ -335,6 +377,8 @@ mod tests {
         // Verify output
         let msg = mix_rx.recv().await.expect("Should receive message");
         assert_eq!(msg.packet_id, "test_pid");
+        assert_eq!(msg.reply_handle, Some([3u8; 16]));
+        assert_eq!(msg.prev_peer.as_deref(), Some("prev"));
         match msg.kind {
             MixMessageKind::Forward { next_hop, .. } => {
                 assert_eq!(next_hop, "node_1");
@@ -358,7 +402,7 @@ mod tests {
 
         let (header, body) = SphinxHeader::from_bytes(&packet).unwrap();
 
-        let (worker_tx, worker_rx) = bounded::<(SphinxHeader, Vec<u8>, String)>(10);
+        let (worker_tx, worker_rx) = bounded::<(SphinxHeader, Vec<u8>, PacketMeta)>(10);
         let (mix_tx, mut mix_rx) = mpsc::channel::<MixMessage>(10);
         let mix_strategy = Arc::new(PoissonMixStrategy::new(1.0));
 
@@ -373,7 +417,7 @@ mod tests {
         );
 
         worker_tx
-            .send((header, body.to_vec(), "exit_pid".into()))
+            .send((header, body.to_vec(), PacketMeta::local("exit_pid")))
             .await
             .unwrap();
         drop(worker_tx);
@@ -409,7 +453,7 @@ mod tests {
 
         let (header, body) = SphinxHeader::from_bytes(&packet).unwrap();
 
-        let (worker_tx, worker_rx) = bounded::<(SphinxHeader, Vec<u8>, String)>(10);
+        let (worker_tx, worker_rx) = bounded::<(SphinxHeader, Vec<u8>, PacketMeta)>(10);
         let (mix_tx, mut mix_rx) = mpsc::channel::<MixMessage>(10);
         let mix_strategy = Arc::new(PoissonMixStrategy::new(1.0));
 
@@ -425,7 +469,7 @@ mod tests {
         );
 
         worker_tx
-            .send((header, body.to_vec(), "corrupted_pid".into()))
+            .send((header, body.to_vec(), PacketMeta::local("corrupted_pid")))
             .await
             .unwrap();
         drop(worker_tx);

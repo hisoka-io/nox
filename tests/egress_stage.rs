@@ -18,6 +18,8 @@ fn make_message(kind: MixMessageKind) -> MixMessage {
         kind,
         delay: Duration::ZERO,
         packet_id: "egress-test-pkt".to_string(),
+        reply_handle: None,
+        prev_peer: None,
         original_processing_start: Instant::now(),
         #[cfg(feature = "hop-metrics")]
         hop_timings: None,
@@ -87,7 +89,9 @@ async fn test_egress_exit_publishes_payload_decrypted() {
     let event = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             match rx.recv().await {
-                Ok(NoxEvent::PayloadDecrypted { packet_id, payload }) => {
+                Ok(NoxEvent::PayloadDecrypted {
+                    packet_id, payload, ..
+                }) => {
                     return (packet_id, payload);
                 }
                 Ok(_) => continue,
