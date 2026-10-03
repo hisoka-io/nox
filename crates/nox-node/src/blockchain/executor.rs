@@ -79,6 +79,13 @@ pub(crate) enum OutboxBroadcastError {
     Rejected { detail: &'static str },
     #[error("transaction broadcast outcome is uncertain: {detail}")]
     Uncertain { detail: &'static str },
+    /// The node already has a transaction at this nonce (mined or pending): the wallet
+    /// signed elsewhere, or this transaction was mined earlier.
+    #[error("transaction nonce is already used")]
+    NonceTooLow,
+    /// A different pending transaction holds this nonce at a higher gas price.
+    #[error("another pending transaction holds this nonce")]
+    ReplacementUnderpriced,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -574,10 +581,11 @@ impl ChainExecutor {
         }
     }
 
-    /// Check balance and warn if low.
-    pub async fn check_gas_health(&self) -> Result<(), InfrastructureError> {
+    /// Reads the wallet balance and warns when it is below `min_gas_balance`.
+    /// Returns the balance and whether it is low.
+    pub async fn check_gas_health(&self) -> Result<(U256, bool), InfrastructureError> {
         if self.is_mock() {
-            return Ok(());
+            return Ok((self.min_gas_balance, false));
         }
 
         let balance = self
@@ -586,14 +594,14 @@ impl ChainExecutor {
             .await
             .map_err(|e| InfrastructureError::Blockchain(format!("Failed to get balance: {e}")))?;
 
-        if balance < self.min_gas_balance {
+        let low = balance < self.min_gas_balance;
+        if low {
             warn!(
                 "LOW GAS BALANCE: {} wei (Threshold: {})",
                 balance, self.min_gas_balance
             );
-            // In v1, we might fire a SystemEvent::LowGas here
         }
-        Ok(())
+        Ok((balance, low))
     }
 
     pub fn address(&self) -> Address {
@@ -1191,6 +1199,23 @@ impl ChainExecutor {
             .map_err(|e| InfrastructureError::Blockchain(format!("Get nonce failed: {e}")))
     }
 
+    /// Nonce of the next transaction in the latest block, ignoring the mempool.
+    pub async fn get_confirmed_nonce(&self) -> Result<U256, InfrastructureError> {
+        if self.is_mock() {
+            return Ok(U256::zero());
+        }
+
+        self.provider
+            .get_transaction_count(
+                self.wallet.address(),
+                Some(BlockId::Number(BlockNumber::Latest)),
+            )
+            .await
+            .map_err(|e| {
+                InfrastructureError::Blockchain(format!("Get confirmed nonce failed: {e}"))
+            })
+    }
+
     /// Fetch the transaction receipt for a given tx hash.
     pub async fn get_transaction_receipt(
         &self,
@@ -1349,6 +1374,12 @@ fn classify_broadcast_provider_error(error: ProviderError) -> OutboxBroadcastErr
     if message.contains("already known") {
         return OutboxBroadcastError::AlreadyKnown;
     }
+    if message.contains("nonce too low") || message.contains("nonce has already been used") {
+        return OutboxBroadcastError::NonceTooLow;
+    }
+    if message.contains("replacement transaction underpriced") {
+        return OutboxBroadcastError::ReplacementUnderpriced;
+    }
     if let Some(classification) = [
         "intrinsic gas too low",
         "insufficient funds",
@@ -1420,6 +1451,33 @@ mod tests {
             }
         });
         format!("http://{address}")
+    }
+
+    #[test]
+    fn nonce_conflicts_are_classified() {
+        let rpc_error = |message: &str| {
+            ProviderError::JsonRpcClientError(Box::new(
+                ethers::providers::HttpClientError::JsonRpcError(ethers::providers::JsonRpcError {
+                    code: -32000,
+                    message: message.to_string(),
+                    data: None,
+                }),
+            ))
+        };
+        assert_eq!(
+            classify_broadcast_provider_error(rpc_error(
+                "nonce too low: address 0x1, tx: 5 state: 6"
+            )),
+            OutboxBroadcastError::NonceTooLow
+        );
+        assert_eq!(
+            classify_broadcast_provider_error(rpc_error("replacement transaction underpriced")),
+            OutboxBroadcastError::ReplacementUnderpriced
+        );
+        assert_eq!(
+            classify_broadcast_provider_error(rpc_error("already known")),
+            OutboxBroadcastError::AlreadyKnown
+        );
     }
 
     #[tokio::test]

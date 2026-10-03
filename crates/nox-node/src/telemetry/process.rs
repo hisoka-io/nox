@@ -1,6 +1,8 @@
 //! Process metrics: polls `/proc/self/status` for memory and FD counts (Linux only).
 
+use crate::infra::storage::DegradedFlag;
 use crate::telemetry::metrics::MetricsService;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -9,6 +11,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(30);
 pub struct ProcessMonitor {
     metrics: MetricsService,
     start_epoch: i64,
+    storage_degraded: Option<DegradedFlag>,
 }
 
 impl ProcessMonitor {
@@ -17,7 +20,15 @@ impl ProcessMonitor {
         Self {
             metrics,
             start_epoch,
+            storage_degraded: None,
         }
+    }
+
+    /// Reports storage write failures in `nox_storage_degraded` and `nox_health_status`.
+    #[must_use]
+    pub fn with_storage_degraded_flag(mut self, flag: DegradedFlag) -> Self {
+        self.storage_degraded = Some(flag);
+        self
     }
 
     /// Call once at startup before spawning `run()`.
@@ -39,7 +50,21 @@ impl ProcessMonitor {
             tick.tick().await;
             self.update_uptime();
             self.update_proc_metrics();
+            self.update_health();
         }
+    }
+
+    /// 2 = healthy, 1 = degraded: storage writes failing or paid submission paused.
+    fn update_health(&self) {
+        let storage_degraded = self
+            .storage_degraded
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed));
+        self.metrics
+            .storage_degraded
+            .set(i64::from(storage_degraded));
+        let degraded = storage_degraded || self.metrics.eth_submission_blocked.get() != 0;
+        self.metrics.health_status.set(if degraded { 1 } else { 2 });
     }
 
     fn update_uptime(&self) {
