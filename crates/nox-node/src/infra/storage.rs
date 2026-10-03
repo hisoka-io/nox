@@ -1623,9 +1623,7 @@ mod tests {
     }
 
     fn blob_count(dir: &Path) -> usize {
-        std::fs::read_dir(dir.join("blobs"))
-            .map(|entries| entries.count())
-            .unwrap_or(0)
+        std::fs::read_dir(dir.join("blobs")).map_or(0, |entries| entries.count())
     }
 
     async fn rewrite_cursor(repo: &SledRepository, writes: u64) {

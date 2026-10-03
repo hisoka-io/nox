@@ -764,7 +764,7 @@ mod tests {
     #[test]
     fn cursor_is_written_at_most_once_per_interval() {
         let start = Instant::now();
-        let interval = Duration::from_secs(60);
+        let interval = Duration::from_mins(1);
         let mut cursor = CursorPersistence::new(interval, Some(100));
 
         // The first completed scan is written straight away.
@@ -793,7 +793,7 @@ mod tests {
     #[test]
     fn cursor_already_stored_is_not_rewritten() {
         let start = Instant::now();
-        let mut cursor = CursorPersistence::new(Duration::from_secs(60), Some(500));
+        let mut cursor = CursorPersistence::new(Duration::from_mins(1), Some(500));
         assert_eq!(cursor.unsaved(), None);
         assert_eq!(cursor.scanned_through(500, start), None);
         assert_eq!(cursor.unsaved(), None);
