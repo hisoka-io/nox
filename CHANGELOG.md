@@ -5,6 +5,21 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+## [0.4.0-rc.2] - 2026-10-03
+
+### Upgrade notes
+
+- Upgrade one node at a time. Replay tags are derived differently from rc.1, so a node forgets the previous
+  replay window on its first start; mixed rc.1/rc.2 meshes interoperate.
+- `GET /api/v1/responses/pending` returns 410 Gone. Clients claim replies on `/api/v1/responses/claim` (all
+  published client releases already do).
+- `network.peer_admission` defaults to `enforce`: only registered nodes may connect over P2P once the node set is
+  verified on-chain. Use `monitor` first if you want to observe admission decisions.
+- The price server needs `PRICE_MIN_SOURCES` providers to agree (default 2). Set it to 1 only if a single provider
+  is reachable from your host.
+
+### Changes
+
 - Packet identifiers are assigned independently at each hop. Replies carry only `reply-0-{surb_id}` towards
   the entry node, and the claim, WebSocket and SSE endpoints return that identifier. Earlier identifier
   formats are still accepted from peers, so mixed-version meshes keep working. Benchmark harnesses can keep
