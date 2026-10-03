@@ -6,12 +6,15 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 
-/// `CryptoCompare` price provider.
-/// Uses the free min-api endpoint -- no API key required.
-/// Works from US-based IPs (unlike `CoinGecko`/Binance free tiers).
+pub const DEFAULT_BASE_URL: &str = "https://min-api.cryptocompare.com";
+
+/// `CryptoCompare` price provider (min-api endpoint).
+/// The endpoint now answers 401 without an API key, so the price server only enables this
+/// provider when a key is configured.
 pub struct CryptoCompareProvider {
     client: Client,
     base_url: String,
+    api_key: Option<String>,
 }
 
 impl Default for CryptoCompareProvider {
@@ -23,18 +26,32 @@ impl Default for CryptoCompareProvider {
 impl CryptoCompareProvider {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            client: Client::new(),
-            base_url: "https://min-api.cryptocompare.com".to_string(),
-        }
+        Self::with_client(
+            crate::http::default_provider_client(),
+            DEFAULT_BASE_URL.to_string(),
+        )
     }
 
     #[must_use]
     pub fn with_base_url(base_url: String) -> Self {
+        Self::with_client(crate::http::default_provider_client(), base_url)
+    }
+
+    /// Uses a caller-supplied client (see [`crate::http::provider_client`]).
+    #[must_use]
+    pub fn with_client(client: Client, base_url: String) -> Self {
         Self {
-            client: Client::new(),
+            client,
             base_url,
+            api_key: None,
         }
+    }
+
+    /// Sends the API key as `authorization: Apikey <key>`.
+    #[must_use]
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        self.api_key = api_key.filter(|key| !key.trim().is_empty());
+        self
     }
 
     fn asset_to_symbol(asset: &str) -> Option<&'static str> {
@@ -81,13 +98,14 @@ impl PriceProvider for CryptoCompareProvider {
         let fsyms = symbols.join(",");
         let url = format!("{}/data/pricemulti", self.base_url);
 
-        let resp = self
+        let mut request = self
             .client
             .get(&url)
-            .query(&[("fsyms", &fsyms), ("tsyms", &"USD".to_string())])
-            .send()
-            .await
-            .map_err(ProviderError::Network)?;
+            .query(&[("fsyms", &fsyms), ("tsyms", &"USD".to_string())]);
+        if let Some(api_key) = &self.api_key {
+            request = request.header(reqwest::header::AUTHORIZATION, format!("Apikey {api_key}"));
+        }
+        let resp = request.send().await.map_err(ProviderError::Network)?;
 
         if !resp.status().is_success() {
             if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -171,6 +189,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(prices["ethereum"].get(), 9_007_199_254_740_993);
+    }
+
+    #[tokio::test]
+    async fn configured_api_key_is_sent_as_authorization_header() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/data/pricemulti"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Apikey test-key",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ETH": {"USD": 2400.0}
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let provider = CryptoCompareProvider::with_base_url(mock_server.uri())
+            .with_api_key(Some("test-key".to_string()));
+        let prices = provider
+            .get_prices(&["ethereum".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(prices["ethereum"].get(), 240_000_000_000);
     }
 
     #[tokio::test]

@@ -146,7 +146,8 @@ impl NoxNode {
         metrics_service.node_start_time_seconds.set(start_epoch);
 
         let process_monitor =
-            crate::telemetry::process::ProcessMonitor::new(metrics_service.clone(), start_epoch);
+            crate::telemetry::process::ProcessMonitor::new(metrics_service.clone(), start_epoch)
+                .with_storage_degraded_flag(db.degraded_flag());
         process_monitor.record_build_info(
             env!("CARGO_PKG_VERSION"),
             &format!("{:?}", config.node_role),
@@ -516,6 +517,7 @@ impl NoxNode {
             };
 
             let exit_service = exit_service
+                .with_worker_config(config.exit_workers.clone())
                 .with_pending_replenishments(pending_map)
                 .with_surb_accumulator(surb_acc)
                 .with_publisher(bus_publisher.clone())
@@ -648,6 +650,7 @@ impl NoxNode {
                 metrics_service.clone(),
             )
             .with_publisher(bus_publisher.clone())
+            .with_worker_config(config.exit_workers.clone())
             .with_pending_replenishments(pending_map)
             .with_surb_accumulator(surb_acc)
             .with_cancel_token(shutdown_token.clone());

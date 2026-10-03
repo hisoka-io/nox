@@ -49,6 +49,44 @@ fn quote_transaction_error(
     }
 }
 
+/// Snapshot of the quote reservation counters, read outside a transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QuoteCounters {
+    pub outstanding: u64,
+    pub pending_sponsored_gas: u64,
+    /// Loss recorded in the current window, as last written.
+    pub rolling_loss_native: U256,
+    pub loss_window_start: Option<u64>,
+}
+
+impl QuoteCounters {
+    /// Cheap admission check with the same limits that `create_quote_durably` enforces
+    /// atomically. Lets a quote be refused before any RPC, oracle or signing work.
+    pub fn admit(
+        &self,
+        requested_gas: u64,
+        maximum_outstanding: u32,
+        maximum_pending_gas: u64,
+        rolling_loss_limit_native: U256,
+        rolling_loss_window_secs: u64,
+        now_unix: u64,
+    ) -> Result<(), QuoteStoreError> {
+        let window_expired = self
+            .loss_window_start
+            .is_none_or(|start| now_unix.saturating_sub(start) >= rolling_loss_window_secs);
+        if !window_expired && self.rolling_loss_native >= rolling_loss_limit_native {
+            return Err(QuoteStoreError::PendingLossLimit);
+        }
+        if self.outstanding >= u64::from(maximum_outstanding) {
+            return Err(QuoteStoreError::OutstandingCapacity);
+        }
+        match self.pending_sponsored_gas.checked_add(requested_gas) {
+            Some(next) if next <= maximum_pending_gas => Ok(()),
+            _ => Err(QuoteStoreError::PendingGasCapacity),
+        }
+    }
+}
+
 fn decode_u64(bytes: &[u8]) -> Result<u64, String> {
     let encoded: [u8; 8] = bytes
         .try_into()
@@ -154,6 +192,28 @@ impl SledRepository {
         })??;
         self.durable_flush("quote nonce").await?;
         Ok(nonce)
+    }
+
+    pub async fn quote_counters(&self) -> Result<QuoteCounters, InfrastructureError> {
+        let counter = |bytes: Option<Vec<u8>>| -> Result<Option<u64>, InfrastructureError> {
+            bytes
+                .map(|value| decode_u64(&value).map_err(InfrastructureError::Database))
+                .transpose()
+        };
+        let outstanding = counter(self.get(b"quote:outstanding").await?)?.unwrap_or(0);
+        let pending_sponsored_gas = counter(self.get(b"quote:pending-gas").await?)?.unwrap_or(0);
+        let loss_window_start = counter(self.get(b"quote:loss-window-start").await?)?;
+        let rolling_loss_native = self
+            .get(b"quote:rolling-loss")
+            .await?
+            .map(|value| U256::from_big_endian(&value))
+            .unwrap_or_default();
+        Ok(QuoteCounters {
+            outstanding,
+            pending_sponsored_gas,
+            rolling_loss_native,
+            loss_window_start,
+        })
     }
 
     pub async fn create_quote_durably(
@@ -1099,5 +1159,69 @@ mod tests {
 
         assert!(flag.load(Ordering::Relaxed));
         assert!(clone.is_degraded());
+    }
+
+    fn counters(outstanding: u64, pending: u64, loss: u64, start: Option<u64>) -> QuoteCounters {
+        QuoteCounters {
+            outstanding,
+            pending_sponsored_gas: pending,
+            rolling_loss_native: U256::from(loss),
+            loss_window_start: start,
+        }
+    }
+
+    #[test]
+    fn quote_admission_mirrors_reservation_limits() {
+        let limit = U256::from(100);
+        assert!(counters(0, 0, 0, None)
+            .admit(10, 2, 20, limit, 60, 1_000)
+            .is_ok());
+        assert!(matches!(
+            counters(2, 0, 0, None).admit(10, 2, 20, limit, 60, 1_000),
+            Err(QuoteStoreError::OutstandingCapacity)
+        ));
+        assert!(matches!(
+            counters(1, 15, 0, None).admit(10, 2, 20, limit, 60, 1_000),
+            Err(QuoteStoreError::PendingGasCapacity)
+        ));
+        assert!(matches!(
+            counters(0, u64::MAX, 0, None).admit(1, 2, u64::MAX, limit, 60, 1_000),
+            Err(QuoteStoreError::PendingGasCapacity)
+        ));
+        assert!(matches!(
+            counters(0, 0, 100, Some(990)).admit(10, 2, 20, limit, 60, 1_000),
+            Err(QuoteStoreError::PendingLossLimit)
+        ));
+        // An expired loss window no longer blocks admission.
+        assert!(counters(0, 0, 100, Some(900))
+            .admit(10, 2, 20, limit, 60, 1_000)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn quote_counters_default_to_zero_and_read_stored_values() {
+        let repo = test_repo();
+        assert_eq!(
+            repo.quote_counters().await.unwrap(),
+            QuoteCounters::default()
+        );
+
+        repo.put(b"quote:outstanding", &3_u64.to_le_bytes())
+            .await
+            .unwrap();
+        repo.put(b"quote:pending-gas", &4_000_u64.to_le_bytes())
+            .await
+            .unwrap();
+        repo.put(b"quote:loss-window-start", &50_u64.to_le_bytes())
+            .await
+            .unwrap();
+        let mut loss = [0_u8; 32];
+        U256::from(7).to_big_endian(&mut loss);
+        repo.put(b"quote:rolling-loss", &loss).await.unwrap();
+
+        assert_eq!(
+            repo.quote_counters().await.unwrap(),
+            counters(3, 4_000, 7, Some(50))
+        );
     }
 }

@@ -7,6 +7,11 @@ use prometheus_client::registry::Registry;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 
+/// Exit dispatch lanes, used as the `lane` label.
+pub const EXIT_LANES: [&str; 4] = ["paid", "quote", "proxy", "control"];
+/// Reasons an exit payload is dropped before dispatch, used as the `reason` label.
+pub const EXIT_DROP_REASONS: [&str; 2] = ["queue_full", "lane_closed"];
+
 /// Prometheus metrics for all NOX subsystems.
 #[derive(Clone)]
 pub struct MetricsService {
@@ -61,6 +66,18 @@ pub struct MetricsService {
     pub chain_events_processed_total: Family<Vec<(String, String)>, Counter>,
     pub eth_tx_pending: Gauge<i64, AtomicI64>,
     pub oracle_fetch_total: Family<Vec<(String, String)>, Counter>,
+    /// Paid quote and execution outcomes: `kind`, `result`, `code`.
+    pub paid_outcomes_total: Family<Vec<(String, String)>, Counter>,
+    pub eth_submission_blocked: Gauge<i64, AtomicI64>,
+    pub eth_wallet_balance_gwei: Gauge<i64, AtomicI64>,
+    pub eth_wallet_balance_low: Gauge<i64, AtomicI64>,
+    pub quote_outstanding: Gauge<i64, AtomicI64>,
+    pub quote_pending_sponsored_gas: Gauge<i64, AtomicI64>,
+    pub quote_rolling_loss_gwei: Gauge<i64, AtomicI64>,
+    pub storage_degraded: Gauge<i64, AtomicI64>,
+    pub exit_payloads_dropped_total: Family<Vec<(String, String)>, Counter>,
+    pub exit_lane_inflight: Family<Vec<(String, String)>, Gauge<i64, AtomicI64>>,
+    pub event_bus_subscriber_lag_total: Family<Vec<(String, String)>, Counter>,
 
     pub cover_traffic_generated_total: Family<Vec<(String, String)>, Counter>,
     pub cover_traffic_errors_total: Family<Vec<(String, String)>, Counter>,
@@ -418,6 +435,83 @@ impl MetricsService {
             oracle_fetch_total.clone(),
         );
 
+        let paid_outcomes_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_paid_outcomes",
+            "Paid quote and execution outcomes by kind, result and rejection code",
+            paid_outcomes_total.clone(),
+        );
+
+        let eth_submission_blocked = Gauge::<i64, AtomicI64>::default();
+        registry.register(
+            "nox_eth_submission_blocked",
+            "1 while paid submission is paused by an unresolved outbox transaction",
+            eth_submission_blocked.clone(),
+        );
+
+        let eth_wallet_balance_gwei = Gauge::<i64, AtomicI64>::default();
+        registry.register(
+            "nox_eth_wallet_balance_gwei",
+            "Exit wallet native balance in gwei",
+            eth_wallet_balance_gwei.clone(),
+        );
+
+        let eth_wallet_balance_low = Gauge::<i64, AtomicI64>::default();
+        registry.register(
+            "nox_eth_wallet_balance_low",
+            "1 while the exit wallet balance is below min_gas_balance",
+            eth_wallet_balance_low.clone(),
+        );
+
+        let quote_outstanding = Gauge::<i64, AtomicI64>::default();
+        registry.register(
+            "nox_quote_outstanding",
+            "Paid quotes that are reserved and not yet terminal",
+            quote_outstanding.clone(),
+        );
+
+        let quote_pending_sponsored_gas = Gauge::<i64, AtomicI64>::default();
+        registry.register(
+            "nox_quote_pending_sponsored_gas",
+            "Gas reserved by quotes that are not yet terminal",
+            quote_pending_sponsored_gas.clone(),
+        );
+
+        let quote_rolling_loss_gwei = Gauge::<i64, AtomicI64>::default();
+        registry.register(
+            "nox_quote_rolling_loss_gwei",
+            "Unreimbursed sponsored loss in the current rolling window, in gwei",
+            quote_rolling_loss_gwei.clone(),
+        );
+
+        let storage_degraded = Gauge::<i64, AtomicI64>::default();
+        registry.register(
+            "nox_storage_degraded",
+            "1 while durable storage writes are failing",
+            storage_degraded.clone(),
+        );
+
+        let exit_payloads_dropped_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_exit_payloads_dropped",
+            "Exit payloads dropped before dispatch, by lane and reason",
+            exit_payloads_dropped_total.clone(),
+        );
+
+        let exit_lane_inflight = Family::<Vec<(String, String)>, Gauge<i64, AtomicI64>>::default();
+        registry.register(
+            "nox_exit_lane_inflight",
+            "Exit payloads currently being handled, by lane",
+            exit_lane_inflight.clone(),
+        );
+
+        let event_bus_subscriber_lag_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_event_bus_subscriber_lagged",
+            "Events skipped because a subscriber fell behind, by subscriber",
+            event_bus_subscriber_lag_total.clone(),
+        );
+
         let cover_traffic_generated_total = Family::<Vec<(String, String)>, Counter>::default();
         registry.register(
             "nox_cover_traffic_generated_total",
@@ -660,6 +754,17 @@ impl MetricsService {
             chain_events_processed_total,
             eth_tx_pending,
             oracle_fetch_total,
+            paid_outcomes_total,
+            eth_submission_blocked,
+            eth_wallet_balance_gwei,
+            eth_wallet_balance_low,
+            quote_outstanding,
+            quote_pending_sponsored_gas,
+            quote_rolling_loss_gwei,
+            storage_degraded,
+            exit_payloads_dropped_total,
+            exit_lane_inflight,
+            event_bus_subscriber_lag_total,
             cover_traffic_generated_total,
             cover_traffic_errors_total,
             cover_traffic_degraded,
@@ -881,6 +986,24 @@ impl MetricsService {
 
         m.insert("ethPending".into(), self.eth_tx_pending.get().into());
         m.insert(
+            "ethSubmissionBlocked".into(),
+            self.eth_submission_blocked.get().into(),
+        );
+        m.insert(
+            "exitPayloadsDropped".into(),
+            EXIT_LANES
+                .iter()
+                .flat_map(|lane| EXIT_DROP_REASONS.iter().map(move |reason| (*lane, *reason)))
+                .map(|(lane, reason)| {
+                    fc(
+                        &self.exit_payloads_dropped_total,
+                        &[("lane", lane), ("reason", reason)],
+                    )
+                })
+                .sum::<u64>()
+                .into(),
+        );
+        m.insert(
             "ethSimulationReverts".into(),
             fc0(&self.eth_simulation_reverts).into(),
         );
@@ -890,7 +1013,11 @@ impl MetricsService {
         );
         m.insert(
             "ethTransactionsSubmitted".into(),
-            fc0(&self.eth_transactions_submitted).into(),
+            ["paid", "paid_v2", "broadcast"]
+                .iter()
+                .map(|kind| fc(&self.eth_transactions_submitted, &[("type", kind)]))
+                .sum::<u64>()
+                .into(),
         );
 
         m.insert(
@@ -1151,5 +1278,50 @@ mod tests {
         assert_eq!(projection["profitableCount"], 1);
         assert_eq!(projection["unprofitableCount"], 1);
         assert_eq!(projection["cumulativeMaximumCostUsd"], 1.25);
+    }
+
+    #[test]
+    fn dashboard_projection_sums_submissions_and_exit_drops() {
+        let metrics = MetricsService::new();
+        for kind in ["paid_v2", "paid_v2", "broadcast"] {
+            metrics
+                .eth_transactions_submitted
+                .get_or_create(&vec![("type".into(), kind.into())])
+                .inc();
+        }
+        metrics
+            .exit_payloads_dropped_total
+            .get_or_create(&vec![
+                ("lane".into(), "quote".into()),
+                ("reason".into(), "queue_full".into()),
+            ])
+            .inc();
+        metrics.eth_submission_blocked.set(1);
+
+        let projection = metrics.to_json();
+
+        assert_eq!(projection["ethTransactionsSubmitted"], 3);
+        assert_eq!(projection["exitPayloadsDropped"], 1);
+        assert_eq!(projection["ethSubmissionBlocked"], 1);
+    }
+
+    #[test]
+    fn new_counters_are_not_double_suffixed() {
+        let metrics = MetricsService::new();
+        metrics
+            .paid_outcomes_total
+            .get_or_create(&vec![
+                ("kind".into(), "quote".into()),
+                ("result".into(), "issued".into()),
+                ("code".into(), "none".into()),
+            ])
+            .inc();
+        let mut encoded = String::new();
+        prometheus_client::encoding::text::encode(&mut encoded, &metrics.get_registry().lock())
+            .unwrap_or_default();
+        assert!(encoded.contains("nox_paid_outcomes_total{"));
+        assert!(!encoded.contains("nox_paid_outcomes_total_total"));
+        assert!(!encoded.contains("nox_exit_payloads_dropped_total_total"));
+        assert!(!encoded.contains("nox_event_bus_subscriber_lagged_total_total"));
     }
 }

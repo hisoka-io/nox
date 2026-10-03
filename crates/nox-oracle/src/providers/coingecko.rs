@@ -6,9 +6,13 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 
+pub const DEFAULT_BASE_URL: &str = "https://api.coingecko.com/api/v3";
+const API_KEY_HEADER: &str = "x-cg-demo-api-key";
+
 pub struct CoinGeckoProvider {
     client: Client,
     base_url: String,
+    api_key: Option<String>,
 }
 
 impl Default for CoinGeckoProvider {
@@ -20,18 +24,33 @@ impl Default for CoinGeckoProvider {
 impl CoinGeckoProvider {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            client: Client::new(),
-            base_url: "https://api.coingecko.com/api/v3".to_string(),
-        }
+        Self::with_client(
+            crate::http::default_provider_client(),
+            DEFAULT_BASE_URL.to_string(),
+        )
     }
 
     #[must_use]
     pub fn with_base_url(base_url: String) -> Self {
+        Self::with_client(crate::http::default_provider_client(), base_url)
+    }
+
+    /// Uses a caller-supplied client (see [`crate::http::provider_client`]).
+    #[must_use]
+    pub fn with_client(client: Client, base_url: String) -> Self {
         Self {
-            client: Client::new(),
+            client,
             base_url,
+            api_key: None,
         }
+    }
+
+    /// Sends a `CoinGecko` demo API key. The keyless public API also works when the
+    /// request carries a descriptive User-Agent.
+    #[must_use]
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        self.api_key = api_key.filter(|key| !key.trim().is_empty());
+        self
     }
 }
 
@@ -51,13 +70,14 @@ impl PriceProvider for CoinGeckoProvider {
         let ids = assets.join(",");
         let url = format!("{}/simple/price", self.base_url);
 
-        let resp = self
+        let mut request = self
             .client
             .get(&url)
-            .query(&[("ids", &ids), ("vs_currencies", &"usd".to_string())])
-            .send()
-            .await
-            .map_err(ProviderError::Network)?;
+            .query(&[("ids", &ids), ("vs_currencies", &"usd".to_string())]);
+        if let Some(api_key) = &self.api_key {
+            request = request.header(API_KEY_HEADER, api_key);
+        }
+        let resp = request.send().await.map_err(ProviderError::Network)?;
 
         if !resp.status().is_success() {
             if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -117,6 +137,33 @@ mod tests {
 
         assert_eq!(prices["ethereum"].get(), 240_000_000_000);
         assert_eq!(prices["bitcoin"].get(), 4_400_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn default_client_sends_user_agent_and_optional_demo_key() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/simple/price"))
+            .and(wiremock::matchers::header(
+                "user-agent",
+                crate::http::PROVIDER_USER_AGENT,
+            ))
+            .and(wiremock::matchers::header("x-cg-demo-api-key", "demo-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ethereum": {"usd": 2500.0}
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let provider = CoinGeckoProvider::with_base_url(mock_server.uri())
+            .with_api_key(Some("demo-key".to_string()));
+        let prices = provider
+            .get_prices(&["ethereum".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(prices["ethereum"].get(), 250_000_000_000);
     }
 
     #[tokio::test]
