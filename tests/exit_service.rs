@@ -300,7 +300,7 @@ async fn single_fragment_echo_answered(with_fec: bool) -> bool {
         make_surbs(2),
     );
     // A well-formed 1-of-1 FEC header that would reassemble to the same bytes.
-    let fec = with_fec.then(|| nox_core::FecInfo {
+    let fec = with_fec.then_some(nox_core::FecInfo {
         data_shard_count: 1,
         original_data_len: inner.len() as u64,
     });
