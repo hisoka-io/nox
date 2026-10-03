@@ -1,9 +1,9 @@
 //! `ResponseBuffer` -- Thread-safe buffer for SURB responses.
 //!
 //! Exit nodes send SURB responses back through the mixnet. When a response
-//! arrives at the entry node, it is stored here under its `packet_id`
-//! (`"{handler}-{request_id}-{surb_id_hex}"`). Clients retrieve their own
-//! responses by the exact 16-byte SURB IDs they generated.
+//! arrives at the entry node, it is stored here under `reply-0-{surb_id_hex}`
+//! (see `ResponseRouter`). Clients retrieve their own responses by the exact
+//! 16-byte SURB IDs they generated.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -38,8 +38,8 @@ pub fn parse_surb_id(hex_id: &str) -> Option<SurbId> {
     Some(id)
 }
 
-/// Extracts the SURB ID from a SURB response `packet_id`
-/// (`"{handler}-{request_id}-{surb_id_hex}"`): the text after the last `-`.
+/// Extracts the SURB ID from a buffer key such as `reply-0-{surb_id_hex}`:
+/// the text after the last `-`.
 #[must_use]
 pub fn surb_id_from_packet_id(packet_id: &str) -> Option<SurbId> {
     let (_, suffix) = packet_id.rsplit_once('-')?;

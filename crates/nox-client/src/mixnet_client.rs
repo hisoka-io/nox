@@ -555,6 +555,8 @@ impl MixnetClient {
                                         packet_id: pkt_id,
                                         data: pkt.clone(),
                                         size_bytes: pkt.len(),
+                                        reply_handle: None,
+                                        prev_peer: None,
                                     });
                                 }
                             }
@@ -784,6 +786,8 @@ impl MixnetClient {
                                     packet_id: pkt_id,
                                     data: pkt.clone(),
                                     size_bytes: pkt.len(),
+                                    reply_handle: None,
+                                    prev_peer: None,
                                 });
                             }
                         }
@@ -1003,6 +1007,8 @@ impl MixnetClient {
                         packet_id: format!("mixnet-{counter_id}"),
                         data: packet,
                         size_bytes: payload_bytes.len(),
+                        reply_handle: None,
+                        prev_peer: None,
                     })
                     .map_err(|_| MixnetClientError::ChannelClosed)?;
             }
@@ -1042,6 +1048,8 @@ impl MixnetClient {
                             packet_id: format!("mixnet-{counter_id}-frag-{i}"),
                             data: packet,
                             size_bytes: frag_bytes.len(),
+                            reply_handle: None,
+                            prev_peer: None,
                         })
                         .map_err(|_| MixnetClientError::ChannelClosed)?;
                 }

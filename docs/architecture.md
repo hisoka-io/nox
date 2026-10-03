@@ -62,6 +62,23 @@ PacketReceived
 - **Mix**: Poisson delay queue (`tokio_util::time::DelayQueue`). λ = 1/avg_delay_ms.
 - **Egress**: Publishes `SendPacket` (forward) or `PayloadDecrypted` (exit) to the event bus.
 
+### Packet identifiers
+
+Each `SphinxPacket` carries an `id` string. A node uses its own random local ID internally and picks the
+`id` it sends to the next hop when the packet leaves (`relayer.wire_ids = "per_hop"`, the default):
+
+- Forward and cover packets get a fresh random ID (32 lowercase hex characters) at every hop.
+- A reply built by an exit from a client's SURB is sent as `reply-0-{surb_id_hex}`. The entry node needs
+  this handle to file the reply for its client.
+- A node relaying a packet passes the reply handle on only when the packet came from an exit-capable
+  registry member (role Exit or Full), which is where replies come from. In every other case, including a
+  previous hop that is not a known member, the packet leaves with a fresh ID and
+  `nox_wire_handle_dropped_total{reason}` counts the dropped handle.
+- Inbound IDs from earlier versions (`{label}-{counter}-{surb_id_hex}`) are read as the same handle.
+
+`relayer.wire_ids = "passthrough"` keeps IDs unchanged from hop to hop. It exists for benchmark harnesses
+that follow one packet across nodes and is only accepted with `benchmark_mode = true`.
+
 ---
 
 ## SURB responses
@@ -74,7 +91,7 @@ The client pre-computes a return path as a SURB. The exit node wraps its respons
 2. **Client attaches SURBs to request**: Multiple SURBs for fragmented responses + FEC parity.
 3. **Exit encapsulates**: Pad, encrypt with SURB's payload key, build Sphinx packet from pre-computed header.
 4. **Response traverses mixnet**: Indistinguishable from forward traffic.
-5. **Entry buffers the reply**: The last hop of the return path is the client's entry node. It buffers the still-encrypted reply under its `packet_id` (`{handler}-{request_id}-{surb_id_hex}`).
+5. **Entry buffers the reply**: The last hop of the return path is the client's entry node. It buffers the still-encrypted reply under `reply-0-{surb_id_hex}`, using the reply handle the packet arrived with. Packets without a handle are never buffered.
 6. **Client claims and decrypts**: The client claims its replies by exact SURB ID (`POST /api/v1/responses/claim`, `GET /api/v1/ws` or `GET /api/v1/responses/stream`; each SURB ID is 32 hex characters), peels each layer with stored keys, decrypts the final payload and removes padding.
 
 ---

@@ -18,15 +18,16 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::response_buffer::{surb_id_from_packet_id, ResponseBuffer};
+use super::response_buffer::ResponseBuffer;
+use nox_core::models::wire_id::{reply_wire_id, ReplyHandle};
 
 /// Whether a decrypted payload is a SURB reply that a client of this node can claim.
 ///
-/// It must carry a SURB ID in its `packet_id` and must not decode as a
+/// It must have arrived over P2P with a reply handle and must not decode as a
 /// `RelayerPayload`, which is handled by the exit service instead.
 #[must_use]
-pub fn is_claimable_surb_reply(packet_id: &str, payload: &[u8]) -> bool {
-    if surb_id_from_packet_id(packet_id).is_none() {
+pub fn is_claimable_surb_reply(reply_handle: Option<&ReplyHandle>, payload: &[u8]) -> bool {
+    if reply_handle.is_none() {
         return false;
     }
     let limit = u64::try_from(payload.len()).unwrap_or(u64::MAX);
@@ -90,18 +91,21 @@ impl ResponseRouter {
             tokio::select! {
                 event = rx.recv() => {
                     match event {
-                        Ok(NoxEvent::PayloadDecrypted { packet_id, payload }) => {
-                            if !self.buffer_all_payloads
-                                && !is_claimable_surb_reply(&packet_id, &payload)
-                            {
+                        Ok(NoxEvent::PayloadDecrypted { packet_id, payload, reply_handle }) => {
+                            // Replies are filed as `reply-0-{surb id}`, the ID clients
+                            // see when they claim them.
+                            let key = if is_claimable_surb_reply(reply_handle.as_ref(), &payload) {
+                                reply_handle.as_ref().map(reply_wire_id)
+                            } else if self.buffer_all_payloads {
+                                Some(packet_id)
+                            } else {
+                                None
+                            };
+                            let Some(key) = key else {
                                 continue;
-                            }
-                            debug!(
-                                packet_id = %packet_id,
-                                bytes = payload.len(),
-                                "ResponseRouter: buffering SURB response"
-                            );
-                            self.response_buffer.store_response(&packet_id, payload);
+                            };
+                            debug!("ResponseRouter: buffering SURB response");
+                            self.response_buffer.store_response(&key, payload);
                             self.metrics
                                 .ingress_response_buffer_entries
                                 .set(self.response_buffer.len() as i64);
@@ -165,10 +169,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Publish a PayloadDecrypted event
-        let packet_id = format!("reply-42-{SURB_HEX}");
+        let packet_id = format!("reply-0-{SURB_HEX}");
         let _ = publisher.publish(NoxEvent::PayloadDecrypted {
-            packet_id: packet_id.clone(),
+            packet_id: "0123456789abcdef0123456789abcdef".to_string(),
             payload: vec![0xA5; 64],
+            reply_handle: Some(SURB),
         });
 
         // Give router time to process
@@ -182,6 +187,10 @@ mod tests {
     }
 
     const SURB_HEX: &str = "00112233445566778899aabbccddeeff";
+    const SURB: ReplyHandle = [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff,
+    ];
 
     fn relayer_payload() -> Vec<u8> {
         let mut bytes = nox_core::models::payloads::encode_payload(
@@ -198,25 +207,44 @@ mod tests {
     #[test]
     fn test_relayer_payloads_are_not_claimable() {
         let payload = relayer_payload();
-        assert!(!is_claimable_surb_reply(
-            &format!("reply-1-{SURB_HEX}"),
-            &payload
-        ));
-        assert!(!is_claimable_surb_reply("http-00000000deadbeef", &payload));
+        assert!(!is_claimable_surb_reply(Some(&SURB), &payload));
+        assert!(!is_claimable_surb_reply(None, &payload));
     }
 
     #[test]
-    fn test_reply_needs_surb_id_in_packet_id() {
+    fn test_reply_needs_a_handle() {
         let ciphertext = vec![0xA5; 1024];
-        assert!(is_claimable_surb_reply(
-            &format!("rpc-1-{SURB_HEX}"),
-            &ciphertext
-        ));
-        assert!(!is_claimable_surb_reply(
-            "http-00000000deadbeef",
-            &ciphertext
-        ));
-        assert!(!is_claimable_surb_reply("surb-resp-42", &ciphertext));
+        assert!(is_claimable_surb_reply(Some(&SURB), &ciphertext));
+        assert!(!is_claimable_surb_reply(None, &ciphertext));
+    }
+
+    #[tokio::test]
+    async fn test_reply_is_filed_under_its_handle_not_its_local_id() {
+        let bus = TokioEventBus::new(64);
+        let publisher: Arc<dyn IEventPublisher> = Arc::new(bus.clone());
+        let subscriber: Arc<dyn IEventSubscriber> = Arc::new(bus);
+        let buffer = Arc::new(ResponseBuffer::new());
+        let router = ResponseRouter::new(subscriber, buffer.clone(), 60, MetricsService::new());
+        let handle = tokio::spawn(async move {
+            router.run().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // A local ID that looks like a reply ID must not matter.
+        let _ = publisher.publish(NoxEvent::PayloadDecrypted {
+            packet_id: "rpc-9-ffeeddccbbaa99887766554433221100".to_string(),
+            payload: vec![0xA5; 1024],
+            reply_handle: Some(SURB),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let claimed = buffer.claim_by_surb_ids(&[SURB]);
+        assert_eq!(
+            claimed,
+            vec![(format!("reply-0-{SURB_HEX}"), vec![0xA5; 1024])]
+        );
+        assert!(buffer.is_empty());
+        handle.abort();
     }
 
     #[tokio::test]
@@ -231,19 +259,25 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+        // Exit-bound payloads, with or without a handle, are not replies.
+        for reply_handle in [None, Some(SURB)] {
+            let _ = publisher.publish(NoxEvent::PayloadDecrypted {
+                packet_id: "http-00000000deadbeef".to_string(),
+                payload: relayer_payload(),
+                reply_handle,
+            });
+        }
+        // Without a handle nothing is stored, whatever the local ID looks like.
         for packet_id in [
-            "http-00000000deadbeef".to_string(),
+            "http-00000000cafebabe".to_string(),
             format!("reply-1-{SURB_HEX}"),
         ] {
             let _ = publisher.publish(NoxEvent::PayloadDecrypted {
                 packet_id,
-                payload: relayer_payload(),
+                payload: vec![0xA5; 1024],
+                reply_handle: None,
             });
         }
-        let _ = publisher.publish(NoxEvent::PayloadDecrypted {
-            packet_id: "http-00000000cafebabe".to_string(),
-            payload: vec![0xA5; 1024],
-        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         assert!(buffer.is_empty());
@@ -266,6 +300,7 @@ mod tests {
         let _ = publisher.publish(NoxEvent::PayloadDecrypted {
             packet_id: "http-00000000deadbeef".to_string(),
             payload: relayer_payload(),
+            reply_handle: None,
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -294,6 +329,8 @@ mod tests {
             packet_id: "pkt-1".to_string(),
             data: vec![0; 100],
             size_bytes: 100,
+            reply_handle: None,
+            prev_peer: None,
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

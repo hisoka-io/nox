@@ -58,6 +58,7 @@ http = "1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+tokio-tungstenite = "0.24"
 
 [lints]
 workspace = true

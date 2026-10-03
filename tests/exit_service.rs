@@ -94,13 +94,18 @@ async fn test_exit_service_echo_produces_send_packet() {
     bus.publish(NoxEvent::PayloadDecrypted {
         packet_id: "pkt-echo-1".to_string(),
         payload: payload_bytes,
+        reply_handle: None,
     })
     .expect("publish");
 
     let event = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             match rx.recv().await {
-                Ok(NoxEvent::SendPacket { packet_id, .. }) if packet_id.starts_with("echo-") => {
+                Ok(NoxEvent::SendPacket {
+                    packet_id,
+                    reply_handle: Some(handle),
+                    ..
+                }) if packet_id == nox_core::models::wire_id::reply_wire_id(&handle) => {
                     return packet_id;
                 }
                 Ok(_) => continue,
@@ -112,8 +117,8 @@ async fn test_exit_service_echo_produces_send_packet() {
     .expect("timeout waiting for SendPacket");
 
     assert!(
-        event.starts_with("echo-"),
-        "expected echo- prefix, got: {event}"
+        event.starts_with("reply-0-") && event.len() == "reply-0-".len() + 32,
+        "expected a reply-0- identifier, got: {event}"
     );
     cancel.cancel();
 }
@@ -137,6 +142,7 @@ async fn test_exit_service_dummy_payload_no_send_packet() {
     bus.publish(NoxEvent::PayloadDecrypted {
         packet_id: "pkt-dummy-1".to_string(),
         payload: payload_bytes,
+        reply_handle: None,
     })
     .expect("publish");
 
@@ -175,6 +181,7 @@ async fn test_exit_service_heartbeat_no_send_packet() {
     bus.publish(NoxEvent::PayloadDecrypted {
         packet_id: "pkt-hb-1".to_string(),
         payload: payload_bytes,
+        reply_handle: None,
     })
     .expect("publish");
 
@@ -206,6 +213,7 @@ async fn test_exit_service_garbage_payload_ignored() {
     bus.publish(NoxEvent::PayloadDecrypted {
         packet_id: "pkt-garbage-1".to_string(),
         payload: garbage,
+        reply_handle: None,
     })
     .expect("publish");
 
@@ -250,6 +258,7 @@ async fn test_exit_service_service_response_ignored() {
     bus.publish(NoxEvent::PayloadDecrypted {
         packet_id: "pkt-resp-1".to_string(),
         payload: payload_bytes,
+        reply_handle: None,
     })
     .expect("publish");
 
@@ -288,6 +297,7 @@ async fn test_exit_service_need_more_surbs_ignored() {
     bus.publish(NoxEvent::PayloadDecrypted {
         packet_id: "pkt-nms-1".to_string(),
         payload: payload_bytes,
+        reply_handle: None,
     })
     .expect("publish");
 
@@ -329,6 +339,7 @@ async fn test_exit_service_multiple_echo_requests() {
         bus.publish(NoxEvent::PayloadDecrypted {
             packet_id: format!("pkt-multi-{i}"),
             payload: payload_bytes,
+            reply_handle: None,
         })
         .expect("publish");
     }
@@ -342,7 +353,11 @@ async fn test_exit_service_multiple_echo_requests() {
             break;
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Ok(NoxEvent::SendPacket { packet_id, .. })) if packet_id.starts_with("echo-") => {
+            Ok(Ok(NoxEvent::SendPacket {
+                packet_id,
+                reply_handle: Some(handle),
+                ..
+            })) if packet_id == nox_core::models::wire_id::reply_wire_id(&handle) => {
                 count += 1;
             }
             Ok(Ok(_)) => {}
@@ -427,6 +442,7 @@ async fn test_exit_service_slow_http_does_not_block_echo() {
     bus.publish(NoxEvent::PayloadDecrypted {
         packet_id: "pkt-slow-http".to_string(),
         payload: slow_http_request(&url),
+        reply_handle: None,
     })
     .expect("publish http");
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -438,13 +454,18 @@ async fn test_exit_service_slow_http_does_not_block_echo() {
             },
             make_surbs(2),
         ),
+        reply_handle: None,
     })
     .expect("publish echo");
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             match rx.recv().await {
-                Ok(NoxEvent::SendPacket { packet_id, .. }) if packet_id.starts_with("echo-") => {
+                Ok(NoxEvent::SendPacket {
+                    packet_id,
+                    reply_handle: Some(handle),
+                    ..
+                }) if packet_id == nox_core::models::wire_id::reply_wire_id(&handle) => {
                     return;
                 }
                 Ok(_) => continue,
@@ -479,6 +500,7 @@ async fn test_exit_service_full_lane_drops_and_counts() {
         bus.publish(NoxEvent::PayloadDecrypted {
             packet_id: format!("pkt-slow-{index}"),
             payload: slow_http_request(&url),
+            reply_handle: None,
         })
         .expect("publish http");
         tokio::time::sleep(Duration::from_millis(100)).await;

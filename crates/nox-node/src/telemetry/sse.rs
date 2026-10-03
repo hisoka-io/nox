@@ -151,6 +151,8 @@ mod tests {
             packet_id: "pkt-1".to_string(),
             data: vec![0; 4],
             size_bytes: 4,
+            reply_handle: None,
+            prev_peer: None,
         };
         assert!(to_sse(&received, "node").is_none());
     }

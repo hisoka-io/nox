@@ -129,6 +129,8 @@ impl CoverTrafficController {
                     packet_id: format!("cover-{counter}"),
                     data: packet,
                     size_bytes: PACKET_SIZE,
+                    reply_handle: None,
+                    prev_peer: None,
                 })
                 .map_err(|e| format!("publish: {e}"))?;
         }

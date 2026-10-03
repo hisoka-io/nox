@@ -8,6 +8,7 @@ use crate::telemetry::metrics::MetricsService;
 use async_trait::async_trait;
 use nox_core::events::NoxEvent;
 use nox_core::models::payloads::{RelayerPayload, ServiceRequest};
+use nox_core::models::wire_id::{reply_wire_id, PacketOrigin};
 use nox_core::traits::service::{ServiceError, ServiceHandler};
 use nox_core::traits::IEventPublisher;
 use nox_crypto::sphinx::surb::Surb;
@@ -441,8 +442,10 @@ impl HttpHandler {
                 let packed = result?;
                 let _ = publisher.publish(NoxEvent::SendPacket {
                     next_hop_peer_id: packed.first_hop.clone(),
-                    packet_id: format!("reply-{}-{}", req_id, hex::encode(packed.surb_id)),
+                    packet_id: reply_wire_id(&packed.surb_id),
                     data: packed.packet_bytes,
+                    reply_handle: Some(packed.surb_id),
+                    origin: PacketOrigin::Originated,
                 });
                 dispatched += 1;
             }
@@ -528,12 +531,10 @@ impl HttpHandler {
                     .map_err(|e| HandlerError::PackFailed(e.to_string()))?;
                 let _ = self.publisher.publish(NoxEvent::SendPacket {
                     next_hop_peer_id: distress_packet.first_hop.clone(),
-                    packet_id: format!(
-                        "distress-{}-{}",
-                        request_id,
-                        hex::encode(distress_packet.surb_id)
-                    ),
+                    packet_id: reply_wire_id(&distress_packet.surb_id),
                     data: distress_packet.packet_bytes,
+                    reply_handle: Some(distress_packet.surb_id),
+                    origin: PacketOrigin::Originated,
                 });
                 let _ = packets_dispatched + 1; // suppress unused assignment warning
 
@@ -647,12 +648,10 @@ impl ServiceHandler for HttpHandler {
                             for packet in chunk {
                                 if let Err(e) = self.publisher.publish(NoxEvent::SendPacket {
                                     next_hop_peer_id: packet.first_hop.clone(),
-                                    packet_id: format!(
-                                        "reply-{}-{}",
-                                        request_id,
-                                        hex::encode(packet.surb_id)
-                                    ),
+                                    packet_id: reply_wire_id(&packet.surb_id),
                                     data: packet.packet_bytes.clone(),
+                                    reply_handle: Some(packet.surb_id),
+                                    origin: PacketOrigin::Originated,
                                 }) {
                                     warn!(
                                         request_id = request_id,

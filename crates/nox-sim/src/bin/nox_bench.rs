@@ -322,7 +322,9 @@ fn spawn_payload_watcher(subscriber: Arc<dyn IEventSubscriber>, registry: Payloa
         let mut rx = subscriber.subscribe();
         loop {
             match rx.recv().await {
-                Ok(NoxEvent::PayloadDecrypted { packet_id, payload }) => {
+                Ok(NoxEvent::PayloadDecrypted {
+                    packet_id, payload, ..
+                }) => {
                     if let Some(tx) = registry.lock().remove(&packet_id) {
                         let _ = tx.send(payload);
                     }
@@ -350,6 +352,7 @@ async fn spawn_bench_node(id: usize, mix_delay_ms: f64, bus_capacity: usize) -> 
     let config = {
         let mut c = NoxConfig::default();
         c.benchmark_mode = true;
+        c.relayer.wire_ids = nox_node::config::WireIdMode::Passthrough;
         c.p2p_listen_addr = "127.0.0.1".into();
         c.p2p_port = 0; // OS-assigned
         c.db_path = dir.path().to_str().unwrap_or_default().into();
@@ -582,6 +585,8 @@ async fn run_latency(cfg: &BenchConfig) -> Result<BenchResult> {
                 packet_id: pkt_id.clone(),
                 data: packet_bytes,
                 size_bytes: pkt_size,
+                reply_handle: None,
+                prev_peer: None,
             });
 
             let result = tokio::time::timeout(Duration::from_secs(30), rx).await;
@@ -748,6 +753,8 @@ async fn run_throughput(
                     packet_id: pkt_id.clone(),
                     data: packet_bytes,
                     size_bytes: pkt_size,
+                    reply_handle: None,
+                    prev_peer: None,
                 });
 
                 let result = tokio::time::timeout(Duration::from_secs(10), rx).await;
@@ -897,6 +904,8 @@ async fn run_scale(cfg: &BenchConfig, node_counts: Vec<usize>) -> Result<BenchRe
                     packet_id: pkt_id.clone(),
                     data: packet_bytes,
                     size_bytes: pkt_size,
+                    reply_handle: None,
+                    prev_peer: None,
                 });
 
                 let result = tokio::time::timeout(Duration::from_secs(30), rx).await;
@@ -1112,6 +1121,8 @@ async fn run_surb_rtt(cfg: &BenchConfig) -> Result<BenchResult> {
                 packet_id: fwd_id.clone(),
                 data: fwd_packet,
                 size_bytes: fwd_size,
+                reply_handle: None,
+                prev_peer: None,
             });
 
             let fwd_ok = tokio::time::timeout(Duration::from_secs(15), fwd_rx).await;
@@ -1148,6 +1159,8 @@ async fn run_surb_rtt(cfg: &BenchConfig) -> Result<BenchResult> {
                 packet_id: ret_id.clone(),
                 data: reply_bytes,
                 size_bytes: reply_size,
+                reply_handle: None,
+                prev_peer: None,
             });
 
             // Step 4: Wait for SURB reply at entry node
@@ -1371,6 +1384,8 @@ async fn run_surb_rtt_fec_mode(
                 packet_id: fwd_id.clone(),
                 data: fwd_packet,
                 size_bytes: fwd_size,
+                reply_handle: None,
+                prev_peer: None,
             });
 
             let fwd_ok = tokio::time::timeout(Duration::from_secs(15), fwd_rx).await;
@@ -1445,6 +1460,8 @@ async fn run_surb_rtt_fec_mode(
                     packet_id: frag_id,
                     data: packet.packet_bytes,
                     size_bytes: frag_size,
+                    reply_handle: None,
+                    prev_peer: None,
                 });
             }
 

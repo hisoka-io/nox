@@ -1,16 +1,17 @@
+use super::worker::PacketMeta;
 use crate::telemetry::metrics::MetricsService;
 use async_channel::Sender;
 use nox_core::{events::NoxEvent, traits::IEventSubscriber};
 use nox_crypto::sphinx::SphinxHeader;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Parses incoming packets and hands them to the workers. Replay checks run in
 /// the workers, after the header MAC is verified (see `WorkerStage`).
 pub struct IngestStage {
     bus_subscriber: Arc<dyn IEventSubscriber>,
-    worker_tx: Sender<(SphinxHeader, Vec<u8>, String)>, // Header, Body, PacketID
+    worker_tx: Sender<(SphinxHeader, Vec<u8>, PacketMeta)>,
     metrics: MetricsService,
     cancel_token: Option<CancellationToken>,
 }
@@ -18,7 +19,7 @@ pub struct IngestStage {
 impl IngestStage {
     pub fn new(
         bus_subscriber: Arc<dyn IEventSubscriber>,
-        worker_tx: Sender<(SphinxHeader, Vec<u8>, String)>,
+        worker_tx: Sender<(SphinxHeader, Vec<u8>, PacketMeta)>,
         metrics: MetricsService,
     ) -> Self {
         Self {
@@ -44,9 +45,10 @@ impl IngestStage {
                 event = rx.recv() => {
                     match event {
                         Ok(NoxEvent::PacketReceived {
-                            packet_id, data, ..
+                            packet_id, data, reply_handle, prev_peer, ..
                         }) => {
-                            self.handle_packet(packet_id, data).await;
+                            let meta = PacketMeta { packet_id, reply_handle, prev_peer };
+                            self.handle_packet(meta, data).await;
                         }
                         Ok(_) => {} // Ignore other events
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -71,11 +73,11 @@ impl IngestStage {
         }
     }
 
-    async fn handle_packet(&self, packet_id: String, data: Vec<u8>) {
+    async fn handle_packet(&self, meta: PacketMeta, data: Vec<u8>) {
         let (header, body) = match SphinxHeader::from_bytes(&data) {
             Ok(res) => res,
             Err(e) => {
-                warn!("Invalid Sphinx packet structure for {}: {}.", packet_id, e);
+                debug!(error = %e, "Invalid Sphinx packet structure");
                 self.metrics
                     .ingest_dropped_total
                     .get_or_create(&vec![("reason".to_string(), "parse_error".to_string())])
@@ -85,15 +87,9 @@ impl IngestStage {
         };
 
         // PoW is enforced at HTTP ingress, not here (Sphinx header transforms per hop).
-        if let Err(e) = self
-            .worker_tx
-            .try_send((header, body.to_vec(), packet_id.clone()))
-        {
+        if let Err(e) = self.worker_tx.try_send((header, body.to_vec(), meta)) {
             if e.is_full() {
-                warn!(
-                    "Relayer Overload: Dropping packet {} due to backpressure.",
-                    packet_id
-                );
+                debug!("Relayer overload: dropping packet due to backpressure");
                 self.metrics
                     .ingest_dropped_total
                     .get_or_create(&vec![("reason".to_string(), "backpressure".to_string())])

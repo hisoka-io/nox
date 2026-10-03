@@ -375,8 +375,16 @@ fn spawn_traffic_generator(
             let mut rx = node_sub.subscribe();
             loop {
                 match rx.recv().await {
-                    Ok(NoxEvent::PayloadDecrypted { packet_id, payload }) => {
-                        let _ = resp_tx.send((packet_id, payload)).await;
+                    Ok(NoxEvent::PayloadDecrypted {
+                        packet_id,
+                        payload,
+                        reply_handle,
+                    }) => {
+                        // Replies are identified by their handle, as at a real entry node.
+                        let id = reply_handle
+                            .as_ref()
+                            .map_or(packet_id, nox_core::models::wire_id::reply_wire_id);
+                        let _ = resp_tx.send((id, payload)).await;
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {

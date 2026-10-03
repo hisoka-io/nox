@@ -34,6 +34,10 @@ pub struct MetricsService {
     pub mix_delay_seconds: Histogram,
 
     pub ingest_dropped_total: Family<Vec<(String, String)>, Counter>,
+    /// Outbound packet identifiers by kind (`fresh`, `legacy_handle`, `passthrough`).
+    pub wire_ids_total: Family<Vec<(String, String)>, Counter>,
+    /// Reply handles not passed on to the next hop, by reason.
+    pub wire_handle_dropped_total: Family<Vec<(String, String)>, Counter>,
     pub relayer_worker_queue_depth: Gauge<i64, AtomicI64>,
     pub relayer_mix_queue_depth: Gauge<i64, AtomicI64>,
     pub relayer_egress_queue_depth: Gauge<i64, AtomicI64>,
@@ -200,6 +204,20 @@ impl MetricsService {
             "nox_relayer_ingest_dropped_total",
             "Packets dropped at ingest stage by reason",
             ingest_dropped_total.clone(),
+        );
+
+        let wire_ids_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_wire_ids",
+            "Outbound packet identifiers by kind",
+            wire_ids_total.clone(),
+        );
+
+        let wire_handle_dropped_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_wire_handle_dropped",
+            "Reply handles not passed on to the next hop, by reason",
+            wire_handle_dropped_total.clone(),
         );
 
         let relayer_worker_queue_depth = Gauge::<i64, AtomicI64>::default();
@@ -723,6 +741,8 @@ impl MetricsService {
             processing_duration,
             mix_delay_seconds,
             ingest_dropped_total,
+            wire_ids_total,
+            wire_handle_dropped_total,
             relayer_worker_queue_depth,
             relayer_mix_queue_depth,
             relayer_egress_queue_depth,
@@ -1323,5 +1343,23 @@ mod tests {
         assert!(!encoded.contains("nox_paid_outcomes_total_total"));
         assert!(!encoded.contains("nox_exit_payloads_dropped_total_total"));
         assert!(!encoded.contains("nox_event_bus_subscriber_lagged_total_total"));
+    }
+
+    #[test]
+    fn wire_id_counters_have_their_documented_names() {
+        let metrics = MetricsService::new();
+        metrics
+            .wire_ids_total
+            .get_or_create(&vec![("kind".into(), "fresh".into())])
+            .inc();
+        metrics
+            .wire_handle_dropped_total
+            .get_or_create(&vec![("reason".into(), "unknown_layer".into())])
+            .inc();
+        let mut encoded = String::new();
+        prometheus_client::encoding::text::encode(&mut encoded, &metrics.get_registry().lock())
+            .unwrap_or_default();
+        assert!(encoded.contains("nox_wire_ids_total{kind=\"fresh\"} 1"));
+        assert!(encoded.contains("nox_wire_handle_dropped_total{reason=\"unknown_layer\"} 1"));
     }
 }
