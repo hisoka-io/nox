@@ -1,6 +1,6 @@
 //! Process metrics: polls `/proc/self/status` for memory and FD counts (Linux only).
 
-use crate::infra::storage::DegradedFlag;
+use crate::infra::storage::{DegradedFlag, SledRepository};
 use crate::telemetry::metrics::MetricsService;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -12,6 +12,7 @@ pub struct ProcessMonitor {
     metrics: MetricsService,
     start_epoch: i64,
     storage_degraded: Option<DegradedFlag>,
+    storage: Option<SledRepository>,
 }
 
 impl ProcessMonitor {
@@ -21,6 +22,7 @@ impl ProcessMonitor {
             metrics,
             start_epoch,
             storage_degraded: None,
+            storage: None,
         }
     }
 
@@ -28,6 +30,13 @@ impl ProcessMonitor {
     #[must_use]
     pub fn with_storage_degraded_flag(mut self, flag: DegradedFlag) -> Self {
         self.storage_degraded = Some(flag);
+        self
+    }
+
+    /// Reports the database's size in `nox_storage_size_on_disk_bytes`.
+    #[must_use]
+    pub fn with_storage_size_source(mut self, storage: SledRepository) -> Self {
+        self.storage = Some(storage);
         self
     }
 
@@ -51,6 +60,21 @@ impl ProcessMonitor {
             self.update_uptime();
             self.update_proc_metrics();
             self.update_health();
+            self.update_storage_size().await;
+        }
+    }
+
+    async fn update_storage_size(&self) {
+        let Some(storage) = &self.storage else {
+            return;
+        };
+        match storage.size_on_disk().await {
+            Ok(bytes) => {
+                self.metrics
+                    .storage_size_on_disk_bytes
+                    .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+            }
+            Err(e) => debug!(error = %e, "Storage size probe failed"),
         }
     }
 
