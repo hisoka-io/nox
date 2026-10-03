@@ -120,6 +120,11 @@ db_path = "./data/nox_db"
 # Block polling interval in seconds
 block_poll_interval_secs = 12
 
+# Write the chain observer's scan cursor at most this often, in seconds, and
+# again on graceful shutdown. After a crash the observer re-scans up to this
+# much history; registry events are safe to replay (0 = write every poll).
+chain_cursor_persist_interval_secs = 60
+
 # Re-read every member from the registry and compare the node set with
 # topologyFingerprint() and relayerCount() this often (0 = disabled).
 # P2P admission only enforces while this check passes.

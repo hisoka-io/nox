@@ -11,7 +11,7 @@ use nox_crypto::sphinx::surb::Surb;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::debug;
 
 /// Max size for deserializing inner payloads from `AnonymousRequest` (7 MB).
 const MAX_INNER_PAYLOAD_SIZE: u64 = 7 * 1024 * 1024;
@@ -40,7 +40,7 @@ impl EchoHandler {
             MAX_INNER_PAYLOAD_SIZE,
         ) {
             Ok(ServiceRequest::Echo { data }) => {
-                info!(
+                debug!(
                     request_id = request_id,
                     data_len = data.len(),
                     "Echo request received"
@@ -48,7 +48,7 @@ impl EchoHandler {
                 data
             }
             Ok(ServiceRequest::HttpRequest { .. }) => {
-                warn!(
+                debug!(
                     request_id = request_id,
                     "Echo handler received HTTP request"
                 );
@@ -57,13 +57,13 @@ impl EchoHandler {
                 ));
             }
             Ok(ServiceRequest::RpcRequest { .. }) => {
-                warn!(request_id = request_id, "Echo handler received RPC request");
+                debug!(request_id = request_id, "Echo handler received RPC request");
                 return Err(ServiceError::ProcessingFailed(
                     "Echo handler cannot process RPC requests".into(),
                 ));
             }
             Ok(ServiceRequest::SubmitTransaction { .. }) => {
-                warn!(
+                debug!(
                     request_id = request_id,
                     "Echo handler received SubmitTransaction request"
                 );
@@ -82,7 +82,7 @@ impl EchoHandler {
                 ));
             }
             Ok(ServiceRequest::BroadcastSignedTransaction { .. }) => {
-                warn!(
+                debug!(
                     request_id = request_id,
                     "Echo handler received BroadcastSignedTransaction request"
                 );
@@ -106,7 +106,7 @@ impl EchoHandler {
             .pack_response(request_id, &response_data, surbs)
             .map_err(|e| ServiceError::ProcessingFailed(e.to_string()))?;
 
-        info!(
+        debug!(
             request_id = request_id,
             packets = pack_result.packets.len(),
             "Echo response packed"
@@ -142,7 +142,7 @@ impl ServiceHandler for EchoHandler {
                         reply_handle: packet.reply_handle(),
                         origin: PacketOrigin::Originated,
                     }) {
-                        warn!(
+                        debug!(
                             request_id = request_id,
                             error = %e,
                             "Failed to publish echo response SendPacket -- reply lost"
@@ -151,12 +151,12 @@ impl ServiceHandler for EchoHandler {
                 }
 
                 if pack_result.remaining.is_some() {
-                    warn!(
+                    debug!(
                         request_id = request_id,
                         "Echo response partially delivered (SURB exhaustion) -- remaining data dropped"
                     );
                 }
-                info!(
+                debug!(
                     request_id = request_id,
                     "Echo response packets dispatched to network"
                 );

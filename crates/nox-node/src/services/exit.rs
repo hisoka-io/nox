@@ -666,7 +666,7 @@ impl ExitService {
                         .exit_reassembly_total
                         .get_or_create(&vec![("result".to_string(), "complete".to_string())])
                         .inc();
-                    info!(
+                    debug!(
                         message_id = message_id,
                         total_bytes = data.len(),
                         pending = reassembler.pending_count(),
@@ -694,7 +694,7 @@ impl ExitService {
                     if matches!(e, FragmentationError::DuplicateDataMismatch { .. }) {
                         self.metrics.reassembly_conflict_total.inc();
                     }
-                    warn!(
+                    debug!(
                         message_id = message_id,
                         error = %e,
                         "Fragment rejected"
@@ -709,14 +709,14 @@ impl ExitService {
         match decode_payload_limited::<RelayerPayload>(&data, MAX_REASSEMBLED_PAYLOAD_SIZE) {
             Ok(inner_payload) => {
                 if matches!(inner_payload, RelayerPayload::Fragment { .. }) {
-                    warn!(
+                    debug!(
                         message_id = message_id,
                         "Reassembled payload is itself a Fragment - dropping to prevent loop"
                     );
                     return None;
                 }
 
-                info!(
+                debug!(
                     message_id = message_id,
                     packet_id = %packet_id,
                     "Re-injecting reassembled payload"
@@ -724,7 +724,7 @@ impl ExitService {
                 Some(inner_payload)
             }
             Err(e) => {
-                warn!(
+                debug!(
                     message_id = message_id,
                     size = data.len(),
                     error = %e,
@@ -745,7 +745,7 @@ impl ExitService {
                         "legacy_rejected".to_string(),
                     )])
                     .inc();
-                warn!(
+                debug!(
                     packet_id = %packet_id,
                     "Legacy SubmitTransaction payload rejected: paid execution requires PaidTransactionV2"
                 );
@@ -756,11 +756,11 @@ impl ExitService {
                     .get_or_create(&vec![("handler".to_string(), "traffic".to_string())])
                     .inc();
                 if let Err(e) = self.traffic_handler.handle(packet_id, &command).await {
-                    warn!("Traffic handler failed for {}: {}", packet_id, e);
+                    debug!("Traffic handler failed for {}: {}", packet_id, e);
                 }
             }
             RelayerPayload::Fragment { .. } => {
-                warn!(packet_id = %packet_id, "dispatch_payload called with Fragment - bug");
+                warn!("dispatch_payload called with an unreassembled Fragment; dropping it");
             }
             RelayerPayload::AnonymousRequest { inner, reply_surbs } => {
                 match decode_payload_limited::<ServiceRequest>(&inner, MAX_REASSEMBLED_PAYLOAD_SIZE)
@@ -776,14 +776,14 @@ impl ExitService {
                                 reply_surbs: reply_surbs.clone(),
                             };
                             if let Err(e) = handler.handle(packet_id, &payload).await {
-                                warn!(
+                                debug!(
                                     packet_id = %packet_id,
                                     error = %e,
                                     "HTTP handler failed"
                                 );
                             }
                         } else {
-                            warn!(
+                            debug!(
                                 packet_id = %packet_id,
                                 "HTTP request received but no HTTP handler configured"
                             );
@@ -800,14 +800,14 @@ impl ExitService {
                                 reply_surbs: reply_surbs.clone(),
                             };
                             if let Err(e) = handler.handle(packet_id, &payload).await {
-                                warn!(
+                                debug!(
                                     packet_id = %packet_id,
                                     error = %e,
                                     "Echo handler failed"
                                 );
                             }
                         } else {
-                            warn!(
+                            debug!(
                                 packet_id = %packet_id,
                                 "Echo request received but no Echo handler configured"
                             );
@@ -824,14 +824,14 @@ impl ExitService {
                                 reply_surbs: reply_surbs.clone(),
                             };
                             if let Err(e) = handler.handle(packet_id, &payload).await {
-                                warn!(
+                                debug!(
                                     packet_id = %packet_id,
                                     error = %e,
                                     "RPC handler failed"
                                 );
                             }
                         } else {
-                            warn!(
+                            debug!(
                                 packet_id = %packet_id,
                                 "RPC request received but no RPC handler configured"
                             );
@@ -845,7 +845,7 @@ impl ExitService {
                                 "legacy_rejected".to_string(),
                             )])
                             .inc();
-                        warn!(
+                        debug!(
                             packet_id = %packet_id,
                             "Legacy SubmitTransaction request rejected: paid execution requires PaidTransactionV2"
                         );
@@ -866,7 +866,7 @@ impl ExitService {
                         }) {
                             Ok(bytes) => bytes,
                             Err(e) => {
-                                warn!(
+                                debug!(
                                     packet_id = %packet_id,
                                     error = %e,
                                     "Failed to encode legacy submission rejection"
@@ -876,7 +876,7 @@ impl ExitService {
                         };
                         let echo_payload = RelayerPayload::AnonymousRequest { inner, reply_surbs };
                         if let Err(e) = echo.handle(packet_id, &echo_payload).await {
-                            warn!(
+                            debug!(
                                 packet_id = %packet_id,
                                 error = %e,
                                 "Failed to send legacy submission rejection via SURBs"
@@ -907,7 +907,7 @@ impl ExitService {
                                 let response_data = match encode_payload(&outcome) {
                                     Ok(bytes) => bytes,
                                     Err(error) => {
-                                        warn!(
+                                        debug!(
                                             packet_id = %packet_id,
                                             error = %error,
                                             "Failed to encode paid v2 outcome"
@@ -920,7 +920,7 @@ impl ExitService {
                                 }) {
                                     Ok(bytes) => bytes,
                                     Err(error) => {
-                                        warn!(
+                                        debug!(
                                             packet_id = %packet_id,
                                             error = %error,
                                             "Failed to encode paid v2 SURB response"
@@ -931,7 +931,7 @@ impl ExitService {
                                 let response =
                                     RelayerPayload::AnonymousRequest { inner, reply_surbs };
                                 if let Err(error) = echo.handle(packet_id, &response).await {
-                                    warn!(
+                                    debug!(
                                         packet_id = %packet_id,
                                         error = %error,
                                         "Failed to send paid v2 response via SURBs"
@@ -942,14 +942,14 @@ impl ExitService {
                     }
                     Ok(ServiceRequest::PaidQuoteRequestV2(request)) => {
                         if reply_surbs.is_empty() {
-                            warn!(
+                            debug!(
                                 packet_id = %packet_id,
                                 "Paid quote request has no reply SURB; rejecting before reservation"
                             );
                             return;
                         }
                         let Some(ref echo) = self.echo_handler else {
-                            warn!(
+                            debug!(
                                 packet_id = %packet_id,
                                 "Paid quote response handler unavailable; rejecting before reservation"
                             );
@@ -970,7 +970,7 @@ impl ExitService {
                         let response_data = match encode_payload(&outcome) {
                             Ok(bytes) => bytes,
                             Err(error) => {
-                                warn!(
+                                debug!(
                                     packet_id = %packet_id,
                                     error = %error,
                                     "Failed to encode paid quote outcome"
@@ -983,7 +983,7 @@ impl ExitService {
                         }) {
                             Ok(bytes) => bytes,
                             Err(error) => {
-                                warn!(
+                                debug!(
                                     packet_id = %packet_id,
                                     error = %error,
                                     "Failed to encode paid quote SURB response"
@@ -993,7 +993,7 @@ impl ExitService {
                         };
                         let response = RelayerPayload::AnonymousRequest { inner, reply_surbs };
                         if let Err(error) = echo.handle(packet_id, &response).await {
-                            warn!(
+                            debug!(
                                 packet_id = %packet_id,
                                 error = %error,
                                 "Failed to send paid quote response via SURBs"
@@ -1011,14 +1011,14 @@ impl ExitService {
                             .inc();
 
                         let Some(ref eth_handler) = self.ethereum_handler else {
-                            warn!(
+                            debug!(
                                 packet_id = %packet_id,
                                 "BroadcastSignedTransaction received but no Ethereum handler (simulation mode) -- dropping"
                             );
                             return;
                         };
 
-                        info!(
+                        debug!(
                             packet_id = %packet_id,
                             signed_tx_len = signed_tx.len(),
                             custom_url = rpc_url.is_some(),
@@ -1040,7 +1040,7 @@ impl ExitService {
                                 }) {
                                     Ok(bytes) => bytes,
                                     Err(e) => {
-                                        warn!(
+                                        debug!(
                                             packet_id = %packet_id,
                                             error = %e,
                                             "Failed to encode broadcast response for SURB delivery"
@@ -1051,7 +1051,7 @@ impl ExitService {
                                 let echo_payload =
                                     RelayerPayload::AnonymousRequest { inner, reply_surbs };
                                 if let Err(e) = echo.handle(packet_id, &echo_payload).await {
-                                    warn!(
+                                    debug!(
                                         packet_id = %packet_id,
                                         error = %e,
                                         "Failed to send broadcast response via SURBs"
@@ -1061,7 +1061,7 @@ impl ExitService {
                         }
 
                         if let Err(e) = tx_result {
-                            warn!(
+                            debug!(
                                 packet_id = %packet_id,
                                 error = %e,
                                 "Broadcast signed transaction handler failed"
@@ -1112,7 +1112,7 @@ impl ExitService {
                         }
                     }
                     Err(e) => {
-                        warn!(
+                        debug!(
                             packet_id = %packet_id,
                             error = %e,
                             inner_len = inner.len(),

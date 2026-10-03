@@ -27,7 +27,7 @@ use governor::{Quota, RateLimiter};
 use std::collections::HashSet;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::debug;
 
 type RpcRateLimiter = RateLimiter<NotKeyed, InMemoryState, governor::clock::DefaultClock>;
 
@@ -194,7 +194,7 @@ impl RpcHandler {
         surbs: Vec<Surb>,
     ) -> Result<PackResult, ServiceError> {
         if self.rate_limiter.check().is_err() {
-            warn!(
+            debug!(
                 request_id = request_id,
                 method = method,
                 "RPC rate limit exceeded"
@@ -224,7 +224,7 @@ impl RpcHandler {
         };
 
         let result = if let Some(url) = rpc_url {
-            info!(
+            debug!(
                 request_id = request_id,
                 method = method,
                 rpc_url = url,
@@ -235,7 +235,7 @@ impl RpcHandler {
                 match security::validate_url_ssrf(url, self.allow_private_ips).await {
                     Ok(result) => result,
                     Err(e) => {
-                        warn!(
+                        debug!(
                             request_id = request_id,
                             error = %e,
                             "SSRF check blocked user-supplied RPC URL"
@@ -275,7 +275,7 @@ impl RpcHandler {
             .unwrap_or_else(|_| Err("RPC request timed out".to_string()))
         } else {
             if !self.allowed_methods.contains(method) {
-                warn!(
+                debug!(
                     request_id = request_id,
                     method = method,
                     "RPC method not in whitelist"
@@ -289,7 +289,7 @@ impl RpcHandler {
                 return self.pack_and_return(request_id, &response_bytes, surbs);
             }
 
-            info!(
+            debug!(
                 request_id = request_id,
                 method = method,
                 params_len = params.len(),
@@ -883,7 +883,7 @@ impl ServiceHandler for RpcHandler {
                                 reply_handle: packet.reply_handle(),
                                 origin: PacketOrigin::Originated,
                             }) {
-                                warn!(
+                                debug!(
                                     request_id = id,
                                     error = %e,
                                     "Failed to publish RPC response SendPacket -- reply lost"
@@ -894,14 +894,14 @@ impl ServiceHandler for RpcHandler {
                         // RPC handler does not yet support SURB replenishment --
                         // remaining data from the distress path is dropped.
                         if pack_result.remaining.is_some() {
-                            warn!(
+                            debug!(
                                 request_id = id,
                                 method = method,
                                 "RPC response partially delivered (SURB exhaustion) -- remaining data dropped"
                             );
                         }
 
-                        info!(
+                        debug!(
                             request_id = id,
                             method = method,
                             "RPC response packets dispatched to network"
@@ -918,7 +918,7 @@ impl ServiceHandler for RpcHandler {
                         Ok(())
                     }
                     Err(e) => {
-                        warn!(
+                        debug!(
                             packet_id = packet_id,
                             error = %e,
                             "Failed to deserialize AnonymousRequest inner"

@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 /// Max RPC timeout for broadcast operations (matches RPC handler timeout).
 const BROADCAST_RPC_TIMEOUT: Duration = Duration::from_secs(15);
@@ -720,13 +720,13 @@ impl EthereumHandler {
             validate_initial_plan_caps(&candidate, quoted_gas, quoted_fee_per_gas)
         {
             match violation {
-                QuotePlanCapViolation::GasLimit { actual, maximum } => warn!(
+                QuotePlanCapViolation::GasLimit { actual, maximum } => debug!(
                     execution_id = %hex::encode(request.execution_id),
                     actual = %actual,
                     maximum = %maximum,
                     "Actual gas limit exceeds signed quote maximum"
                 ),
-                QuotePlanCapViolation::InitialFeePerGas { actual, maximum } => warn!(
+                QuotePlanCapViolation::InitialFeePerGas { actual, maximum } => debug!(
                     execution_id = %hex::encode(request.execution_id),
                     actual = %actual,
                     maximum = %maximum,
@@ -1026,7 +1026,7 @@ impl EthereumHandler {
         let response_bytes = if let Some(ref url) = rpc_url {
             let (resolved_ip, validated_url) =
                 security::validate_url_ssrf(url, false).await.map_err(|e| {
-                    warn!(
+                    debug!(
                         packet_id,
                         error = %e,
                         "SSRF check blocked broadcast RPC URL"
@@ -1043,7 +1043,7 @@ impl EthereumHandler {
                     ))
                 })?;
 
-            info!(
+            debug!(
                 packet_id,
                 rpc_url = url,
                 rpc_method = method,
@@ -1063,19 +1063,19 @@ impl EthereumHandler {
                     ServiceError::ProcessingFailed(format!("Failed to serialize RPC response: {e}"))
                 })?,
                 Ok(Err(e)) => {
-                    warn!(packet_id, error = %e, "Custom URL broadcast rejected");
+                    debug!(packet_id, error = %e, "Custom URL broadcast rejected");
                     return Err(ServiceError::ProcessingFailed(format!(
                         "Broadcast rejected: {}",
                         public_rpc_error(&e)
                     )));
                 }
                 Err(_) => {
-                    warn!(packet_id, "Custom URL broadcast timed out");
+                    debug!(packet_id, "Custom URL broadcast timed out");
                     return Err(ServiceError::ProcessingFailed("Broadcast timed out".into()));
                 }
             }
         } else if method != DEFAULT_BROADCAST_METHOD {
-            warn!(
+            debug!(
                 packet_id,
                 rpc_method = method,
                 "Broadcast rejected: custom RPC method requires rpc_url"
@@ -1084,7 +1084,7 @@ impl EthereumHandler {
                 "Custom RPC method '{method}' requires rpc_url (use BroadcastOptions with rpc_url)"
             )));
         } else {
-            info!(
+            debug!(
                 packet_id,
                 signed_tx_len = signed_tx.len(),
                 "Broadcast via default provider (eth_sendRawTransaction)"
@@ -1099,7 +1099,7 @@ impl EthereumHandler {
             let tx_hash = match broadcast_result {
                 Ok(Ok(hash)) => hash,
                 Ok(Err(e)) => {
-                    warn!(
+                    debug!(
                         packet_id,
                         error = %e,
                         "Broadcast signed TX rejected by RPC"
@@ -1109,14 +1109,14 @@ impl EthereumHandler {
                     )));
                 }
                 Err(_) => {
-                    warn!(packet_id, "Broadcast signed TX timed out");
+                    debug!(packet_id, "Broadcast signed TX timed out");
                     return Err(ServiceError::ProcessingFailed("Broadcast timed out".into()));
                 }
             };
 
             match self.chain_executor.get_transaction_receipt(tx_hash).await {
                 Ok(Some(receipt)) => {
-                    info!(
+                    debug!(
                         packet_id,
                         %tx_hash,
                         status = ?receipt.status,
@@ -1127,21 +1127,21 @@ impl EthereumHandler {
                     );
                 }
                 Ok(None) => {
-                    info!(
+                    debug!(
                         packet_id,
                         %tx_hash,
                         "Broadcast TX in mempool (receipt not yet available)"
                     );
                 }
                 Err(e) => {
-                    warn!(packet_id, %tx_hash, error = %e, "Broadcast TX receipt fetch failed");
+                    debug!(packet_id, %tx_hash, error = %e, "Broadcast TX receipt fetch failed");
                 }
             }
 
             tx_hash.as_bytes().to_vec()
         };
 
-        info!(
+        debug!(
             packet_id,
             response_len = response_bytes.len(),
             rpc_method = method,
@@ -1597,7 +1597,7 @@ impl ServiceHandler for EthereumHandler {
     async fn handle(&self, packet_id: &str, payload: &RelayerPayload) -> Result<(), ServiceError> {
         match payload {
             RelayerPayload::SubmitTransaction { .. } => {
-                warn!(packet_id, "Legacy SubmitTransaction payload rejected");
+                debug!(packet_id, "Legacy SubmitTransaction payload rejected");
                 Err(ServiceError::ProcessingFailed(
                     legacy_submission_rejection().public_detail(),
                 ))

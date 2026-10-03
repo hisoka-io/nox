@@ -92,6 +92,7 @@ pub struct MetricsService {
     pub quote_pending_sponsored_gas: Gauge<i64, AtomicI64>,
     pub quote_rolling_loss_gwei: Gauge<i64, AtomicI64>,
     pub storage_degraded: Gauge<i64, AtomicI64>,
+    pub storage_size_on_disk_bytes: Gauge<i64, AtomicI64>,
     pub exit_payloads_dropped_total: Family<Vec<(String, String)>, Counter>,
     pub exit_lane_inflight: Family<Vec<(String, String)>, Gauge<i64, AtomicI64>>,
     pub event_bus_subscriber_lag_total: Family<Vec<(String, String)>, Counter>,
@@ -559,6 +560,13 @@ impl MetricsService {
             storage_degraded.clone(),
         );
 
+        let storage_size_on_disk_bytes = Gauge::<i64, AtomicI64>::default();
+        registry.register(
+            "nox_storage_size_on_disk_bytes",
+            "Bytes the sled database occupies on disk, log file plus blob files",
+            storage_size_on_disk_bytes.clone(),
+        );
+
         let exit_payloads_dropped_total = Family::<Vec<(String, String)>, Counter>::default();
         registry.register(
             "nox_exit_payloads_dropped",
@@ -845,6 +853,7 @@ impl MetricsService {
             quote_pending_sponsored_gas,
             quote_rolling_loss_gwei,
             storage_degraded,
+            storage_size_on_disk_bytes,
             exit_payloads_dropped_total,
             exit_lane_inflight,
             event_bus_subscriber_lag_total,
