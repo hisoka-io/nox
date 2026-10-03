@@ -5,6 +5,20 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+### Changes
+
+- SURB reply format 2. `Surb::new_v2` marks every hop of a return path with a flag covered by the header MAC.
+  Entries file format 2 replies under a delivery ID derived from the final hop's shared secret, exits add a
+  16-byte reply tag that `SurbRecovery::decrypt` checks, and relays send these replies on with fresh
+  identifiers. Format 2 replies are kept in a separate bounded store (1,000 entries, 64 MiB, 25% per
+  previous-hop peer) and only replies that arrive over P2P are stored. Format 1 SURBs work as before.
+  `relayer.surb_formats = "v1"` turns format 2 off.
+- `SurbRecovery` has a `version` field (default 1 when absent).
+- `/metrics/json` lists node `capabilities` (`surb_v2`; `paid_v2` on exits with paid execution).
+- New metrics: `nox_reply_v2_packets_total{hop}`, `nox_reply_format_total{format}`,
+  `nox_response_store_total{key}`, `nox_response_evicted_total{key,reason}` and
+  `nox_response_buffer_bytes{key}`.
+
 ## [0.4.0-rc.2] - 2026-10-03
 
 ### Upgrade notes

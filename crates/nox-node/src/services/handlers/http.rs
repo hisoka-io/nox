@@ -443,8 +443,8 @@ impl HttpHandler {
                 let _ = publisher.publish(NoxEvent::SendPacket {
                     next_hop_peer_id: packed.first_hop.clone(),
                     packet_id: reply_wire_id(&packed.surb_id),
+                    reply_handle: packed.reply_handle(),
                     data: packed.packet_bytes,
-                    reply_handle: Some(packed.surb_id),
                     origin: PacketOrigin::Originated,
                 });
                 dispatched += 1;
@@ -532,8 +532,8 @@ impl HttpHandler {
                 let _ = self.publisher.publish(NoxEvent::SendPacket {
                     next_hop_peer_id: distress_packet.first_hop.clone(),
                     packet_id: reply_wire_id(&distress_packet.surb_id),
+                    reply_handle: distress_packet.reply_handle(),
                     data: distress_packet.packet_bytes,
-                    reply_handle: Some(distress_packet.surb_id),
                     origin: PacketOrigin::Originated,
                 });
                 let _ = packets_dispatched + 1; // suppress unused assignment warning
@@ -650,7 +650,7 @@ impl ServiceHandler for HttpHandler {
                                     next_hop_peer_id: packet.first_hop.clone(),
                                     packet_id: reply_wire_id(&packet.surb_id),
                                     data: packet.packet_bytes.clone(),
-                                    reply_handle: Some(packet.surb_id),
+                                    reply_handle: packet.reply_handle(),
                                     origin: PacketOrigin::Originated,
                                 }) {
                                     warn!(

@@ -9,6 +9,7 @@
 //! - `GET /api/v1/responses/:request_id` -- Long-poll for a SURB response
 //! - `GET /health` -- Health check
 
+pub mod delivery_buffer;
 pub mod http_server;
 pub mod policy;
 pub mod response_buffer;

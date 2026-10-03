@@ -117,6 +117,7 @@ Three reputation tiers: Unknown, Trusted, Penalized.
 | `drop_traffic_rate` | `0.05` | Drop cover packets/sec |
 | `cover_loop_timeout_secs` | `60` | A loop cover packet not back within this time counts as lost |
 | `wire_ids` | `"per_hop"` | Packet identifiers sent to the next hop: `"per_hop"` (fresh at every hop, replies keep only their `reply-0-{surb_id}` handle) or `"passthrough"` (unchanged across hops, benchmark harnesses only; requires `benchmark_mode = true`). Env: `NOX__RELAYER__WIRE_IDS` |
+| `surb_formats` | `"both"` | SURB reply formats handled: `"both"` (format 1 and format 2, advertises `surb_v2`) or `"v1"` (format 2 off; flags ignored, format 2 SURBs answered in format 1). Env: `NOX__RELAYER__SURB_FORMATS` |
 
 ### `[relayer.fragmentation]`
 

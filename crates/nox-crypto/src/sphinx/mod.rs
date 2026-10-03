@@ -144,6 +144,49 @@ pub fn replay_tag_from_shared_secret(shared_secret: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key(REPLAY_TAG_CONTEXT, shared_secret)
 }
 
+/// Domain separator for the delivery ID of a format 2 reply.
+const DELIVERY_ID_CONTEXT: &str = "nox surb v2 delivery id";
+
+/// Routing-info byte value that marks a format 2 reply header.
+pub const REPLY_V2_FLAG: u8 = 0x02;
+
+/// Position of the format 2 flag in a relay hop's routing info: the last byte
+/// of the hop's own segment, after the next-hop address.
+pub const RELAY_FLAG_OFFSET: usize = SHIFT_SIZE - 1;
+
+/// Position of the format 2 flag in a final hop's routing info.
+pub const FINAL_FLAG_OFFSET: usize = 1;
+
+/// Longest next-hop address that leaves room for the relay flag.
+pub const MAX_FLAGGED_ADDRESS_LEN: usize = RELAY_FLAG_OFFSET - 34;
+
+/// Delivery ID of a format 2 reply at its final hop, derived from that hop's
+/// shared secret. Only the reply's creator and the final hop can compute it.
+#[must_use]
+pub fn delivery_id_from_shared_secret(shared_secret: &[u8; 32]) -> [u8; 16] {
+    let key = blake3::derive_key(DELIVERY_ID_CONTEXT, shared_secret);
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&key[..16]);
+    id
+}
+
+/// Whether decrypted routing info (at least `SHIFT_SIZE` bytes) carries the
+/// format 2 reply flag.
+#[must_use]
+pub fn routing_has_reply_v2_flag(routing: &[u8]) -> bool {
+    if routing.len() < SHIFT_SIZE {
+        return false;
+    }
+    match routing[0] {
+        0x00 => {
+            let addr_end = 34 + routing[1] as usize;
+            addr_end <= RELAY_FLAG_OFFSET && routing[RELAY_FLAG_OFFSET] == REPLY_V2_FLAG
+        }
+        0x01 => routing[FINAL_FLAG_OFFSET] == REPLY_V2_FLAG,
+        _ => false,
+    }
+}
+
 /// A header whose MAC has been verified for this hop, holding the per-hop keys
 /// needed to finish processing. Created by [`SphinxHeader::verify`].
 pub struct VerifiedHeader<'a> {
@@ -152,6 +195,7 @@ pub struct VerifiedHeader<'a> {
     pi: [u8; 32],
     blinding_factor: Scalar,
     replay_tag: [u8; 32],
+    delivery_id: [u8; 16],
     #[cfg(feature = "hop-metrics")]
     total_start: std::time::Instant,
     #[cfg(feature = "hop-metrics")]
@@ -211,6 +255,7 @@ impl SphinxHeader {
             pi,
             blinding_factor,
             replay_tag: replay_tag_from_shared_secret(shared_secret.as_bytes()),
+            delivery_id: delivery_id_from_shared_secret(shared_secret.as_bytes()),
             #[cfg(feature = "hop-metrics")]
             total_start,
             #[cfg(feature = "hop-metrics")]
@@ -238,6 +283,24 @@ impl VerifiedHeader<'_> {
     #[must_use]
     pub fn replay_tag(&self) -> [u8; 32] {
         self.replay_tag
+    }
+
+    /// Delivery ID this hop would file a format 2 reply under. Meaningful only
+    /// when [`Self::reply_v2_flag`] is set and this is the final hop.
+    #[must_use]
+    pub fn delivery_id(&self) -> [u8; 16] {
+        self.delivery_id
+    }
+
+    /// Whether the routing info for this hop carries the format 2 reply flag.
+    /// The flag is covered by the header MAC, so only the header's creator can
+    /// set it.
+    #[must_use]
+    pub fn reply_v2_flag(&self) -> bool {
+        let mut prefix = [0u8; SHIFT_SIZE];
+        prefix.copy_from_slice(&self.header.routing_info[..SHIFT_SIZE]);
+        apply_stream_cipher(&self.rho, &[0u8; 12], &mut prefix);
+        routing_has_reply_v2_flag(&prefix)
     }
 
     /// Finish processing: decrypt routing info and body, blind the key for the next hop.

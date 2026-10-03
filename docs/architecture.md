@@ -94,6 +94,32 @@ The client pre-computes a return path as a SURB. The exit node wraps its respons
 5. **Entry buffers the reply**: The last hop of the return path is the client's entry node. It buffers the still-encrypted reply under `reply-0-{surb_id_hex}`, using the reply handle the packet arrived with. Packets without a handle are never buffered.
 6. **Client claims and decrypts**: The client claims its replies by exact SURB ID (`POST /api/v1/responses/claim`, `GET /api/v1/ws` or `GET /api/v1/responses/stream`; each SURB ID is 32 hex characters), peels each layer with stored keys, decrypts the final payload and removes padding.
 
+### Format 2 replies
+
+`Surb::new_v2` builds a SURB whose replies need no handle on the wire:
+
+- Every hop's routing info carries a format 2 flag, covered by the header MAC (relay hops: the last byte of
+  the hop's 128-byte segment; final hop: byte 1). Relay addresses in a format 2 SURB are limited to 93 bytes.
+- The entry derives a 16-byte *delivery ID* from its shared secret with the SURB
+  (`blake3::derive_key("nox surb v2 delivery id", ss)`). The client computes the same value; it is
+  `SurbRecovery.id`.
+- `Surb.id` is the constant `SURB_V2_MARKER`. An exit that sees it seals the reply with a 16-byte tag
+  (`message || tag || 0x80 || 0...`, keyed from the SURB payload keys) and sends no reply handle.
+  `SurbRecovery::decrypt` checks the tag when `version = 2`.
+
+Node behaviour with `relayer.surb_formats = "both"` (default):
+
+- A relay that sees the flag sends the packet on with a fresh identifier, whatever identifier it arrived with.
+- An entry that sees the flag on the final hop files the reply under its delivery ID only, and only when the
+  packet came over P2P from an admitted peer. Packets submitted over HTTP are never filed.
+- Delivery-keyed replies live in their own store: at most 1,000 entries and 64 MiB, and no single previous-hop
+  peer may hold more than 25% of either. They never push handle-keyed replies out.
+- Claim, WebSocket and SSE return each reply as `reply-0-{the ID it was claimed with}`.
+- The node lists `surb_v2` in `capabilities` in `/metrics/json` (and `paid_v2` on exits with paid execution).
+
+`relayer.surb_formats = "v1"` turns format 2 off: flags are ignored and a format 2 SURB is answered like any
+other SURB.
+
 ---
 
 ## Forward error correction

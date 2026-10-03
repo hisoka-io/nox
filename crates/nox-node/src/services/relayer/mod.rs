@@ -96,7 +96,8 @@ impl RelayerService {
                 replay.clone(),
                 self.mix_strategy.clone(),
                 self.metrics.clone(),
-            );
+            )
+            .with_reply_v2(self.config.relayer.surb_formats.v2_enabled());
             handles.push(tokio::spawn(worker.run()));
         }
 

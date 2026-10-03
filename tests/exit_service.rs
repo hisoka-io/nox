@@ -95,6 +95,7 @@ async fn test_exit_service_echo_produces_send_packet() {
         packet_id: "pkt-echo-1".to_string(),
         payload: payload_bytes,
         reply_handle: None,
+        delivery: None,
     })
     .expect("publish");
 
@@ -143,6 +144,7 @@ async fn test_exit_service_dummy_payload_no_send_packet() {
         packet_id: "pkt-dummy-1".to_string(),
         payload: payload_bytes,
         reply_handle: None,
+        delivery: None,
     })
     .expect("publish");
 
@@ -182,6 +184,7 @@ async fn test_exit_service_heartbeat_no_send_packet() {
         packet_id: "pkt-hb-1".to_string(),
         payload: payload_bytes,
         reply_handle: None,
+        delivery: None,
     })
     .expect("publish");
 
@@ -214,6 +217,7 @@ async fn test_exit_service_garbage_payload_ignored() {
         packet_id: "pkt-garbage-1".to_string(),
         payload: garbage,
         reply_handle: None,
+        delivery: None,
     })
     .expect("publish");
 
@@ -259,6 +263,7 @@ async fn test_exit_service_service_response_ignored() {
         packet_id: "pkt-resp-1".to_string(),
         payload: payload_bytes,
         reply_handle: None,
+        delivery: None,
     })
     .expect("publish");
 
@@ -298,6 +303,7 @@ async fn test_exit_service_need_more_surbs_ignored() {
         packet_id: "pkt-nms-1".to_string(),
         payload: payload_bytes,
         reply_handle: None,
+        delivery: None,
     })
     .expect("publish");
 
@@ -340,6 +346,7 @@ async fn test_exit_service_multiple_echo_requests() {
             packet_id: format!("pkt-multi-{i}"),
             payload: payload_bytes,
             reply_handle: None,
+            delivery: None,
         })
         .expect("publish");
     }
@@ -443,6 +450,7 @@ async fn test_exit_service_slow_http_does_not_block_echo() {
         packet_id: "pkt-slow-http".to_string(),
         payload: slow_http_request(&url),
         reply_handle: None,
+        delivery: None,
     })
     .expect("publish http");
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -455,6 +463,7 @@ async fn test_exit_service_slow_http_does_not_block_echo() {
             make_surbs(2),
         ),
         reply_handle: None,
+        delivery: None,
     })
     .expect("publish echo");
 
@@ -501,6 +510,7 @@ async fn test_exit_service_full_lane_drops_and_counts() {
             packet_id: format!("pkt-slow-{index}"),
             payload: slow_http_request(&url),
             reply_handle: None,
+            delivery: None,
         })
         .expect("publish http");
         tokio::time::sleep(Duration::from_millis(100)).await;

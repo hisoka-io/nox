@@ -193,6 +193,7 @@ cover_traffic_rate = 0.05         # ~1 loop packet every 20s
 drop_traffic_rate = 0.05          # ~1 drop packet every 20s
 cover_loop_timeout_secs = 60      # loop cover not back in this time counts as lost
 # wire_ids = "per_hop"            # "passthrough" keeps packet IDs across hops (benchmarks only)
+# surb_formats = "both"           # "v1" turns format 2 replies off
 
 # Fragment reassembly limits
 [relayer.fragmentation]

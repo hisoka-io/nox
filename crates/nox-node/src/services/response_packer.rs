@@ -36,8 +36,19 @@ pub enum PackerError {
 pub struct PackedPacket {
     pub first_hop: String,
     pub packet_bytes: Vec<u8>,
-    /// Propagated as `packet_id` so the client can do O(1) SURB registry lookup.
+    /// `Surb.id` of the SURB this packet was sealed with.
     pub surb_id: [u8; 16],
+    /// Sealed in format 2: tagged body, no reply handle on the wire.
+    pub v2: bool,
+}
+
+impl PackedPacket {
+    /// Reply handle to send with this packet: the SURB ID for format 1, none
+    /// for format 2 (the entry files those under their delivery ID).
+    #[must_use]
+    pub fn reply_handle(&self) -> Option<[u8; 16]> {
+        (!self.v2).then_some(self.surb_id)
+    }
 }
 
 /// Tracks fragment numbering across multi-round SURB replenishment.
@@ -63,6 +74,7 @@ pub struct PackResult {
 
 pub struct ResponsePacker {
     metrics: Option<MetricsService>,
+    reply_v2: bool,
 }
 
 impl Default for ResponsePacker {
@@ -74,7 +86,42 @@ impl Default for ResponsePacker {
 impl ResponsePacker {
     #[must_use]
     pub fn new() -> Self {
-        Self { metrics: None }
+        Self {
+            metrics: None,
+            reply_v2: true,
+        }
+    }
+
+    /// Whether format 2 SURBs get format 2 replies (`surb_formats`). When
+    /// off, a format 2 SURB is answered like any other SURB.
+    #[must_use]
+    pub fn with_reply_v2(mut self, enabled: bool) -> Self {
+        self.reply_v2 = enabled;
+        self
+    }
+
+    fn seal(&self, surb: &Surb, serialized: &[u8]) -> Result<PackedPacket, PackerError> {
+        let v2 = self.reply_v2 && surb.is_v2();
+        let sphinx_packet = if v2 {
+            surb.encapsulate_v2(serialized)
+        } else {
+            surb.encapsulate(serialized)
+        }
+        .map_err(PackerError::Surb)?;
+        if let Some(ref m) = self.metrics {
+            m.reply_format_total
+                .get_or_create(&vec![(
+                    "format".into(),
+                    if v2 { "v2" } else { "v1" }.into(),
+                )])
+                .inc();
+        }
+        Ok(PackedPacket {
+            first_hop: surb.first_hop.clone(),
+            packet_bytes: sphinx_packet.into_bytes(),
+            surb_id: surb.id,
+            v2,
+        })
     }
 
     #[must_use]
@@ -286,13 +333,7 @@ impl ResponsePacker {
                     };
                     let serialized =
                         encode_payload(&response).map_err(PackerError::Serialization)?;
-                    let sphinx_packet = surb.encapsulate(&serialized).map_err(PackerError::Surb)?;
-                    let packet_bytes = sphinx_packet.into_bytes();
-                    Ok(PackedPacket {
-                        first_hop: surb.first_hop.clone(),
-                        packet_bytes,
-                        surb_id: surb.id,
-                    })
+                    self.seal(&surb, &serialized)
                 })
                 .collect()
         };
@@ -460,12 +501,7 @@ impl ResponsePacker {
             fragment,
         };
         let serialized = encode_payload(&response).map_err(PackerError::Serialization)?;
-        let sphinx_packet = surb.encapsulate(&serialized).map_err(PackerError::Surb)?;
-        Ok(PackedPacket {
-            first_hop: surb.first_hop.clone(),
-            packet_bytes: sphinx_packet.into_bytes(),
-            surb_id: surb.id,
-        })
+        self.seal(surb, &serialized)
     }
 
     fn pack_fragments_with_surbs(
@@ -481,12 +517,7 @@ impl ResponsePacker {
                 fragment: fragment.clone(),
             };
             let serialized = encode_payload(&response).map_err(PackerError::Serialization)?;
-            let sphinx_packet = surb.encapsulate(&serialized).map_err(PackerError::Surb)?;
-            packets.push(PackedPacket {
-                first_hop: surb.first_hop.clone(),
-                packet_bytes: sphinx_packet.into_bytes(),
-                surb_id: surb.id,
-            });
+            packets.push(self.seal(&surb, &serialized)?);
         }
         Ok(packets)
     }
@@ -502,12 +533,7 @@ impl ResponsePacker {
             fragments_remaining,
         };
         let serialized = encode_payload(&signal).map_err(PackerError::Serialization)?;
-        let sphinx_packet = surb.encapsulate(&serialized).map_err(PackerError::Surb)?;
-        Ok(PackedPacket {
-            first_hop: surb.first_hop.clone(),
-            packet_bytes: sphinx_packet.into_bytes(),
-            surb_id: surb.id,
-        })
+        self.seal(&surb, &serialized)
     }
 
     fn apply_fec(
@@ -764,6 +790,89 @@ mod tests {
         let result2 = packer.pack_continuation(42, &pending, surbs2).unwrap();
         assert_eq!(result2.packets.len(), d - 3);
         assert!(result2.remaining.is_none());
+    }
+
+    fn v2_surb() -> (Surb, nox_crypto::SurbRecovery) {
+        let sk = X25519SecretKey::random_from_rng(rand::thread_rng());
+        let path = vec![PathHop {
+            public_key: X25519PublicKey::from(&sk),
+            address: "/ip4/127.0.0.1/tcp/9000".to_string(),
+        }];
+        Surb::new_v2(&path, 0).expect("v2 SURB")
+    }
+
+    /// Body of a sealed one-hop reply as the client sees it.
+    fn body(packed: &PackedPacket) -> &[u8] {
+        &packed.packet_bytes[nox_crypto::sphinx::HEADER_SIZE..]
+    }
+
+    #[test]
+    fn test_v2_surb_gets_tagged_reply_and_no_handle() {
+        let metrics = MetricsService::new();
+        let packer = ResponsePacker::new().with_metrics(metrics.clone());
+        let (surb, recovery) = v2_surb();
+        let recovery = nox_crypto::SurbRecovery {
+            id: recovery.id,
+            layer_keys: vec![],
+            payload_keys: recovery.payload_keys.clone(),
+            version: 2,
+        };
+        let packed = packer.pack_distress_signal(7, 3, surb).expect("pack");
+        assert!(packed.v2);
+        assert_eq!(packed.reply_handle(), None);
+        let message = recovery.decrypt(body(&packed)).expect("tag verifies");
+        assert!(matches!(
+            nox_core::models::payloads::decode_payload::<RelayerPayload>(&message),
+            Ok(RelayerPayload::NeedMoreSurbs { request_id: 7, .. })
+        ));
+        assert_eq!(
+            metrics
+                .reply_format_total
+                .get_or_create(&vec![("format".into(), "v2".into())])
+                .get(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_v2_surbs_in_a_multi_fragment_response_all_get_v2() {
+        let packer = ResponsePacker::new();
+        let data = vec![0x11u8; 70_000];
+        let surbs: Vec<Surb> = (0..packer.surbs_needed(data.len()))
+            .map(|_| v2_surb().0)
+            .collect();
+        let result = packer.pack_response(9, &data, surbs).expect("pack");
+        assert!(result.remaining.is_none());
+        assert!(result
+            .packets
+            .iter()
+            .all(|p| p.v2 && p.reply_handle().is_none()));
+    }
+
+    #[test]
+    fn test_v1_mode_answers_v2_surbs_in_format_1() {
+        let packer = ResponsePacker::new().with_reply_v2(false);
+        let (surb, recovery) = v2_surb();
+        let packed = packer.pack_distress_signal(7, 3, surb).expect("pack");
+        assert!(!packed.v2);
+        assert_eq!(packed.reply_handle(), Some(nox_crypto::SURB_V2_MARKER));
+        let v1_view = nox_crypto::SurbRecovery {
+            id: recovery.id,
+            layer_keys: vec![],
+            payload_keys: recovery.payload_keys.clone(),
+            version: 1,
+        };
+        assert!(v1_view.decrypt(body(&packed)).is_ok());
+    }
+
+    #[test]
+    fn test_v1_surb_keeps_its_handle() {
+        let packer = ResponsePacker::new();
+        let surb = make_test_surbs(1).remove(0);
+        let id = surb.id;
+        let packed = packer.pack_distress_signal(1, 1, surb).expect("pack");
+        assert!(!packed.v2);
+        assert_eq!(packed.reply_handle(), Some(id));
     }
 
     #[test]

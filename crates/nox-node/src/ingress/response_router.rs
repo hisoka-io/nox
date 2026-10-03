@@ -8,6 +8,10 @@
 //! Other `PayloadDecrypted` events are handled by the exit service and are
 //! not stored here.
 //!
+//! A format 2 reply (one that carries the authenticated format 2 flag at its
+//! final hop and came over P2P) is filed under its delivery ID only, in a
+//! separate bounded store. Nothing else creates delivery-keyed entries.
+//!
 //! Also runs periodic pruning of expired entries.
 
 use crate::telemetry::metrics::MetricsService;
@@ -18,8 +22,9 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use super::delivery_buffer::DeliveryStore;
 use super::response_buffer::ResponseBuffer;
-use nox_core::models::wire_id::{reply_wire_id, ReplyHandle};
+use nox_core::models::wire_id::{reply_wire_id, ReplyDelivery, ReplyHandle};
 
 /// Whether a decrypted payload is a SURB reply that a client of this node can claim.
 ///
@@ -27,9 +32,12 @@ use nox_core::models::wire_id::{reply_wire_id, ReplyHandle};
 /// `RelayerPayload`, which is handled by the exit service instead.
 #[must_use]
 pub fn is_claimable_surb_reply(reply_handle: Option<&ReplyHandle>, payload: &[u8]) -> bool {
-    if reply_handle.is_none() {
-        return false;
-    }
+    reply_handle.is_some() && is_reply_ciphertext(payload)
+}
+
+/// Whether a decrypted payload is a ciphertext reply rather than a request
+/// for the exit service.
+fn is_reply_ciphertext(payload: &[u8]) -> bool {
     let limit = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     decode_padded_relayer_payload_limited(payload, limit).is_err()
 }
@@ -77,6 +85,62 @@ impl ResponseRouter {
         self
     }
 
+    fn store_delivery(&self, delivery: ReplyDelivery, payload: Vec<u8>) {
+        if !is_reply_ciphertext(&payload) {
+            return;
+        }
+        match self
+            .response_buffer
+            .store_delivery(delivery.id, &delivery.source_peer, payload)
+        {
+            DeliveryStore::Stored { evicted } => self.count("delivery", None, evicted),
+            DeliveryStore::Duplicate => self.count("delivery", Some("duplicate"), 0),
+            DeliveryStore::SourceQuota => self.count("delivery", Some("source_quota"), 0),
+            DeliveryStore::TooLarge => self.count("delivery", Some("too_large"), 0),
+        }
+    }
+
+    /// Records a store attempt: `refused` is the reason when nothing was
+    /// stored, `evicted` the number of older entries removed for room.
+    fn count(&self, key: &str, refused: Option<&str>, evicted: usize) {
+        match refused {
+            None => {
+                self.metrics
+                    .response_store_total
+                    .get_or_create(&vec![("key".into(), key.into())])
+                    .inc();
+            }
+            Some(reason) => self.evicted(key, reason, 1),
+        }
+        self.evicted(key, "capacity", evicted);
+        self.update_gauges();
+    }
+
+    fn evicted(&self, key: &str, reason: &str, n: usize) {
+        if n > 0 {
+            self.metrics
+                .response_evicted_total
+                .get_or_create(&vec![
+                    ("key".into(), key.into()),
+                    ("reason".into(), reason.into()),
+                ])
+                .inc_by(n as u64);
+        }
+    }
+
+    fn update_gauges(&self) {
+        let (handle_bytes, delivery_bytes) = self.response_buffer.bytes_by_key();
+        self.metrics
+            .ingress_response_buffer_entries
+            .set(self.response_buffer.len() as i64);
+        for (key, bytes) in [("handle", handle_bytes), ("delivery", delivery_bytes)] {
+            self.metrics
+                .response_buffer_bytes
+                .get_or_create(&vec![("key".into(), key.into())])
+                .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+        }
+    }
+
     /// Run the response routing loop.
     ///
     /// Subscribes to the event bus and stores `PayloadDecrypted` payloads
@@ -91,7 +155,12 @@ impl ResponseRouter {
             tokio::select! {
                 event = rx.recv() => {
                     match event {
-                        Ok(NoxEvent::PayloadDecrypted { packet_id, payload, reply_handle }) => {
+                        Ok(NoxEvent::PayloadDecrypted { delivery: Some(delivery), payload, .. }) => {
+                            // A format 2 reply is filed under its delivery ID only,
+                            // whatever its wire identifier said.
+                            self.store_delivery(delivery, payload);
+                        }
+                        Ok(NoxEvent::PayloadDecrypted { packet_id, payload, reply_handle, delivery: None }) => {
                             // Replies are filed as `reply-0-{surb id}`, the ID clients
                             // see when they claim them.
                             let key = if is_claimable_surb_reply(reply_handle.as_ref(), &payload) {
@@ -105,10 +174,8 @@ impl ResponseRouter {
                                 continue;
                             };
                             debug!("ResponseRouter: buffering SURB response");
-                            self.response_buffer.store_response(&key, payload);
-                            self.metrics
-                                .ingress_response_buffer_entries
-                                .set(self.response_buffer.len() as i64);
+                            let evicted = self.response_buffer.store_response(&key, payload);
+                            self.count("handle", None, evicted);
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             warn!("ResponseRouter: bus lagged by {n} events");
@@ -121,14 +188,15 @@ impl ResponseRouter {
                     }
                 }
                 _ = prune_interval.tick() => {
-                    let pruned = self.response_buffer.prune_expired();
+                    let (handle, delivery) = self.response_buffer.prune_expired_by_key();
+                    let pruned = handle + delivery;
                     if pruned > 0 {
                         debug!("ResponseRouter: pruned {pruned} expired responses");
                         self.metrics.ingress_responses_pruned_total.inc_by(pruned as u64);
-                        self.metrics.ingress_response_buffer_entries.set(
-                            self.response_buffer.len() as i64,
-                        );
+                        self.evicted("handle", "ttl", handle);
+                        self.evicted("delivery", "ttl", delivery);
                     }
+                    self.update_gauges();
                 }
                 () = async {
                     match &self.cancel_token {
@@ -174,6 +242,7 @@ mod tests {
             packet_id: "0123456789abcdef0123456789abcdef".to_string(),
             payload: vec![0xA5; 64],
             reply_handle: Some(SURB),
+            delivery: None,
         });
 
         // Give router time to process
@@ -235,6 +304,7 @@ mod tests {
             packet_id: "rpc-9-ffeeddccbbaa99887766554433221100".to_string(),
             payload: vec![0xA5; 1024],
             reply_handle: Some(SURB),
+            delivery: None,
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -265,6 +335,7 @@ mod tests {
                 packet_id: "http-00000000deadbeef".to_string(),
                 payload: relayer_payload(),
                 reply_handle,
+                delivery: None,
             });
         }
         // Without a handle nothing is stored, whatever the local ID looks like.
@@ -276,6 +347,7 @@ mod tests {
                 packet_id,
                 payload: vec![0xA5; 1024],
                 reply_handle: None,
+                delivery: None,
             });
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -301,6 +373,7 @@ mod tests {
             packet_id: "http-00000000deadbeef".to_string(),
             payload: relayer_payload(),
             reply_handle: None,
+            delivery: None,
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -368,5 +441,78 @@ mod tests {
             result.is_ok(),
             "Router should exit within 2s after cancellation"
         );
+    }
+
+    async fn router_with_buffer() -> (
+        Arc<dyn IEventPublisher>,
+        Arc<ResponseBuffer>,
+        MetricsService,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let bus = TokioEventBus::new(64);
+        let publisher: Arc<dyn IEventPublisher> = Arc::new(bus.clone());
+        let subscriber: Arc<dyn IEventSubscriber> = Arc::new(bus);
+        let buffer = Arc::new(ResponseBuffer::new());
+        let metrics = MetricsService::new();
+        let router = ResponseRouter::new(subscriber, buffer.clone(), 60, metrics.clone());
+        let handle = tokio::spawn(async move {
+            router.run().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (publisher, buffer, metrics, handle)
+    }
+
+    const DELIVERY: ReplyHandle = [0x44; 16];
+
+    fn delivery() -> Option<ReplyDelivery> {
+        Some(ReplyDelivery {
+            id: DELIVERY,
+            source_peer: "peer-a".into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_v2_reply_is_filed_under_delivery_id_only() {
+        let (publisher, buffer, metrics, handle) = router_with_buffer().await;
+        // Even with a handle present, the delivery ID is the only key.
+        let _ = publisher.publish(NoxEvent::PayloadDecrypted {
+            packet_id: "local".into(),
+            payload: vec![0xA5; 1024],
+            reply_handle: Some(SURB),
+            delivery: delivery(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(buffer.claim_by_surb_ids(&[SURB]).is_empty());
+        let claimed = buffer.claim_by_surb_ids(&[DELIVERY]);
+        assert_eq!(
+            claimed,
+            vec![(
+                format!("reply-0-{}", hex::encode(DELIVERY)),
+                vec![0xA5; 1024]
+            )]
+        );
+        let mut text = String::new();
+        prometheus_client::encoding::text::encode(&mut text, &metrics.get_registry().lock())
+            .expect("encode");
+        assert!(
+            text.contains("nox_response_store_total{key=\"delivery\"} 1"),
+            "{text}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_v2_flagged_relayer_payload_is_not_stored() {
+        let (publisher, buffer, _, handle) = router_with_buffer().await;
+        let _ = publisher.publish(NoxEvent::PayloadDecrypted {
+            packet_id: "local".into(),
+            payload: relayer_payload(),
+            reply_handle: None,
+            delivery: delivery(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(buffer.is_empty());
+        handle.abort();
     }
 }

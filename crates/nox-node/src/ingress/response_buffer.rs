@@ -4,6 +4,10 @@
 //! arrives at the entry node, it is stored here under `reply-0-{surb_id_hex}`
 //! (see `ResponseRouter`). Clients retrieve their own responses by the exact
 //! 16-byte SURB IDs they generated.
+//!
+//! Format 2 replies live in a separate [`DeliveryBuffer`] under their
+//! delivery ID. Each reply is filed under exactly one key, and a claim
+//! returns it as `reply-0-{the ID the client claimed with}`.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -11,6 +15,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tracing::{debug, warn};
+
+use super::delivery_buffer::{DeliveryBuffer, DeliveryLimits, DeliveryStore};
 
 /// Default TTL for buffered responses (5 minutes).
 const DEFAULT_TTL: Duration = Duration::from_mins(5);
@@ -57,11 +63,13 @@ struct Entries {
     by_packet_id: HashMap<String, BufferedResponse>,
     /// SURB ID -> `packet_id` key in `by_packet_id`.
     by_surb_id: HashMap<SurbId, String>,
+    bytes: usize,
 }
 
 impl Entries {
     fn remove(&mut self, packet_id: &str) -> Option<BufferedResponse> {
         let entry = self.by_packet_id.remove(packet_id)?;
+        self.bytes -= entry.data.len();
         if let Some(surb_id) = entry.surb_id {
             if self
                 .by_surb_id
@@ -95,6 +103,7 @@ impl Entries {
 /// prune cycles -- when the cap is reached, the oldest entry is evicted.
 pub struct ResponseBuffer {
     entries: Mutex<Entries>,
+    delivery: Mutex<DeliveryBuffer>,
     ttl: Duration,
     max_entries: usize,
     /// Wakes waiting handlers (WebSocket, SSE, long-poll) when a new response is stored.
@@ -123,18 +132,47 @@ impl ResponseBuffer {
     pub fn with_ttl_and_capacity(ttl: Duration, max_entries: usize) -> Self {
         Self {
             entries: Mutex::new(Entries::default()),
+            delivery: Mutex::new(DeliveryBuffer::new(DeliveryLimits::default())),
             ttl,
             max_entries,
             notify: Arc::new(Notify::new()),
         }
     }
 
-    /// Store a response under its `packet_id`.
+    /// Replace the limits of the format 2 store. Drops anything already in it.
+    #[must_use]
+    pub fn with_delivery_limits(self, limits: DeliveryLimits) -> Self {
+        *self.delivery.lock() = DeliveryBuffer::new(limits);
+        self
+    }
+
+    /// Store a format 2 reply under its delivery ID, on behalf of the peer
+    /// it came from. Never touches handle-keyed entries.
+    pub fn store_delivery(
+        &self,
+        delivery_id: SurbId,
+        source_peer: &str,
+        data: Vec<u8>,
+    ) -> DeliveryStore {
+        let outcome = self
+            .delivery
+            .lock()
+            .store(delivery_id, source_peer, data, self.ttl);
+        if matches!(outcome, DeliveryStore::Stored { .. }) {
+            debug!("Buffered format 2 reply");
+            self.notify.notify_waiters();
+        }
+        outcome
+    }
+
+    /// Store a response under its `packet_id`. Returns how many older entries
+    /// were evicted to make room.
     ///
     /// If the buffer is at capacity, the oldest entry is evicted first. If a
     /// response for the same SURB ID is already buffered under another
     /// `packet_id`, the new one is dropped: a SURB is single-use.
-    pub fn store_response(&self, packet_id: &str, data: Vec<u8>) {
+    pub fn store_response(&self, packet_id: &str, data: Vec<u8>) -> usize {
+        let mut evicted = 0;
         let surb_id = surb_id_from_packet_id(packet_id);
         let mut entries = self.entries.lock();
 
@@ -147,11 +185,8 @@ impl ResponseBuffer {
                 if expired {
                     entries.remove(&existing);
                 } else if existing != packet_id {
-                    debug!(
-                        packet_id = packet_id,
-                        "Dropping response for a SURB ID that is already buffered"
-                    );
-                    return;
+                    debug!("Dropping response for a SURB ID that is already buffered");
+                    return 0;
                 }
             }
         }
@@ -172,22 +207,19 @@ impl ResponseBuffer {
                     .map(|(key, _)| key.clone())
                 {
                     warn!(
-                        evicted_id = %oldest_key,
                         buffer_size = entries.by_packet_id.len(),
                         max = self.max_entries,
                         "ResponseBuffer at capacity, evicting oldest entry"
                     );
                     entries.remove(&oldest_key);
+                    evicted += 1;
                 }
             }
         }
 
-        debug!(
-            packet_id = packet_id,
-            bytes = data.len(),
-            "Buffered SURB response"
-        );
+        debug!("Buffered SURB response");
         entries.remove(packet_id);
+        entries.bytes += data.len();
         if let Some(id) = surb_id {
             entries.by_surb_id.insert(id, packet_id.to_string());
         }
@@ -202,6 +234,7 @@ impl ResponseBuffer {
 
         // Wake any waiting handlers (WebSocket, SSE, long-poll) immediately.
         self.notify.notify_waiters();
+        evicted
     }
 
     /// Returns a future that completes when a new response is stored.
@@ -220,10 +253,12 @@ impl ResponseBuffer {
         (entry.created_at.elapsed() < self.ttl).then_some(entry.data)
     }
 
-    /// Claim the responses for exactly these SURB IDs. Returns `(packet_id, data)`
-    /// pairs; matching entries are removed, all others remain.
+    /// Claim the responses for exactly these IDs (SURB IDs for format 1,
+    /// delivery IDs for format 2). Returns `(id, data)` pairs where `id` is
+    /// `reply-0-{the claimed ID}`; matching entries are removed, all others
+    /// remain.
     ///
-    /// The client knows which SURB IDs it generated and passes them here to
+    /// The client knows which IDs it generated and passes them here to
     /// claim only its own responses.
     pub fn claim_by_surb_ids(&self, surb_ids: &[SurbId]) -> Vec<(String, Vec<u8>)> {
         if surb_ids.is_empty() {
@@ -231,16 +266,19 @@ impl ResponseBuffer {
         }
 
         let mut entries = self.entries.lock();
+        let mut delivery = self.delivery.lock();
         let mut claimed = Vec::new();
 
         for surb_id in surb_ids {
-            let Some(key) = entries.by_surb_id.get(surb_id).cloned() else {
-                continue;
-            };
-            if let Some(entry) = entries.remove(&key) {
-                if entry.created_at.elapsed() < self.ttl {
-                    claimed.push((key, entry.data));
+            if let Some(key) = entries.by_surb_id.get(surb_id).cloned() {
+                if let Some(entry) = entries.remove(&key) {
+                    if entry.created_at.elapsed() < self.ttl {
+                        claimed.push((key, entry.data));
+                    }
                 }
+            }
+            if let Some(data) = delivery.take(surb_id, self.ttl) {
+                claimed.push((format!("reply-0-{}", hex::encode(surb_id)), data));
             }
         }
 
@@ -249,19 +287,40 @@ impl ResponseBuffer {
 
     /// Prune all expired entries. Returns the number of entries removed.
     pub fn prune_expired(&self) -> usize {
-        self.entries.lock().retain_fresh(self.ttl)
+        let (handle, delivery) = self.prune_expired_by_key();
+        handle + delivery
     }
 
-    /// Number of currently buffered responses.
+    /// Prune all expired entries. Returns the number removed from the
+    /// handle-keyed and the delivery-keyed stores.
+    pub fn prune_expired_by_key(&self) -> (usize, usize) {
+        let handle = self.entries.lock().retain_fresh(self.ttl);
+        let delivery = self.delivery.lock().prune(self.ttl);
+        (handle, delivery)
+    }
+
+    /// Number of currently buffered responses, of both kinds.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.lock().by_packet_id.len()
+        self.entries.lock().by_packet_id.len() + self.delivery.lock().len()
+    }
+
+    /// Number of buffered format 2 replies.
+    #[must_use]
+    pub fn delivery_len(&self) -> usize {
+        self.delivery.lock().len()
+    }
+
+    /// Bytes held by handle-keyed and by delivery-keyed replies.
+    #[must_use]
+    pub fn bytes_by_key(&self) -> (usize, usize) {
+        (self.entries.lock().bytes, self.delivery.lock().bytes())
     }
 
     /// Whether the buffer is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.lock().by_packet_id.is_empty()
+        self.len() == 0
     }
 }
 
@@ -494,5 +553,71 @@ mod tests {
         let b_claimed = buf.claim_by_surb_ids(&[id(SURB_C), id(SURB_D)]);
         assert_eq!(b_claimed.len(), 2);
         assert!(buf.is_empty());
+    }
+
+    fn delivery_buffer(max_entries: usize) -> ResponseBuffer {
+        ResponseBuffer::new().with_delivery_limits(DeliveryLimits {
+            max_entries,
+            max_bytes: 1 << 20,
+            source_share_percent: 100,
+        })
+    }
+
+    #[test]
+    fn test_delivery_entry_is_claimed_as_reply_0_of_the_claimed_id() {
+        let buf = ResponseBuffer::new();
+        assert!(matches!(
+            buf.store_delivery(id(SURB_A), "peer", vec![7]),
+            DeliveryStore::Stored { .. }
+        ));
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.delivery_len(), 1);
+        let claimed = buf.claim_by_surb_ids(&[id(SURB_A)]);
+        assert_eq!(claimed, vec![(format!("reply-0-{SURB_A}"), vec![7])]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_delivery_entries_never_evict_handle_entries() {
+        let buf = ResponseBuffer::with_ttl_and_capacity(Duration::from_mins(1), 2)
+            .with_delivery_limits(DeliveryLimits {
+                max_entries: 2,
+                max_bytes: 1 << 20,
+                source_share_percent: 100,
+            });
+        buf.store_response(&format!("reply-0-{SURB_A}"), vec![1]);
+        buf.store_response(&format!("reply-0-{SURB_B}"), vec![2]);
+        for n in 0u8..50 {
+            buf.store_delivery([n; 16], "peer", vec![n]);
+        }
+        assert_eq!(buf.delivery_len(), 2);
+        assert_eq!(buf.claim_by_surb_ids(&[id(SURB_A), id(SURB_B)]).len(), 2);
+    }
+
+    #[test]
+    fn test_handle_claim_does_not_reach_delivery_entries() {
+        let buf = delivery_buffer(10);
+        buf.store_delivery(id(SURB_C), "peer", vec![3]);
+        buf.store_response(&format!("reply-0-{SURB_A}"), vec![1]);
+        assert_eq!(buf.claim_by_surb_ids(&[id(SURB_A)]).len(), 1);
+        assert_eq!(buf.delivery_len(), 1);
+        assert!(buf.take_response(&format!("reply-0-{SURB_C}")).is_none());
+    }
+
+    #[test]
+    fn test_bytes_are_tracked_per_key() {
+        let buf = delivery_buffer(10);
+        buf.store_response(&format!("reply-0-{SURB_A}"), vec![0; 10]);
+        buf.store_delivery(id(SURB_B), "peer", vec![0; 30]);
+        assert_eq!(buf.bytes_by_key(), (10, 30));
+        buf.claim_by_surb_ids(&[id(SURB_A), id(SURB_B)]);
+        assert_eq!(buf.bytes_by_key(), (0, 0));
+    }
+
+    #[test]
+    fn test_store_reports_evictions() {
+        let buf = ResponseBuffer::with_ttl_and_capacity(Duration::from_mins(1), 1);
+        assert_eq!(buf.store_response("a", vec![1]), 0);
+        assert_eq!(buf.store_response("b", vec![1]), 1);
     }
 }

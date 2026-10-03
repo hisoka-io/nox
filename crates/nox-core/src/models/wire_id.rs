@@ -58,6 +58,15 @@ pub fn parse_legacy_handle(wire_id: &str) -> Option<ReplyHandle> {
     Some(handle)
 }
 
+/// How a format 2 reply is filed at its final hop.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplyDelivery {
+    /// Delivery ID derived from the final hop's shared secret.
+    pub id: ReplyHandle,
+    /// Libp2p peer ID of the node the reply came from.
+    pub source_peer: String,
+}
+
 /// Where a packet handed to the network layer came from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum PacketOrigin {

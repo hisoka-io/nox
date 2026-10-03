@@ -1,6 +1,6 @@
 use crate::telemetry::metrics::MetricsService;
 use async_channel::Receiver;
-use nox_core::models::wire_id::ReplyHandle;
+use nox_core::models::wire_id::{ReplyDelivery, ReplyHandle};
 use nox_core::traits::{IMixStrategy, IReplayProtection};
 use nox_crypto::sphinx::{into_result, ProcessResult, SphinxError, SphinxHeader};
 use std::sync::Arc;
@@ -44,6 +44,8 @@ pub struct MixMessage {
     pub reply_handle: Option<ReplyHandle>,
     /// Libp2p peer ID of the node the packet came from.
     pub prev_peer: Option<String>,
+    /// Set for a format 2 reply delivered at this node (see [`ReplyDelivery`]).
+    pub delivery: Option<ReplyDelivery>,
     pub original_processing_start: std::time::Instant,
     #[cfg(feature = "hop-metrics")]
     pub hop_timings: Option<nox_crypto::sphinx::HopTimings>,
@@ -68,6 +70,46 @@ pub struct WorkerStage {
     replay: ReplayGuard,
     mix_strategy: Arc<dyn IMixStrategy>,
     metrics: MetricsService,
+    reply_v2: bool,
+}
+
+/// What the format 2 reply flag means for one packet at this hop.
+#[derive(Debug, PartialEq, Eq)]
+struct ReplyRouting {
+    reply_handle: Option<ReplyHandle>,
+    delivery: Option<ReplyDelivery>,
+}
+
+/// Applies the format 2 reply flag.
+///
+/// A flagged packet never keeps a handle from its wire identifier: a relay
+/// sends it on with a fresh identifier, and a final hop files it under its
+/// delivery ID only, and only when it came over P2P. Unflagged packets keep
+/// the format 1 behaviour.
+fn reply_routing(
+    flagged: bool,
+    is_final_hop: bool,
+    delivery_id: [u8; 16],
+    meta_handle: Option<ReplyHandle>,
+    prev_peer: Option<&String>,
+) -> ReplyRouting {
+    if !flagged {
+        return ReplyRouting {
+            reply_handle: meta_handle,
+            delivery: None,
+        };
+    }
+    let delivery = match (is_final_hop, prev_peer) {
+        (true, Some(peer)) => Some(ReplyDelivery {
+            id: delivery_id,
+            source_peer: peer.clone(),
+        }),
+        _ => None,
+    };
+    ReplyRouting {
+        reply_handle: None,
+        delivery,
+    }
 }
 
 impl WorkerStage {
@@ -86,7 +128,15 @@ impl WorkerStage {
             replay,
             mix_strategy,
             metrics,
+            reply_v2: true,
         }
+    }
+
+    /// Whether format 2 reply flags are honoured (`surb_formats`).
+    #[must_use]
+    pub fn with_reply_v2(mut self, enabled: bool) -> Self {
+        self.reply_v2 = enabled;
+        self
     }
 
     fn record_sphinx_error(&self, pid: &str, e: &SphinxError) {
@@ -157,6 +207,8 @@ impl WorkerStage {
             if !self.admit(&pid, &verified.replay_tag()).await {
                 continue;
             }
+            let flagged = self.reply_v2 && verified.reply_v2_flag();
+            let delivery_id = verified.delivery_id();
 
             match verified.process(body) {
                 Ok(output) => {
@@ -183,12 +235,42 @@ impl WorkerStage {
                         ProcessResult::Exit { payload } => MixMessageKind::Exit { payload },
                     };
 
+                    let routing = reply_routing(
+                        flagged,
+                        matches!(kind, MixMessageKind::Exit { .. }),
+                        delivery_id,
+                        meta.reply_handle,
+                        meta.prev_peer.as_ref(),
+                    );
+                    if flagged {
+                        if meta.reply_handle.is_some() {
+                            self.metrics
+                                .wire_handle_dropped_total
+                                .get_or_create(&vec![("reason".into(), "reply_v2".into())])
+                                .inc();
+                        }
+                        self.metrics
+                            .reply_v2_packets_total
+                            .get_or_create(&vec![(
+                                "hop".into(),
+                                if routing.delivery.is_some() {
+                                    "final".into()
+                                } else if matches!(kind, MixMessageKind::Exit { .. }) {
+                                    "final_not_p2p".into()
+                                } else {
+                                    "relay".into()
+                                },
+                            )])
+                            .inc();
+                    }
+
                     let msg = MixMessage {
                         kind,
                         delay,
                         packet_id: pid.clone(),
-                        reply_handle: meta.reply_handle,
+                        reply_handle: routing.reply_handle,
                         prev_peer: meta.prev_peer.clone(),
+                        delivery: routing.delivery,
                         original_processing_start: start,
                         #[cfg(feature = "hop-metrics")]
                         hop_timings,
@@ -267,6 +349,51 @@ mod tests {
         let packet = build_multi_hop_packet(&path, b"replay", 0).expect("Build failed");
         let (header, body) = SphinxHeader::from_bytes(&packet).unwrap();
         (header, body.to_vec())
+    }
+
+    #[test]
+    fn reply_routing_follows_the_flag() {
+        let d = [4u8; 16];
+        let h = Some([5u8; 16]);
+        let peer = "peer".to_string();
+
+        // Unflagged: format 1 behaviour, handle kept, no delivery.
+        for final_hop in [true, false] {
+            assert_eq!(
+                reply_routing(false, final_hop, d, h, Some(&peer)),
+                ReplyRouting {
+                    reply_handle: h,
+                    delivery: None
+                }
+            );
+        }
+        // Flagged relay hop: handle dropped.
+        assert_eq!(
+            reply_routing(true, false, d, h, Some(&peer)),
+            ReplyRouting {
+                reply_handle: None,
+                delivery: None
+            }
+        );
+        // Flagged final hop over P2P: delivery ID only.
+        assert_eq!(
+            reply_routing(true, true, d, h, Some(&peer)),
+            ReplyRouting {
+                reply_handle: None,
+                delivery: Some(ReplyDelivery {
+                    id: d,
+                    source_peer: peer.clone()
+                })
+            }
+        );
+        // Flagged final hop not from P2P (HTTP ingress): nothing to file under.
+        assert_eq!(
+            reply_routing(true, true, d, h, None),
+            ReplyRouting {
+                reply_handle: None,
+                delivery: None
+            }
+        );
     }
 
     #[tokio::test]

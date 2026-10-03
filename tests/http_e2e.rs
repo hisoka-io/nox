@@ -121,6 +121,7 @@ async fn test_http_e2e_packet_injection_and_response_poll() {
             packet_id: "0123456789abcdef0123456789abcdef".to_string(),
             payload: test_payload.clone(),
             reply_handle: Some([42; 16]),
+            delivery: None,
         })
         .expect("publish PayloadDecrypted");
 
@@ -147,6 +148,7 @@ async fn test_http_e2e_batch_response_retrieval() {
                 packet_id: format!("{i:032x}"),
                 payload: vec![0xA0 | i; 4],
                 reply_handle: Some([i; 16]),
+                delivery: None,
             })
             .expect("publish PayloadDecrypted");
     }
@@ -194,6 +196,7 @@ async fn test_http_e2e_only_surb_replies_buffered() {
             packet_id: format!("reply-9-{}", surb_hex(9)),
             payload: relayer_payload,
             reply_handle: Some([9; 16]),
+            delivery: None,
         })
         .expect("publish");
     harness
@@ -202,6 +205,7 @@ async fn test_http_e2e_only_surb_replies_buffered() {
             packet_id: "http-00000000deadbeef".to_string(),
             payload: vec![0xA5; 64],
             reply_handle: None,
+            delivery: None,
         })
         .expect("publish");
     // A local ID shaped like a reply ID carries no handle.
@@ -211,6 +215,7 @@ async fn test_http_e2e_only_surb_replies_buffered() {
             packet_id: format!("reply-9-{}", surb_hex(9)),
             payload: vec![0xA5; 64],
             reply_handle: None,
+            delivery: None,
         })
         .expect("publish");
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -233,6 +238,7 @@ async fn test_http_e2e_pending_endpoint_removed() {
             packet_id: format!("reply-1-{}", surb_hex(1)),
             payload: vec![0xA5; 8],
             reply_handle: Some([1; 16]),
+            delivery: None,
         })
         .expect("publish");
     tokio::time::sleep(Duration::from_millis(200)).await;
