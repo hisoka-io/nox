@@ -229,6 +229,7 @@ async fn test_exit_service_rejects_legacy_submit_tx() {
         packet_id: "pkt-submit-1".to_string(),
         payload: payload_bytes,
         reply_handle: None,
+        delivery: None,
     })
     .expect("publish");
 
@@ -286,6 +287,7 @@ async fn test_exit_service_anon_submit_tx_replies_with_rejection() {
         packet_id: "pkt-anon-submit".to_string(),
         payload: payload_bytes,
         reply_handle: None,
+        delivery: None,
     })
     .expect("publish");
 
@@ -362,6 +364,7 @@ async fn paid_quote_without_reply_surb_does_not_reserve_capacity() {
         packet_id: "quote-without-surb".to_string(),
         payload: encode_payload(&payload).expect("outer"),
         reply_handle: None,
+        delivery: None,
     })
     .expect("publish");
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -411,6 +414,7 @@ async fn test_exit_service_broadcast_tx_sends_response_via_surbs() {
         packet_id: "pkt-broadcast".to_string(),
         payload: payload_bytes,
         reply_handle: None,
+        delivery: None,
     })
     .expect("publish");
 
@@ -481,6 +485,7 @@ async fn test_exit_service_simulation_mode_drops_submit_tx() {
         packet_id: "pkt-sim-drop".to_string(),
         payload: payload_bytes,
         reply_handle: None,
+        delivery: None,
     })
     .expect("publish");
 

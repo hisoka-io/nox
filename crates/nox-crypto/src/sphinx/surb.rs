@@ -3,13 +3,15 @@
 use super::lioness::{lioness_decrypt, lioness_encrypt, LionessKeys};
 use super::packet::{PacketError, SphinxPacket};
 use super::{
-    apply_stream_cipher, compute_mac, derive_keys, PathHop, SphinxError, SphinxHeader,
-    ROUTING_INFO_SIZE, SHIFT_SIZE,
+    apply_stream_cipher, compute_mac, delivery_id_from_shared_secret, derive_keys, PathHop,
+    SphinxError, SphinxHeader, FINAL_FLAG_OFFSET, MAX_FLAGGED_ADDRESS_LEN, RELAY_FLAG_OFFSET,
+    REPLY_V2_FLAG, ROUTING_INFO_SIZE, SHIFT_SIZE,
 };
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use curve25519_dalek::scalar::Scalar;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use x25519_dalek::PublicKey as X25519PublicKey;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -20,6 +22,33 @@ fn unpad_iso7816(data: &[u8]) -> Result<Vec<u8>, SurbError> {
 }
 
 pub const DEFAULT_POW_DIFFICULTY: u32 = 0;
+
+/// `Surb.id` of a format 2 SURB. It is the same for every format 2 SURB, so
+/// it identifies nothing; it only tells the exit to add a reply tag and to
+/// send no reply handle.
+pub const SURB_V2_MARKER: [u8; 16] = *b"nox:surb:v2\0\0\0\0\0";
+
+/// Length of the reply tag in a format 2 reply body.
+pub const SURB_TAG_LEN: usize = 16;
+
+/// Domain separator for the format 2 reply tag key.
+const REPLY_TAG_CONTEXT: &str = "nox surb v2 reply mac";
+
+/// Reply tag over `message`, keyed from the SURB's payload keys.
+fn reply_tag(payload_keys: &LionessKeys, message: &[u8]) -> [u8; SURB_TAG_LEN] {
+    let mut material = [0u8; 128];
+    material[..32].copy_from_slice(&payload_keys.k1);
+    material[32..64].copy_from_slice(&payload_keys.k2);
+    material[64..96].copy_from_slice(&payload_keys.k3);
+    material[96..].copy_from_slice(&payload_keys.k4);
+    let mut key = blake3::derive_key(REPLY_TAG_CONTEXT, &material);
+    material.zeroize();
+    let full = blake3::keyed_hash(&key, message);
+    key.zeroize();
+    let mut tag = [0u8; SURB_TAG_LEN];
+    tag.copy_from_slice(&full.as_bytes()[..SURB_TAG_LEN]);
+    tag
+}
 
 #[derive(Debug, Error)]
 pub enum SurbError {
@@ -40,6 +69,9 @@ pub enum SurbError {
 
     #[error("Invalid address at hop {index}: {reason}")]
     InvalidAddress { index: usize, reason: String },
+
+    #[error("Reply tag check failed")]
+    TagMismatch,
 }
 
 /// A Single Use Reply Block. Contains a pre-computed return-path header and payload encryption keys.
@@ -59,6 +91,35 @@ impl Surb {
         id: [u8; 16],
         pow_difficulty: u32,
     ) -> Result<(Self, SurbRecovery), SurbError> {
+        Self::build(path, id, pow_difficulty, false)
+    }
+
+    /// Creates a format 2 SURB.
+    ///
+    /// Every hop's routing info carries the format 2 flag, which the header
+    /// MAC covers. The final hop files the reply under a delivery ID derived
+    /// from its shared secret, which is also `SurbRecovery.id`. `Surb.id` is
+    /// [`SURB_V2_MARKER`], and the exit adds a reply tag that
+    /// [`SurbRecovery::decrypt`] checks.
+    pub fn new_v2(
+        path: &[PathHop],
+        pow_difficulty: u32,
+    ) -> Result<(Self, SurbRecovery), SurbError> {
+        Self::build(path, SURB_V2_MARKER, pow_difficulty, true)
+    }
+
+    /// Whether this SURB asks for a format 2 reply.
+    #[must_use]
+    pub fn is_v2(&self) -> bool {
+        self.id == SURB_V2_MARKER
+    }
+
+    fn build(
+        path: &[PathHop],
+        id: [u8; 16],
+        pow_difficulty: u32,
+        v2: bool,
+    ) -> Result<(Self, SurbRecovery), SurbError> {
         if path.is_empty() {
             return Err(SurbError::EmptyPath);
         }
@@ -74,6 +135,15 @@ impl Surb {
                 return Err(SurbError::InvalidAddress {
                     index: i,
                     reason: format!("address too long ({} bytes, max 255)", hop.address.len()),
+                });
+            }
+            if v2 && i > 0 && hop.address.len() > MAX_FLAGGED_ADDRESS_LEN {
+                return Err(SurbError::InvalidAddress {
+                    index: i,
+                    reason: format!(
+                        "address too long for a format 2 SURB ({} bytes, max {MAX_FLAGGED_ADDRESS_LEN})",
+                        hop.address.len()
+                    ),
                 });
             }
         }
@@ -146,6 +216,9 @@ impl Surb {
             if i == path.len() - 1 {
                 // Final hop (deliver to user)
                 current_routing[0] = 0x01; // Exit flag
+                if v2 {
+                    current_routing[FINAL_FLAG_OFFSET] = REPLY_V2_FLAG;
+                }
                 if !filler.is_empty() {
                     let filler_start = ROUTING_INFO_SIZE - filler.len();
                     current_routing[filler_start..].copy_from_slice(&filler);
@@ -157,6 +230,9 @@ impl Surb {
                 current_routing[1] = next_addr_bytes.len() as u8;
                 current_routing[2..34].copy_from_slice(&next_mac);
                 current_routing[34..34 + next_addr_bytes.len()].copy_from_slice(next_addr_bytes);
+                if v2 {
+                    current_routing[RELAY_FLAG_OFFSET] = REPLY_V2_FLAG;
+                }
 
                 let remainder_len = ROUTING_INFO_SIZE - SHIFT_SIZE;
                 current_routing[SHIFT_SIZE..].copy_from_slice(&routing_info[0..remainder_len]);
@@ -188,23 +264,46 @@ impl Surb {
             payload_keys: payload_keys.clone(),
         };
 
+        let (recovery_id, version) = if v2 {
+            let last = shared_secrets.len() - 1;
+            (delivery_id_from_shared_secret(&shared_secrets[last]), 2)
+        } else {
+            (id, 1)
+        };
+        for secret in &mut shared_secrets {
+            secret.zeroize();
+        }
+
         let recovery = SurbRecovery {
-            id,
+            id: recovery_id,
             layer_keys,
             payload_keys,
+            version,
         };
 
         Ok((surb, recovery))
     }
 
-    /// Wraps a reply message into a 32KB `SphinxPacket` using this SURB. Called by the service.
+    /// Wraps a reply message into a 32KB `SphinxPacket` using this SURB, in
+    /// format 1 (no reply tag). Called by the service.
     pub fn encapsulate(&self, message: &[u8]) -> Result<SphinxPacket, SurbError> {
+        self.seal(message, false)
+    }
+
+    /// Wraps a reply message in format 2: the body carries a reply tag after
+    /// the message.
+    pub fn encapsulate_v2(&self, message: &[u8]) -> Result<SphinxPacket, SurbError> {
+        self.seal(message, true)
+    }
+
+    fn seal(&self, message: &[u8], tagged: bool) -> Result<SphinxPacket, SurbError> {
         use super::packet::PACKET_SIZE;
         use super::HEADER_SIZE as SPHINX_HEADER_SIZE;
 
         let body_size = PACKET_SIZE - SPHINX_HEADER_SIZE;
+        let tag_len = if tagged { SURB_TAG_LEN } else { 0 };
 
-        if message.len() >= body_size {
+        if message.len() + tag_len >= body_size {
             return Err(SurbError::MessageTooLarge {
                 size: message.len(),
             });
@@ -212,7 +311,11 @@ impl Surb {
 
         let mut body = vec![0u8; body_size];
         body[..message.len()].copy_from_slice(message);
-        body[message.len()] = 0x80;
+        if tagged {
+            let tag = reply_tag(&self.payload_keys, message);
+            body[message.len()..message.len() + SURB_TAG_LEN].copy_from_slice(&tag);
+        }
+        body[message.len() + tag_len] = 0x80;
 
         lioness_encrypt(&self.payload_keys, &mut body);
 
@@ -237,9 +340,17 @@ pub struct SurbRecovery {
     pub layer_keys: Vec<LionessKeys>,
     /// Final Lioness keys to decrypt the inner message
     pub payload_keys: LionessKeys,
+    /// Reply format: 1 (untagged) or 2 (tagged, `id` is the delivery ID).
+    /// Recovery data saved before format 2 existed has no field and is format 1.
+    #[serde(default = "SurbRecovery::default_version")]
+    pub version: u8,
 }
 
 impl SurbRecovery {
+    fn default_version() -> u8 {
+        1
+    }
+
     /// Decrypts a reply by peeling onion layers then decrypting the inner payload.
     pub fn decrypt(&self, encrypted_body: &[u8]) -> Result<Vec<u8>, SurbError> {
         let mut body = encrypted_body.to_vec();
@@ -251,7 +362,19 @@ impl SurbRecovery {
 
         lioness_decrypt(&self.payload_keys, &mut body);
 
-        let unpadded = unpad_iso7816(&body)?;
+        let mut unpadded = unpad_iso7816(&body)?;
+
+        if self.version >= 2 {
+            if unpadded.len() < SURB_TAG_LEN {
+                return Err(SurbError::TagMismatch);
+            }
+            let message_len = unpadded.len() - SURB_TAG_LEN;
+            let expected = reply_tag(&self.payload_keys, &unpadded[..message_len]);
+            if expected.ct_eq(&unpadded[message_len..]).unwrap_u8() == 0 {
+                return Err(SurbError::TagMismatch);
+            }
+            unpadded.truncate(message_len);
+        }
 
         Ok(unpadded)
     }
@@ -477,6 +600,7 @@ mod tests {
             id: recovery.id,
             layer_keys: vec![],
             payload_keys: recovery.payload_keys.clone(),
+            version: 1,
         };
 
         let result = recovery_no_layers.decrypt_packet(&packet);
@@ -509,6 +633,7 @@ mod tests {
             id: recovery.id,
             layer_keys: vec![],
             payload_keys: recovery.payload_keys.clone(),
+            version: 1,
         };
 
         let packet_bytes = packet.as_bytes();
@@ -664,5 +789,153 @@ mod tests {
 
         assert_eq!(recovery.id, recovered);
         assert_eq!(hex.len(), 32);
+    }
+
+    /// Processes a reply hop by hop. Returns each hop's format 2 flag, the
+    /// final hop's delivery ID and the body the final hop hands over.
+    fn walk_return_path(
+        packet: &SphinxPacket,
+        secret_keys: &[X25519SecretKey],
+    ) -> (Vec<bool>, [u8; 16], Vec<u8>) {
+        let mut bytes = packet.as_bytes().to_vec();
+        let mut flags = Vec::new();
+        for (i, sk) in secret_keys.iter().enumerate() {
+            let (header, body) = SphinxHeader::from_bytes(&bytes).expect("parse");
+            let verified = header.verify(sk).expect("verify");
+            flags.push(verified.reply_v2_flag());
+            let delivery_id = verified.delivery_id();
+            match super::super::into_result(verified.process(body.to_vec()).expect("process")) {
+                super::super::ProcessResult::Forward {
+                    next_packet,
+                    processed_body,
+                    ..
+                } => {
+                    assert!(i + 1 < secret_keys.len(), "last hop must deliver");
+                    bytes = next_packet.to_bytes(&processed_body);
+                }
+                super::super::ProcessResult::Exit { payload } => {
+                    assert_eq!(i + 1, secret_keys.len(), "only the last hop delivers");
+                    return (flags, delivery_id, payload);
+                }
+            }
+        }
+        unreachable!("path ended without delivery")
+    }
+
+    #[test]
+    fn v2_delivery_id_matches_final_hop_for_every_path_length() {
+        for hops in 1..=3 {
+            let (path, sks) = generate_test_path(hops);
+            let (surb, recovery) = Surb::new_v2(&path, 0).expect("v2 SURB");
+            assert!(surb.is_v2());
+            assert_eq!(surb.id, SURB_V2_MARKER);
+            assert_eq!(recovery.version, 2);
+
+            let packet = surb.encapsulate_v2(b"reply body").expect("seal");
+            let (flags, delivery_id, payload) = walk_return_path(&packet, &sks);
+            assert_eq!(flags, vec![true; hops], "every hop sees the flag");
+            assert_eq!(delivery_id, recovery.id);
+            assert_eq!(recovery.decrypt(&payload).expect("decrypt"), b"reply body");
+        }
+    }
+
+    #[test]
+    fn v1_surbs_and_forward_packets_carry_no_flag() {
+        let (path, sks) = generate_test_path(3);
+        let id: [u8; 16] = rand::random();
+        let (surb, recovery) = Surb::new(&path, id, 0).expect("v1 SURB");
+        assert!(!surb.is_v2());
+        assert_eq!(recovery.version, 1);
+        let (flags, delivery_id, payload) =
+            walk_return_path(&surb.encapsulate(b"m").expect("seal"), &sks);
+        assert_eq!(flags, vec![false; 3]);
+        assert_ne!(delivery_id, id);
+        assert_eq!(recovery.decrypt(&payload).expect("decrypt"), b"m");
+
+        let forward = super::super::build_multi_hop_packet(&path, b"fwd", 0).expect("build");
+        let (flags, _, _) =
+            walk_return_path(&SphinxPacket::from_bytes(forward).expect("packet"), &sks);
+        assert_eq!(flags, vec![false; 3]);
+    }
+
+    #[test]
+    fn delivery_id_is_separate_from_replay_tag() {
+        let ss: [u8; 32] = rand::random();
+        let tag = super::super::replay_tag_from_shared_secret(&ss);
+        assert_ne!(delivery_id_from_shared_secret(&ss)[..], tag[..16]);
+    }
+
+    #[test]
+    fn v2_reply_rejects_any_flipped_bit() {
+        let (path, sks) = generate_test_path(2);
+        let (surb, recovery) = Surb::new_v2(&path, 0).expect("v2 SURB");
+        let packet = surb.encapsulate_v2(b"tamper check").expect("seal");
+        let (_, _, payload) = walk_return_path(&packet, &sks);
+        let mut rng = rand::thread_rng();
+        for _ in 0..2_000 {
+            let mut body = payload.clone();
+            let bit = rng.gen_range(0..body.len() * 8);
+            body[bit / 8] ^= 1 << (bit % 8);
+            assert!(recovery.decrypt(&body).is_err(), "bit {bit} accepted");
+        }
+    }
+
+    #[test]
+    fn v2_recovery_rejects_an_untagged_reply() {
+        let (path, sks) = generate_test_path(2);
+        let (surb, recovery) = Surb::new_v2(&path, 0).expect("v2 SURB");
+        let (_, _, payload) = walk_return_path(&surb.encapsulate(b"untagged").expect("seal"), &sks);
+        assert!(matches!(
+            recovery.decrypt(&payload),
+            Err(SurbError::TagMismatch | SurbError::InvalidPadding)
+        ));
+    }
+
+    #[test]
+    fn v2_message_length_limits() {
+        use super::super::packet::PACKET_SIZE;
+        let body_size = PACKET_SIZE - super::super::HEADER_SIZE;
+        let (path, _) = generate_test_path(1);
+        let (surb, recovery) = Surb::new_v2(&path, 0).expect("v2 SURB");
+        let recovery = SurbRecovery {
+            id: recovery.id,
+            layer_keys: vec![],
+            payload_keys: recovery.payload_keys.clone(),
+            version: 2,
+        };
+        for len in [0, body_size - 1 - SURB_TAG_LEN] {
+            let message = vec![0x42; len];
+            let packet = surb.encapsulate_v2(&message).expect("seal");
+            assert_eq!(recovery.decrypt_packet(&packet).expect("decrypt"), message);
+        }
+        assert!(matches!(
+            surb.encapsulate_v2(&vec![0; body_size - SURB_TAG_LEN]),
+            Err(SurbError::MessageTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn recovery_without_version_loads_as_format_1() {
+        let (path, _) = generate_test_path(1);
+        let (_, recovery) = Surb::new(&path, [1; 16], 0).expect("v1 SURB");
+        let mut json = serde_json::to_value(&recovery).expect("json");
+        json.as_object_mut().expect("object").remove("version");
+        let loaded: SurbRecovery = serde_json::from_value(json).expect("load");
+        assert_eq!(loaded.version, 1);
+    }
+
+    #[test]
+    fn v2_rejects_relay_addresses_without_room_for_the_flag() {
+        let (mut path, _) = generate_test_path(2);
+        path[1].address = "a".repeat(MAX_FLAGGED_ADDRESS_LEN + 1);
+        assert!(matches!(
+            Surb::new_v2(&path, 0),
+            Err(SurbError::InvalidAddress { index: 1, .. })
+        ));
+        path[1].address = "a".repeat(MAX_FLAGGED_ADDRESS_LEN);
+        assert!(Surb::new_v2(&path, 0).is_ok());
+        // Format 1 keeps the old limit.
+        path[1].address = "a".repeat(MAX_FLAGGED_ADDRESS_LEN + 1);
+        assert!(Surb::new(&path, [0; 16], 0).is_ok());
     }
 }

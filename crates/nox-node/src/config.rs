@@ -233,6 +233,29 @@ pub struct RelayerConfig {
     /// How packet identifiers are chosen for the next hop.
     #[serde(default)]
     pub wire_ids: WireIdMode,
+    /// Which SURB reply formats this node handles.
+    #[serde(default)]
+    pub surb_formats: SurbFormats,
+}
+
+/// SURB reply formats a node handles.
+#[derive(Debug, Deserialize, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SurbFormats {
+    /// Format 1 and format 2 replies. Advertises `surb_v2`.
+    #[default]
+    Both,
+    /// Format 1 only: format 2 flags are ignored and a format 2 SURB is
+    /// answered like any other SURB. For turning format 2 off.
+    V1,
+}
+
+impl SurbFormats {
+    /// Whether format 2 replies are handled.
+    #[must_use]
+    pub fn v2_enabled(self) -> bool {
+        self == Self::Both
+    }
 }
 
 /// How a node picks the identifier it sends with each packet.
@@ -286,6 +309,7 @@ impl Default for RelayerConfig {
             cover_loop_timeout_secs: default_cover_loop_timeout_secs(),
             fragmentation: FragmentationConfig::default(),
             wire_ids: WireIdMode::default(),
+            surb_formats: SurbFormats::default(),
         }
     }
 }
@@ -1125,6 +1149,15 @@ mod tests {
         config.benchmark_mode = true;
         let errors = config.validate().err().unwrap_or_default();
         assert!(!errors.iter().any(|e| e.contains("wire_ids")));
+    }
+
+    #[test]
+    fn surb_formats_default_and_parse() {
+        assert_eq!(RelayerConfig::default().surb_formats, SurbFormats::Both);
+        assert!(SurbFormats::Both.v2_enabled());
+        assert!(!SurbFormats::V1.v2_enabled());
+        let parsed: SurbFormats = serde_json::from_str("\"v1\"").expect("parse");
+        assert_eq!(parsed, SurbFormats::V1);
     }
 
     #[test]

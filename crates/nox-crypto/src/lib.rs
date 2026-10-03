@@ -15,7 +15,9 @@ pub use sphinx::packet::{
     PACKET_SIZE, PAYLOAD_OVERHEAD, POLY1305_TAG_SIZE,
 };
 
-pub use sphinx::surb::{Surb, SurbError, SurbRecovery, DEFAULT_POW_DIFFICULTY};
+pub use sphinx::surb::{
+    Surb, SurbError, SurbRecovery, DEFAULT_POW_DIFFICULTY, SURB_TAG_LEN, SURB_V2_MARKER,
+};
 
 pub use sphinx::pow::{
     count_leading_zeros, default_solver, fast_solver, meets_difficulty, Blake3Pow, PowAlgorithm,

@@ -379,6 +379,7 @@ fn spawn_traffic_generator(
                         packet_id,
                         payload,
                         reply_handle,
+                        ..
                     }) => {
                         // Replies are identified by their handle, as at a real entry node.
                         let id = reply_handle

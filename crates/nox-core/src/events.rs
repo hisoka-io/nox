@@ -1,4 +1,4 @@
-use crate::models::wire_id::{PacketOrigin, ReplyHandle};
+use crate::models::wire_id::{PacketOrigin, ReplyDelivery, ReplyHandle};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -39,6 +39,10 @@ pub enum NoxEvent {
         /// Reply handle the packet arrived with, if any.
         #[serde(default)]
         reply_handle: Option<ReplyHandle>,
+        /// Set when this node is the final hop of a format 2 reply that came
+        /// over P2P. Such a reply is filed under the delivery ID only.
+        #[serde(default)]
+        delivery: Option<ReplyDelivery>,
     },
 
     PeerConnected {
@@ -192,6 +196,7 @@ mod tests {
             packet_id: "pkt-003".into(),
             payload: b"hello world".to_vec(),
             reply_handle: None,
+            delivery: None,
         };
         assert_json_roundtrip(&event);
         assert_bincode_roundtrip(&event);
@@ -389,6 +394,7 @@ mod tests {
                 packet_id: String::new(),
                 payload: vec![],
                 reply_handle: None,
+                delivery: None,
             },
             NoxEvent::PeerConnected {
                 peer_id: String::new(),

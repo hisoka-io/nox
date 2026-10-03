@@ -138,6 +138,9 @@ impl NoxNode {
             &config.ingress.cors_allowed_origins,
             config.network.topology_liveness_window_secs,
         );
+        if config.relayer.surb_formats.v2_enabled() {
+            metrics_service.add_capability("surb_v2");
+        }
 
         let start_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -465,7 +468,8 @@ impl NoxNode {
             });
             let response_packer = Arc::new(
                 crate::services::response_packer::ResponsePacker::new()
-                    .with_metrics(metrics_service.clone()),
+                    .with_metrics(metrics_service.clone())
+                    .with_reply_v2(config.relayer.surb_formats.v2_enabled()),
             );
             let pending_map = ExitService::new_pending_map();
             let surb_acc = ExitService::new_surb_accumulator();
@@ -526,6 +530,7 @@ impl NoxNode {
                 exit_service.run().await;
             });
         } else if let Some(ref executor) = chain_executor {
+            metrics_service.add_capability("paid_v2");
             info!("Initializing Transaction Manager (exit/full role)...");
             let tx_manager = match TransactionManager::new(
                 executor.clone(),
@@ -604,7 +609,8 @@ impl NoxNode {
 
             let response_packer = Arc::new(
                 crate::services::response_packer::ResponsePacker::new()
-                    .with_metrics(metrics_service.clone()),
+                    .with_metrics(metrics_service.clone())
+                    .with_reply_v2(config.relayer.surb_formats.v2_enabled()),
             );
             let pending_map = ExitService::new_pending_map();
             let surb_acc = ExitService::new_surb_accumulator();

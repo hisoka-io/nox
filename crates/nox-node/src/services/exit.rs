@@ -1166,7 +1166,7 @@ fn continue_or_stash(
                             packet_id: reply_wire_id(&packed.surb_id),
                             next_hop_peer_id: packed.first_hop.clone(),
                             data: packed.packet_bytes.clone(),
-                            reply_handle: Some(packed.surb_id),
+                            reply_handle: packed.reply_handle(),
                             origin: PacketOrigin::Originated,
                         });
                     }

@@ -20,6 +20,7 @@ fn make_message(kind: MixMessageKind) -> MixMessage {
         packet_id: "egress-test-pkt".to_string(),
         reply_handle: None,
         prev_peer: None,
+        delivery: None,
         original_processing_start: Instant::now(),
         #[cfg(feature = "hop-metrics")]
         hop_timings: None,

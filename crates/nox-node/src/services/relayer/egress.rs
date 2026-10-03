@@ -77,6 +77,7 @@ impl EgressStage {
                         packet_id: msg.packet_id.clone(),
                         payload,
                         reply_handle: msg.reply_handle,
+                        delivery: msg.delivery,
                     }) {
                         error!(
                             packet_id = %msg.packet_id,

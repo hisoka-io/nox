@@ -16,6 +16,8 @@ pub const EXIT_DROP_REASONS: [&str; 2] = ["queue_full", "lane_closed"];
 #[derive(Clone)]
 pub struct MetricsService {
     registry: Arc<Mutex<Registry>>,
+    /// Features this node supports, reported in `/metrics/json` as `capabilities`.
+    capabilities: Arc<Mutex<std::collections::BTreeSet<String>>>,
 
     pub packets_received: Family<Vec<(String, String)>, Counter>,
     pub packets_forwarded: Family<Vec<(String, String)>, Counter>,
@@ -38,6 +40,17 @@ pub struct MetricsService {
     pub wire_ids_total: Family<Vec<(String, String)>, Counter>,
     /// Reply handles not passed on to the next hop, by reason.
     pub wire_handle_dropped_total: Family<Vec<(String, String)>, Counter>,
+    /// Packets carrying the format 2 reply flag, by `hop` (`relay`, `final`, `final_not_p2p`).
+    pub reply_v2_packets_total: Family<Vec<(String, String)>, Counter>,
+    /// Replies stored in the response buffer, by `key` (`handle`, `delivery`).
+    pub response_store_total: Family<Vec<(String, String)>, Counter>,
+    /// Replies removed from or refused by the response buffer without being
+    /// claimed, by `key` and `reason`.
+    pub response_evicted_total: Family<Vec<(String, String)>, Counter>,
+    /// Bytes held in the response buffer, by `key`.
+    pub response_buffer_bytes: Family<Vec<(String, String)>, Gauge<i64, AtomicI64>>,
+    /// Format of the replies this exit sends, by `format` (`v1`, `v2`).
+    pub reply_format_total: Family<Vec<(String, String)>, Counter>,
     pub relayer_worker_queue_depth: Gauge<i64, AtomicI64>,
     pub relayer_mix_queue_depth: Gauge<i64, AtomicI64>,
     pub relayer_egress_queue_depth: Gauge<i64, AtomicI64>,
@@ -218,6 +231,42 @@ impl MetricsService {
             "nox_wire_handle_dropped",
             "Reply handles not passed on to the next hop, by reason",
             wire_handle_dropped_total.clone(),
+        );
+
+        let reply_v2_packets_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_reply_v2_packets",
+            "Packets carrying the format 2 reply flag, by hop",
+            reply_v2_packets_total.clone(),
+        );
+
+        let response_store_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_response_store",
+            "Replies stored in the response buffer, by key kind",
+            response_store_total.clone(),
+        );
+
+        let response_evicted_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_response_evicted",
+            "Replies removed from or refused by the response buffer, by key kind and reason",
+            response_evicted_total.clone(),
+        );
+
+        let response_buffer_bytes =
+            Family::<Vec<(String, String)>, Gauge<i64, AtomicI64>>::default();
+        registry.register(
+            "nox_response_buffer_bytes",
+            "Bytes held in the response buffer, by key kind",
+            response_buffer_bytes.clone(),
+        );
+
+        let reply_format_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_reply_format",
+            "Replies sent by this exit, by format",
+            reply_format_total.clone(),
         );
 
         let relayer_worker_queue_depth = Gauge::<i64, AtomicI64>::default();
@@ -729,6 +778,7 @@ impl MetricsService {
 
         Self {
             registry: Arc::new(Mutex::new(registry)),
+            capabilities: Arc::default(),
             packets_received,
             packets_forwarded,
             dummy_packets_dropped,
@@ -743,6 +793,11 @@ impl MetricsService {
             ingest_dropped_total,
             wire_ids_total,
             wire_handle_dropped_total,
+            reply_v2_packets_total,
+            response_store_total,
+            response_evicted_total,
+            response_buffer_bytes,
+            reply_format_total,
             relayer_worker_queue_depth,
             relayer_mix_queue_depth,
             relayer_egress_queue_depth,
@@ -833,6 +888,17 @@ impl MetricsService {
         self.registry.clone()
     }
 
+    /// Adds a capability to the `capabilities` list in `/metrics/json`.
+    pub fn add_capability(&self, capability: &str) {
+        self.capabilities.lock().insert(capability.to_string());
+    }
+
+    /// Capabilities reported in `/metrics/json`, sorted.
+    #[must_use]
+    pub fn capabilities(&self) -> Vec<String> {
+        self.capabilities.lock().iter().cloned().collect()
+    }
+
     /// Flat JSON for dashboard indexers (labeled metrics flattened by label value).
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
@@ -860,6 +926,8 @@ impl MetricsService {
         };
 
         let mut m = serde_json::Map::new();
+
+        m.insert("capabilities".into(), self.capabilities().into());
 
         m.insert("packetsReceived".into(), fc0(&self.packets_received).into());
         m.insert(
@@ -1361,5 +1429,18 @@ mod tests {
             .unwrap_or_default();
         assert!(encoded.contains("nox_wire_ids_total{kind=\"fresh\"} 1"));
         assert!(encoded.contains("nox_wire_handle_dropped_total{reason=\"unknown_layer\"} 1"));
+    }
+
+    #[test]
+    fn capabilities_are_reported_in_json() {
+        let metrics = MetricsService::new();
+        assert_eq!(metrics.to_json()["capabilities"], serde_json::json!([]));
+        metrics.add_capability("surb_v2");
+        metrics.add_capability("paid_v2");
+        metrics.add_capability("surb_v2");
+        assert_eq!(
+            metrics.to_json()["capabilities"],
+            serde_json::json!(["paid_v2", "surb_v2"])
+        );
     }
 }

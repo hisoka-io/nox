@@ -139,7 +139,7 @@ impl ServiceHandler for EchoHandler {
                         next_hop_peer_id: packet.first_hop.clone(),
                         packet_id: reply_wire_id(&packet.surb_id),
                         data: packet.packet_bytes.clone(),
-                        reply_handle: Some(packet.surb_id),
+                        reply_handle: packet.reply_handle(),
                         origin: PacketOrigin::Originated,
                     }) {
                         warn!(

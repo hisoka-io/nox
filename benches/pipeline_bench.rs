@@ -298,6 +298,7 @@ fn bench_worker_process(c: &mut Criterion) {
                     packet_id: String::new(),
                     reply_handle: None,
                     prev_peer: None,
+                    delivery: None,
                     original_processing_start: start,
                     #[cfg(feature = "hop-metrics")]
                     hop_timings: None,
@@ -407,6 +408,7 @@ fn bench_egress_publish(c: &mut Criterion) {
                     packet_id: String::new(),
                     payload: payload_data.clone(),
                     reply_handle: None,
+                    delivery: None,
                 };
                 let result = bus.publish(black_box(event));
                 black_box(result)
@@ -544,6 +546,7 @@ fn bench_full_pipeline_pass(c: &mut Criterion) {
                             packet_id: String::new(),
                             payload,
                             reply_handle: None,
+                            delivery: None,
                         });
                     }
                 }
