@@ -58,6 +58,9 @@ pub enum SubmitError {
     NonceConsumed { nonce: u64 },
 }
 
+/// Wait before the final receipt lookup that decides a transaction was superseded.
+const SUPERSEDED_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How a nonce conflict reported by the RPC was resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NonceConflict {
@@ -325,7 +328,9 @@ impl TransactionManager {
         if confirmed <= U256::from(transaction.nonce) {
             return NonceConflict::Unresolved;
         }
-        // The nonce is mined. Look again in case it was this transaction that just landed.
+        // The nonce is mined. Wait for load-balanced RPC backends to catch up, then look
+        // again in case it was this transaction that landed.
+        tokio::time::sleep(SUPERSEDED_SETTLE_DELAY).await;
         match self.reconcile_hashes(transaction).await {
             Ok(Some(status)) => NonceConflict::Terminal(status),
             Ok(None) => NonceConflict::Superseded,
