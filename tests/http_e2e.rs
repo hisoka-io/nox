@@ -118,7 +118,7 @@ async fn test_http_e2e_packet_injection_and_response_poll() {
     harness
         .publisher
         .publish(NoxEvent::PayloadDecrypted {
-            packet_id: test_request_id.to_string(),
+            packet_id: test_request_id.clone(),
             payload: test_payload.clone(),
         })
         .expect("publish PayloadDecrypted");
