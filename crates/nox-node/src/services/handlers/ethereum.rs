@@ -1,6 +1,8 @@
 //! Ethereum TX handler: simulate, profitability-check, and submit on-chain.
 
-use crate::blockchain::executor::{build_ethers_http1_provider, ChainExecutor};
+use crate::blockchain::executor::{
+    build_pinned_ethers_http1_provider, public_rpc_error, ChainExecutor,
+};
 use crate::blockchain::tx_manager::{SubmitError, TransactionManager};
 use crate::infra::storage::QuoteStoreError;
 use crate::price::client::FixedPriceSource;
@@ -120,6 +122,17 @@ impl PaidRejection {
             self.code(),
             BoundedDetail::from_public_message(&self.to_string())
         )
+    }
+}
+
+/// Rejection returned for the legacy `SubmitTransaction` surface, which exit nodes
+/// no longer execute. Clients must use `PaidTransactionV2`.
+#[must_use]
+pub fn legacy_submission_rejection() -> PaidRejection {
+    PaidRejection::Submission {
+        detail: BoundedDetail::from_public_message(
+            "legacy SubmitTransaction is disabled; use PaidTransactionV2",
+        ),
     }
 }
 
@@ -380,6 +393,8 @@ impl EthereumHandler {
         self.profit_calc.clear_tokens();
     }
 
+    /// In-process entry point for the legacy paid path. Not reachable from the
+    /// mixnet: exit nodes reject `SubmitTransaction` (see [`legacy_submission_rejection`]).
     pub async fn handle_paid_transaction(
         &self,
         packet_id: &str,
@@ -898,22 +913,12 @@ impl EthereumHandler {
                     ServiceError::ProcessingFailed(format!("RPC URL blocked: {e}"))
                 })?;
 
-            // DNS rebinding: connect to resolved IP for HTTP (HTTPS needs hostname for TLS).
-            let provider_url = if validated_url.scheme() == "http" {
-                let mut ip_url = validated_url.clone();
-                if ip_url.set_host(Some(&resolved_ip.to_string())).is_ok() {
-                    ip_url.to_string()
-                } else {
-                    url.clone()
-                }
-            } else {
-                url.clone()
-            };
-
-            let user_provider =
-                build_ethers_http1_provider(provider_url.as_str()).map_err(|e| {
+            // Pinned to the validated address with redirects disabled, so neither
+            // DNS rebinding nor an upstream redirect can reach another host.
+            let user_provider = build_pinned_ethers_http1_provider(&validated_url, resolved_ip)
+                .map_err(|e| {
                     ServiceError::ProcessingFailed(format!(
-                        "Failed to create provider for {url}: {e}"
+                        "Failed to create provider for user-supplied RPC URL: {e}"
                     ))
                 })?;
 
@@ -939,7 +944,8 @@ impl EthereumHandler {
                 Ok(Err(e)) => {
                     warn!(packet_id, error = %e, "Custom URL broadcast rejected");
                     return Err(ServiceError::ProcessingFailed(format!(
-                        "Broadcast rejected: {e}"
+                        "Broadcast rejected: {}",
+                        public_rpc_error(&e)
                     )));
                 }
                 Err(_) => {
@@ -1417,17 +1423,15 @@ impl ServiceHandler for EthereumHandler {
         "ethereum"
     }
 
+    /// Paid execution is only reachable through `PaidTransactionV2`; a legacy
+    /// `SubmitTransaction` payload is rejected without simulation or submission.
     async fn handle(&self, packet_id: &str, payload: &RelayerPayload) -> Result<(), ServiceError> {
         match payload {
-            RelayerPayload::SubmitTransaction { to, data } => {
-                let _ = self
-                    .handle_paid_transaction(
-                        packet_id,
-                        Address::from(*to),
-                        Bytes::from(data.clone()),
-                    )
-                    .await;
-                Ok(())
+            RelayerPayload::SubmitTransaction { .. } => {
+                warn!(packet_id, "Legacy SubmitTransaction payload rejected");
+                Err(ServiceError::ProcessingFailed(
+                    legacy_submission_rejection().public_detail(),
+                ))
             }
             _ => Ok(()),
         }

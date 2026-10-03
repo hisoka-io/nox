@@ -8,10 +8,10 @@ All packets are fixed-size **32 KB**.
 
 ```
 |<-------------- 32,768 bytes (PACKET_SIZE) ----------------->|
-|<- Header: 1024B ->|<- Nonce: 12B ->|<- Ciphertext+Tag: 31,732B ->|
+|<- Sphinx header: 472B ->|<- Onion-encrypted body: 32,296B ->|
 ```
 
-The outer packet uses ChaCha20-Poly1305 AEAD. Inside is the Sphinx header and onion-encrypted body.
+There is no outer encryption layer: the Sphinx header and body fill the packet. Application payloads are capped at `MAX_PAYLOAD_SIZE` (31,716 bytes), a budget that is part of the wire format.
 
 ### Header (472 bytes)
 
@@ -138,7 +138,9 @@ Price oracle (`nox-oracle`) aggregates from Binance and CoinGecko.
 
 ## Observability
 
-61 Prometheus metrics at `/metrics`. Additional endpoints: `/topology` (JSON), `/events` (SSE stream), `/admin/config` (redacted).
+61 Prometheus metrics at `/metrics` (JSON summary at `/metrics/json`). Additional endpoints: `/topology` (JSON), `/events` (SSE stream of node, peer and topology events), `/admin/config` (redacted). `/events` carries no per-packet events: packet counts and latency are published only as aggregates.
+
+The HTTP ingress applies a per-client-IP token bucket and an optional CORS origin allowlist (`[ingress]` in `config.example.toml`).
 
 ---
 

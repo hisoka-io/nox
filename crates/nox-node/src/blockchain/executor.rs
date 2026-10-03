@@ -32,6 +32,45 @@ pub fn build_ethers_http1_provider(rpc_url: &str) -> Result<Provider<Http>, Infr
     Ok(Provider::new(Http::new_with_client(url, client)))
 }
 
+/// Builds an HTTP/1 provider for a user-supplied RPC URL that already passed
+/// the SSRF check. The client connects only to `pinned_ip` (the address that
+/// was validated), never follows redirects and ignores proxy environment
+/// variables, so a request cannot reach an address that was not validated.
+pub fn build_pinned_ethers_http1_provider(
+    url: &url::Url,
+    pinned_ip: std::net::IpAddr,
+) -> Result<Provider<Http>, InfrastructureError> {
+    let port = url.port_or_known_default().ok_or_else(|| {
+        InfrastructureError::Blockchain("RPC URL has no port and no known default".to_string())
+    })?;
+    let mut builder = reqwest_legacy::Client::builder()
+        .http1_only()
+        .redirect(reqwest_legacy::redirect::Policy::none())
+        .no_proxy();
+    if let Some(url::Host::Domain(domain)) = url.host() {
+        builder = builder.resolve(domain, std::net::SocketAddr::new(pinned_ip, port));
+    }
+    let client = builder.build().map_err(|error| {
+        InfrastructureError::Blockchain(format!(
+            "pinned Ethers HTTP/1 client initialization failed: {error}"
+        ))
+    })?;
+    Ok(Provider::new(Http::new_with_client(url.clone(), client)))
+}
+
+/// Text of a provider error that is safe to return to an anonymous client.
+///
+/// A JSON-RPC error object from the upstream node (revert data, nonce errors)
+/// is passed through. Transport and decoding errors are replaced by a fixed
+/// message: their text can carry the upstream URL or raw response bodies.
+#[must_use]
+pub fn public_rpc_error(error: &ProviderError) -> String {
+    match RpcError::as_error_response(error) {
+        Some(response) => response.to_string(),
+        None => "upstream RPC request failed".to_string(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum OutboxBroadcastError {
     #[error("transaction is already known")]
@@ -1709,5 +1748,146 @@ mod tests {
                 }
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod user_rpc_provider_tests {
+    use super::*;
+    use axum::http::{header, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    const UNRESOLVABLE_HOST: &str = "rpc.nox-test.invalid";
+
+    async fn serve(router: Router) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        addr
+    }
+
+    async fn counting_rpc_server(hits: Arc<AtomicUsize>) -> SocketAddr {
+        serve(Router::new().route(
+            "/",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": "0x2a",
+                    }))
+                }
+            }),
+        ))
+        .await
+    }
+
+    fn user_url(port: u16) -> url::Url {
+        url::Url::parse(&format!("http://{UNRESOLVABLE_HOST}:{port}/")).expect("valid URL")
+    }
+
+    #[tokio::test]
+    async fn pinned_provider_connects_to_the_validated_address() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let target = counting_rpc_server(hits.clone()).await;
+
+        let provider = build_pinned_ethers_http1_provider(
+            &user_url(target.port()),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        )
+        .expect("provider");
+        let result: serde_json::Value = provider
+            .request("eth_blockNumber", ())
+            .await
+            .expect("pinned request reaches the validated address");
+
+        assert_eq!(result, serde_json::json!("0x2a"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pinned_provider_does_not_follow_redirects() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let target = counting_rpc_server(hits.clone()).await;
+        let location = format!("http://{target}/");
+        let redirector = serve(Router::new().route(
+            "/",
+            post(move || {
+                let location = location.clone();
+                async move {
+                    (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [(header::LOCATION, location)],
+                    )
+                        .into_response()
+                }
+            }),
+        ))
+        .await;
+
+        let provider = build_pinned_ethers_http1_provider(
+            &user_url(redirector.port()),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        )
+        .expect("provider");
+        let error = provider
+            .request::<_, serde_json::Value>("eth_blockNumber", ())
+            .await
+            .expect_err("a redirect must not be followed");
+
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(public_rpc_error(&error), "upstream RPC request failed");
+    }
+
+    #[tokio::test]
+    async fn public_rpc_error_keeps_json_rpc_errors_and_hides_transport_text() {
+        let reverting = serve(Router::new().route(
+            "/",
+            post(|Json(request): Json<serde_json::Value>| async move {
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "error": { "code": 3, "message": "execution reverted" },
+                }))
+            }),
+        ))
+        .await;
+        let provider = build_pinned_ethers_http1_provider(
+            &user_url(reverting.port()),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        )
+        .expect("provider");
+        let error = provider
+            .request::<_, serde_json::Value>("eth_call", ())
+            .await
+            .expect_err("upstream returns a JSON-RPC error");
+        assert!(public_rpc_error(&error).contains("execution reverted"));
+
+        let html =
+            serve(Router::new().route("/", post(|| async { "<html>internal admin page</html>" })))
+                .await;
+        let provider = build_pinned_ethers_http1_provider(
+            &user_url(html.port()),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        )
+        .expect("provider");
+        let error = provider
+            .request::<_, serde_json::Value>("eth_call", ())
+            .await
+            .expect_err("a non JSON-RPC body is an error");
+        let public = public_rpc_error(&error);
+        assert!(!public.contains("internal admin page"), "{public}");
+        assert!(!public.contains(UNRESOLVABLE_HOST), "{public}");
     }
 }

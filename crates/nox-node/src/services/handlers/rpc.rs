@@ -1,7 +1,10 @@
 //! Anonymous JSON-RPC proxy via the mixnet.
 //! Default provider path enforces a read-only method whitelist; user-supplied URLs allow any method.
 
-use crate::blockchain::executor::{build_ethers_http1_provider, ChainExecutor};
+use crate::blockchain::executor::{
+    build_ethers_http1_provider, build_pinned_ethers_http1_provider, public_rpc_error,
+    ChainExecutor,
+};
 use crate::services::response_packer::{PackResult, ResponsePacker};
 use crate::services::security;
 use crate::telemetry::metrics::MetricsService;
@@ -254,22 +257,12 @@ impl RpcHandler {
                     }
                 };
 
-            // DNS rebinding: connect to resolved IP for HTTP (HTTPS needs hostname for TLS).
-            let provider_url = if validated_url.scheme() == "http" {
-                let mut ip_url = validated_url.clone();
-                if ip_url.set_host(Some(&resolved_ip.to_string())).is_ok() {
-                    ip_url.to_string()
-                } else {
-                    url.to_string()
-                }
-            } else {
-                url.to_string()
-            };
-
-            let user_provider =
-                build_ethers_http1_provider(provider_url.as_str()).map_err(|e| {
+            // Pinned to the validated address with redirects disabled, so neither
+            // DNS rebinding nor an upstream redirect can reach another host.
+            let user_provider = build_pinned_ethers_http1_provider(&validated_url, resolved_ip)
+                .map_err(|e| {
                     ServiceError::ProcessingFailed(format!(
-                        "Failed to create provider for {url}: {e}"
+                        "Failed to create provider for user-supplied RPC URL: {e}"
                     ))
                 })?;
 
@@ -344,7 +337,7 @@ impl RpcHandler {
         provider
             .request::<serde_json::Value, serde_json::Value>(method, params)
             .await
-            .map_err(|e| format!("RPC call failed: {e}"))
+            .map_err(|e| format!("RPC call failed: {}", public_rpc_error(&e)))
     }
 
     async fn execute_rpc(
@@ -407,7 +400,7 @@ impl RpcHandler {
             .provider
             .call(&TypedTransaction::Legacy(tx), None)
             .await
-            .map_err(|e| format!("eth_call failed: {e}"))?;
+            .map_err(|e| format!("eth_call failed: {}", public_rpc_error(&e)))?;
 
         Ok(serde_json::Value::String(format!(
             "0x{}",
@@ -433,7 +426,7 @@ impl RpcHandler {
             .provider
             .get_balance(address, None)
             .await
-            .map_err(|e| format!("eth_getBalance failed: {e}"))?;
+            .map_err(|e| format!("eth_getBalance failed: {}", public_rpc_error(&e)))?;
 
         Ok(serde_json::Value::String(format!("0x{balance:x}")))
     }
@@ -469,7 +462,7 @@ impl RpcHandler {
             .provider
             .estimate_gas(&TypedTransaction::Legacy(tx), None)
             .await
-            .map_err(|e| format!("eth_estimateGas failed: {e}"))?;
+            .map_err(|e| format!("eth_estimateGas failed: {}", public_rpc_error(&e)))?;
 
         Ok(serde_json::Value::String(format!("0x{gas:x}")))
     }
@@ -479,7 +472,7 @@ impl RpcHandler {
             .provider
             .get_block_number()
             .await
-            .map_err(|e| format!("eth_blockNumber failed: {e}"))?;
+            .map_err(|e| format!("eth_blockNumber failed: {}", public_rpc_error(&e)))?;
 
         Ok(serde_json::Value::String(format!("0x{:x}", block.as_u64())))
     }
@@ -502,7 +495,7 @@ impl RpcHandler {
             .provider
             .get_transaction_receipt(tx_hash)
             .await
-            .map_err(|e| format!("eth_getTransactionReceipt failed: {e}"))?;
+            .map_err(|e| format!("eth_getTransactionReceipt failed: {}", public_rpc_error(&e)))?;
 
         match receipt {
             Some(r) => serde_json::to_value(r).map_err(|e| format!("Serialization failed: {e}")),
@@ -524,11 +517,10 @@ impl RpcHandler {
             .parse::<H256>()
             .map_err(|e| format!("Invalid tx hash: {e}"))?;
 
-        let tx = self
-            .provider
-            .get_transaction(tx_hash)
-            .await
-            .map_err(|e| format!("eth_getTransactionByHash failed: {e}"))?;
+        let tx =
+            self.provider.get_transaction(tx_hash).await.map_err(|e| {
+                format!("eth_getTransactionByHash failed: {}", public_rpc_error(&e))
+            })?;
 
         match tx {
             Some(t) => serde_json::to_value(t).map_err(|e| format!("Serialization failed: {e}")),
@@ -541,7 +533,7 @@ impl RpcHandler {
             .provider
             .get_chainid()
             .await
-            .map_err(|e| format!("eth_chainId failed: {e}"))?;
+            .map_err(|e| format!("eth_chainId failed: {}", public_rpc_error(&e)))?;
 
         Ok(serde_json::Value::String(format!(
             "0x{:x}",
@@ -554,7 +546,7 @@ impl RpcHandler {
             .provider
             .get_gas_price()
             .await
-            .map_err(|e| format!("eth_gasPrice failed: {e}"))?;
+            .map_err(|e| format!("eth_gasPrice failed: {}", public_rpc_error(&e)))?;
 
         Ok(serde_json::Value::String(format!("0x{gas_price:x}")))
     }
@@ -640,7 +632,7 @@ impl RpcHandler {
             .provider
             .get_logs(&filter)
             .await
-            .map_err(|e| format!("eth_getLogs failed: {e}"))?;
+            .map_err(|e| format!("eth_getLogs failed: {}", public_rpc_error(&e)))?;
 
         serde_json::to_value(logs).map_err(|e| format!("Serialization failed: {e}"))
     }
@@ -663,7 +655,7 @@ impl RpcHandler {
             .provider
             .get_code(address, None)
             .await
-            .map_err(|e| format!("eth_getCode failed: {e}"))?;
+            .map_err(|e| format!("eth_getCode failed: {}", public_rpc_error(&e)))?;
 
         Ok(serde_json::Value::String(format!(
             "0x{}",
@@ -695,7 +687,7 @@ impl RpcHandler {
             .provider
             .get_storage_at(address, slot, None)
             .await
-            .map_err(|e| format!("eth_getStorageAt failed: {e}"))?;
+            .map_err(|e| format!("eth_getStorageAt failed: {}", public_rpc_error(&e)))?;
 
         Ok(serde_json::Value::String(format!(
             "0x{}",
@@ -721,7 +713,7 @@ impl RpcHandler {
             .provider
             .get_transaction_count(address, None)
             .await
-            .map_err(|e| format!("eth_getTransactionCount failed: {e}"))?;
+            .map_err(|e| format!("eth_getTransactionCount failed: {}", public_rpc_error(&e)))?;
 
         Ok(serde_json::Value::String(format!("0x{count:x}")))
     }
@@ -748,13 +740,13 @@ impl RpcHandler {
             self.provider
                 .get_block_with_txs(block_id)
                 .await
-                .map_err(|e| format!("eth_getBlockByNumber failed: {e}"))?
+                .map_err(|e| format!("eth_getBlockByNumber failed: {}", public_rpc_error(&e)))?
                 .and_then(|b| serde_json::to_value(b).ok())
         } else {
             self.provider
                 .get_block(block_id)
                 .await
-                .map_err(|e| format!("eth_getBlockByNumber failed: {e}"))?
+                .map_err(|e| format!("eth_getBlockByNumber failed: {}", public_rpc_error(&e)))?
                 .and_then(|b| serde_json::to_value(b).ok())
         };
 
@@ -784,13 +776,13 @@ impl RpcHandler {
             self.provider
                 .get_block_with_txs(block_hash)
                 .await
-                .map_err(|e| format!("eth_getBlockByHash failed: {e}"))?
+                .map_err(|e| format!("eth_getBlockByHash failed: {}", public_rpc_error(&e)))?
                 .and_then(|b| serde_json::to_value(b).ok())
         } else {
             self.provider
                 .get_block(block_hash)
                 .await
-                .map_err(|e| format!("eth_getBlockByHash failed: {e}"))?
+                .map_err(|e| format!("eth_getBlockByHash failed: {}", public_rpc_error(&e)))?
                 .and_then(|b| serde_json::to_value(b).ok())
         };
 
@@ -817,7 +809,7 @@ impl RpcHandler {
             .provider
             .send_raw_transaction(tx_bytes)
             .await
-            .map_err(|e| format!("eth_sendRawTransaction failed: {e}"))?;
+            .map_err(|e| format!("eth_sendRawTransaction failed: {}", public_rpc_error(&e)))?;
 
         // Return the tx hash
         serde_json::to_value(pending_tx.tx_hash())
