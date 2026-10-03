@@ -15,7 +15,7 @@ use nox_core::models::payloads::{
 };
 use nox_core::models::wire_id::{reply_wire_id, PacketOrigin};
 use nox_core::protocol::fragmentation::{
-    Fragment, Reassembler, ReassemblerConfig, MAX_MESSAGE_SIZE,
+    Fragment, FragmentationError, Reassembler, ReassemblerConfig, MAX_MESSAGE_SIZE,
 };
 use nox_core::traits::service::ServiceHandler;
 use nox_core::traits::IEventSubscriber;
@@ -691,6 +691,9 @@ impl ExitService {
                         .exit_reassembly_total
                         .get_or_create(&vec![("result".to_string(), "rejected".to_string())])
                         .inc();
+                    if matches!(e, FragmentationError::DuplicateDataMismatch { .. }) {
+                        self.metrics.reassembly_conflict_total.inc();
+                    }
                     warn!(
                         message_id = message_id,
                         error = %e,
