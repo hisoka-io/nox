@@ -53,6 +53,22 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   chain position.
 - Loop cover returns to the sending node; `nox_cover_loop_{sent,returned,lost}_total` and
   `nox_cover_loop_rtt_seconds` report per-path delivery.
+- Exit payloads are dispatched through four bounded per-type lanes (`[exit_workers]`: paid, quote, proxy,
+  control). Dropped payloads and bus lag are counted per lane and subscriber.
+- A transaction sent from the exit wallet outside the node no longer pauses paid submission: the node
+  re-reads the chain nonce before signing, classifies "nonce too low" and "replacement transaction
+  underpriced", retires an outbox record whose nonce was mined by another transaction and releases its quote.
+- Paid quotes are refused while submission is paused. Quote admission checks reservation limits earlier, and
+  expired reservations are released on demand.
+- New metrics: `nox_paid_outcomes_total{kind,result,code}`, `nox_eth_submission_blocked`,
+  `nox_eth_wallet_balance_gwei`, `nox_eth_wallet_balance_low`, `nox_quote_outstanding`,
+  `nox_quote_pending_sponsored_gas`, `nox_quote_rolling_loss_gwei`, `nox_storage_degraded`,
+  `nox_exit_payloads_dropped_total`, `nox_exit_lane_inflight`, `nox_event_bus_subscriber_lagged_total`.
+  Paid v2 submissions now count in `nox_eth_transactions_submitted_total{type="paid_v2"}`, and
+  `nox_health_status` reports 1 (degraded) while storage writes fail or paid submission is paused.
+- Price server: one HTTP client with a descriptive User-Agent and a 10 s timeout, providers polled
+  concurrently, Binance via `api.binance.us`, CryptoCompare only with `PRICE_CRYPTOCOMPARE_API_KEY`, and a
+  price is published only when `PRICE_MIN_SOURCES` (default 2) providers agree.
 
 ## [0.1.0] - 2026-04-10
 

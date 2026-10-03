@@ -18,6 +18,7 @@ use nox_core::models::payloads::RelayerPayload;
 use nox_core::traits::service::{ServiceError, ServiceHandler};
 use std::fmt;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -27,6 +28,8 @@ use tracing::{info, warn};
 const BROADCAST_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 
 const DEFAULT_BROADCAST_METHOD: &str = "eth_sendRawTransaction";
+/// Minimum spacing between on-demand expired-quote sweeps triggered by a full quote book.
+const QUOTE_PRUNE_MIN_INTERVAL_SECS: u64 = 2;
 pub const MAX_PUBLIC_DETAIL_BYTES: usize = 256;
 const PAID_EXECUTION_SETTLED_SIGNATURE: &[u8] = b"PaidExecutionSettled(bytes32,bytes32,address,address,uint256,uint256,address,bool,uint256,bytes32)";
 
@@ -146,6 +149,7 @@ pub struct EthereumHandler {
     initial_fee_buffer_bps: u32,
     nox_entry_point_address: Address,
     quote_policy: Option<QuotePolicy>,
+    last_quote_prune_unix: AtomicU64,
 }
 
 impl EthereumHandler {
@@ -172,6 +176,7 @@ impl EthereumHandler {
             initial_fee_buffer_bps: crate::config::DEFAULT_INITIAL_FEE_BUFFER_BPS,
             nox_entry_point_address: Address::zero(),
             quote_policy: None,
+            last_quote_prune_unix: AtomicU64::new(0),
         }
     }
 
@@ -191,6 +196,22 @@ impl EthereumHandler {
     }
 
     pub async fn handle_paid_quote_v2(
+        &self,
+        request: nox_core::PaidQuoteRequestV2,
+    ) -> nox_core::PaidQuoteOutcomeV2 {
+        let outcome = self.issue_paid_quote_v2(request).await;
+        match &outcome {
+            nox_core::PaidQuoteOutcomeV2::Issued { .. } => {
+                record_paid_outcome(&self.metrics, "quote", "issued", None);
+            }
+            nox_core::PaidQuoteOutcomeV2::Rejected { code, .. } => {
+                record_paid_outcome(&self.metrics, "quote", "rejected", Some(*code));
+            }
+        }
+        outcome
+    }
+
+    async fn issue_paid_quote_v2(
         &self,
         request: nox_core::PaidQuoteRequestV2,
     ) -> nox_core::PaidQuoteOutcomeV2 {
@@ -230,6 +251,25 @@ impl EthereumHandler {
             Ok(validated) => validated,
             Err(code) => return paid_quote_rejection(code, false, "paid quote request rejected"),
         };
+        if self.tx_manager.is_submission_blocked() {
+            return paid_quote_rejection(
+                nox_core::PaidTransactionRejectionCodeV2::SubmissionFailure,
+                true,
+                "exit submission is paused",
+            );
+        }
+        if let Err(error) = self
+            .admit_quote(
+                policy,
+                maximum_transaction_gas,
+                wall_timestamp,
+                chain_timestamp,
+            )
+            .await
+        {
+            let (code, retryable) = quote_store_rejection(&error);
+            return paid_quote_rejection(code, retryable, "quote reservation failed");
+        }
         let network_fee_per_gas = match self.chain_executor.get_gas_price().await {
             Ok(price) => price,
             Err(_) => {
@@ -359,27 +399,7 @@ impl EthereumHandler {
             )
             .await
         {
-            let (code, retryable) = match error {
-                QuoteStoreError::DuplicateIdentity => (
-                    nox_core::PaidTransactionRejectionCodeV2::DuplicateExecution,
-                    false,
-                ),
-                QuoteStoreError::PendingLossLimit => (
-                    nox_core::PaidTransactionRejectionCodeV2::PendingLossLimit,
-                    false,
-                ),
-                QuoteStoreError::OutstandingCapacity | QuoteStoreError::PendingGasCapacity => (
-                    nox_core::PaidTransactionRejectionCodeV2::QuoteCapacityExceeded,
-                    true,
-                ),
-                QuoteStoreError::Unknown
-                | QuoteStoreError::Expired
-                | QuoteStoreError::NotOutstanding
-                | QuoteStoreError::Storage(_) => (
-                    nox_core::PaidTransactionRejectionCodeV2::SubmissionFailure,
-                    true,
-                ),
-            };
+            let (code, retryable) = quote_store_rejection(&error);
             return paid_quote_rejection(code, retryable, "quote reservation failed");
         }
         nox_core::PaidQuoteOutcomeV2::Issued {
@@ -387,6 +407,53 @@ impl EthereumHandler {
             execution_id: digest.0,
             exit_signature: signature,
         }
+    }
+
+    /// Refuses a quote before any RPC, oracle or signing work when the reservation limits are
+    /// already reached. Expired quotes are released first (at most once per
+    /// [`QUOTE_PRUNE_MIN_INTERVAL_SECS`]), so their capacity returns as soon as they lapse
+    /// instead of at the next monitor tick. `create_quote_durably` still enforces the limits
+    /// atomically.
+    async fn admit_quote(
+        &self,
+        policy: &QuotePolicy,
+        requested_gas: u64,
+        wall_timestamp: u64,
+        chain_timestamp: u64,
+    ) -> Result<(), QuoteStoreError> {
+        let storage = self.tx_manager.quote_storage();
+        let admit = |counters: crate::infra::storage::QuoteCounters| {
+            counters.admit(
+                requested_gas,
+                policy.maximum_outstanding,
+                policy.maximum_pending_sponsored_gas,
+                policy.rolling_loss_limit_native,
+                policy.rolling_loss_window_secs,
+                wall_timestamp,
+            )
+        };
+        match admit(storage.quote_counters().await?) {
+            Err(QuoteStoreError::OutstandingCapacity | QuoteStoreError::PendingGasCapacity) => {}
+            other => return other,
+        }
+        let last_prune = self.last_quote_prune_unix.load(Ordering::Relaxed);
+        if chain_timestamp.saturating_sub(last_prune) < QUOTE_PRUNE_MIN_INTERVAL_SECS
+            || self
+                .last_quote_prune_unix
+                .compare_exchange(
+                    last_prune,
+                    chain_timestamp,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+        {
+            return admit(storage.quote_counters().await?);
+        }
+        storage
+            .prune_expired_quotes_durably(chain_timestamp)
+            .await?;
+        admit(storage.quote_counters().await?)
     }
 
     pub(crate) fn clear_tokens(&mut self) {
@@ -412,6 +479,33 @@ impl EthereumHandler {
     }
 
     pub async fn handle_paid_transaction_v2(
+        &self,
+        request: nox_core::PaidTransactionRequestV2,
+    ) -> nox_core::PaidTransactionOutcomeV2 {
+        let outcome = self.execute_paid_transaction_v2(request).await;
+        match &outcome {
+            nox_core::PaidTransactionOutcomeV2::Submitted { .. } => {
+                record_paid_outcome(&self.metrics, "execution", "submitted", None);
+                self.metrics
+                    .eth_transactions_submitted
+                    .get_or_create(&vec![("type".into(), "paid_v2".into())])
+                    .inc();
+                self.metrics
+                    .eth_tx_outcomes_total
+                    .get_or_create(&vec![
+                        ("type".into(), "paid_v2".into()),
+                        ("result".into(), "submitted".into()),
+                    ])
+                    .inc();
+            }
+            nox_core::PaidTransactionOutcomeV2::Rejected { code, .. } => {
+                record_paid_outcome(&self.metrics, "execution", "rejected", Some(*code));
+            }
+        }
+        outcome
+    }
+
+    async fn execute_paid_transaction_v2(
         &self,
         request: nox_core::PaidTransactionRequestV2,
     ) -> nox_core::PaidTransactionOutcomeV2 {
@@ -548,6 +642,15 @@ impl EthereumHandler {
                 nox_core::PaidTransactionRejectionCodeV2::MalformedRequest,
                 false,
                 "request does not match stored quote",
+            );
+        }
+
+        if self.tx_manager.is_submission_blocked() {
+            return paid_v2_rejection(
+                Some(request.execution_id),
+                nox_core::PaidTransactionRejectionCodeV2::SubmissionFailure,
+                true,
+                "exit submission is paused",
             );
         }
 
@@ -734,6 +837,24 @@ impl EthereumHandler {
                 execution_id: request.execution_id,
                 transaction_hash,
             },
+            Err(SubmitError::NonceConsumed { .. }) => {
+                let _ = self
+                    .tx_manager
+                    .quote_storage()
+                    .finalize_quote_durably(
+                        request.execution_id,
+                        nox_core::QuoteStatusV2::Rejected,
+                        U256::zero(),
+                        wall_timestamp,
+                    )
+                    .await;
+                return paid_v2_rejection(
+                    Some(request.execution_id),
+                    nox_core::PaidTransactionRejectionCodeV2::SubmissionFailure,
+                    true,
+                    "exit wallet nonce changed; request a new quote",
+                );
+            }
             Err(error @ (SubmitError::GasPlan { .. } | SubmitError::Signing { .. })) => {
                 let _ = self
                     .tx_manager
@@ -1093,6 +1214,7 @@ impl EthereumHandler {
             initial_fee_buffer_bps,
             nox_entry_point_address,
             quote_policy: None,
+            last_quote_prune_unix: AtomicU64::new(0),
         })
     }
 }
@@ -1414,7 +1536,54 @@ fn map_submit_error(error: SubmitError) -> PaidRejection {
                 "transaction broadcast outcome is ambiguous",
             ),
         },
+        SubmitError::NonceConsumed { .. } => PaidRejection::Submission {
+            detail: BoundedDetail::from_public_message("exit wallet nonce changed"),
+        },
     }
+}
+
+fn quote_store_rejection(
+    error: &QuoteStoreError,
+) -> (nox_core::PaidTransactionRejectionCodeV2, bool) {
+    match error {
+        QuoteStoreError::DuplicateIdentity => (
+            nox_core::PaidTransactionRejectionCodeV2::DuplicateExecution,
+            false,
+        ),
+        QuoteStoreError::PendingLossLimit => (
+            nox_core::PaidTransactionRejectionCodeV2::PendingLossLimit,
+            false,
+        ),
+        QuoteStoreError::OutstandingCapacity | QuoteStoreError::PendingGasCapacity => (
+            nox_core::PaidTransactionRejectionCodeV2::QuoteCapacityExceeded,
+            true,
+        ),
+        QuoteStoreError::Unknown
+        | QuoteStoreError::Expired
+        | QuoteStoreError::NotOutstanding
+        | QuoteStoreError::Storage(_) => (
+            nox_core::PaidTransactionRejectionCodeV2::SubmissionFailure,
+            true,
+        ),
+    }
+}
+
+/// Counts a paid quote or execution outcome; `code` is the rejection code when rejected.
+fn record_paid_outcome(
+    metrics: &MetricsService,
+    kind: &str,
+    result: &str,
+    code: Option<nox_core::PaidTransactionRejectionCodeV2>,
+) {
+    let code = code.map_or_else(|| "none".to_string(), |code| format!("{code:?}"));
+    metrics
+        .paid_outcomes_total
+        .get_or_create(&vec![
+            ("kind".into(), kind.into()),
+            ("result".into(), result.into()),
+            ("code".into(), code),
+        ])
+        .inc();
 }
 
 #[async_trait]

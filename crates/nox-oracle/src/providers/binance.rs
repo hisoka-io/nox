@@ -6,6 +6,10 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 
+pub const DEFAULT_BASE_URL: &str = "https://api.binance.us/api/v3";
+
+/// Binance-compatible ticker provider. Defaults to Binance.US, because `api.binance.com`
+/// answers 451 from US hosts. Both expose the same `/api/v3/ticker/price` shape.
 pub struct BinanceProvider {
     client: Client,
     base_url: String,
@@ -20,18 +24,21 @@ impl Default for BinanceProvider {
 impl BinanceProvider {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            client: Client::new(),
-            base_url: "https://api.binance.com/api/v3".to_string(),
-        }
+        Self::with_client(
+            crate::http::default_provider_client(),
+            DEFAULT_BASE_URL.to_string(),
+        )
     }
 
     #[must_use]
     pub fn with_base_url(base_url: String) -> Self {
-        Self {
-            client: Client::new(),
-            base_url,
-        }
+        Self::with_client(crate::http::default_provider_client(), base_url)
+    }
+
+    /// Uses a caller-supplied client (see [`crate::http::provider_client`]).
+    #[must_use]
+    pub fn with_client(client: Client, base_url: String) -> Self {
+        Self { client, base_url }
     }
 
     fn map_to_symbol(&self, asset: &str) -> Option<&'static str> {
