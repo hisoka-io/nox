@@ -134,6 +134,20 @@ Three reputation tiers: Unknown, Trusted, Penalized.
 | `request_timeout_secs` | `10` | Proxy timeout |
 | `max_response_bytes` | `1048576` | Max response (1 MB) |
 
+### `[exit_workers]` (exit node)
+
+Decoded exit payloads go to one of four lanes, each with its own bounded queue and
+concurrency limit. A full lane drops new payloads and counts them in
+`nox_exit_payloads_dropped_total{lane,reason}`; the other lanes keep running.
+
+| Field | Default | Lane |
+|---|---|---|
+| `paid_concurrency` | `4` | Paid transaction submissions |
+| `quote_concurrency` | `8` | Paid quote requests |
+| `proxy_concurrency` | `32` | HTTP, RPC and signed-transaction broadcast |
+| `control_concurrency` | `16` | Echo and cover traffic |
+| `queue_capacity` | `256` | Payloads waiting per lane |
+
 ## Node roles
 
 | Role | Wallet | Chain execution | Exit service |
@@ -178,7 +192,13 @@ identity that result from the file and the environment together.
 |---|---|---|
 | `RUST_LOG` | `info` | Tracing filter (e.g., `debug`, `nox_node=trace`) |
 | `PRICE_SERVER_PORT` | `3000` | Oracle HTTP server port |
-| `PRICE_SERVER_BIND` | `127.0.0.1` | Oracle bind address |
+| `PRICE_SERVER_BIND` | `127.0.0.1` | Oracle bind address. Keep it on loopback: only the local exit reads it |
+| `PRICE_MIN_SOURCES` | `2` | Providers that must agree on an asset before its price is published. Below this, the last price ages out and exits refuse quotes instead of trusting one feed |
+| `PRICE_HTTP_TIMEOUT_SECS` | `10` | Total timeout for one upstream price request |
+| `PRICE_BINANCE_BASE_URL` | `https://api.binance.us/api/v3` | Binance-compatible ticker API (`api.binance.com` refuses US hosts) |
+| `PRICE_COINGECKO_API_KEY` | unset | Optional CoinGecko demo key. The keyless API works without it |
+| `PRICE_CRYPTOCOMPARE_API_KEY` | unset | CryptoCompare is used only when this key is set |
+| `PRICE_KRAKEN_BASE_URL`, `PRICE_COINGECKO_BASE_URL`, `PRICE_CRYPTOCOMPARE_BASE_URL` | public endpoints | Upstream overrides, for mirrors and tests |
 
 ## Examples
 
