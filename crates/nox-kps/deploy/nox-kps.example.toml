@@ -1,0 +1,58 @@
+# nox-kps configuration (mounted at /etc/nox-kps/config.toml).
+# Every key below shows its default except `advertise` and `expected_certhash`, which each node sets.
+# Validate with: nox-kps check-config --config nox-kps.toml
+# Environment overrides: NOX_KPS__<KEY>, NOX_KPS__LIMITS__<KEY> (lists comma-separated).
+
+listen = "[::]:15005"                 # one UDP port: WebRTC for browsers + QUIC for native clients
+advertise = ["203.0.113.10"]          # REQUIRED: the node's public IP(s); EC2 hosts sit behind 1:1 NAT
+key_file = "/var/lib/nox-kps/kps.key" # created once by `nox-kps init`; certhash = published address
+expected_certhash = ""                # REQUIRED by `run`: the certhash `nox-kps init` printed
+node_address = ""                     # the node's registry address (0x...), shown in /metadata.json
+upstream_ingress = "127.0.0.1:15002"  # node ingress_port: packets, claims, health
+upstream_topology = "127.0.0.1:15003" # node topology_api_port
+client_ip_header = "x-real-ip"        # must equal the node's [ingress] client_ip_header
+keccak_dir = "/var/lib/nox-kps/keccak" # worker bundles; "" turns the kps: resolver off
+admin_listen = "127.0.0.1:15006"      # /metrics and /healthz, loopback only
+log_level = "info"
+log_format = "json"
+summary_interval_secs = 60
+
+[limits]
+max_connections = 256
+max_connections_per_ip = 16
+max_streams_per_connection = 32
+conn_idle_timeout_secs = 120
+conn_max_lifetime_secs = 3600
+header_max_bytes = 16384
+header_read_timeout_ms = 10000
+stream_timeout_ms = 30000
+max_stream_timeouts_per_connection = 2
+close_timeout_ms = 1000
+packet_rate_per_ip = 20
+packet_burst = 100
+claim_rate_per_ip = 30
+claim_burst = 200
+topology_rate_per_ip = 2
+topology_burst = 10
+bundle_rate_per_ip = 1
+bundle_burst = 5
+claim_request_max_bytes = 65536
+claim_max_surb_ids = 128               # each ID may match one ~127 KB JSON reply; 128 x 126,928 + 2 must fit below
+claim_response_max_bytes = 16777216
+topology_response_max_bytes = 1048576
+upstream_connect_timeout_ms = 1000
+upstream_packet_timeout_ms = 5000
+upstream_claim_timeout_ms = 10000
+upstream_topology_timeout_ms = 5000
+upstream_health_timeout_ms = 1000
+max_inflight_upstream = 128
+topology_cache_ms = 1000
+health_cache_ms = 1000
+max_bundle_bytes = 67108864
+max_bundles = 16
+max_concurrent_bundle_streams = 8
+bundle_rescan_secs = 60
+
+[shutdown]
+grace_period_ms = 10000
+close_linger_ms = 2000

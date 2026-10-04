@@ -1,0 +1,118 @@
+name: nox-kps CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C target-cpu=x86-64-v2"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: 1.95.0
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          prefix-key: v1-nox-kps
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy (all targets, warnings are errors)
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: kps patch revs match the pinned kps release
+        run: bash scripts/check-kps-patches.sh
+      - name: Advisory exceptions have not expired
+        run: bash scripts/check-advisory-exceptions.sh
+      - name: Unprivileged runtime image
+        run: |
+          grep -F "USER 10002:10002" Dockerfile
+          grep -F "useradd --uid 10002" Dockerfile
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          prefix-key: v1-nox-kps
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Unit and integration tests (QUIC and WebRTC over loopback)
+        run: cargo test --locked
+      - name: Soak (200 sequential 32 KiB exchanges per transport and direction)
+        run: cargo test --locked --release --test soak -- --ignored --nocapture
+        env:
+          SOAK_REQUESTS: "200"
+          SOAK_STALL_MS: "5000"
+
+  interop:
+    name: Interop (reference Node QUIC client)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          prefix-key: v1-nox-kps
+          save-if: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Build nox-kps
+        run: cargo build --locked --bin nox-kps
+      - name: "@kpstreams/quic-client 0.2.1 against nox-kps"
+        working-directory: interop
+        run: npm ci && npm test
+
+  security:
+    name: Security (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check
+          arguments: --locked
+
+  docker:
+    name: Container image
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build
+        run: docker build --tag nox-kps:ci .
+      - name: Smoke (init, check-config, run, healthcheck, restart keeps the certhash)
+        run: bash scripts/container-smoke.sh nox-kps:ci

@@ -1,0 +1,16 @@
+nox-kps
+Copyright 2026 Hisoka IO
+
+This product includes software developed by Hisoka IO (https://hisoka.io),
+licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Parts of the per-stream HTTP/1.1 handling (the hyper server settings for one
+exchange per KPS stream and the request header-block size check) are adapted
+from tor-js-gateway in ethereum/tor-js (https://github.com/ethereum/tor-js),
+Copyright 2019-2025 The Tor Project, Inc. and Copyright 2026 Ethereum
+Foundation, used under the Apache License, Version 2.0 (tor-js is licensed
+MIT OR Apache-2.0). The [patch.crates-io] block in Cargo.toml and its comment
+are copied from the tor-js workspace root.
+
+KPS transport: the kps crate from ethereum/kps (https://github.com/ethereum/kps),
+with the webrtc and webrtc-sctp patches published on that repository.

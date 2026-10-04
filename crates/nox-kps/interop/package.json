@@ -1,0 +1,13 @@
+{
+  "name": "nox-kps-interop",
+  "private": true,
+  "type": "module",
+  "description": "Interop tests: the KPS reference JS clients against a nox-kps binary",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 quic.test.mjs"
+  },
+  "dependencies": {
+    "@kpstreams/quic-client": "0.2.1"
+  }
+}
