@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Checks that the workspace [patch.crates-io] revs for webrtc and webrtc-sctp
-# equal the ones in libs/rust/Cargo.toml at the kps tag this workspace pins,
+# Checks that the nox workspace [patch.crates-io] revs for webrtc and webrtc-sctp
+# equal the ones in libs/rust/Cargo.toml at the kps tag nox-kps pins,
 # and that Cargo.lock resolved that tag to the commit it names upstream (a
 # moved tag fails here). A kps bump that forgets the patches fails here
 # instead of at runtime.
