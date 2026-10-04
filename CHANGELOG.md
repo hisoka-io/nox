@@ -10,9 +10,18 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 - `nox-kps` (`crates/nox-kps`), the KPS entry sidecar: browsers (WebRTC) and native clients (QUIC) reach a node
   directly on UDP 15005, authenticated by the certificate hash in the node's KPS address, and nox-kps forwards a
   fixed route allowlist to the node's loopback ingress. The node image carries the `nox-kps` binary; it runs as its
-  own container from that image as uid 10002, and the node binary keeps its behaviour. Operator guide:
-  [crates/nox-kps/README.md](crates/nox-kps/README.md); wire profile:
+  own container from that image as uid 10002. The one node setting nox-kps uses is `[ingress] client_ip_header`.
+  Operator guide: [crates/nox-kps/README.md](crates/nox-kps/README.md); wire profile:
   [crates/nox-kps/PROTOCOL.md](crates/nox-kps/PROTOCOL.md).
+
+### Fixed
+
+- Nodes keep delivering P2P packets when the per-peer or total connection limit refuses an extra connection, for
+  example when a registry replay re-dials a peer that is already connected. The connection limit now decides
+  before request-response registers a connection, so request-response sends only over connections that opened
+  (in rc.4 it could pick the refused connection, and packets sent to it were dropped). Nodes get the fix by
+  running the new node image. Regression test: `packets_survive_refused_duplicate_connections` in
+  `tests/p2p_connectivity.rs`.
 
 ### Changes
 

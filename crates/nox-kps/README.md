@@ -26,8 +26,7 @@ the node's loopback ingress and serves the rest itself:
 nox-kps is built and released with the node: the `nox` image carries the
 `nox-kps` binary, and nox-kps runs from that image as its own container in the
 node's compose project, with host networking, as uid 10002 (the node runs as
-uid 10001). The node binary keeps its behaviour; the one node setting nox-kps
-uses is `[ingress] client_ip_header`.
+uid 10001). nox-kps needs one node setting, `[ingress] client_ip_header`.
 
 ## Ports
 
