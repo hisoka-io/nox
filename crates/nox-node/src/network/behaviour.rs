@@ -40,16 +40,23 @@ pub struct GossipMessage {
     pub content: Vec<u8>,
 }
 
+/// Field order is the order libp2p asks each behaviour to accept a new
+/// connection, and the first refusal stops it. Behaviours that can refuse come
+/// first: one listed later would refuse a connection that earlier behaviours
+/// already registered, and `request_response` then keeps sending requests to
+/// that connection, which never exists, so those packets are lost.
 #[derive(NetworkBehaviour)]
 pub struct NoxBehaviour {
     /// First, so registry admission is decided before other behaviours set up
     /// state for the connection.
     pub admission: AdmissionGate,
+    /// Second, for the same reason: a connection over the per-peer or total
+    /// limit is refused before any behaviour below has seen it.
+    pub connection_limits: connection_limits::Behaviour,
     pub ping: ping::Behaviour,
     pub identify: identify::Behaviour,
     pub gossipsub: gossipsub::Behaviour,
     pub direct_message: request_response::cbor::Behaviour<SystemMessage, SystemMessage>,
-    pub connection_limits: connection_limits::Behaviour,
 }
 
 impl NoxBehaviour {
@@ -95,11 +102,11 @@ impl NoxBehaviour {
 
         Ok(Self {
             admission,
+            connection_limits,
             ping,
             identify,
             gossipsub,
             direct_message,
-            connection_limits,
         })
     }
 }

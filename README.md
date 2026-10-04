@@ -58,6 +58,7 @@ Full setup guide, prerequisites, environment variables, and testing in [docs/qui
 - [Quick setup](docs/quick-setup.md)
 - [Architecture](docs/architecture.md)
 - [Configuration](docs/configuration.md)
+- [KPS entry (nox-kps)](crates/nox-kps/README.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security](SECURITY.md)
 - [Changelog](CHANGELOG.md)

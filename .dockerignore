@@ -19,3 +19,5 @@ SECURITY.md
 Makefile
 deny.toml
 rustfmt.toml
+**/node_modules/
+crates/nox-kps/interop/

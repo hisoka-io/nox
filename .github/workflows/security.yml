@@ -21,4 +21,7 @@ jobs:
         run: bash scripts/check-rustsec-exceptions.sh
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
-          command: check advisories licenses bans
+          command: check advisories licenses bans sources
+          # The root package is not a virtual manifest, so without --workspace
+          # cargo-deny would check only the nox binary's graph (not nox-kps).
+          arguments: --all-features --workspace

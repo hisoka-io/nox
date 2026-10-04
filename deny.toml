@@ -8,7 +8,7 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 # Temporary exceptions are tracked with reachability and migration deadlines in SECURITY.md.
 ignore = [
-    "RUSTSEC-2025-0141", # expires=2026-12-31 owner=protocol-wire
+    "RUSTSEC-2025-0141", # expires=2026-12-01 owner=protocol-wire,nox-kps
     "RUSTSEC-2025-0057", # expires=2026-12-31 owner=chain-transport
     "RUSTSEC-2024-0384", # expires=2026-12-31 owner=networking
     "RUSTSEC-2024-0436", # expires=2026-12-31 owner=networking
@@ -52,11 +52,21 @@ license-files = []
 multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"
+deny = [
+    # RUSTSEC-2026-0285: the rustls 0.23 line (kps QUIC and nox-kps) must resolve 0.23.45 or newer.
+    { name = "rustls", version = ">=0.23, <0.23.45" },
+    # chacha20 0.10.1 was yanked; 0.10.2 or 0.9.x only.
+    { name = "chacha20", version = "=0.10.1" },
+]
 
 [sources]
-unknown-registry = "warn"
-unknown-git = "warn"
+unknown-registry = "deny"
+unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     "https://github.com/zkpassport/noir_rs",
+    # nox-kps: the kps library and its vendored webrtc / webrtc-sctp patches (orphan
+    # branches of the kps repository; see the workspace Cargo.toml). cargo-deny
+    # normalises the ".git" suffix, so one entry covers both spellings.
+    "https://github.com/ethereum/kps",
 ]

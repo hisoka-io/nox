@@ -1,0 +1,62 @@
+[package]
+name = "nox-kps"
+description = "KPS entry sidecar for Nox mixnet nodes: WebRTC and QUIC on one UDP port, proxied to the node's loopback ingress"
+version.workspace = true
+edition = "2021"
+rust-version = "1.95"
+authors = ["Hisoka IO"]
+license = "Apache-2.0"
+repository = "https://github.com/hisoka-io/nox"
+publish = false
+
+[lib]
+name = "nox_kps"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nox-kps"
+path = "src/main.rs"
+
+[dependencies]
+# KPS transport (QUIC + WebRTC on one UDP port). Not on crates.io; the nox
+# workspace root carries the [patch.crates-io] block it needs.
+kps = { git = "https://github.com/ethereum/kps", tag = "libs/rust/v0.2.2" }
+
+# Interface listing for the loopback preflight check (already in the graph
+# through kps -> webrtc; pinned to that exact version).
+webrtc-util = { version = "=0.12.0", default-features = false, features = ["ifaces"] }
+
+# Runtime
+tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# HTTP/1.1 on each KPS stream (server) and towards the loopback upstreams (client)
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+
+# Config, CLI, errors
+serde = { workspace = true }
+serde_json = { workspace = true }
+config = { version = "0.14", default-features = false, features = ["toml"] }
+clap = { version = "4.4", features = ["derive", "env"] }
+thiserror = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+prometheus-client = "0.22"
+
+# Worker bundles (anon-rpc SPEC §4.2 kps: resolver profile)
+sha3 = "0.10"
+hex = { workspace = true }
+flate2 = "1"
+
+[dev-dependencies]
+tempfile = "3.10"
+httparse = "1"
+
+[lints]
+workspace = true

@@ -55,7 +55,7 @@ documented reachability, and an enforced control.
 
 | Advisory | Reachability | Compensating control | Migration owner | Deadline |
 | --- | --- | --- | --- | --- |
-| `RUSTSEC-2025-0141` | Bincode v1 encodes the versioned mixnet wire | Payload size/version limits and strict inner decoding are enforced; outer Sphinx padding has a dedicated zero-only decoder | protocol-wire | 2026-12-31 |
+| `RUSTSEC-2025-0141` | Bincode v1 encodes the versioned mixnet wire; in nox-kps, `kps -> webrtc -> webrtc-dtls` (de)serialises local DTLS session state | Payload size/version limits and strict inner decoding are enforced; outer Sphinx padding has a dedicated zero-only decoder; nox-kps hands bincode no network input | protocol-wire, nox-kps | 2026-12-01 |
 | `RUSTSEC-2025-0057` | `ethers-providers -> hashers -> fxhash` internal request maps, and `sled 0.34 -> fxhash` in the node's local store | RPC methods, payload sizes, concurrency, and timeouts are bounded; sled hashes only its internal page ids, log offsets and tree names with it, never stored keys | chain-transport, storage | 2026-12-31 |
 | `RUSTSEC-2024-0384` | Ethers and libp2p runtime timing | Protocol expiry and money arithmetic use explicit chain or standard monotonic time, not this crate | networking | 2026-12-31 |
 | `RUSTSEC-2024-0436` | `libp2p -> netlink-packet-utils -> paste` proc macro | Build-time expansion only; no runtime input reaches the macro | networking | 2026-12-31 |
@@ -63,7 +63,7 @@ documented reachability, and an enforced control.
 | `RUSTSEC-2025-0010` | Same Ethers JSON Web Token dependency path | No Nox runtime JWT call site; migrate the legacy Ethers provider rather than adopting another obsolete Ring line | chain-transport | 2026-12-31 |
 | `RUSTSEC-2025-0134` | `ethers -> reqwest 0.11 -> rustls-pemfile` | Ethers Rustls features are disabled and production Ethers HTTP clients use HTTP/1 with native TLS | chain-transport | 2026-12-31 |
 | `RUSTSEC-2026-0258` | `ethers 2.0.14 -> reqwest 0.11 -> h2 0.3` | Every production Ethers HTTP provider is built with an HTTP/1-only client; Ethers' redundant Rustls feature is disabled | chain-transport | 2026-11-30 |
-| Yanked `keccak 0.1.5` | Ethers signing, ABI, and hash dependencies | Cargo lock checksum is pinned; EIP-712, transaction identity, and cross-language hash vectors are tested | chain-transport | 2026-12-31 |
+| Yanked `keccak 0.1.5` | Ethers signing, ABI, and hash dependencies; `sha3` worker-bundle hashing in nox-kps | Cargo lock checksum is pinned; EIP-712, transaction identity, and cross-language hash vectors are tested; nox-kps tests bundle names against known Keccak-256 digests | chain-transport | 2026-12-31 |
 | Yanked `spin 0.9.8` | `reed-solomon-erasure 6` synchronization | Fragment/shard counts and memory are bounded; FEC property, corruption, and recovery suites cover the path | protocol-wire | 2026-12-31 |
 
 Owners must migrate Ethers to Alloy, update libp2p and Reed-Solomon dependencies, replace sled as the node's local
