@@ -28,18 +28,21 @@ CRLF
 Then the client closes its write side (`closeWrite()`).
 
 - Header block (request line included): at most 16 KiB, else `431`.
-- Complete header block within 30 s of opening the stream, else the stream is reset.
+- Complete header block within 10 s of opening the stream, else the stream is reset.
 - The whole exchange completes within 30 s, else the stream is reset.
 - Refused with `400`: `Transfer-Encoding`, more than one distinct `Content-Length`,
   `Upgrade`, `Expect`, a missing `Host`, an absolute-form target. `obs-fold` is
   refused by the parser.
 - HTTP versions other than 1.1: `505`.
+- A body shorter than its `Content-Length` abandons the exchange: the stream is
+  reset without a response.
 - A second request written on the same stream is never read.
 
 ## 3. Responses
 
-- Status line, headers, body. nox-kps always sends `Content-Length` and then
-  finishes the stream, so the body is also delimited by end of stream.
+- Status line, headers, body. nox-kps always sends `Content-Length` (except on
+  `204` and `304`, which carry neither body nor length) and then finishes the
+  stream, so the body is also delimited by end of stream.
 - Never `Transfer-Encoding`, never `3xx`.
 - Errors carry a short `text/plain; charset=utf-8` diagnostic that clients must
   not parse.
@@ -64,7 +67,8 @@ a `GET` route is `400`. Query strings are ignored and never forwarded.
 Per client IP (IPv6: per /64), token buckets limit packets (20/s, burst 100),
 claims (30/s, burst 200), topology (2/s, burst 10) and bundles (1/s, burst 5).
 Over the limit: `429` with `Retry-After: 1`. When too many upstream requests
-are in flight: `503` with `Retry-After: 1`.
+are in flight, or 8 bundle downloads are already in progress: `503` with
+`Retry-After: 1`.
 
 Upstream failures: `502` (connection refused or reset, response over the
 relay cap) and `504` (no answer in time). Other node statuses pass through.

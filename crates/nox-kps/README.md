@@ -36,6 +36,11 @@ project, with host networking, as uid 10002.
 Open UDP 15005 in the cloud security group and in the host firewall. nox-kps
 makes no outbound internet connections.
 
+The `lo` interface should carry only `127.0.0.1/8` and `::1`: the kps listener
+gathers its WebRTC candidates from `lo*` interfaces, and an extra address there
+breaks browser dials. `nox-kps check-config` and the startup log name any
+such address.
+
 ## Install on a node
 
 1. Load the image (until a registry image is published):
@@ -65,7 +70,10 @@ makes no outbound internet connections.
 
    The key lives in the `nox-kps-identity` volume. Back it up with the node's
    other secrets: the certhash is part of the node's published address, and
-   `nox-kps run` only ever loads this key.
+   `nox-kps run` only ever loads this key. Copy the printed
+   `expected_certhash = "..."` line into `nox-kps.toml`: `run` serves only the
+   identity it names, so a swapped or wrongly restored volume is caught before
+   any client connects.
 
 5. Set the node's client-IP header so its per-IP limits apply to KPS clients
    (nginx already sends the same header), then restart the node:
@@ -108,9 +116,11 @@ keys are refused, and every invalid value is reported with its field name.
 [`deploy/nox-kps.example.toml`](deploy/nox-kps.example.toml) lists every key
 with its default.
 
-Limits worth knowing: 512 connections (16 per client IP), 64 concurrent streams
-per connection, 300 s idle timeout, 24 h connection lifetime, 30 s per
-exchange, and per-IP request rates that match the node's nginx limits.
+Limits worth knowing: 256 connections (16 per client IP), 32 concurrent streams
+per connection, 120 s idle timeout, 1 h connection lifetime, 10 s to send a
+request head, 30 s per exchange, 8 bundle downloads at once, and per-IP
+request rates that match the node's nginx limits. A connection whose
+exchanges time out twice in a row is closed so the client redials.
 
 ## Observability
 
