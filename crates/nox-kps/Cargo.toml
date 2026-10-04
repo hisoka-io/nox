@@ -1,0 +1,58 @@
+[package]
+name = "nox-kps"
+description = "KPS entry sidecar for Nox mixnet nodes: WebRTC and QUIC on one UDP port, proxied to the node's loopback ingress"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "nox_kps"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nox-kps"
+path = "src/main.rs"
+
+[dependencies]
+# KPS transport (QUIC + WebRTC on one UDP port). Not on crates.io; the
+# workspace root carries the [patch.crates-io] block it needs.
+kps = { git = "https://github.com/ethereum/kps", tag = "libs/rust/v0.2.2" }
+
+# Runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "io-util", "fs"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# HTTP/1.1 on each KPS stream (server) and towards the loopback upstreams (client)
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+
+# Config, CLI, errors
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+config = { version = "0.15", default-features = false, features = ["toml"] }
+clap = { version = "4", features = ["derive", "env"] }
+thiserror = "2"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+prometheus-client = "0.22"
+
+# Worker bundles (anon-rpc SPEC §4.2 kps: resolver profile)
+sha3 = "0.10"
+hex = "0.4"
+flate2 = "1"
+
+[dev-dependencies]
+tempfile = "3"
+httparse = "1"
+
+[lints]
+workspace = true
