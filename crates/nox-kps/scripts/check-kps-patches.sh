@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Checks that the workspace [patch.crates-io] revs for webrtc and webrtc-sctp
-# equal the ones in libs/rust/Cargo.toml at the kps tag this workspace pins.
-# A kps bump that forgets the patches fails here instead of at runtime.
+# equal the ones in libs/rust/Cargo.toml at the kps tag this workspace pins,
+# and that Cargo.lock resolved that tag to the commit it names upstream (a
+# moved tag fails here). A kps bump that forgets the patches fails here
+# instead of at runtime.
 #
-# Usage: scripts/check-kps-patches.sh            (fetches the upstream file)
-#        KPS_CARGO_TOML=path scripts/check-kps-patches.sh   (offline)
+# Usage: scripts/check-kps-patches.sh            (fetches the upstream file and tag)
+#        KPS_CARGO_TOML=path KPS_TAG_COMMIT=<sha> scripts/check-kps-patches.sh   (offline)
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -26,6 +28,18 @@ rev_of() { # <crate> <text>
 }
 
 status=0
+locked="$(grep -A2 '^name = "kps"$' "$root/Cargo.lock" | sed -n 's/^source = ".*#\([0-9a-f]\{40\}\)"$/\1/p')"
+if [[ -n "${KPS_TAG_COMMIT:-}" ]]; then
+  tag_commit="$KPS_TAG_COMMIT"
+else
+  tag_commit="$(git ls-remote https://github.com/ethereum/kps "refs/tags/${tag}" | cut -f1)"
+fi
+if [[ -z "$locked" || "$locked" != "$tag_commit" ]]; then
+  echo "kps: Cargo.lock pins '${locked}' but tag ${tag} is '${tag_commit}'" >&2
+  status=1
+else
+  echo "kps: Cargo.lock commit $locked is tag ${tag}"
+fi
 for crate in webrtc webrtc-sctp; do
   ours="$(rev_of "$crate" "$(cat "$root/Cargo.toml")")"
   theirs="$(rev_of "$crate" "$upstream")"
