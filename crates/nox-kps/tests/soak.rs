@@ -351,5 +351,16 @@ async fn soak_large_claim_bodies() {
         std::fs::write(&path, serde_json::to_string_pretty(&results).unwrap()).unwrap();
         println!("results written to {path}");
     }
+    let metrics = t.metrics_text().await;
+    for line in metrics.lines().filter(|l| {
+        l.starts_with("nox_kps_stream_failures_total")
+            || l.starts_with("nox_kps_connections_closed_total")
+            || l.starts_with("nox_kps_streams_active")
+            || l.starts_with("nox_kps_connections_active")
+            || l.starts_with("nox_kps_streams_total")
+            || l.starts_with("nox_kps_bytes_total")
+    }) {
+        println!("server: {line}");
+    }
     t.stop().await;
 }
