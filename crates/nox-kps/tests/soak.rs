@@ -8,8 +8,9 @@
 //! SOAK_LARGE_BYTES=5242880 SOAK_LARGE_REQUESTS=20 cargo test --release --test soak soak_large -- --ignored --nocapture
 //! ```
 //!
-//! Loopback has no loss and no delay, so these numbers bound nox-kps's own
-//! behaviour; WAN stall rates come from the canary soak (TST-502).
+//! `SOAK_MAX_STALL_RATE` (for example `0`) turns stalls into failures; CI sets
+//! it. Loopback has no loss and no delay, so these numbers bound nox-kps's own
+//! behaviour; WAN stall rates come from soaks over real links.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -62,6 +63,23 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Fails when `failed` of `requests` exchanges is above `SOAK_MAX_STALL_RATE`
+/// (unset: stalls are reported only).
+fn assert_stall_rate(what: &str, failed: usize, requests: usize) {
+    let Ok(max) = std::env::var("SOAK_MAX_STALL_RATE") else {
+        return;
+    };
+    let max: f64 = max
+        .parse()
+        .unwrap_or_else(|e| panic!("SOAK_MAX_STALL_RATE must be a number such as 0 or 0.01: {e}"));
+    let rate = failed as f64 / requests.max(1) as f64;
+    assert!(
+        rate <= max,
+        "{what}: {failed} of {requests} exchanges stalled ({:.2}%), over SOAK_MAX_STALL_RATE {max}",
+        rate * 100.0
+    );
 }
 
 fn pct(sorted: &[f64], p: f64) -> f64 {
@@ -242,22 +260,18 @@ async fn soak_sequential_32k_requests() {
     t.stop().await;
 
     // Stalls are reported, not hidden. Every exchange that completed returned
-    // the right status and size; set SOAK_MAX_STALL_RATE to also gate on stalls.
+    // the right status and size; SOAK_MAX_STALL_RATE also gates on stalls.
     for run in &runs {
         assert_eq!(
             run.errors, 0,
             "{} {}: {:?}",
             run.transport, run.direction, run.first_errors
         );
-        if let Ok(max) = std::env::var("SOAK_MAX_STALL_RATE") {
-            let max: f64 = max.parse().unwrap();
-            assert!(
-                run.stalls as f64 / run.requests as f64 <= max,
-                "{} {} stall rate over {max}",
-                run.transport,
-                run.direction
-            );
-        }
+        assert_stall_rate(
+            &format!("{} {}", run.transport, run.direction),
+            run.stalls,
+            run.requests,
+        );
     }
 }
 
@@ -285,7 +299,8 @@ async fn soak_large_claim_bodies() {
     let mut results = Vec::new();
     for transport in [Transport::Quic, Transport::WebRtc] {
         let mut conn = dial(&t.addr(), transport).await;
-        let (mut ok, mut stalls, mut errors, mut redials) = (0usize, 0usize, Vec::new(), 0usize);
+        let (mut ok, mut stalls, mut closes, mut errors, mut redials) =
+            (0usize, 0usize, 0usize, Vec::new(), 0usize);
         let mut ms = Vec::new();
         // One character per exchange: '.' ok, 'S' stall (no response within
         // the deadline), 'C' the server closed the connection, 'E' a wrong
@@ -315,7 +330,10 @@ async fn soak_large_claim_bodies() {
                     sequence.push('S');
                     stalls += 1;
                 }
-                Err(_) => sequence.push('C'),
+                Err(_) => {
+                    sequence.push('C');
+                    closes += 1;
+                }
             }
         }
         println!("sequence {}: {sequence}", transport.name());
@@ -340,6 +358,7 @@ async fn soak_large_claim_bodies() {
             "requests": count,
             "ok": ok,
             "stalls": stalls,
+            "closes": closes,
             "redials": redials,
             "sequence": sequence,
             "errors": errors,
@@ -347,6 +366,13 @@ async fn soak_large_claim_bodies() {
             "max_ms": ms.last().copied().unwrap_or(0.0),
         }));
         assert!(errors.is_empty(), "{} errors: {errors:?}", transport.name());
+        // A stall and a closed connection both leave the client without its
+        // response.
+        assert_stall_rate(
+            &format!("large {} {size} B ({sequence})", transport.name()),
+            stalls + closes,
+            count,
+        );
         let _ = conn.close().await;
     }
     if let Ok(path) = std::env::var("SOAK_OUT") {
