@@ -9,7 +9,7 @@ exchange per KPS stream and the request header-block size check) are adapted
 from tor-js-gateway in ethereum/tor-js (https://github.com/ethereum/tor-js),
 Copyright 2019-2025 The Tor Project, Inc. and Copyright 2026 Ethereum
 Foundation, used under the Apache License, Version 2.0 (tor-js is licensed
-MIT OR Apache-2.0). The [patch.crates-io] block in Cargo.toml and its comment
+MIT OR Apache-2.0). The [patch.crates-io] block in the workspace Cargo.toml and its comment
 are copied from the tor-js workspace root.
 
 KPS transport: the kps crate from ethereum/kps (https://github.com/ethereum/kps),

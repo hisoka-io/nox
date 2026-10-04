@@ -2,11 +2,11 @@
 name = "nox-kps"
 description = "KPS entry sidecar for Nox mixnet nodes: WebRTC and QUIC on one UDP port, proxied to the node's loopback ingress"
 version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
-authors.workspace = true
+edition = "2021"
+rust-version = "1.95"
+authors = ["Hisoka IO"]
+license = "Apache-2.0"
+repository = "https://github.com/hisoka-io/nox"
 publish = false
 
 [lib]
@@ -18,7 +18,7 @@ name = "nox-kps"
 path = "src/main.rs"
 
 [dependencies]
-# KPS transport (QUIC + WebRTC on one UDP port). Not on crates.io; the
+# KPS transport (QUIC + WebRTC on one UDP port). Not on crates.io; the nox
 # workspace root carries the [patch.crates-io] block it needs.
 kps = { git = "https://github.com/ethereum/kps", tag = "libs/rust/v0.2.2" }
 
@@ -27,7 +27,7 @@ kps = { git = "https://github.com/ethereum/kps", tag = "libs/rust/v0.2.2" }
 webrtc-util = { version = "=0.12.0", default-features = false, features = ["ifaces"] }
 
 # Runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "io-util", "fs"] }
+tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # HTTP/1.1 on each KPS stream (server) and towards the loopback upstreams (client)
@@ -38,24 +38,24 @@ http-body-util = "0.1"
 bytes = "1"
 
 # Config, CLI, errors
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-config = { version = "0.15", default-features = false, features = ["toml"] }
-clap = { version = "4", features = ["derive", "env"] }
-thiserror = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+config = { version = "0.14", default-features = false, features = ["toml"] }
+clap = { version = "4.4", features = ["derive", "env"] }
+thiserror = { workspace = true }
 
 # Observability
-tracing = "0.1"
+tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 prometheus-client = "0.22"
 
 # Worker bundles (anon-rpc SPEC §4.2 kps: resolver profile)
 sha3 = "0.10"
-hex = "0.4"
+hex = { workspace = true }
 flate2 = "1"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3.10"
 httparse = "1"
 
 [lints]

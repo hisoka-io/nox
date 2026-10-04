@@ -8,6 +8,7 @@ members = [
     "crates/nox-test-infra",
     "crates/nox-oracle",
     "crates/nox-sim",
+    "crates/nox-kps",
 ]
 
 [workspace.package]
@@ -147,3 +148,27 @@ panic = "abort"
 [profile.bench]
 lto = "fat"
 codegen-units = 1
+
+# Release profile for the nox-kps binary (built with `--profile release-kps`). It keeps
+# unwinding, as the stock kps gateway does: a panic inside one connection's task in the
+# young webrtc-rs stack then ends that connection only, not every client's. The node
+# binaries keep `panic = "abort"`; nox-kps runs as its own process either way.
+[profile.release-kps]
+inherits = "release"
+panic = "unwind"
+
+# Vendored dependency patches required by the `kps` crate (nox-kps), copied from the
+# workspace root of ethereum/tor-js (7ac2a60), which pins the same kps release. They
+# mirror the pinned kps version's libs/rust/Cargo.toml exactly (keep in sync when bumping
+# kps; scripts/check-kps-patches.sh checks it). Each rev is an orphan branch of the kps
+# repo: verbatim crates.io source plus fix commit(s). Only nox-kps pulls these crates
+# in, but Cargo honours [patch] only at the workspace root.
+#   - webrtc-sctp: read-shutdown drain (webrtc-rs/webrtc#816) + zero-window
+#     deadlock on tail-of-burst loss (webrtc-rs/webrtc#822)
+#   - webrtc: (1) negotiated-channel accept race: an early inbound message
+#     parsed as DCEP kills the accept loop (webrtc-rs/webrtc#821); (2) gate the
+#     id-reuse claim on ReadyState::Open so a stale closed channel does not
+#     shadow a reused SCTP stream id, hanging reads after ~2 streams (kps#4)
+[patch.crates-io]
+webrtc-sctp = { git = "https://github.com/ethereum/kps.git", rev = "a73a0a8f9e4f76f3b89ba1155562ec836bcf3f3b" }
+webrtc = { git = "https://github.com/ethereum/kps.git", rev = "4982e1c1cdce3baa3f703a746367a5e53ca64928" }

@@ -1210,8 +1210,7 @@ max_connections = 512
 
     #[test]
     fn the_shipped_example_config_is_valid_and_states_the_defaults() {
-        let raw =
-            RawConfig::from_toml_str(include_str!("../../../deploy/nox-kps.example.toml")).unwrap();
+        let raw = RawConfig::from_toml_str(include_str!("../deploy/nox-kps.example.toml")).unwrap();
         raw.validate().unwrap();
         assert_eq!(raw.limits, LimitsConfig::default());
         assert_eq!(raw.shutdown, ShutdownConfig::default());
