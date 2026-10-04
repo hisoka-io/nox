@@ -183,6 +183,16 @@ ingress, metadata, key, role, stake, freeze) and by a periodic reconcile that re
 node set with the chain. Loop cover travels through one node in each of the other two layers and back to the sender;
 `nox_cover_loop_{sent,returned,lost}_total{first_hop,second_hop}` expose nodes that drop traffic.
 
+### KPS entry
+
+`nox-kps` (`crates/nox-kps`) gives browsers and native clients a direct path to a node's ingress over
+[KPS](https://github.com/ethereum/kps): WebRTC and QUIC on one UDP port (15005), with the node authenticated by the
+certificate hash in its address (`<ip>:15005:<certhash>`, published through the registry `metadataUrl`). Each KPS
+stream carries one HTTP/1.1 exchange under the `nox-kps-http/1` profile ([PROTOCOL.md](../crates/nox-kps/PROTOCOL.md)).
+nox-kps forwards packets, claims, topology and health to the node's loopback ingress with the client's source
+address in `X-Real-IP`, so the node's per-IP limits apply, and serves `/metadata.json` and hash-addressed worker
+bundles itself. It ships in the node image and runs as its own process and container (uid 10002).
+
 ---
 
 ## Economic model

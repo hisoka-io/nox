@@ -1,8 +1,8 @@
 // Interop: the reference Node QUIC client (@kpstreams/quic-client 0.2.1)
 // against a nox-kps binary and a mock of the node's loopback services.
 //
-//   cargo build --locked && (cd interop && npm ci && npm test)
-//   NOX_KPS_BIN=/path/to/nox-kps npm test
+//   cargo build --locked -p nox-kps && (cd crates/nox-kps/interop && npm ci && npm test)
+//   NOX_KPS_BIN=/path/to/nox-kps npm test   (default: the workspace's target/debug/nox-kps)
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn, execFileSync } from 'node:child_process'
@@ -16,7 +16,7 @@ import { createInterface } from 'node:readline'
 import { dial } from '@kpstreams/quic-client'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const BIN = process.env.NOX_KPS_BIN ?? join(here, '..', 'target', 'debug', 'nox-kps')
+const BIN = process.env.NOX_KPS_BIN ?? join(here, '..', '..', '..', 'target', 'debug', 'nox-kps')
 const PACKET_BYTES = 32768
 const SURB_ID = '00112233445566778899aabbccddeeff'
 

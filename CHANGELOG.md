@@ -5,6 +5,21 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+### Added
+
+- `nox-kps` (`crates/nox-kps`), the KPS entry sidecar: browsers (WebRTC) and native clients (QUIC) reach a node
+  directly on UDP 15005, authenticated by the certificate hash in the node's KPS address, and nox-kps forwards a
+  fixed route allowlist to the node's loopback ingress. The node image carries the `nox-kps` binary; it runs as its
+  own container from that image as uid 10002, and the node binary keeps its behaviour. Operator guide:
+  [crates/nox-kps/README.md](crates/nox-kps/README.md); wire profile:
+  [crates/nox-kps/PROTOCOL.md](crates/nox-kps/PROTOCOL.md).
+
+### Changes
+
+- The Dockerfile pins its base images by digest.
+- `cargo deny` in CI covers every workspace crate and checks dependency sources too: crates.io, plus the
+  `ethereum/kps` and `zkpassport/noir_rs` git repositories.
+
 ## [0.4.0-rc.4] - 2026-10-03
 
 ### Upgrade notes
