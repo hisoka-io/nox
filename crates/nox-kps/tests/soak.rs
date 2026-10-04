@@ -366,3 +366,123 @@ async fn soak_large_claim_bodies() {
     }
     t.stop().await;
 }
+
+/// The large-claim WebRTC soak with nox-kps as a separate process, so each
+/// end of the link logs to its own file: the webrtc-rs SCTP association has
+/// no name, and in one process both ends log the same `[]` prefix. Used to
+/// localize the wedge seen after 16 MiB responses.
+///
+/// ```text
+/// SOAK_LARGE_BYTES=16777216 SOAK_LARGE_REQUESTS=20 SOAK_LOG_DIR=/tmp/wedge \
+/// SOAK_SERVER_LOG='warn,nox_kps=debug,webrtc=debug,webrtc_sctp=trace,webrtc_data=debug' \
+/// SOAK_CLIENT_LOG='warn,webrtc=debug,webrtc_sctp=trace,webrtc_data=debug' \
+/// cargo test --release --test soak soak_large_split_process -- --ignored --nocapture
+/// ```
+///
+/// Writes `server.log` (nox-kps stdout) and `client.log` (this process) to
+/// `SOAK_LOG_DIR`, plus one `client.log` marker line per exchange.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "diagnostic soak; run explicitly with --ignored"]
+async fn soak_large_split_process() {
+    use std::process::{Command, Stdio};
+
+    let size: usize = env_or("SOAK_LARGE_BYTES", 16 * 1024 * 1024);
+    let count: usize = env_or("SOAK_LARGE_REQUESTS", 20);
+    let stall = Duration::from_millis(env_or("SOAK_STALL_MS", 15_000));
+    let log_dir = std::path::PathBuf::from(
+        std::env::var("SOAK_LOG_DIR").unwrap_or_else(|_| "target/soak-split".to_string()),
+    );
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let server_filter = std::env::var("SOAK_SERVER_LOG").unwrap_or_else(|_| "info".to_string());
+    let client_filter = std::env::var("SOAK_CLIENT_LOG").unwrap_or_else(|_| "info".to_string());
+
+    let client_log = std::fs::File::create(log_dir.join("client.log")).unwrap();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(&client_filter))
+        .with_ansi(false)
+        .with_writer(std::sync::Mutex::new(client_log))
+        .init();
+
+    let upstream = common::MockUpstream::start().await;
+    upstream.set_body_bytes("/api/v1/responses/claim", size);
+    upstream.behaviour.lock().unwrap().skip_bodies = true;
+
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("kps.key");
+    let certhash = nox_kps::identity::init(&key).unwrap().certhash;
+    let port = {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let admin_port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let cfg = dir.path().join("config.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "listen = \"127.0.0.1:{port}\"\nadvertise = [\"127.0.0.1\"]\nallow_private_advertise = true\n\
+             key_file = \"{}\"\nexpected_certhash = \"{certhash}\"\nkeccak_dir = \"\"\n\
+             upstream_ingress = \"{up}\"\nupstream_topology = \"{up}\"\n\
+             admin_listen = \"127.0.0.1:{admin_port}\"\nlog_format = \"text\"\nsummary_interval_secs = 0\n\
+             [limits]\nclaim_rate_per_ip = 1000000\nclaim_burst = 1000000\nclaim_max_surb_ids = 1\n\
+             claim_response_max_bytes = {cap}\nupstream_claim_timeout_ms = 20000\nconn_idle_timeout_secs = 600\n",
+            key.display(),
+            up = upstream.authority(),
+            cap = size.max(max_claim_response_bytes(1)),
+        ),
+    )
+    .unwrap();
+    let server_log = std::fs::File::create(log_dir.join("server.log")).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nox-kps"))
+        .args(["--config", cfg.to_str().unwrap(), "run"])
+        .env("RUST_LOG", &server_filter)
+        .stdout(Stdio::from(server_log.try_clone().unwrap()))
+        .stderr(Stdio::from(server_log))
+        .spawn()
+        .unwrap();
+
+    let addr = nox_kps::identity::format_address("127.0.0.1".parse().unwrap(), port, &certhash);
+    let req = claim_request(&certhash, &[SURB_ID]);
+    let mut conn = None;
+    for _ in 0..100 {
+        if let Ok(Ok(c)) =
+            tokio::time::timeout(Duration::from_secs(5), kps::dial_webrtc(&addr)).await
+        {
+            conn = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let conn = conn.expect("nox-kps accepts a WebRTC dial");
+    let mut sequence = String::new();
+    for i in 0..count {
+        tracing::warn!(target: "soak", "exchange {i} begins");
+        let t0 = Instant::now();
+        let mark = match try_exchange(conn.as_ref(), &req, stall).await {
+            Ok(res) if res.status == 200 && res.body.len() == size => '.',
+            Ok(_) => 'E',
+            Err(e) if e.starts_with("no response within") => 'S',
+            Err(_) => 'C',
+        };
+        tracing::warn!(target: "soak", "exchange {i} ends: {mark} after {} ms", t0.elapsed().as_millis());
+        sequence.push(mark);
+    }
+    println!("sequence webrtc (split process): {sequence}");
+    let metrics = common::admin_get(
+        format!("127.0.0.1:{admin_port}").parse().unwrap(),
+        "/metrics",
+    )
+    .await;
+    for line in metrics.lines().filter(|l| {
+        l.starts_with("nox_kps_stream_failures_total")
+            || l.starts_with("nox_kps_streams_total")
+            || l.starts_with("nox_kps_streams_active")
+    }) {
+        println!("server: {line}");
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    println!("logs in {}", log_dir.display());
+}
