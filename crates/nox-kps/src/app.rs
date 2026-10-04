@@ -94,6 +94,7 @@ struct MetadataDocument<'a> {
 struct MetadataLimits {
     packet_bytes: usize,
     claim_request_max_bytes: usize,
+    claim_max_surb_ids: usize,
     claim_response_max_bytes: usize,
 }
 
@@ -118,6 +119,7 @@ pub fn metadata_document(
         limits: MetadataLimits {
             packet_bytes: SPHINX_PACKET_BYTES,
             claim_request_max_bytes: settings.limits.claim_request_max_bytes,
+            claim_max_surb_ids: settings.limits.claim_max_surb_ids,
             claim_response_max_bytes: settings.limits.claim_response_max_bytes,
         },
         demo: false,
@@ -155,7 +157,7 @@ mod tests {
                 env!("CARGO_PKG_VERSION"),
                 r#"","node":"0x862d6b1105bde9d64dc5182fe3cd9d09f6f37463","addresses":["3.239.73.249:15005:uEiX"],"#,
                 r#""capabilities":["metadata","health","packets","claim","topology","worker-bundles"],"#,
-                r#""limits":{"packetBytes":32768,"claimRequestMaxBytes":65536,"claimResponseMaxBytes":16777216},"demo":false}"#
+                r#""limits":{"packetBytes":32768,"claimRequestMaxBytes":65536,"claimMaxSurbIds":128,"claimResponseMaxBytes":16777216},"demo":false}"#
             )
         );
         let doc = metadata_document(&settings(""), &addrs, false).unwrap();

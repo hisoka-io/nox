@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use common::{
     claim_request, dial, exchange, packet, packet_request, request, TestServer, Transport, SURB_ID,
 };
+use nox_kps::config::{max_claim_response_bytes, LimitsConfig, MAX_REPLY_PAYLOAD_BYTES};
 
 async fn packets_round_trip(transport: Transport) {
     let t = TestServer::start(|_| {}).await;
@@ -228,6 +229,62 @@ async fn metadata_describes_the_endpoint() {
     t.stop().await;
 }
 
+/// A claim at the configured ID limit, every ID matching a full-size reply,
+/// is relayed whole: the node has already deleted those replies, so a `502`
+/// here would lose them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_claim_at_the_id_limit_is_relayed() {
+    let t = TestServer::start(|_| {}).await;
+    let limits = LimitsConfig::default();
+    let max_ids = limits.claim_max_surb_ids;
+    let cap = limits.claim_response_max_bytes;
+    assert_eq!(
+        (max_ids, cap),
+        (128, 16 * 1024 * 1024),
+        "the shipped defaults"
+    );
+    t.upstream.behaviour.lock().unwrap().full_size_claims = true;
+    let conn = dial(&t.addr(), Transport::Quic).await;
+    let ch = t.certhash();
+
+    let ids: Vec<String> = (0..max_ids).map(|i| format!("{i:032x}")).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let res = exchange(conn.as_ref(), &claim_request(&ch, &refs)).await;
+    assert_eq!(res.status, 200, "{}", res.text());
+    assert!(res.body.len() <= max_claim_response_bytes(max_ids));
+    assert!(res.body.len() <= cap);
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&res.body).unwrap();
+    assert_eq!(items.len(), max_ids);
+    assert_eq!(items[0]["id"], format!("reply-0-{}", ids[0]));
+    assert_eq!(
+        items[max_ids - 1]["data"].as_array().unwrap().len(),
+        MAX_REPLY_PAYLOAD_BYTES
+    );
+
+    // One more ID is refused before the node sees it.
+    let seen = t.upstream.count();
+    let extra = format!("{max_ids:032x}");
+    let mut over = refs.clone();
+    over.push(&extra);
+    let res = exchange(conn.as_ref(), &claim_request(&ch, &over)).await;
+    assert_eq!(res.status, 400, "{}", res.text());
+    assert!(
+        res.text().contains("at most 128 SURB IDs"),
+        "{}",
+        res.text()
+    );
+    assert_eq!(t.upstream.count(), seen, "never reaches the node");
+
+    let res = exchange(
+        conn.as_ref(),
+        &request("GET", "/metadata.json", &ch, &[], b""),
+    )
+    .await;
+    let doc: serde_json::Value = serde_json::from_slice(&res.body).unwrap();
+    assert_eq!(doc["limits"]["claimMaxSurbIds"], 128);
+    t.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn upstream_failures_map_to_gateway_errors() {
     // A port with nothing listening.
@@ -238,7 +295,8 @@ async fn upstream_failures_map_to_gateway_errors() {
     let t = TestServer::start(|raw| {
         raw.upstream_topology = dead.clone();
         raw.limits.upstream_claim_timeout_ms = 500;
-        raw.limits.claim_response_max_bytes = 1024;
+        raw.limits.claim_max_surb_ids = 1;
+        raw.limits.claim_response_max_bytes = max_claim_response_bytes(1);
     })
     .await;
     let conn = dial(&t.addr(), Transport::Quic).await;
@@ -257,7 +315,8 @@ async fn upstream_failures_map_to_gateway_errors() {
     assert_eq!(res.status, 504, "{}", res.text());
     t.upstream.set_delay("/api/v1/responses/claim", 0);
 
-    t.upstream.set_body_bytes("/api/v1/responses/claim", 4096);
+    t.upstream
+        .set_body_bytes("/api/v1/responses/claim", max_claim_response_bytes(1) + 1);
     let res = exchange(conn.as_ref(), &claim_request(&ch, &[SURB_ID])).await;
     assert_eq!(res.status, 502, "{}", res.text());
     assert!(res.text().contains("exceeds"));

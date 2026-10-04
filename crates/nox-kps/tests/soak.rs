@@ -22,6 +22,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{claim_request, dial, packet_request, try_exchange, TestServer, Transport, SURB_ID};
+use nox_kps::config::max_claim_response_bytes;
 
 const PAYLOAD: usize = 32 * 1024;
 
@@ -272,7 +273,8 @@ async fn soak_large_claim_bodies() {
     let t = TestServer::start(|raw| {
         raw.limits.claim_rate_per_ip = 1_000_000;
         raw.limits.claim_burst = 1_000_000;
-        raw.limits.claim_response_max_bytes = size.max(1024);
+        raw.limits.claim_max_surb_ids = 1;
+        raw.limits.claim_response_max_bytes = size.max(max_claim_response_bytes(1));
         raw.limits.upstream_claim_timeout_ms = 20_000;
         raw.limits.conn_idle_timeout_secs = 600;
     })

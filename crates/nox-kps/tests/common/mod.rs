@@ -22,7 +22,7 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use nox_kps::config::RawConfig;
+use nox_kps::config::{RawConfig, MAX_REPLY_PAYLOAD_BYTES};
 use nox_kps::RunningServer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -48,6 +48,9 @@ pub struct Behaviour {
     pub status: HashMap<String, u16>,
     /// Record request heads only (long soaks).
     pub skip_bodies: bool,
+    /// Answer claims like a node holding a full-size reply for every ID
+    /// (`MAX_REPLY_PAYLOAD_BYTES` of 255s, the longest JSON encoding).
+    pub full_size_claims: bool,
 }
 
 /// A mock of the node's ingress/topology HTTP services.
@@ -174,7 +177,10 @@ async fn mock_handle(
         .map(|c| c.to_bytes())
         .unwrap_or_default();
     let path = parts.uri.path().to_string();
-    let skip_bodies = behaviour.lock().unwrap().skip_bodies;
+    let (skip_bodies, full_size_claims) = {
+        let b = behaviour.lock().unwrap();
+        (b.skip_bodies, b.full_size_claims)
+    };
     recorded.lock().unwrap().push(Recorded {
         method: parts.method.to_string(),
         path_and_query: parts
@@ -199,46 +205,55 @@ async fn mock_handle(
     if delay > 0 {
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }
-    let (status, ctype, out): (StatusCode, &str, Bytes) =
-        match (parts.method.as_str(), path.as_str()) {
-            ("POST", "/api/v1/packets") => (
-                StatusCode::ACCEPTED,
-                "text/plain; charset=utf-8",
-                Bytes::from(format!("http-{:016x}", body.len())),
-            ),
-            ("POST", "/api/v1/responses/claim") => {
-                let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-                let ids = json["surb_ids"].as_array().cloned().unwrap_or_default();
-                if ids.is_empty() {
-                    (StatusCode::NO_CONTENT, "application/json", Bytes::new())
-                } else {
-                    let items: Vec<serde_json::Value> = ids
+    let (status, ctype, out): (StatusCode, &str, Bytes) = match (
+        parts.method.as_str(),
+        path.as_str(),
+    ) {
+        ("POST", "/api/v1/packets") => (
+            StatusCode::ACCEPTED,
+            "text/plain; charset=utf-8",
+            Bytes::from(format!("http-{:016x}", body.len())),
+        ),
+        ("POST", "/api/v1/responses/claim") => {
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let ids = json["surb_ids"].as_array().cloned().unwrap_or_default();
+            if ids.is_empty() {
+                (StatusCode::NO_CONTENT, "application/json", Bytes::new())
+            } else {
+                let items: Vec<serde_json::Value> = ids
                         .iter()
-                        .map(|id| serde_json::json!({"id": id, "data": [7, 7, 7]}))
+                        .map(|id| {
+                            if full_size_claims {
+                                let id = format!("reply-0-{}", id.as_str().unwrap_or_default());
+                                serde_json::json!({"id": id, "data": vec![255u8; MAX_REPLY_PAYLOAD_BYTES]})
+                            } else {
+                                serde_json::json!({"id": id, "data": [7, 7, 7]})
+                            }
+                        })
                         .collect();
-                    (
-                        StatusCode::OK,
-                        "application/json",
-                        Bytes::from(serde_json::to_vec(&items).unwrap()),
-                    )
-                }
+                (
+                    StatusCode::OK,
+                    "application/json",
+                    Bytes::from(serde_json::to_vec(&items).unwrap()),
+                )
             }
-            ("GET", "/topology") => (
-                StatusCode::OK,
-                "application/json",
-                Bytes::from_static(br#"{"nodes":[],"fingerprint":"0x00"}"#),
-            ),
-            ("GET", "/health") => (
-                StatusCode::OK,
-                "text/plain; charset=utf-8",
-                Bytes::from_static(b"ok"),
-            ),
-            _ => (
-                StatusCode::NOT_FOUND,
-                "text/plain",
-                Bytes::from_static(b"mock: no such route"),
-            ),
-        };
+        }
+        ("GET", "/topology") => (
+            StatusCode::OK,
+            "application/json",
+            Bytes::from_static(br#"{"nodes":[],"fingerprint":"0x00"}"#),
+        ),
+        ("GET", "/health") => (
+            StatusCode::OK,
+            "text/plain; charset=utf-8",
+            Bytes::from_static(b"ok"),
+        ),
+        _ => (
+            StatusCode::NOT_FOUND,
+            "text/plain",
+            Bytes::from_static(b"mock: no such route"),
+        ),
+    };
     let out = size.map_or(out, |n| Bytes::from(vec![b'x'; n]));
     let status = forced
         .and_then(|s| StatusCode::from_u16(s).ok())

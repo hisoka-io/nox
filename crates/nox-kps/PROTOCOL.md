@@ -55,7 +55,7 @@ another method `405` with `Allow`; unknown method `501`.
 | Method | Path | Request rules | Served by |
 |---|---|---|---|
 | POST | `/api/v1/packets` | `Content-Type: application/octet-stream`; body exactly 32,768 bytes (shorter `400`, longer `413`) | node ingress |
-| POST | `/api/v1/responses/claim` | `Content-Type: application/json`; at most 64 KiB (`413`); `{"surb_ids":[...]}` with at most 1,024 IDs of exactly 32 hex characters (`400`) | node ingress |
+| POST | `/api/v1/responses/claim` | `Content-Type: application/json`; at most 64 KiB (`413`); `{"surb_ids":[...]}` with at most 128 IDs of exactly 32 hex characters (`400`; the operator's value is `limits.claimMaxSurbIds` in §5) | node ingress |
 | GET | `/topology` | no body | node topology API; one response is shared by all clients for 1 s |
 | GET | `/health` | no body | nox-kps: `200 {"status":"ok"}` when the node ingress answers its health check, else `503 {"status":"degraded","upstream":"ingress-unreachable"}` |
 | GET, HEAD | `/metadata.json` | no body | nox-kps (§5) |
@@ -73,6 +73,14 @@ are in flight, or 8 bundle downloads are already in progress: `503` with
 Upstream failures: `502` (connection refused or reset, response over the
 relay cap) and `504` (no answer in time). Other node statuses pass through.
 
+Claim sizing. The node removes every reply it returns from its buffer, and
+writes each reply's bytes as a JSON array of decimal numbers: one full reply
+(31,716 bytes) is at most 126,928 bytes of JSON. nox-kps refuses to start
+unless `claimMaxSurbIds` full replies fit in `claimResponseMaxBytes`
+(128 × 126,928 + 2 = 16,246,786 ≤ 16,777,216 with the defaults), so every
+claim it accepts can be relayed whole. Clients split larger claims into
+chunks of at most `claimMaxSurbIds` IDs.
+
 What reaches the node: the route's fixed method and path, `Host`,
 `Content-Type`, `Content-Length`, the body, and one `X-Real-IP` carrying the
 KPS source address of the client (any client-supplied forwarding header is
@@ -89,7 +97,7 @@ dropped). What returns to the client: status, body, `Content-Type`,
   "node": "0x862d6b1105bde9d64dc5182fe3cd9d09f6f37463",
   "addresses": ["3.239.73.249:15005:uEiB..."],
   "capabilities": ["metadata", "health", "packets", "claim", "topology", "worker-bundles"],
-  "limits": { "packetBytes": 32768, "claimRequestMaxBytes": 65536, "claimResponseMaxBytes": 16777216 },
+  "limits": { "packetBytes": 32768, "claimRequestMaxBytes": 65536, "claimMaxSurbIds": 128, "claimResponseMaxBytes": 16777216 },
   "demo": false
 }
 ```

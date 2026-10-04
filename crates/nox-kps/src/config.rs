@@ -32,6 +32,33 @@ pub const SPHINX_PACKET_BYTES: usize = 32_768;
 /// Hex length of one SURB ID (`nox-node` `SURB_ID_HEX_LEN`).
 pub const SURB_ID_HEX_LEN: usize = 32;
 
+/// Largest reply payload the node buffers for one SURB or delivery ID
+/// (`nox-crypto` `MAX_PAYLOAD_SIZE`: one Sphinx payload).
+pub const MAX_REPLY_PAYLOAD_BYTES: usize = 31_716;
+/// Bytes one claimed reply adds to the node's claim JSON besides its data:
+/// `{"data":[` `],"id":"reply-0-<32 hex>"}` (59 bytes) and the `,` between
+/// items, rounded up.
+pub const CLAIM_ITEM_OVERHEAD_BYTES: usize = 64;
+/// Upper bound for one claimed reply in the node's claim JSON. The node
+/// writes `data` as an array of decimal numbers: at most 3 digits and a comma
+/// per byte.
+pub const MAX_CLAIM_ITEM_JSON_BYTES: usize =
+    MAX_REPLY_PAYLOAD_BYTES * 4 + CLAIM_ITEM_OVERHEAD_BYTES;
+/// The `[` and `]` around the claimed items.
+pub const CLAIM_ARRAY_OVERHEAD_BYTES: usize = 2;
+
+/// Largest claim response the node can send for `surb_ids` IDs, each matching
+/// one full-size reply. The node removes a reply from its buffer when it
+/// builds the response, so `limits.claim_response_max_bytes` must cover this
+/// for `limits.claim_max_surb_ids`, or a valid claim can destroy replies the
+/// relay then refuses to deliver.
+#[must_use]
+pub const fn max_claim_response_bytes(surb_ids: usize) -> usize {
+    surb_ids
+        .saturating_mul(MAX_CLAIM_ITEM_JSON_BYTES)
+        .saturating_add(CLAIM_ARRAY_OVERHEAD_BYTES)
+}
+
 /// Lowest header-block cap hyper accepts (its read buffer cannot be smaller).
 pub const MIN_HEADER_BYTES: usize = 8 * 1024;
 /// Upper bound for the header-block cap; KPS-HTTP/1 recommends 16 KiB.
@@ -177,9 +204,12 @@ pub struct LimitsConfig {
     pub rate_limit_max_clients: usize,
     /// Largest `POST /api/v1/responses/claim` body (nginx uses 64 KiB).
     pub claim_request_max_bytes: usize,
-    /// Most SURB IDs in one claim.
+    /// Most SURB IDs in one claim. Bounded by `claim_response_max_bytes`:
+    /// every ID may match one full-size reply (see
+    /// [`max_claim_response_bytes`]).
     pub claim_max_surb_ids: usize,
-    /// Largest claim response relayed (JSON is ~3.6x the binary size).
+    /// Largest claim response relayed (the node's JSON is up to 4x the
+    /// binary size, about 127 KB per full reply).
     pub claim_response_max_bytes: usize,
     /// Largest topology response relayed.
     pub topology_response_max_bytes: usize,
@@ -236,7 +266,7 @@ impl Default for LimitsConfig {
             bundle_burst: 5,
             rate_limit_max_clients: 100_000,
             claim_request_max_bytes: 64 * 1024,
-            claim_max_surb_ids: 1024,
+            claim_max_surb_ids: 128,
             claim_response_max_bytes: 16 * 1024 * 1024,
             topology_response_max_bytes: 1024 * 1024,
             small_response_max_bytes: 1024,
@@ -563,6 +593,16 @@ impl LimitsConfig {
             MAX_BODY_BYTES,
             "limits.claim_response_max_bytes",
         );
+        let claim_needs = max_claim_response_bytes(self.claim_max_surb_ids);
+        if claim_needs > self.claim_response_max_bytes {
+            v.err(format!(
+                "limits.claim_response_max_bytes ({}) must hold a full claim of limits.claim_max_surb_ids ({}) replies, {claim_needs} bytes of node JSON ({MAX_CLAIM_ITEM_JSON_BYTES} per reply + {CLAIM_ARRAY_OVERHEAD_BYTES}); lower claim_max_surb_ids to at most {} or raise claim_response_max_bytes, since the node deletes the replies it answers with",
+                self.claim_response_max_bytes,
+                self.claim_max_surb_ids,
+                self.claim_response_max_bytes.saturating_sub(CLAIM_ARRAY_OVERHEAD_BYTES)
+                    / MAX_CLAIM_ITEM_JSON_BYTES,
+            ));
+        }
         v.range(
             self.topology_response_max_bytes,
             1,
@@ -1072,10 +1112,70 @@ mod tests {
         assert_eq!(l.topology_rate, Rate::new(2, 10));
         assert_eq!(l.bundle_rate, Rate::new(1, 5));
         assert_eq!(l.claim_request_max_bytes, 65_536);
+        assert_eq!(l.claim_max_surb_ids, 128);
         assert_eq!(l.claim_response_max_bytes, 16_777_216);
         assert_eq!(l.topology_response_max_bytes, 1_048_576);
         assert_eq!(l.max_bundle_bytes, 67_108_864);
         assert!(!l.bundle_gzip, "v1 serves identity bytes only");
+    }
+
+    /// The node's claim JSON, built the way `nox-node` builds it
+    /// (`http_server.rs`: `json!({"id": id, "data": data})` per reply).
+    fn node_claim_json(replies: usize, byte: u8) -> Vec<u8> {
+        let items: Vec<serde_json::Value> = (0..replies)
+            .map(|i| {
+                serde_json::json!({
+                    "id": format!("reply-0-{i:032x}"),
+                    "data": vec![byte; MAX_REPLY_PAYLOAD_BYTES],
+                })
+            })
+            .collect();
+        serde_json::to_vec(&items).unwrap()
+    }
+
+    #[test]
+    fn the_claim_bound_covers_the_node_json_for_full_replies() {
+        for replies in [1, 2, 7] {
+            let worst = node_claim_json(replies, 255).len();
+            let bound = max_claim_response_bytes(replies);
+            assert!(worst <= bound, "{replies} replies: {worst} > {bound}");
+            assert!(
+                bound - worst <= replies * 8,
+                "{replies} replies: the bound stays tight ({bound} vs {worst})"
+            );
+        }
+        assert!(node_claim_json(1, 0).len() < max_claim_response_bytes(1));
+    }
+
+    #[test]
+    fn default_claim_limits_fit_a_full_claim() {
+        let l = LimitsConfig::default();
+        assert_eq!(l.claim_max_surb_ids, 128);
+        assert!(max_claim_response_bytes(l.claim_max_surb_ids) <= l.claim_response_max_bytes);
+    }
+
+    #[test]
+    fn claim_ids_beyond_the_response_cap_are_refused() {
+        let mut raw = valid();
+        raw.limits.claim_max_surb_ids = 1024;
+        assert_error(
+            &raw,
+            "limits.claim_response_max_bytes (16777216) must hold a full claim of limits.claim_max_surb_ids (1024) replies",
+        );
+        assert_error(&raw, "lower claim_max_surb_ids to at most 132");
+
+        raw.limits.claim_max_surb_ids = 132;
+        assert!(errors_of(&raw).is_empty(), "{:?}", errors_of(&raw));
+        raw.limits.claim_max_surb_ids = 133;
+        assert_error(&raw, "at most 132");
+
+        raw.limits.claim_max_surb_ids = 1024;
+        raw.limits.claim_response_max_bytes = max_claim_response_bytes(1024);
+        assert!(errors_of(&raw).is_empty(), "{:?}", errors_of(&raw));
+
+        raw.limits.claim_max_surb_ids = 1;
+        raw.limits.claim_response_max_bytes = 1024;
+        assert_error(&raw, "lower claim_max_surb_ids to at most 0");
     }
 
     #[test]
