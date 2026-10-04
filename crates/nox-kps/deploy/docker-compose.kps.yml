@@ -1,0 +1,79 @@
+# nox-kps as an override for a Nox node's compose project (ARCHITECTURE §2.12).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.kps.yml config   # validate the merge
+#   docker compose -f docker-compose.yml -f docker-compose.kps.yml run --rm nox-kps-admin nox-kps init
+#   docker compose -f docker-compose.yml -f docker-compose.kps.yml up -d nox-kps
+#
+# Publishing a worker bundle (the long-running service mounts the bundle
+# volume read-only; the admin service mounts it read-write):
+#   docker compose -f docker-compose.yml -f docker-compose.kps.yml run --rm \
+#     -v "$PWD/anon-rpc-worker.js:/in/anon-rpc-worker.js:ro" \
+#     nox-kps-admin nox-kps bundle add /in/anon-rpc-worker.js
+#
+# NOX_KPS_IMAGE is an immutable image reference (a digest), as NOX_IMAGE is for
+# the node. Until images are published, load one with `docker load`.
+
+x-nox-kps-common: &nox-kps-common
+  image: ${NOX_KPS_IMAGE:?NOX_KPS_IMAGE must be an immutable nox-kps image digest}
+  user: "10002:10002"
+  read_only: true
+  cap_drop: ["ALL"]
+  security_opt: ["no-new-privileges:true"]
+  # Host networking: the node trusts the client-IP header only from loopback
+  # connections, and UDP 15005 is served on the host directly.
+  network_mode: host
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+
+services:
+  nox-kps:
+    <<: *nox-kps-common
+    container_name: nox-kps
+    volumes:
+      - type: bind
+        source: ./nox-kps.toml
+        target: /etc/nox-kps/config.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - nox-kps-identity:/var/lib/nox-kps
+      - nox-kps-bundles:/var/lib/nox-kps/keccak:ro
+    command: ["nox-kps", "run", "--config", "/etc/nox-kps/config.toml"]
+    depends_on:
+      nox:
+        condition: service_started
+    restart: unless-stopped
+    stop_grace_period: 15s
+    mem_limit: 512m
+    cpus: 1.0
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "nox-kps", "healthcheck"]
+      interval: 15s
+      timeout: 6s
+      retries: 3
+      start_period: 10s
+
+  # One-off operations: init, address, check-config, bundle add/list/verify.
+  nox-kps-admin:
+    <<: *nox-kps-common
+    profiles: ["kps-admin"]
+    volumes:
+      - type: bind
+        source: ./nox-kps.toml
+        target: /etc/nox-kps/config.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - nox-kps-identity:/var/lib/nox-kps
+      - nox-kps-bundles:/var/lib/nox-kps/keccak
+    command: ["nox-kps", "check-config"]
+    restart: "no"
+
+volumes:
+  nox-kps-identity:
+  nox-kps-bundles:
