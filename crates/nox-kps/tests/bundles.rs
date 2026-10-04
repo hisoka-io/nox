@@ -1,7 +1,12 @@
 //! The anon-rpc `kps:` bundle-resolver profile (SPEC §4.2), exercised the way
 //! the reference harness fetches: one GET per stream with `Host` = certhash
 //! and `Accept-Encoding`, `closeWrite`, read to EOF, decode, keccak check.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::pedantic
+)]
 
 mod common;
 
@@ -37,6 +42,13 @@ fn harness_get(path: &str, certhash: &str, accept_encoding: Option<&str>) -> Vec
     raw_request("GET", path, &headers, b"")
 }
 
+fn bundle_config(raw: &mut nox_kps::RawConfig, dir: String, gzip: bool) {
+    raw.keccak_dir = dir;
+    raw.limits.bundle_gzip = gzip;
+    raw.limits.bundle_rate_per_ip = 1000;
+    raw.limits.bundle_burst = 1000;
+}
+
 async fn serves_bundles(transport: Transport) {
     let bundles = tempfile::tempdir().unwrap();
     let bytes = bundle_bytes();
@@ -51,34 +63,25 @@ async fn serves_bundles(transport: Transport) {
     .unwrap();
 
     let dir = bundles.path().to_string_lossy().into_owned();
-    let t = TestServer::start(|raw| raw.bundles.dir = dir).await;
+    let t = TestServer::start(|raw| bundle_config(raw, dir, false)).await;
     let conn = dial(&t.addr(), transport).await;
     let ch = t.certhash();
     let path = format!("/keccak/{}/{}", &hash[..2], &hash[2..]);
 
-    // Harness that can decode gzip.
+    // v1 serves identity bytes even to a harness that lists gzip.
     let res = exchange(
         conn.as_ref(),
         &harness_get(&path, &ch, Some("zstd, br, gzip, deflate")),
     )
     .await;
     assert_eq!(res.status, 200, "{}", transport.name());
-    assert_eq!(res.header("content-encoding"), Some("gzip"));
+    assert!(res.header("content-encoding").is_none());
     assert_eq!(
         res.header("cache-control"),
         Some("public, max-age=31536000, immutable")
     );
     assert_eq!(res.header("content-type"), Some("text/javascript"));
-    assert!(res.body.len() < bytes.len(), "compressed on the wire");
-    let mut decoded = Vec::new();
-    flate2::read::GzDecoder::new(res.body.as_slice())
-        .read_to_end(&mut decoded)
-        .unwrap();
-    assert_eq!(
-        keccak256_hex(&decoded),
-        hash,
-        "decoded bytes hash to the name"
-    );
+    assert_eq!(keccak256_hex(&res.body), hash, "bytes hash to the name");
 
     // Harness without decoders: identity bytes.
     let res = exchange(conn.as_ref(), &harness_get(&path, &ch, None)).await;
@@ -129,8 +132,84 @@ async fn serves_bundles(transport: Transport) {
     assert_eq!(t.upstream.count(), 0, "bundles are served locally");
     let metrics = t.metrics_text().await;
     assert!(metrics.contains("nox_kps_bundles_loaded 1"), "{metrics}");
-    assert!(metrics.contains("nox_kps_bundle_responses_total{encoding=\"gzip\"}"));
+    assert!(
+        metrics.contains("nox_kps_bundle_requests_total{result=\"hit\"} 3"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("nox_kps_bundle_requests_total{result=\"miss\"} 5"),
+        "{metrics}"
+    );
     t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gzip_is_served_when_enabled() {
+    let bundles = tempfile::tempdir().unwrap();
+    let bytes = bundle_bytes();
+    let hash = publish(bundles.path(), &bytes);
+    let dir = bundles.path().to_string_lossy().into_owned();
+    let t = TestServer::start(|raw| bundle_config(raw, dir, true)).await;
+    let conn = dial(&t.addr(), Transport::Quic).await;
+    let path = format!("/keccak/{}/{}", &hash[..2], &hash[2..]);
+    let res = exchange(
+        conn.as_ref(),
+        &harness_get(&path, &t.certhash(), Some("gzip")),
+    )
+    .await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.header("content-encoding"), Some("gzip"));
+    assert_eq!(res.header("vary"), Some("accept-encoding"));
+    assert!(res.body.len() < bytes.len(), "compressed on the wire");
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(res.body.as_slice())
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(
+        keccak256_hex(&decoded),
+        hash,
+        "decoded bytes hash to the name"
+    );
+    let res = exchange(conn.as_ref(), &harness_get(&path, &t.certhash(), None)).await;
+    assert!(res.header("content-encoding").is_none());
+    assert_eq!(keccak256_hex(&res.body), hash);
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bundle_requests_are_rate_limited_per_ip() {
+    let bundles = tempfile::tempdir().unwrap();
+    let hash = publish(bundles.path(), b"rate limited bundle");
+    let dir = bundles.path().to_string_lossy().into_owned();
+    let t = TestServer::start(|raw| raw.keccak_dir = dir).await;
+    let conn = dial(&t.addr(), Transport::Quic).await;
+    let path = format!("/keccak/{}/{}", &hash[..2], &hash[2..]);
+    let mut statuses = Vec::new();
+    for _ in 0..7 {
+        statuses.push(
+            exchange(conn.as_ref(), &harness_get(&path, &t.certhash(), None))
+                .await
+                .status,
+        );
+    }
+    assert_eq!(
+        statuses,
+        [200, 200, 200, 200, 200, 429, 429],
+        "default burst of 5"
+    );
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_keccak_dir_stops_startup() {
+    let upstream = common::MockUpstream::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("kps.key");
+    nox_kps::identity::init(&key).unwrap();
+    let mut raw = common::base_config(&upstream, &key);
+    raw.keccak_dir = dir.path().join("absent").to_string_lossy().into_owned();
+    let err = nox_kps::start(raw.validate().unwrap()).await.unwrap_err();
+    assert!(err.to_string().contains("keccak_dir"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -149,8 +228,8 @@ async fn rescans_pick_up_published_and_removed_bundles() {
     let first = publish(bundles.path(), b"first bundle");
     let dir = bundles.path().to_string_lossy().into_owned();
     let t = TestServer::start(|raw| {
-        raw.bundles.dir = dir;
-        raw.bundles.rescan_interval_secs = 1;
+        bundle_config(raw, dir, false);
+        raw.limits.bundle_rescan_secs = 1;
     })
     .await;
     let conn = dial(&t.addr(), Transport::Quic).await;

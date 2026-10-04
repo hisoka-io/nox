@@ -1,23 +1,34 @@
-//! `nox-kps` command line: run the sidecar, check a config, print the KPS
-//! address, or probe the local health endpoint.
+//! `nox-kps` command line.
+//!
+//! ```text
+//! nox-kps init            create the identity key once, print the addresses
+//! nox-kps run             serve (the default)
+//! nox-kps address         print <ip>:<port>:<certhash> and the metadataUrl string
+//! nox-kps check-config    validate the configuration and the key file
+//! nox-kps bundle add F    publish a worker bundle under its keccak-256 name
+//! nox-kps bundle list     list the verified bundles and their kps: resolvers
+//! nox-kps bundle verify   re-hash every bundle file; non-zero exit on a mismatch
+//! nox-kps healthcheck     exit 0 when /healthz answers 200 (--kps: dial over QUIC too)
+//! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use nox_kps::bundles::{add_bundle, bundle_path, BundleSettings, BundleStore};
 use nox_kps::config::{summary, ConfigSource, RawConfig, Settings, DEFAULT_CONFIG_PATH};
-use nox_kps::error::HealthcheckError;
-use nox_kps::identity::{self, advertised_ips, format_address, is_non_public};
+use nox_kps::healthcheck::{admin_target, local_kps_address, probe_kps};
+use nox_kps::identity::{self, format_address, metadata_url};
 use nox_kps::metrics::probe_health;
 use tracing::{error, info, warn};
 
-/// Exit status for an invalid configuration.
+/// Exit status for an invalid configuration or key file.
 const EXIT_CONFIG: u8 = 2;
-/// Exit status when the server fails or the health probe fails.
+/// Exit status when the server, a probe or a bundle check fails.
 const EXIT_FAILURE: u8 = 1;
-/// How long `healthcheck` waits for an answer.
-const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long `healthcheck` waits for each probe.
+const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Parser)]
 #[command(
@@ -28,7 +39,7 @@ const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(3);
 struct Cli {
     /// TOML config file. Without this flag, /etc/nox-kps/config.toml is used
     /// when it exists; otherwise built-in defaults plus `NOX_KPS__*` variables.
-    #[arg(short, long, env = "NOX_KPS_CONFIG")]
+    #[arg(short, long, env = "NOX_KPS_CONFIG", global = true)]
     config: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -37,14 +48,35 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create the identity key (once) and print the addresses to publish
+    Init,
     /// Run the sidecar (default)
     Run,
-    /// Validate the configuration and show the address it would publish
-    CheckConfig,
-    /// Print the KPS address(es) to publish, creating the identity key if needed
+    /// Print the KPS address(es) and the registry metadataUrl string
     Address,
-    /// Exit 0 when the local /health endpoint answers 200 (container health checks)
-    Healthcheck,
+    /// Validate the configuration and the identity key file
+    CheckConfig,
+    /// Manage worker bundles served at /keccak/<hh>/<62 hex>
+    Bundle {
+        #[command(subcommand)]
+        action: BundleAction,
+    },
+    /// Exit 0 when the admin /healthz answers 200 (container health checks)
+    Healthcheck {
+        /// Also dial the local KPS listener over QUIC and GET /health end to end
+        #[arg(long)]
+        kps: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BundleAction {
+    /// Publish a file under its keccak-256 name (atomic, read-only)
+    Add { file: PathBuf },
+    /// List the bundles that verify, with their kps: resolver strings
+    List,
+    /// Re-hash every bundle file; exit 1 when any file does not match its name
+    Verify,
 }
 
 fn main() -> ExitCode {
@@ -52,6 +84,13 @@ fn main() -> ExitCode {
     let source = match cli.config {
         Some(path) => ConfigSource::Explicit(path),
         None => ConfigSource::Default(PathBuf::from(DEFAULT_CONFIG_PATH)),
+    };
+    let settings = match RawConfig::load(&source).and_then(|raw| raw.validate()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("nox-kps: {e}");
+            return ExitCode::from(EXIT_CONFIG);
+        }
     };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -64,28 +103,229 @@ fn main() -> ExitCode {
         }
     };
     match cli.command.unwrap_or(Command::Run) {
-        Command::Run => runtime.block_on(run(&source)),
-        Command::CheckConfig => check_config(&source),
-        Command::Address => address(&source),
-        Command::Healthcheck => runtime.block_on(healthcheck(&source)),
+        Command::Init => init(&settings),
+        Command::Run => runtime.block_on(run(&source, settings)),
+        Command::Address => address(&settings),
+        Command::CheckConfig => check_config(&source, &settings),
+        Command::Bundle { action } => bundle(&settings, &action),
+        Command::Healthcheck { kps } => runtime.block_on(healthcheck(&settings, kps)),
     }
 }
 
-fn load_settings(source: &ConfigSource) -> Result<Settings, ExitCode> {
-    RawConfig::load(source)
-        .and_then(|raw| raw.validate())
-        .map_err(|e| {
-            eprintln!("nox-kps: {e}");
-            ExitCode::from(EXIT_CONFIG)
-        })
+fn addresses(settings: &Settings, certhash: &str) -> Vec<String> {
+    settings
+        .advertise
+        .iter()
+        .map(|ip| format_address(*ip, settings.listen.port(), certhash))
+        .collect()
 }
 
-async fn run(source: &ConfigSource) -> ExitCode {
-    let settings = match load_settings(source) {
-        Ok(s) => s,
+fn print_addresses(settings: &Settings, certhash: &str) {
+    for addr in addresses(settings, certhash) {
+        println!("address: {addr}");
+        println!("metadataUrl: {}", metadata_url(&addr));
+    }
+}
+
+fn init(settings: &Settings) -> ExitCode {
+    if settings.listen.port() == 0 {
+        eprintln!("nox-kps: listen uses port 0; set a fixed UDP port before publishing an address");
+        return ExitCode::from(EXIT_CONFIG);
+    }
+    match identity::init(&settings.key_file) {
+        Ok(id) => {
+            println!("created KPS identity {}", settings.key_file.display());
+            println!("certhash: {}", id.certhash);
+            print_addresses(settings, &id.certhash);
+            println!(
+                "back up the key file with the node's secrets; publish the metadataUrl with updateMetadataUrl"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("nox-kps: {e}");
+            ExitCode::from(EXIT_CONFIG)
+        }
+    }
+}
+
+fn address(settings: &Settings) -> ExitCode {
+    if settings.listen.port() == 0 {
+        eprintln!("nox-kps: listen uses port 0; set a fixed UDP port to publish an address");
+        return ExitCode::from(EXIT_CONFIG);
+    }
+    match identity::read_existing(&settings.key_file) {
+        Ok(Some(id)) => {
+            print_addresses(settings, &id.certhash);
+            ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            eprintln!(
+                "nox-kps: no identity key at {}; create it with `nox-kps init`",
+                settings.key_file.display()
+            );
+            ExitCode::from(EXIT_CONFIG)
+        }
+        Err(e) => {
+            eprintln!("nox-kps: {e}");
+            ExitCode::from(EXIT_CONFIG)
+        }
+    }
+}
+
+fn check_config(source: &ConfigSource, settings: &Settings) -> ExitCode {
+    let origin = match source {
+        ConfigSource::Default(p) if !p.exists() => {
+            format!(
+                "built-in defaults + environment (no file at {})",
+                p.display()
+            )
+        }
+        _ => source.path().display().to_string(),
+    };
+    println!("configuration OK: {origin}");
+    for (key, value) in summary(settings) {
+        println!("  {key}: {value}");
+    }
+    match identity::read_existing(&settings.key_file) {
+        Ok(Some(id)) => {
+            if let Err(e) = identity::check_private(&settings.key_file) {
+                eprintln!("nox-kps: {e}");
+                return ExitCode::from(EXIT_CONFIG);
+            }
+            println!(
+                "identity: {} (certhash {})",
+                settings.key_file.display(),
+                id.certhash
+            );
+            if settings.listen.port() == 0 {
+                println!("address: the UDP port is chosen at startup (listen port 0)");
+            } else {
+                print_addresses(settings, &id.certhash);
+            }
+        }
+        Ok(None) => println!(
+            "identity: {} does not exist yet; create it once with `nox-kps init`",
+            settings.key_file.display()
+        ),
+        Err(e) => {
+            eprintln!("nox-kps: {e}");
+            return ExitCode::from(EXIT_CONFIG);
+        }
+    }
+    if let Some(dir) = &settings.keccak_dir {
+        if !dir.is_dir() {
+            eprintln!(
+                "nox-kps: keccak_dir {} is not a directory; create it or set keccak_dir = \"\"",
+                dir.display()
+            );
+            return ExitCode::from(EXIT_CONFIG);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn bundle_settings(settings: &Settings) -> Result<BundleSettings, ExitCode> {
+    let Some(dir) = &settings.keccak_dir else {
+        eprintln!("nox-kps: keccak_dir is empty; set it to manage worker bundles");
+        return Err(ExitCode::from(EXIT_CONFIG));
+    };
+    Ok(BundleSettings {
+        dir: dir.clone(),
+        max_bundle_bytes: settings.limits.max_bundle_bytes,
+        max_bundles: settings.limits.max_bundles,
+        gzip: false,
+    })
+}
+
+/// `kps:<address>/keccak/<hh>/<62 hex>` per advertised IP, when the identity exists.
+fn resolvers(settings: &Settings, hash: &str) -> Vec<String> {
+    match identity::read_existing(&settings.key_file) {
+        Ok(Some(id)) => addresses(settings, &id.certhash)
+            .iter()
+            .map(|a| format!("kps:{a}{}", bundle_path(hash)))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn bundle(settings: &Settings, action: &BundleAction) -> ExitCode {
+    let bs = match bundle_settings(settings) {
+        Ok(bs) => bs,
         Err(code) => return code,
     };
-    if let Err(e) = nox_kps::telemetry::init(&settings.log) {
+    match action {
+        BundleAction::Add { file } => bundle_add(settings, &bs.dir, file, bs.max_bundle_bytes),
+        BundleAction::List | BundleAction::Verify => {
+            let (store, report) = match BundleStore::load(bs) {
+                Ok(loaded) => loaded,
+                Err(e) => {
+                    eprintln!("nox-kps: {e}");
+                    return ExitCode::from(EXIT_FAILURE);
+                }
+            };
+            for hash in store.hashes() {
+                let size = hex_to_array(&hash)
+                    .and_then(|h| store.get(&h))
+                    .map_or(0, |b| b.identity.len());
+                println!("{hash} {size} bytes");
+                for r in resolvers(settings, &hash) {
+                    println!("  {r}");
+                }
+            }
+            for path in &report.mismatched {
+                eprintln!(
+                    "MISMATCH {}: keccak-256 of the bytes differs from the file name",
+                    path.display()
+                );
+            }
+            for path in &report.skipped {
+                eprintln!(
+                    "SKIPPED {}: over limits.max_bundle_bytes or limits.max_bundles",
+                    path.display()
+                );
+            }
+            let failed = matches!(action, BundleAction::Verify)
+                && !(report.mismatched.is_empty() && report.skipped.is_empty());
+            if failed {
+                ExitCode::from(EXIT_FAILURE)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+    }
+}
+
+fn bundle_add(settings: &Settings, dir: &Path, file: &Path, max: usize) -> ExitCode {
+    match add_bundle(dir, file, max) {
+        Ok(added) => {
+            let verb = if added.created {
+                "added"
+            } else {
+                "already present"
+            };
+            println!("{verb}: {} ({})", added.hash, added.path.display());
+            for r in resolvers(settings, &added.hash) {
+                println!("resolver: {r}");
+            }
+            println!("running servers pick it up at the next rescan (limits.bundle_rescan_secs)");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("nox-kps: {e}");
+            ExitCode::from(EXIT_FAILURE)
+        }
+    }
+}
+
+fn hex_to_array(hash: &str) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(hash, &mut out).ok()?;
+    Some(out)
+}
+
+async fn run(source: &ConfigSource, settings: Settings) -> ExitCode {
+    if let Err(e) = nox_kps::telemetry::init(&settings.log_filter, settings.log_format) {
         eprintln!("nox-kps: {e}");
         return ExitCode::from(EXIT_CONFIG);
     }
@@ -108,17 +348,20 @@ async fn run(source: &ConfigSource) -> ExitCode {
         }
     };
     info!(
-        "KPS listener on UDP {} (port {}): WebRTC for browsers and QUIC for native clients",
-        listen,
+        "KPS listener on UDP {listen} (port {}): WebRTC for browsers and QUIC for native clients",
         server.port()
     );
-    info!("publish these addresses (clients dial them directly; there is no DNS):");
+    info!(
+        certhash = server.certhash(),
+        "published addresses (clients dial them directly):"
+    );
     for addr in server.addresses() {
         info!("  {addr}");
     }
-    if let Some(addr) = server.metrics_addr() {
-        info!("metrics and health on http://{addr}/metrics and http://{addr}/health");
-    }
+    info!(
+        "admin endpoint on http://{0}/metrics and http://{0}/healthz",
+        server.admin_addr()
+    );
 
     wait_for_signal().await;
     info!("shutdown requested; finishing in-flight exchanges");
@@ -151,124 +394,20 @@ async fn wait_for_signal() {
     }
 }
 
-fn check_config(source: &ConfigSource) -> ExitCode {
-    let settings = match load_settings(source) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let origin = match source {
-        ConfigSource::Default(p) if !p.exists() => {
-            format!(
-                "built-in defaults + environment (no file at {})",
-                p.display()
-            )
-        }
-        _ => source.path().display().to_string(),
-    };
-    println!("configuration OK: {origin}");
-    for (key, value) in summary(&settings) {
-        println!("  {key}: {value}");
+async fn healthcheck(settings: &Settings, kps: bool) -> ExitCode {
+    if let Err(e) = probe_health(admin_target(settings), HEALTHCHECK_TIMEOUT).await {
+        eprintln!("nox-kps: unhealthy: {e}");
+        return ExitCode::from(EXIT_FAILURE);
     }
-    match identity::read_existing(&settings.identity_key_file) {
-        Ok(Some(id)) => {
-            println!(
-                "identity: {} (certhash {})",
-                settings.identity_key_file.display(),
-                id.certhash
-            );
-            if settings.listen.port() == 0 {
-                println!("address: the UDP port is chosen at startup (kps.listen port 0)");
-            } else {
-                let adv = advertised_ips(&settings.public_ips, settings.listen);
-                for ip in &adv.ips {
-                    println!(
-                        "address: {}",
-                        format_address(*ip, settings.listen.port(), &id.certhash)
-                    );
-                }
-            }
-        }
-        Ok(None) => println!(
-            "identity: {} does not exist yet; it is created on first start (or with `nox-kps address`)",
-            settings.identity_key_file.display()
-        ),
-        Err(e) => {
-            eprintln!("nox-kps: {e}");
-            return ExitCode::from(EXIT_CONFIG);
-        }
-    }
-    if settings.public_ips.is_empty() {
-        println!("note: kps.public_ips is empty; set it to the node's public IP for production");
-    }
-    for ip in settings.public_ips.iter().filter(|ip| is_non_public(**ip)) {
-        println!("note: public IP {ip} is not publicly routable");
-    }
-    if let Some(b) = &settings.bundles {
-        if !b.dir.is_dir() {
-            eprintln!(
-                "nox-kps: bundles.dir {} is not a directory",
-                b.dir.display()
-            );
-            return ExitCode::from(EXIT_CONFIG);
-        }
-    }
-    ExitCode::SUCCESS
-}
-
-fn address(source: &ConfigSource) -> ExitCode {
-    let settings = match load_settings(source) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    if settings.listen.port() == 0 {
-        eprintln!("nox-kps: kps.listen uses port 0; set a fixed UDP port to publish an address");
-        return ExitCode::from(EXIT_CONFIG);
-    }
-    let loaded = match identity::load_or_create(&settings.identity_key_file) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("nox-kps: {e}");
+    if kps {
+        let probe = match local_kps_address(settings) {
+            Ok(addr) => probe_kps(&addr, HEALTHCHECK_TIMEOUT).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = probe {
+            eprintln!("nox-kps: unhealthy: {e}");
             return ExitCode::from(EXIT_FAILURE);
         }
-    };
-    if loaded.created {
-        eprintln!(
-            "created a new KPS identity key at {}; back it up with the node's secrets",
-            settings.identity_key_file.display()
-        );
-    }
-    let adv = advertised_ips(&settings.public_ips, settings.listen);
-    if adv.detected {
-        eprintln!("note: kps.public_ips is empty; printing detected addresses");
-    }
-    for ip in &adv.ips {
-        println!(
-            "{}",
-            format_address(*ip, settings.listen.port(), &loaded.identity.certhash)
-        );
     }
     ExitCode::SUCCESS
-}
-
-async fn healthcheck(source: &ConfigSource) -> ExitCode {
-    let settings = match load_settings(source) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let result = match settings.metrics_listen {
-        None => Err(HealthcheckError::Disabled),
-        Some(mut addr) => {
-            if addr.ip().is_unspecified() {
-                addr.set_ip(std::net::IpAddr::from([127, 0, 0, 1]));
-            }
-            probe_health(addr, HEALTHCHECK_TIMEOUT).await
-        }
-    };
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("nox-kps: unhealthy: {e}");
-            ExitCode::from(EXIT_FAILURE)
-        }
-    }
 }

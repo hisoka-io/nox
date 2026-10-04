@@ -19,17 +19,27 @@ pub enum ConfigError {
     Invalid(Vec<String>),
 }
 
-/// Loading, creating or inspecting the persistent KPS identity.
+/// Creating, loading or inspecting the persistent KPS identity.
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
+    #[error(
+        "no KPS identity key at {path}; create it once with `nox-kps init` (run never generates a key, because the certhash is the published address)"
+    )]
+    Missing { path: PathBuf },
+    #[error(
+        "a KPS identity key already exists at {path}; init refuses to replace it (a new key changes the published address; delete the file deliberately to rotate)"
+    )]
+    AlreadyExists { path: PathBuf },
+    #[error("the KPS identity key at {path} has mode {mode:o}; it must be private: run chmod 600 {path}")]
+    Permissions { path: PathBuf, mode: u32 },
     #[error("cannot create the identity key directory {path}: {source}")]
     CreateDir {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("cannot load or create the KPS identity key at {path}: {source}")]
-    LoadOrCreate {
+    #[error("cannot create the KPS identity key at {path}: {source}")]
+    Create {
         path: PathBuf,
         #[source]
         source: kps::Error,
@@ -48,7 +58,7 @@ pub enum IdentityError {
     },
 }
 
-/// Scanning the worker-bundle directory.
+/// Scanning, adding or verifying worker bundles.
 #[derive(Debug, thiserror::Error)]
 pub enum BundleError {
     #[error("cannot read the bundle directory {path}: {source}")]
@@ -56,6 +66,31 @@ pub enum BundleError {
         path: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+    #[error("cannot read bundle file {path}: {source}")]
+    ReadFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("bundle file {path} is {size} bytes, over limits.max_bundle_bytes ({limit})")]
+    TooLarge {
+        path: PathBuf,
+        size: u64,
+        limit: usize,
+    },
+    #[error("cannot write bundle {hash} into {dir}: {source}")]
+    Write {
+        hash: String,
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("bundle {hash} already exists in {dir} with different bytes ({path}); remove the damaged file and add it again")]
+    Conflict {
+        hash: String,
+        dir: PathBuf,
+        path: PathBuf,
     },
     #[error("cannot compress bundle {hash}: {source}")]
     Compress {
@@ -78,33 +113,54 @@ pub enum StartError {
         #[source]
         source: kps::Error,
     },
-    #[error("cannot bind the metrics TCP listener on {addr}: {source}")]
-    MetricsBind {
+    #[error("cannot encode /metadata.json: {0}")]
+    Metadata(#[source] serde_json::Error),
+    #[error("cannot bind the admin TCP listener (metrics, healthz) on {addr}: {source}")]
+    AdminBind {
         addr: SocketAddr,
         #[source]
         source: std::io::Error,
     },
-    #[error("cannot register metric {name}: {reason}")]
-    Metrics { name: &'static str, reason: String },
 }
 
 /// Forwarding one exchange to an upstream.
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
-    #[error("cannot reach upstream {upstream} ({authority}): {reason}")]
+    #[error(
+        "route {route}: cannot reach {upstream} ({authority}) after {elapsed_ms} ms: {reason}"
+    )]
     Connect {
-        upstream: String,
+        route: &'static str,
+        upstream: &'static str,
         authority: String,
+        elapsed_ms: u128,
         reason: String,
     },
-    #[error("upstream {upstream} did not answer within {timeout_ms} ms")]
-    Timeout { upstream: String, timeout_ms: u128 },
-    #[error("upstream {upstream} response body exceeds {limit} bytes")]
-    ResponseTooLarge { upstream: String, limit: usize },
-    #[error("upstream {upstream} exchange failed: {reason}")]
-    Upstream { upstream: String, reason: String },
-    #[error("cannot build the upstream request for {upstream}: {reason}")]
-    BuildRequest { upstream: String, reason: String },
+    #[error("route {route}: {upstream} did not answer within {timeout_ms} ms")]
+    Timeout {
+        route: &'static str,
+        upstream: &'static str,
+        timeout_ms: u128,
+    },
+    #[error("route {route}: {upstream} response body exceeds {limit} bytes")]
+    ResponseTooLarge {
+        route: &'static str,
+        upstream: &'static str,
+        limit: usize,
+    },
+    #[error("route {route}: {upstream} exchange failed after {elapsed_ms} ms: {reason}")]
+    Upstream {
+        route: &'static str,
+        upstream: &'static str,
+        elapsed_ms: u128,
+        reason: String,
+    },
+    #[error("route {route}: cannot build the request for {upstream}: {reason}")]
+    BuildRequest {
+        route: &'static str,
+        upstream: &'static str,
+        reason: String,
+    },
 }
 
 impl ProxyError {
@@ -121,23 +177,25 @@ impl ProxyError {
     }
 }
 
-/// Probing the local health endpoint (`nox-kps healthcheck`).
+/// `nox-kps healthcheck`.
 #[derive(Debug, thiserror::Error)]
 pub enum HealthcheckError {
-    #[error("metrics/health endpoint is disabled (metrics.listen is empty)")]
-    Disabled,
     #[error("cannot connect to {addr}: {source}")]
     Connect {
         addr: SocketAddr,
         #[source]
         source: std::io::Error,
     },
-    #[error("health request to {addr} failed: {reason}")]
-    Request { addr: SocketAddr, reason: String },
-    #[error("health endpoint {addr} answered {status}")]
-    Unhealthy { addr: SocketAddr, status: u16 },
-    #[error("health endpoint {addr} did not answer within {timeout_ms} ms")]
-    Timeout { addr: SocketAddr, timeout_ms: u128 },
+    #[error("health request to {target} failed: {reason}")]
+    Request { target: String, reason: String },
+    #[error("health endpoint {target} answered {status}")]
+    Unhealthy { target: String, status: u16 },
+    #[error("health endpoint {target} did not answer within {timeout_ms} ms")]
+    Timeout { target: String, timeout_ms: u128 },
+    #[error("cannot dial the local KPS listener {target}: {reason}")]
+    Dial { target: String, reason: String },
+    #[error(transparent)]
+    Identity(#[from] IdentityError),
 }
 
 /// Initialising logging.

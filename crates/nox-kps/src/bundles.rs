@@ -20,8 +20,19 @@ use http::header::{self, HeaderMap};
 use sha3::{Digest, Keccak256};
 use tracing::{info, warn};
 
-use crate::config::BundleSettings;
 use crate::error::BundleError;
+
+/// Where bundles live and how many are served.
+#[derive(Debug, Clone)]
+pub struct BundleSettings {
+    /// `<dir>/<hh>/<62 hex>` (the GitHub `keccak` branch layout); flat
+    /// `<dir>/<64 hex>` files are read too.
+    pub dir: PathBuf,
+    pub max_bundle_bytes: usize,
+    pub max_bundles: usize,
+    /// Keep a gzip copy for clients that list `gzip` (off in v1).
+    pub gzip: bool,
+}
 
 /// `Cache-Control` for immutable, hash-addressed objects (anon-rpc network
 /// guide; tor-js-gateway PROTOCOL §5).
@@ -116,6 +127,87 @@ impl BundleStore {
     fn snapshot(&self) -> Arc<Index> {
         Arc::clone(&self.index.read().unwrap_or_else(PoisonError::into_inner))
     }
+}
+
+/// Result of [`add_bundle`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Added {
+    /// keccak-256 of the bytes, lowercase hex.
+    pub hash: String,
+    /// Where the bundle now lives.
+    pub path: PathBuf,
+    /// `false` when identical bytes were already published.
+    pub created: bool,
+}
+
+/// The `/keccak/<hh>/<62 hex>` path for a 64-hex hash.
+#[must_use]
+pub fn bundle_path(hash: &str) -> String {
+    let (hh, rest) = hash.split_at(2.min(hash.len()));
+    format!("/keccak/{hh}/{rest}")
+}
+
+/// Publishes `file` into `dir` under its keccak-256 name (`nox-kps bundle
+/// add`): written to a temporary file, made read-only (0444) and renamed into
+/// place, so a running server never sees a partial bundle.
+pub fn add_bundle(dir: &Path, file: &Path, max_bytes: usize) -> Result<Added, BundleError> {
+    let read_err = |source| BundleError::ReadFile {
+        path: file.to_path_buf(),
+        source,
+    };
+    let size = std::fs::metadata(file).map_err(read_err)?.len();
+    if size > max_bytes as u64 {
+        return Err(BundleError::TooLarge {
+            path: file.to_path_buf(),
+            size,
+            limit: max_bytes,
+        });
+    }
+    let bytes = std::fs::read(file).map_err(|source| BundleError::ReadFile {
+        path: file.to_path_buf(),
+        source,
+    })?;
+    let hash = keccak256_hex(&bytes);
+    let shard = dir.join(&hash[..2]);
+    let target = shard.join(&hash[2..]);
+    let write_err = |source| BundleError::Write {
+        hash: hash.clone(),
+        dir: dir.to_path_buf(),
+        source,
+    };
+    match std::fs::read(&target) {
+        Ok(existing) if existing == bytes => {
+            return Ok(Added {
+                hash,
+                path: target,
+                created: false,
+            })
+        }
+        Ok(_) => {
+            return Err(BundleError::Conflict {
+                hash,
+                dir: dir.to_path_buf(),
+                path: target,
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(write_err(e)),
+    }
+    std::fs::create_dir_all(&shard).map_err(write_err)?;
+    let tmp = shard.join(format!(".{}.tmp-{}", &hash[2..], std::process::id()));
+    std::fs::write(&tmp, &bytes).map_err(write_err)?;
+    let mut perms = std::fs::metadata(&tmp).map_err(write_err)?.permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&tmp, perms).map_err(write_err)?;
+    if let Err(e) = std::fs::rename(&tmp, &target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(write_err(e));
+    }
+    Ok(Added {
+        hash,
+        path: target,
+        created: true,
+    })
 }
 
 /// Logs a scan report at the right levels. Hashes are public (they are on
@@ -329,7 +421,7 @@ fn gzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::pedantic)]
 
     use std::io::Read;
 
@@ -342,7 +434,6 @@ mod tests {
             dir: dir.to_path_buf(),
             max_bundle_bytes: 1024 * 1024,
             max_bundles: 16,
-            rescan_interval: None,
             gzip: true,
         }
     }
@@ -358,6 +449,57 @@ mod tests {
         let mut out = [0u8; 32];
         hex::decode_to_slice(hash, &mut out).unwrap();
         out
+    }
+
+    #[test]
+    fn add_bundle_publishes_atomically_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("keccak");
+        let src = dir.path().join("worker.js");
+        std::fs::write(&src, b"(()=>{})();").unwrap();
+        let added = add_bundle(&store, &src, 1024).unwrap();
+        assert!(added.created);
+        assert_eq!(added.hash, keccak256_hex(b"(()=>{})();"));
+        assert_eq!(
+            added.path,
+            store.join(&added.hash[..2]).join(&added.hash[2..])
+        );
+        assert!(std::fs::metadata(&added.path)
+            .unwrap()
+            .permissions()
+            .readonly());
+        assert_eq!(
+            bundle_path(&added.hash),
+            format!("/keccak/{}/{}", &added.hash[..2], &added.hash[2..])
+        );
+        let again = add_bundle(&store, &src, 1024).unwrap();
+        assert!(!again.created);
+        let leftovers = std::fs::read_dir(store.join(&added.hash[..2]))
+            .unwrap()
+            .count();
+        assert_eq!(leftovers, 1, "no temporary files remain");
+        let (loaded, _) = BundleStore::load(settings(&store)).unwrap();
+        assert_eq!(loaded.hashes(), vec![added.hash]);
+    }
+
+    #[test]
+    fn add_bundle_refuses_oversized_files_and_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("keccak");
+        let src = dir.path().join("big.js");
+        std::fs::write(&src, vec![b'x'; 2048]).unwrap();
+        assert!(matches!(
+            add_bundle(&store, &src, 1024),
+            Err(BundleError::TooLarge { .. })
+        ));
+        std::fs::write(&src, b"genuine").unwrap();
+        let hash = keccak256_hex(b"genuine");
+        std::fs::create_dir_all(store.join(&hash[..2])).unwrap();
+        std::fs::write(store.join(&hash[..2]).join(&hash[2..]), b"damaged").unwrap();
+        assert!(matches!(
+            add_bundle(&store, &src, 1024),
+            Err(BundleError::Conflict { .. })
+        ));
     }
 
     #[test]

@@ -1,23 +1,23 @@
-//! Shared per-process state: settings, the route allowlist, the upstream
-//! client, the bundle store, the capability document and the metrics.
+//! Shared per-process state: settings, the upstream client, response caches,
+//! rate limiters, the bundle store, the capability document and the metrics.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::Method;
+use serde::Serialize;
 use tokio::sync::Semaphore;
 
 use crate::bundles::BundleStore;
-use crate::config::{Route, Settings};
-use crate::limits::ConnLimiter;
+use crate::config::{Settings, SPHINX_PACKET_BYTES};
+use crate::limits::{ConnLimiter, RateLimiter};
 use crate::metrics::Metrics;
-use crate::proxy::UpstreamClient;
+use crate::proxy::{SharedResponse, UpstreamClient};
+use crate::routes::Route;
 
 /// Everything a stream handler needs.
 #[derive(Debug)]
 pub struct App {
     pub settings: Arc<Settings>,
-    pub router: Router,
     pub upstream: UpstreamClient,
     pub bundles: Option<Arc<BundleStore>>,
     /// `GET /metadata.json` body, built once at startup.
@@ -26,149 +26,143 @@ pub struct App {
     /// Upstream requests in flight across all clients.
     pub inflight: Arc<Semaphore>,
     pub conn_limiter: Arc<ConnLimiter>,
+    pub rate: RateLimiters,
+    pub topology: SharedResponse,
+    pub health: SharedResponse,
 }
 
-/// Exact-match allowlist of proxied routes.
-#[derive(Debug, Clone)]
-pub struct Router {
-    routes: Vec<Route>,
+/// Per-IP token buckets, one per rate-limited route class.
+#[derive(Debug)]
+pub struct RateLimiters {
+    pub packets: RateLimiter,
+    pub claim: RateLimiter,
+    pub topology: RateLimiter,
+    pub bundle: RateLimiter,
 }
 
-/// Result of a route lookup.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Lookup<'a> {
-    Found(&'a Route),
-    /// The path exists with other methods; carries the `Allow` value.
-    MethodNotAllowed(String),
-    NotFound,
-}
-
-impl Router {
+impl RateLimiters {
     #[must_use]
-    pub fn new(routes: Vec<Route>) -> Self {
-        Self { routes }
-    }
-
-    #[must_use]
-    pub fn routes(&self) -> &[Route] {
-        &self.routes
-    }
-
-    /// Exact path match; the method must match too.
-    #[must_use]
-    pub fn lookup(&self, method: &Method, path: &str) -> Lookup<'_> {
-        let mut allowed: Vec<&str> = Vec::new();
-        for route in self.routes.iter().filter(|r| r.path == path) {
-            if route.method == *method {
-                return Lookup::Found(route);
-            }
-            allowed.push(route.method.as_str());
-        }
-        if allowed.is_empty() {
-            Lookup::NotFound
-        } else {
-            allowed.sort_unstable();
-            allowed.dedup();
-            Lookup::MethodNotAllowed(allowed.join(", "))
+    pub fn new(settings: &Settings) -> Self {
+        let l = &settings.limits;
+        let make = |rate| RateLimiter::new(rate, l.ipv6_prefix_len, l.rate_limit_max_clients);
+        Self {
+            packets: make(l.packet_rate),
+            claim: make(l.claim_rate),
+            topology: make(l.topology_rate),
+            bundle: make(l.bundle_rate),
         }
     }
+
+    /// The limiter for `route`; `None` for routes without a per-IP rate.
+    #[must_use]
+    pub fn for_route(&self, route: Route) -> Option<&RateLimiter> {
+        match route {
+            Route::Packets => Some(&self.packets),
+            Route::Claim => Some(&self.claim),
+            Route::Topology => Some(&self.topology),
+            Route::Bundle => Some(&self.bundle),
+            Route::Health | Route::Metadata => None,
+        }
+    }
+
+    /// Drops idle client buckets (run periodically).
+    pub fn sweep(&self) {
+        for limiter in [&self.packets, &self.claim, &self.topology, &self.bundle] {
+            limiter.sweep();
+        }
+    }
 }
 
-/// The capability document served at `/metadata.json` (the KPS-HTTP/1
-/// convention from tor-js-gateway PROTOCOL.md §5): protocol, software,
-/// version, capabilities (`metadata`, the route names, `worker-bundles` when
-/// enabled) and the published addresses.
-#[must_use]
-pub fn metadata_document(routes: &[Route], bundles_enabled: bool, addresses: &[String]) -> Bytes {
-    let mut capabilities = vec!["metadata".to_string()];
-    capabilities.extend(routes.iter().map(|r| r.name.clone()));
-    if bundles_enabled {
-        capabilities.push("worker-bundles".to_string());
-    }
-    let doc = serde_json::json!({
-        "protocol": "kps-http/1",
-        "software": "nox-kps",
-        "version": env!("CARGO_PKG_VERSION"),
-        "capabilities": capabilities,
-        "addresses": addresses,
-    });
-    Bytes::from(doc.to_string())
+/// `/metadata.json` (ARCHITECTURE §2.9), in this key order.
+#[derive(Debug, Serialize)]
+struct MetadataDocument<'a> {
+    protocol: &'static str,
+    software: &'static str,
+    version: &'static str,
+    node: Option<&'a str>,
+    addresses: &'a [String],
+    capabilities: Vec<&'static str>,
+    limits: MetadataLimits,
+    demo: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_field_names)] // the JSON keys are part of the published format
+struct MetadataLimits {
+    packet_bytes: usize,
+    claim_request_max_bytes: usize,
+    claim_response_max_bytes: usize,
+}
+
+/// The capability document served at `/metadata.json`.
+pub fn metadata_document(
+    settings: &Settings,
+    addresses: &[String],
+    bundles_enabled: bool,
+) -> Result<Bytes, serde_json::Error> {
+    let capabilities = Route::ALL
+        .iter()
+        .filter(|r| bundles_enabled || **r != Route::Bundle)
+        .map(|r| r.label())
+        .collect();
+    let doc = MetadataDocument {
+        protocol: crate::PROTOCOL,
+        software: "nox-kps",
+        version: env!("CARGO_PKG_VERSION"),
+        node: settings.node_address.as_deref(),
+        addresses,
+        capabilities,
+        limits: MetadataLimits {
+            packet_bytes: SPHINX_PACKET_BYTES,
+            claim_request_max_bytes: settings.limits.claim_request_max_bytes,
+            claim_response_max_bytes: settings.limits.claim_response_max_bytes,
+        },
+        demo: false,
+    };
+    serde_json::to_vec(&doc).map(Bytes::from)
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::pedantic)]
 
     use super::*;
     use crate::config::RawConfig;
 
-    fn router() -> Router {
-        Router::new(RawConfig::default().validate().unwrap().routes)
+    fn settings(node: &str) -> Settings {
+        RawConfig {
+            advertise: vec!["3.239.73.249".into()],
+            node_address: node.into(),
+            ..RawConfig::default()
+        }
+        .validate()
+        .unwrap()
     }
 
     #[test]
-    fn exact_matches_only() {
-        let r = router();
-        assert!(
-            matches!(r.lookup(&Method::POST, "/api/v1/packets"), Lookup::Found(route) if route.name == "nox-packets")
-        );
-        assert!(matches!(
-            r.lookup(&Method::GET, "/topology"),
-            Lookup::Found(_)
-        ));
+    fn metadata_matches_the_architecture_shape() {
+        let s = settings("0x862D6B1105bdE9d64dC5182fe3CD9d09F6F37463");
+        let addrs = vec!["3.239.73.249:15005:uEiX".to_string()];
+        let doc = metadata_document(&s, &addrs, true).unwrap();
+        let text = std::str::from_utf8(&doc).unwrap();
         assert_eq!(
-            r.lookup(&Method::POST, "/api/v1/packets/"),
-            Lookup::NotFound
+            text,
+            concat!(
+                r#"{"protocol":"nox-kps-http/1","software":"nox-kps","version":""#,
+                env!("CARGO_PKG_VERSION"),
+                r#"","node":"0x862d6b1105bde9d64dc5182fe3cd9d09f6f37463","addresses":["3.239.73.249:15005:uEiX"],"#,
+                r#""capabilities":["metadata","health","packets","claim","topology","worker-bundles"],"#,
+                r#""limits":{"packetBytes":32768,"claimRequestMaxBytes":65536,"claimResponseMaxBytes":16777216},"demo":false}"#
+            )
         );
-        assert_eq!(r.lookup(&Method::POST, "/api/v1/packet"), Lookup::NotFound);
-        assert_eq!(r.lookup(&Method::GET, "/api/v1/ws"), Lookup::NotFound);
-        assert_eq!(
-            r.lookup(&Method::GET, "/api/v1/responses/stream"),
-            Lookup::NotFound
-        );
-        assert_eq!(r.lookup(&Method::GET, "/metrics"), Lookup::NotFound);
-        assert_eq!(r.lookup(&Method::GET, "/API/V1/PACKETS"), Lookup::NotFound);
-    }
-
-    #[test]
-    fn wrong_method_lists_the_allowed_ones() {
-        let r = router();
-        assert_eq!(
-            r.lookup(&Method::GET, "/api/v1/packets"),
-            Lookup::MethodNotAllowed("POST".to_string())
-        );
-        assert_eq!(
-            r.lookup(&Method::HEAD, "/topology"),
-            Lookup::MethodNotAllowed("GET".to_string())
-        );
-    }
-
-    #[test]
-    fn metadata_lists_capabilities_and_addresses() {
-        let routes = RawConfig::default().validate().unwrap().routes;
-        let doc = metadata_document(&routes, true, &["203.0.113.5:15005:uEiX".to_string()]);
+        let doc = metadata_document(&settings(""), &addrs, false).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&doc).unwrap();
-        assert_eq!(v["protocol"], "kps-http/1");
-        assert_eq!(v["software"], "nox-kps");
-        let caps: Vec<&str> = v["capabilities"]
+        assert!(v["node"].is_null());
+        assert!(!v["capabilities"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|c| c.as_str().unwrap())
-            .collect();
-        assert_eq!(
-            caps,
-            [
-                "metadata",
-                "nox-packets",
-                "nox-responses-claim",
-                "nox-topology",
-                "nox-health",
-                "worker-bundles"
-            ]
-        );
-        assert_eq!(v["addresses"][0], "203.0.113.5:15005:uEiX");
-        let doc = metadata_document(&routes, false, &[]);
-        assert!(!String::from_utf8_lossy(&doc).contains("worker-bundles"));
+            .any(|c| c == "worker-bundles"));
     }
 }

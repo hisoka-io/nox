@@ -6,13 +6,18 @@
 //! cargo test --release --test soak -- --ignored --nocapture
 //! SOAK_REQUESTS=2000 SOAK_STALL_MS=5000 SOAK_OUT=soak.json cargo test --release --test soak -- --ignored --nocapture
 //! ```
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::pedantic
+)]
 
 mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{dial, request, route, try_exchange, TestServer, Transport};
+use common::{claim_request, dial, packet_request, try_exchange, TestServer, Transport, SURB_ID};
 
 const PAYLOAD: usize = 32 * 1024;
 
@@ -20,7 +25,7 @@ const PAYLOAD: usize = 32 * 1024;
 enum Direction {
     /// `POST /api/v1/packets` with a 32 KiB body, short response.
     Upload,
-    /// `GET /blob` answered with a 32 KiB body.
+    /// `POST /api/v1/responses/claim` answered with a 32 KiB body.
     Download,
 }
 
@@ -72,20 +77,8 @@ async fn soak(
     let ch = t.certhash();
     let packet: Vec<u8> = (0..PAYLOAD).map(|i| (i % 251) as u8).collect();
     let req = match direction {
-        Direction::Upload => request(
-            "POST",
-            "/api/v1/packets",
-            &ch,
-            &[("Content-Type", "application/octet-stream")],
-            &packet,
-        ),
-        Direction::Download => request(
-            "GET",
-            "/blob",
-            &ch,
-            &[("X-Mock-Response-Bytes", "32768")],
-            b"",
-        ),
+        Direction::Upload => packet_request(&ch, &packet),
+        Direction::Download => claim_request(&ch, &[SURB_ID]),
     };
     let mut run = Run {
         transport: transport.name(),
@@ -149,15 +142,18 @@ async fn soak_sequential_32k_requests() {
     let count: usize = env_or("SOAK_REQUESTS", 2000);
     let stall = Duration::from_millis(env_or("SOAK_STALL_MS", 5000));
     let t = TestServer::start(|raw| {
-        raw.proxy
-            .forward_request_headers
-            .push("x-mock-response-bytes".into());
-        raw.routes.push(route("blob", "GET", "/blob", "ingress", 0));
+        raw.limits.packet_rate_per_ip = 1_000_000;
+        raw.limits.packet_burst = 1_000_000;
+        raw.limits.claim_rate_per_ip = 1_000_000;
+        raw.limits.claim_burst = 1_000_000;
         raw.limits.header_read_timeout_ms = 10_000;
         raw.limits.stream_timeout_ms = 20_000;
-        raw.limits.connection_idle_timeout_ms = 600_000;
+        raw.limits.conn_idle_timeout_secs = 600;
     })
     .await;
+    t.upstream
+        .set_body_bytes("/api/v1/responses/claim", PAYLOAD);
+    t.upstream.behaviour.lock().unwrap().skip_bodies = true;
 
     let mut runs = Vec::new();
     for transport in [Transport::Quic, Transport::WebRtc] {

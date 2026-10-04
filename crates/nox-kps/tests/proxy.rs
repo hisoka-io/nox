@@ -1,19 +1,25 @@
 //! End-to-end proxying over real KPS connections (QUIC and WebRTC) to a mock
 //! of the node's loopback services.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::pedantic
+)]
 
 mod common;
 
 use std::net::IpAddr;
+use std::time::{Duration, Instant};
 
-use common::{dial, exchange, request, TestServer, Transport};
-
-const PACKET_SIZE: usize = 32_768;
+use common::{
+    claim_request, dial, exchange, packet, packet_request, request, TestServer, Transport, SURB_ID,
+};
 
 async fn packets_round_trip(transport: Transport) {
     let t = TestServer::start(|_| {}).await;
     let conn = dial(&t.addr(), transport).await;
-    let packet: Vec<u8> = (0..PACKET_SIZE).map(|i| (i % 251) as u8).collect();
+    let body: Vec<u8> = (0..32_768).map(|i| (i % 251) as u8).collect();
     let req = request(
         "POST",
         "/api/v1/packets",
@@ -26,18 +32,20 @@ async fn packets_round_trip(transport: Transport) {
             ("Cookie", "session=1"),
             ("Connection", "close, x-hop"),
             ("X-Hop", "1"),
+            ("Accept", "*/*"),
         ],
-        &packet,
+        &body,
     );
     let res = exchange(conn.as_ref(), &req).await;
     assert_eq!(res.status, 202, "{}: {}", transport.name(), res.text());
-    assert_eq!(res.text(), format!("http-{:016x}", PACKET_SIZE));
-    assert_eq!(res.header("x-nox-version"), Some("test-upstream"));
-    assert!(
-        res.header("set-cookie").is_none(),
-        "upstream-only headers are dropped"
+    assert_eq!(res.text(), format!("http-{:016x}", 32_768));
+    for absent in ["set-cookie", "x-internal", "x-nox-version"] {
+        assert!(res.header(absent).is_none(), "{absent} is not relayed");
+    }
+    assert_eq!(
+        res.header("content-type"),
+        Some("text/plain; charset=utf-8")
     );
-    assert!(res.header("x-internal").is_none());
     assert!(
         res.header("content-length").is_some(),
         "responses carry Content-Length"
@@ -48,30 +56,33 @@ async fn packets_round_trip(transport: Transport) {
     assert_eq!(seen.path_and_query, "/api/v1/packets");
     assert_eq!(
         seen.body.as_ref(),
-        packet.as_slice(),
+        body.as_slice(),
         "packet bytes arrive intact"
     );
-    assert_eq!(seen.headers["host"], t.upstream.addr.to_string());
+    let mut names: Vec<&str> = seen.headers.keys().map(http::HeaderName::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["content-length", "content-type", "host", "x-real-ip"],
+        "only these headers reach the node"
+    );
+    assert_eq!(seen.headers["host"], t.upstream.authority());
     assert_eq!(seen.headers["content-type"], "application/octet-stream");
-    let forwarded: Vec<_> = seen.headers.get_all("x-forwarded-for").iter().collect();
-    assert_eq!(forwarded.len(), 1, "exactly one client IP value");
-    let ip: IpAddr = forwarded[0].to_str().unwrap().parse().unwrap();
+    assert_eq!(seen.headers["content-length"], "32768");
+    let real: Vec<_> = seen.headers.get_all("x-real-ip").iter().collect();
+    assert_eq!(real.len(), 1, "exactly one client IP value");
+    let ip: IpAddr = real[0].to_str().unwrap().parse().unwrap();
     assert_ne!(
         ip.to_string(),
         "6.6.6.6",
         "client-supplied value is replaced"
     );
     if transport == Transport::Quic {
-        assert_eq!(
-            ip.to_string(),
-            "127.0.0.1",
-            "QUIC source address of a loopback dial"
-        );
-    }
-    for absent in ["x-real-ip", "forwarded", "cookie", "x-hop", "connection"] {
+        // QUIC: the UDP source of a loopback dial. WebRTC: the ICE candidate
+        // the client nominated, which may be any local interface address.
         assert!(
-            seen.headers.get(absent).is_none(),
-            "{absent} must not reach the node"
+            ip.is_loopback(),
+            "the KPS source address of a loopback dial: {ip}"
         );
     }
     conn.close().await.unwrap();
@@ -89,43 +100,37 @@ async fn packets_are_proxied_over_webrtc() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn claim_topology_and_health_are_proxied() {
+async fn claim_topology_and_health() {
     let t = TestServer::start(|_| {}).await;
     let conn = dial(&t.addr(), Transport::Quic).await;
     let ch = t.certhash();
 
-    let claim = br#"{"surb_ids":["00112233445566778899aabbccddeeff"]}"#;
-    let res = exchange(
-        conn.as_ref(),
-        &request(
-            "POST",
-            "/api/v1/responses/claim",
-            &ch,
-            &[("Content-Type", "application/json")],
-            claim,
-        ),
-    )
-    .await;
+    let res = exchange(conn.as_ref(), &claim_request(&ch, &[SURB_ID])).await;
     assert_eq!(res.status, 200, "{}", res.text());
     assert_eq!(res.header("content-type"), Some("application/json"));
     let items: serde_json::Value = serde_json::from_slice(&res.body).unwrap();
-    assert_eq!(items[0]["id"], "00112233445566778899aabbccddeeff");
-    assert_eq!(
-        t.upstream.last().headers["content-type"],
-        "application/json"
-    );
+    assert_eq!(items[0]["id"], SURB_ID);
+    let seen = t.upstream.last();
+    assert_eq!(seen.path_and_query, "/api/v1/responses/claim");
+    assert_eq!(seen.headers["content-type"], "application/json");
+    assert!(seen.headers.get("x-real-ip").is_some());
 
+    // The SDK's content type may carry parameters.
+    let body = format!(r#"{{"surb_ids":["{SURB_ID}"]}}"#);
     let res = exchange(
         conn.as_ref(),
         &request(
             "POST",
             "/api/v1/responses/claim",
             &ch,
-            &[("Content-Type", "application/json")],
-            br#"{"surb_ids":[]}"#,
+            &[("Content-Type", "application/json; charset=utf-8")],
+            body.as_bytes(),
         ),
     )
     .await;
+    assert_eq!(res.status, 200);
+
+    let res = exchange(conn.as_ref(), &claim_request(&ch, &[])).await;
     assert_eq!(res.status, 204);
     assert!(res.body.is_empty());
 
@@ -133,19 +138,26 @@ async fn claim_topology_and_health_are_proxied() {
     assert_eq!(res.status, 200);
     let topo: serde_json::Value = serde_json::from_slice(&res.body).unwrap();
     assert_eq!(topo["fingerprint"], "0x00");
+    assert!(
+        t.upstream.last().headers.get("x-real-ip").is_none(),
+        "shared fetches carry no client IP"
+    );
 
-    let res = exchange(conn.as_ref(), &request("GET", "/health", &ch, &[], b"")).await;
-    assert_eq!(res.status, 200);
-    assert_eq!(res.text(), "ok");
-
-    // Query strings ride along to the allowlisted path.
+    // Query strings never reach the node.
     let res = exchange(
         conn.as_ref(),
         &request("GET", "/topology?fresh=1", &ch, &[], b""),
     )
     .await;
     assert_eq!(res.status, 200);
-    assert_eq!(t.upstream.last().path_and_query, "/topology?fresh=1");
+    assert_eq!(t.upstream.last().path_and_query, "/topology");
+
+    // /health is answered by nox-kps after probing the node's /health.
+    let res = exchange(conn.as_ref(), &request("GET", "/health", &ch, &[], b"")).await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.text(), r#"{"status":"ok"}"#);
+    assert_eq!(res.header("content-type"), Some("application/json"));
+    assert_eq!(t.upstream.last().path_and_query, "/health");
 
     // Many exchanges share one connection, one stream each.
     for _ in 0..20 {
@@ -162,16 +174,9 @@ async fn concurrent_streams_on_one_connection() {
         std::sync::Arc::from(dial(&t.addr(), Transport::Quic).await);
     let ch = t.certhash();
     let mut tasks = Vec::new();
-    for i in 0..32u32 {
+    for i in 0..32u8 {
         let conn = std::sync::Arc::clone(&conn);
-        let packet = vec![(i % 256) as u8; PACKET_SIZE];
-        let req = request(
-            "POST",
-            "/api/v1/packets",
-            &ch,
-            &[("Content-Type", "application/octet-stream")],
-            &packet,
-        );
+        let req = packet_request(&ch, &packet(i));
         tasks.push(tokio::spawn(async move {
             exchange(conn.as_ref(), &req).await.status
         }));
@@ -185,7 +190,10 @@ async fn concurrent_streams_on_one_connection() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metadata_describes_the_endpoint() {
-    let t = TestServer::start(|_| {}).await;
+    let t = TestServer::start(|raw| {
+        raw.node_address = "0x862D6B1105bdE9d64dC5182fe3CD9d09F6F37463".into();
+    })
+    .await;
     let conn = dial(&t.addr(), Transport::Quic).await;
     let res = exchange(
         conn.as_ref(),
@@ -195,19 +203,23 @@ async fn metadata_describes_the_endpoint() {
     assert_eq!(res.status, 200);
     assert_eq!(res.header("content-type"), Some("application/json"));
     let doc: serde_json::Value = serde_json::from_slice(&res.body).unwrap();
-    assert_eq!(doc["protocol"], "kps-http/1");
+    assert_eq!(doc["protocol"], "nox-kps-http/1");
     assert_eq!(doc["software"], "nox-kps");
+    assert_eq!(doc["node"], "0x862d6b1105bde9d64dc5182fe3cd9d09f6f37463");
     assert_eq!(doc["addresses"][0], t.server.addresses()[0]);
     assert!(doc["addresses"][0]
         .as_str()
         .unwrap()
         .ends_with(&t.certhash()));
-    let caps = doc["capabilities"].as_array().unwrap();
-    assert!(caps.iter().any(|c| c == "nox-packets"));
-    assert!(
-        !caps.iter().any(|c| c == "worker-bundles"),
-        "bundles are off in this config"
-    );
+    assert_eq!(doc["limits"]["packetBytes"], 32_768);
+    assert_eq!(doc["demo"], false);
+    let caps: Vec<&str> = doc["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap())
+        .collect();
+    assert_eq!(caps, ["metadata", "health", "packets", "claim", "topology"]);
     assert_eq!(t.upstream.count(), 0, "served locally, never proxied");
     t.stop().await;
 }
@@ -216,73 +228,58 @@ async fn metadata_describes_the_endpoint() {
 async fn upstream_failures_map_to_gateway_errors() {
     // A port with nothing listening.
     let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dead = format!("http://{}", closed.local_addr().unwrap());
+    let dead = closed.local_addr().unwrap().to_string();
     drop(closed);
 
     let t = TestServer::start(|raw| {
-        raw.upstreams.topology = dead.clone();
-        raw.proxy.upstream_timeout_ms = 500;
-        raw.proxy.max_response_body_bytes = 1024;
-        raw.proxy
-            .forward_request_headers
-            .push("x-mock-delay-ms".into());
-        raw.proxy
-            .forward_request_headers
-            .push("x-mock-response-bytes".into());
-        raw.routes
-            .push(common::route("slow", "GET", "/slow", "ingress", 0));
-        raw.routes
-            .push(common::route("big", "GET", "/big", "ingress", 0));
+        raw.upstream_topology = dead.clone();
+        raw.limits.upstream_claim_timeout_ms = 500;
+        raw.limits.claim_response_max_bytes = 1024;
     })
     .await;
     let conn = dial(&t.addr(), Transport::Quic).await;
     let ch = t.certhash();
 
+    let started = Instant::now();
     let res = exchange(conn.as_ref(), &request("GET", "/topology", &ch, &[], b"")).await;
     assert_eq!(res.status, 502, "{}", res.text());
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "fails within the connect timeout"
+    );
 
-    let res = exchange(
-        conn.as_ref(),
-        &request("GET", "/slow", &ch, &[("X-Mock-Delay-Ms", "2000")], b""),
-    )
-    .await;
+    t.upstream.set_delay("/api/v1/responses/claim", 2_000);
+    let res = exchange(conn.as_ref(), &claim_request(&ch, &[SURB_ID])).await;
     assert_eq!(res.status, 504, "{}", res.text());
+    t.upstream.set_delay("/api/v1/responses/claim", 0);
 
-    let res = exchange(
-        conn.as_ref(),
-        &request(
-            "GET",
-            "/big",
-            &ch,
-            &[("X-Mock-Response-Bytes", "4096")],
-            b"",
-        ),
-    )
-    .await;
+    t.upstream.set_body_bytes("/api/v1/responses/claim", 4096);
+    let res = exchange(conn.as_ref(), &claim_request(&ch, &[SURB_ID])).await;
     assert_eq!(res.status, 502, "{}", res.text());
     assert!(res.text().contains("exceeds"));
 
-    let res = exchange(
-        conn.as_ref(),
-        &request(
-            "GET",
-            "/big",
-            &ch,
-            &[("X-Mock-Response-Bytes", "1000")],
-            b"",
-        ),
-    )
-    .await;
+    t.upstream.set_body_bytes("/api/v1/responses/claim", 1000);
+    let res = exchange(conn.as_ref(), &claim_request(&ch, &[SURB_ID])).await;
     assert_eq!(res.status, 200);
     assert_eq!(res.body.len(), 1000);
 
-    let metrics = t.metrics_text().await;
-    assert!(
-        metrics.contains("nox_kps_upstream_errors_total{upstream=\"topology\",kind=\"connect\"} 1"),
-        "{metrics}"
+    // The node's health check failing turns /health into 503 degraded.
+    t.upstream.set_status("/health", 500);
+    let res = exchange(conn.as_ref(), &request("GET", "/health", &ch, &[], b"")).await;
+    assert_eq!(res.status, 503);
+    assert_eq!(
+        res.text(),
+        r#"{"status":"degraded","upstream":"ingress-unreachable"}"#
     );
-    assert!(metrics.contains("kind=\"timeout\""));
-    assert!(metrics.contains("kind=\"response_too_large\""));
+
+    let metrics = t.metrics_text().await;
+    for needle in [
+        "nox_kps_upstream_errors_total{route=\"topology\",kind=\"connect\"} 1",
+        "nox_kps_upstream_errors_total{route=\"claim\",kind=\"timeout\"} 1",
+        "nox_kps_upstream_errors_total{route=\"claim\",kind=\"response_too_large\"} 1",
+    ] {
+        assert!(metrics.contains(needle), "missing {needle}:\n{metrics}");
+    }
     t.stop().await;
 }
 
@@ -290,20 +287,105 @@ async fn upstream_failures_map_to_gateway_errors() {
 async fn upstream_status_codes_pass_through() {
     let t = TestServer::start(|_| {}).await;
     let conn = dial(&t.addr(), Transport::Quic).await;
-    // The mock answers 202 for packets of any size; a real node answers 400
-    // for a wrong size, and that status would pass through the same way.
-    let res = exchange(
-        conn.as_ref(),
-        &request(
-            "POST",
-            "/api/v1/packets",
-            &t.certhash(),
-            &[("Content-Type", "application/octet-stream")],
-            b"short",
-        ),
-    )
+    // The node answers 400 for a packet it cannot use, 429 when it limits.
+    t.upstream.set_status("/api/v1/packets", 400);
+    let res = exchange(conn.as_ref(), &packet_request(&t.certhash(), &packet(1))).await;
+    assert_eq!(res.status, 400);
+    t.upstream.set_status("/api/v1/packets", 429);
+    let res = exchange(conn.as_ref(), &packet_request(&t.certhash(), &packet(1))).await;
+    assert_eq!(res.status, 429);
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn topology_and_health_are_shared_across_clients() {
+    let t = TestServer::start(|raw| {
+        raw.limits.topology_cache_ms = 60_000;
+        raw.limits.health_cache_ms = 60_000;
+    })
     .await;
-    assert_eq!(res.status, 202);
-    assert_eq!(t.upstream.last().body.as_ref(), b"short");
+    let ch = t.certhash();
+    for transport in [Transport::Quic, Transport::WebRtc] {
+        let conn = dial(&t.addr(), transport).await;
+        for _ in 0..3 {
+            let res = exchange(conn.as_ref(), &request("GET", "/topology", &ch, &[], b"")).await;
+            assert_eq!(res.status, 200);
+            assert_eq!(res.header("content-type"), Some("application/json"));
+            let res = exchange(conn.as_ref(), &request("GET", "/health", &ch, &[], b"")).await;
+            assert_eq!(res.status, 200);
+        }
+    }
+    assert_eq!(
+        t.upstream.count_path("/topology"),
+        1,
+        "one fetch serves every client"
+    );
+    assert_eq!(t.upstream.count_path("/health"), 1);
+    t.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_ip_rate_limits_answer_429() {
+    let t = TestServer::start(|raw| {
+        raw.limits.packet_rate_per_ip = 1;
+        raw.limits.packet_burst = 3;
+        raw.limits.topology_rate_per_ip = 1;
+        raw.limits.topology_burst = 1;
+    })
+    .await;
+    let conn = dial(&t.addr(), Transport::Quic).await;
+    let ch = t.certhash();
+    let mut statuses = Vec::new();
+    for i in 0..5u8 {
+        let res = exchange(conn.as_ref(), &packet_request(&ch, &packet(i))).await;
+        if res.status == 429 {
+            assert_eq!(res.header("retry-after"), Some("1"));
+        }
+        statuses.push(res.status);
+    }
+    assert_eq!(statuses, [202, 202, 202, 429, 429]);
+    assert_eq!(
+        t.upstream.count_path("/api/v1/packets"),
+        3,
+        "limited requests never reach the node"
+    );
+    // Route classes have separate buckets; health is not rate limited.
+    assert_eq!(
+        exchange(conn.as_ref(), &request("GET", "/topology", &ch, &[], b""))
+            .await
+            .status,
+        200
+    );
+    assert_eq!(
+        exchange(conn.as_ref(), &request("GET", "/topology", &ch, &[], b""))
+            .await
+            .status,
+        429
+    );
+    for _ in 0..5 {
+        assert_eq!(
+            exchange(conn.as_ref(), &request("GET", "/health", &ch, &[], b""))
+                .await
+                .status,
+            200
+        );
+    }
+    // The bucket refills at the configured rate.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert_eq!(
+        exchange(conn.as_ref(), &packet_request(&ch, &packet(9)))
+            .await
+            .status,
+        202
+    );
+    let metrics = t.metrics_text().await;
+    assert!(
+        metrics.contains("nox_kps_rate_limited_total{route=\"packets\"} 2"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("nox_kps_rate_limited_total{route=\"topology\"} 1"),
+        "{metrics}"
+    );
     t.stop().await;
 }

@@ -1,7 +1,14 @@
 //! Shared fixtures: a recording mock of the node's loopback HTTP services, an
 //! in-process nox-kps, and a raw KPS-HTTP/1 client over the `kps` crate.
-#![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    dead_code,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::pedantic
+)]
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -15,7 +22,7 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use nox_kps::config::{RawConfig, RouteConfig};
+use nox_kps::config::RawConfig;
 use nox_kps::RunningServer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -33,21 +40,32 @@ pub struct Recorded {
     pub body: Bytes,
 }
 
+/// Per-path overrides for the mock's answers.
+#[derive(Debug, Default)]
+pub struct Behaviour {
+    pub delay_ms: HashMap<String, u64>,
+    pub body_bytes: HashMap<String, usize>,
+    pub status: HashMap<String, u16>,
+    /// Record request heads only (long soaks).
+    pub skip_bodies: bool,
+}
+
 /// A mock of the node's ingress/topology HTTP services.
 ///
-/// Behaviour by path:
+/// Default behaviour by path:
 /// - `POST /api/v1/packets`: `202` with a packet id (like the node)
 /// - `POST /api/v1/responses/claim`: `204` for an empty id list, else `200` JSON
 /// - `GET /topology`: `200` JSON
 /// - `GET /health`: `200 ok`
-/// - anything else: `200`, after `x-mock-delay-ms`, with `x-mock-response-bytes`
-///   bytes of body (when the proxy forwards those headers)
 ///
-/// Every response also carries `set-cookie` and `x-internal`, which the proxy
-/// must not relay, and `x-nox-version`, which it must.
+/// [`MockUpstream::set_delay`], [`MockUpstream::set_body_bytes`] and
+/// [`MockUpstream::set_status`] change the answer for one path. Every
+/// response also carries `set-cookie`, `x-internal` and `x-nox-version`,
+/// which the proxy must not relay.
 pub struct MockUpstream {
     pub addr: SocketAddr,
     pub requests: Arc<Mutex<Vec<Recorded>>>,
+    pub behaviour: Arc<Mutex<Behaviour>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -56,17 +74,21 @@ impl MockUpstream {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let behaviour = Arc::new(Mutex::new(Behaviour::default()));
         let recorded = Arc::clone(&requests);
+        let shared = Arc::clone(&behaviour);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((tcp, _)) = listener.accept().await else {
                     return;
                 };
                 let recorded = Arc::clone(&recorded);
+                let shared = Arc::clone(&shared);
                 tokio::spawn(async move {
                     let svc = service_fn(move |req: Request<Incoming>| {
                         let recorded = Arc::clone(&recorded);
-                        async move { Ok::<_, Infallible>(mock_handle(req, recorded).await) }
+                        let shared = Arc::clone(&shared);
+                        async move { Ok::<_, Infallible>(mock_handle(req, recorded, shared).await) }
                     });
                     let _ = http1::Builder::new()
                         .serve_connection(TokioIo::new(tcp), svc)
@@ -77,12 +99,14 @@ impl MockUpstream {
         Self {
             addr,
             requests,
+            behaviour,
             task,
         }
     }
 
-    pub fn url(&self) -> String {
-        format!("http://{}", self.addr)
+    /// `host:port`, as `upstream_ingress` takes it.
+    pub fn authority(&self) -> String {
+        self.addr.to_string()
     }
 
     pub fn recorded(&self) -> Vec<Recorded> {
@@ -99,6 +123,37 @@ impl MockUpstream {
     pub fn count(&self) -> usize {
         self.requests.lock().unwrap().len()
     }
+
+    pub fn count_path(&self, path: &str) -> usize {
+        self.recorded()
+            .iter()
+            .filter(|r| r.path_and_query == path)
+            .count()
+    }
+
+    pub fn set_delay(&self, path: &str, ms: u64) {
+        self.behaviour
+            .lock()
+            .unwrap()
+            .delay_ms
+            .insert(path.to_string(), ms);
+    }
+
+    pub fn set_body_bytes(&self, path: &str, bytes: usize) {
+        self.behaviour
+            .lock()
+            .unwrap()
+            .body_bytes
+            .insert(path.to_string(), bytes);
+    }
+
+    pub fn set_status(&self, path: &str, status: u16) {
+        self.behaviour
+            .lock()
+            .unwrap()
+            .status
+            .insert(path.to_string(), status);
+    }
 }
 
 impl Drop for MockUpstream {
@@ -110,6 +165,7 @@ impl Drop for MockUpstream {
 async fn mock_handle(
     req: Request<Incoming>,
     recorded: Arc<Mutex<Vec<Recorded>>>,
+    behaviour: Arc<Mutex<Behaviour>>,
 ) -> Response<Full<Bytes>> {
     let (parts, body) = req.into_parts();
     let body = body
@@ -118,6 +174,7 @@ async fn mock_handle(
         .map(|c| c.to_bytes())
         .unwrap_or_default();
     let path = parts.uri.path().to_string();
+    let skip_bodies = behaviour.lock().unwrap().skip_bodies;
     recorded.lock().unwrap().push(Recorded {
         method: parts.method.to_string(),
         path_and_query: parts
@@ -125,17 +182,20 @@ async fn mock_handle(
             .path_and_query()
             .map_or_else(String::new, ToString::to_string),
         headers: parts.headers.clone(),
-        body: body.clone(),
+        body: if skip_bodies {
+            Bytes::new()
+        } else {
+            body.clone()
+        },
     });
-    let header_num = |name: &str| -> u64 {
-        parts
-            .headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
+    let (delay, size, forced) = {
+        let b = behaviour.lock().unwrap();
+        (
+            b.delay_ms.get(&path).copied().unwrap_or(0),
+            b.body_bytes.get(&path).copied(),
+            b.status.get(&path).copied(),
+        )
     };
-    let delay = header_num("x-mock-delay-ms");
     if delay > 0 {
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }
@@ -152,10 +212,9 @@ async fn mock_handle(
                 if ids.is_empty() {
                     (StatusCode::NO_CONTENT, "application/json", Bytes::new())
                 } else {
-                    let size = header_num("x-mock-response-bytes") as usize;
                     let items: Vec<serde_json::Value> = ids
                         .iter()
-                        .map(|id| serde_json::json!({"id": id, "data": vec![7u8; size.max(3)]}))
+                        .map(|id| serde_json::json!({"id": id, "data": [7, 7, 7]}))
                         .collect();
                     (
                         StatusCode::OK,
@@ -174,15 +233,16 @@ async fn mock_handle(
                 "text/plain; charset=utf-8",
                 Bytes::from_static(b"ok"),
             ),
-            _ => {
-                let size = header_num("x-mock-response-bytes") as usize;
-                (
-                    StatusCode::OK,
-                    "application/octet-stream",
-                    Bytes::from(vec![b'x'; size]),
-                )
-            }
+            _ => (
+                StatusCode::NOT_FOUND,
+                "text/plain",
+                Bytes::from_static(b"mock: no such route"),
+            ),
         };
+    let out = size.map_or(out, |n| Bytes::from(vec![b'x'; n]));
+    let status = forced
+        .and_then(|s| StatusCode::from_u16(s).ok())
+        .unwrap_or(status);
     let mut res = Response::new(Full::new(out));
     *res.status_mut() = status;
     let h = res.headers_mut();
@@ -191,17 +251,6 @@ async fn mock_handle(
     h.insert("set-cookie", "leak=1".parse().unwrap());
     h.insert("x-internal", "secret".parse().unwrap());
     res
-}
-
-/// A route config for tests.
-pub fn route(name: &str, method: &str, path: &str, upstream: &str, max_body: usize) -> RouteConfig {
-    RouteConfig {
-        name: name.to_string(),
-        method: method.to_string(),
-        path: path.to_string(),
-        upstream: upstream.to_string(),
-        max_body_bytes: max_body,
-    }
 }
 
 /// An in-process nox-kps pointed at a mock upstream.
@@ -213,12 +262,14 @@ pub struct TestServer {
 }
 
 impl TestServer {
-    /// Test defaults: loopback UDP and metrics on ephemeral ports, a key in a
-    /// temp dir, both upstreams on the mock. `mutate` adjusts the rest.
+    /// Test defaults: loopback UDP and admin on ephemeral ports, an identity
+    /// created in a temp dir, both upstreams on the mock, caches off, the
+    /// bundle resolver off. `mutate` adjusts the rest.
     pub async fn start(mutate: impl FnOnce(&mut RawConfig)) -> Self {
         let upstream = MockUpstream::start().await;
         let dir = tempfile::tempdir().unwrap();
         let key_file = dir.path().join("identity").join("kps.key");
+        nox_kps::identity::init(&key_file).unwrap();
         let mut raw = base_config(&upstream, &key_file);
         mutate(&mut raw);
         let settings = raw.validate().expect("test config validates");
@@ -245,32 +296,74 @@ impl TestServer {
     }
 
     pub async fn metrics_text(&self) -> String {
-        let addr = self.server.metrics_addr().expect("metrics enabled");
-        let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        tcp.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            .await
-            .unwrap();
-        let mut out = Vec::new();
-        timeout(T, tcp.read_to_end(&mut out))
-            .await
-            .unwrap()
-            .unwrap();
-        String::from_utf8_lossy(&out).into_owned()
+        admin_get(self.server.admin_addr(), "/metrics").await
     }
 }
 
+/// One plain HTTP GET against the admin port; returns the raw response.
+pub async fn admin_get(addr: SocketAddr, path: &str) -> String {
+    let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    tcp.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    timeout(T, tcp.read_to_end(&mut out))
+        .await
+        .unwrap()
+        .unwrap();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 pub fn base_config(upstream: &MockUpstream, key_file: &std::path::Path) -> RawConfig {
-    let mut raw = RawConfig::default();
-    raw.kps.listen = "127.0.0.1:0".to_string();
-    raw.kps.public_ips = vec!["127.0.0.1".to_string()];
-    raw.kps.identity_key_file = key_file.to_path_buf();
-    raw.upstreams.ingress = upstream.url();
-    raw.upstreams.topology = upstream.url();
-    raw.metrics.listen = "127.0.0.1:0".to_string();
-    raw.log.filter = "error".to_string();
+    let mut raw = RawConfig {
+        listen: "127.0.0.1:0".to_string(),
+        advertise: vec!["127.0.0.1".to_string()],
+        allow_private_advertise: true,
+        key_file: key_file.to_path_buf(),
+        upstream_ingress: upstream.authority(),
+        upstream_topology: upstream.authority(),
+        keccak_dir: String::new(),
+        admin_listen: "127.0.0.1:0".to_string(),
+        log_level: "error".to_string(),
+        summary_interval_secs: 0,
+        ..RawConfig::default()
+    };
+    raw.limits.topology_cache_ms = 0;
+    raw.limits.health_cache_ms = 0;
     raw.shutdown.grace_period_ms = 5_000;
     raw
 }
+
+/// A fixed-size Sphinx-sized packet.
+pub fn packet(fill: u8) -> Vec<u8> {
+    vec![fill; 32_768]
+}
+
+/// `POST /api/v1/packets` as the SDK sends it.
+pub fn packet_request(certhash: &str, body: &[u8]) -> Vec<u8> {
+    request(
+        "POST",
+        "/api/v1/packets",
+        certhash,
+        &[("Content-Type", "application/octet-stream")],
+        body,
+    )
+}
+
+/// `POST /api/v1/responses/claim` as the SDK sends it.
+pub fn claim_request(certhash: &str, ids: &[&str]) -> Vec<u8> {
+    let body = serde_json::json!({ "surb_ids": ids }).to_string();
+    request(
+        "POST",
+        "/api/v1/responses/claim",
+        certhash,
+        &[("Content-Type", "application/json")],
+        body.as_bytes(),
+    )
+}
+
+/// A valid SURB ID.
+pub const SURB_ID: &str = "00112233445566778899aabbccddeeff";
 
 /// KPS transports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

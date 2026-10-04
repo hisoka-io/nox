@@ -38,34 +38,47 @@ const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ReasonLabels {
-    pub reason: String,
+    pub reason: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct RequestLabels {
-    pub route: String,
-    pub status: String,
+pub struct StreamLabels {
+    pub route: &'static str,
+    pub status: u16,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct RouteLabels {
-    pub route: String,
+    pub route: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct KindLabels {
+    pub kind: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct UpstreamErrorLabels {
-    pub upstream: String,
-    pub kind: String,
+    pub route: &'static str,
+    pub kind: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct EncodingLabels {
-    pub encoding: String,
+pub struct BytesLabels {
+    pub route: &'static str,
+    /// `in` (client to nox-kps) or `out` (nox-kps to client).
+    pub direction: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ResultLabels {
+    pub result: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct BuildLabels {
-    pub version: String,
+    pub version: &'static str,
+    pub kps_version: &'static str,
 }
 
 fn duration_histogram() -> Histogram {
@@ -73,24 +86,26 @@ fn duration_histogram() -> Histogram {
     Histogram::new(exponential_buckets(0.001, 2.0, 16))
 }
 
-/// All metrics, registered under the `nox_kps` prefix.
+/// All metrics, registered under the `nox_kps` prefix (ARCHITECTURE §2.11).
 #[derive(Debug)]
 pub struct Metrics {
     registry: Registry,
-    pub connections_active: Gauge,
     pub connections_accepted: Counter,
+    pub connections_active: Gauge,
     pub connections_rejected: Family<ReasonLabels, Counter>,
     pub connections_closed: Family<ReasonLabels, Counter>,
+    pub streams: Family<StreamLabels, Counter>,
     pub streams_active: Gauge,
-    pub streams_accepted: Counter,
     pub streams_rejected: Family<ReasonLabels, Counter>,
     pub stream_failures: Family<ReasonLabels, Counter>,
-    pub requests: Family<RequestLabels, Counter>,
+    pub profile_violations: Family<KindLabels, Counter>,
     pub request_duration: Family<RouteLabels, Histogram>,
     pub upstream_errors: Family<UpstreamErrorLabels, Counter>,
     pub upstream_inflight: Gauge,
+    pub bytes: Family<BytesLabels, Counter>,
+    pub rate_limited: Family<RouteLabels, Counter>,
+    pub bundle_requests: Family<ResultLabels, Counter>,
     pub bundles_loaded: Gauge,
-    pub bundle_responses: Family<EncodingLabels, Counter>,
     pub build_info: Family<BuildLabels, Gauge>,
 }
 
@@ -99,52 +114,54 @@ impl Metrics {
     pub fn new() -> Arc<Self> {
         let mut registry = Registry::with_prefix("nox_kps");
         let m = Self {
-            connections_active: Gauge::default(),
+            registry: Registry::default(),
             connections_accepted: Counter::default(),
+            connections_active: Gauge::default(),
             connections_rejected: Family::default(),
             connections_closed: Family::default(),
+            streams: Family::default(),
             streams_active: Gauge::default(),
-            streams_accepted: Counter::default(),
             streams_rejected: Family::default(),
             stream_failures: Family::default(),
-            requests: Family::default(),
+            profile_violations: Family::default(),
             request_duration: Family::new_with_constructor(duration_histogram),
             upstream_errors: Family::default(),
             upstream_inflight: Gauge::default(),
+            bytes: Family::default(),
+            rate_limited: Family::default(),
+            bundle_requests: Family::default(),
             bundles_loaded: Gauge::default(),
-            bundle_responses: Family::default(),
             build_info: Family::default(),
-            registry: Registry::default(),
         };
-        registry.register(
-            "connections_active",
-            "KPS connections currently open",
-            m.connections_active.clone(),
-        );
         registry.register(
             "connections_accepted",
             "KPS connections admitted",
             m.connections_accepted.clone(),
         );
         registry.register(
+            "connections_active",
+            "KPS connections currently open",
+            m.connections_active.clone(),
+        );
+        registry.register(
             "connections_rejected",
-            "KPS connections refused by a connection limit",
+            "KPS connections refused by a connection limit, by reason",
             m.connections_rejected.clone(),
         );
         registry.register(
             "connections_closed",
-            "KPS connections closed, by reason (peer, idle, shutdown)",
+            "KPS connections closed, by reason (peer, idle, lifetime, shutdown)",
             m.connections_closed.clone(),
+        );
+        registry.register(
+            "streams",
+            "HTTP exchanges answered, by route and status",
+            m.streams.clone(),
         );
         registry.register(
             "streams_active",
             "KPS streams (exchanges) in progress",
             m.streams_active.clone(),
-        );
-        registry.register(
-            "streams_accepted",
-            "KPS streams served",
-            m.streams_accepted.clone(),
         );
         registry.register(
             "streams_rejected",
@@ -157,9 +174,9 @@ impl Metrics {
             m.stream_failures.clone(),
         );
         registry.register(
-            "requests",
-            "HTTP exchanges answered, by route and status",
-            m.requests.clone(),
+            "profile_violations",
+            "Requests refused by the KPS-HTTP/1 profile or a route's request rules, by kind",
+            m.profile_violations.clone(),
         );
         registry.register(
             "request_duration_seconds",
@@ -168,7 +185,7 @@ impl Metrics {
         );
         registry.register(
             "upstream_errors",
-            "Upstream exchanges that failed, by upstream and kind",
+            "Upstream exchanges that failed, by route and kind",
             m.upstream_errors.clone(),
         );
         registry.register(
@@ -177,23 +194,34 @@ impl Metrics {
             m.upstream_inflight.clone(),
         );
         registry.register(
+            "bytes",
+            "HTTP body bytes, by route and direction (in: from clients, out: to clients)",
+            m.bytes.clone(),
+        );
+        registry.register(
+            "rate_limited",
+            "Requests answered 429 by a per-IP rate limit, by route",
+            m.rate_limited.clone(),
+        );
+        registry.register(
+            "bundle_requests",
+            "Worker bundle requests, by result (hit, miss)",
+            m.bundle_requests.clone(),
+        );
+        registry.register(
             "bundles_loaded",
             "Worker bundles verified and held in memory",
             m.bundles_loaded.clone(),
         );
         registry.register(
-            "bundle_responses",
-            "Worker bundle responses, by content coding",
-            m.bundle_responses.clone(),
-        );
-        registry.register(
             "build_info",
-            "Build version (value is always 1)",
+            "Build and kps library version (value is always 1)",
             m.build_info.clone(),
         );
         m.build_info
             .get_or_create(&BuildLabels {
-                version: env!("CARGO_PKG_VERSION").to_string(),
+                version: env!("CARGO_PKG_VERSION"),
+                kps_version: crate::KPS_VERSION,
             })
             .set(1);
         Arc::new(Self { registry, ..m })
@@ -206,24 +234,48 @@ impl Metrics {
         Ok(out)
     }
 
-    pub(crate) fn reason(family: &Family<ReasonLabels, Counter>, reason: &str) {
-        family
-            .get_or_create(&ReasonLabels {
-                reason: reason.to_string(),
-            })
+    pub(crate) fn reason(family: &Family<ReasonLabels, Counter>, reason: &'static str) {
+        family.get_or_create(&ReasonLabels { reason }).inc();
+    }
+
+    pub(crate) fn violation(&self, kind: &'static str) {
+        self.profile_violations
+            .get_or_create(&KindLabels { kind })
             .inc();
+    }
+
+    pub(crate) fn add_bytes(&self, route: &'static str, direction: &'static str, n: usize) {
+        if n > 0 {
+            self.bytes
+                .get_or_create(&BytesLabels { route, direction })
+                .inc_by(n as u64);
+        }
+    }
+
+    /// Sum of a reason family, for the periodic log summary.
+    #[must_use]
+    pub fn total(family: &Family<ReasonLabels, Counter>, reasons: &[&'static str]) -> u64 {
+        reasons
+            .iter()
+            .map(|reason| family.get_or_create(&ReasonLabels { reason }).get())
+            .sum()
     }
 }
 
-/// What `/health` reports.
+/// What `/healthz` reports.
 #[derive(Debug)]
 pub struct HealthInfo {
     pub certhash: String,
     pub addresses: Vec<String>,
     pub shutting_down: AtomicBool,
+    /// Cleared when the KPS accept loop stops.
+    pub listener_alive: AtomicBool,
 }
 
-/// Serves `/metrics` and `/health` until `shutdown` fires.
+/// Admin path for the liveness document.
+pub const HEALTHZ_PATH: &str = "/healthz";
+
+/// Serves `/metrics` and `/healthz` until `shutdown` fires.
 pub async fn serve(
     listener: TcpListener,
     metrics: Arc<Metrics>,
@@ -287,18 +339,24 @@ fn route(req: &Request<Incoming>, metrics: &Metrics, health: &HealthInfo) -> Res
                 &format!("cannot encode metrics: {e}\n"),
             ),
         },
-        "/health" => {
-            let shutting_down = health.shutting_down.load(Ordering::Relaxed);
+        HEALTHZ_PATH => {
+            let state = if health.shutting_down.load(Ordering::Relaxed) {
+                "shutting_down"
+            } else if !health.listener_alive.load(Ordering::Relaxed) {
+                "listener_stopped"
+            } else {
+                "ok"
+            };
             let body = serde_json::json!({
-                "status": if shutting_down { "shutting_down" } else { "ok" },
+                "status": state,
                 "certhash": health.certhash,
                 "addresses": health.addresses,
                 "version": env!("CARGO_PKG_VERSION"),
             });
-            let status = if shutting_down {
-                StatusCode::SERVICE_UNAVAILABLE
-            } else {
+            let status = if state == "ok" {
                 StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
             };
             response(status, "application/json", Bytes::from(body.to_string()))
         }
@@ -324,35 +382,31 @@ fn plain(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
     )
 }
 
-/// `GET /health` against a running instance; `Ok` only on `200`.
+/// `GET /healthz` against a running instance's admin port; `Ok` only on `200`.
 pub async fn probe_health(addr: SocketAddr, timeout: Duration) -> Result<(), HealthcheckError> {
+    let target = format!("http://{addr}{HEALTHZ_PATH}");
     let probe = async {
         let tcp = TcpStream::connect(addr)
             .await
             .map_err(|source| HealthcheckError::Connect { addr, source })?;
+        let request_err = |e: &dyn std::fmt::Display| HealthcheckError::Request {
+            target: target.clone(),
+            reason: e.to_string(),
+        };
         let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
             .await
-            .map_err(|e| HealthcheckError::Request {
-                addr,
-                reason: e.to_string(),
-            })?;
+            .map_err(|e| request_err(&e))?;
         let conn_task = tokio::spawn(conn);
         let req = Request::builder()
             .method(Method::GET)
-            .uri("/health")
+            .uri(HEALTHZ_PATH)
             .header(header::HOST, addr.to_string())
             .body(Empty::<Bytes>::new())
-            .map_err(|e| HealthcheckError::Request {
-                addr,
-                reason: e.to_string(),
-            })?;
+            .map_err(|e| request_err(&e))?;
         let res = sender
             .send_request(req)
             .await
-            .map_err(|e| HealthcheckError::Request {
-                addr,
-                reason: e.to_string(),
-            })?;
+            .map_err(|e| request_err(&e))?;
         let status = res.status();
         // Drain so the connection closes cleanly.
         let _ = res.into_body().collect().await;
@@ -361,7 +415,7 @@ pub async fn probe_health(addr: SocketAddr, timeout: Duration) -> Result<(), Hea
             Ok(())
         } else {
             Err(HealthcheckError::Unhealthy {
-                addr,
+                target: target.clone(),
                 status: status.as_u16(),
             })
         }
@@ -369,14 +423,14 @@ pub async fn probe_health(addr: SocketAddr, timeout: Duration) -> Result<(), Hea
     tokio::time::timeout(timeout, probe)
         .await
         .map_err(|_| HealthcheckError::Timeout {
-            addr,
+            target: format!("http://{addr}{HEALTHZ_PATH}"),
             timeout_ms: timeout.as_millis(),
         })?
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::pedantic)]
 
     use super::*;
 
@@ -385,26 +439,28 @@ mod tests {
         let m = Metrics::new();
         m.connections_accepted.inc();
         Metrics::reason(&m.connections_rejected, "per_ip_limit");
-        m.requests
-            .get_or_create(&RequestLabels {
-                route: "nox-packets".into(),
-                status: "202".into(),
+        m.streams
+            .get_or_create(&StreamLabels {
+                route: "packets",
+                status: 202,
             })
             .inc();
         m.request_duration
-            .get_or_create(&RouteLabels {
-                route: "nox-packets".into(),
-            })
+            .get_or_create(&RouteLabels { route: "packets" })
             .observe(0.004);
+        m.add_bytes("packets", "in", 32_768);
+        m.violation("transfer_encoding");
         let text = m.encode().unwrap();
         assert!(
             text.contains("nox_kps_connections_accepted_total 1"),
             "{text}"
         );
         assert!(text.contains("nox_kps_connections_rejected_total{reason=\"per_ip_limit\"} 1"));
-        assert!(text.contains("nox_kps_requests_total{route=\"nox-packets\",status=\"202\"} 1"));
+        assert!(text.contains("nox_kps_streams_total{route=\"packets\",status=\"202\"} 1"));
         assert!(text.contains("nox_kps_request_duration_seconds_bucket"));
-        assert!(text.contains("nox_kps_build_info{version="));
+        assert!(text.contains("nox_kps_bytes_total{route=\"packets\",direction=\"in\"} 32768"));
+        assert!(text.contains("nox_kps_profile_violations_total{kind=\"transfer_encoding\"} 1"));
+        assert!(text.contains("kps_version=\"0.2.2\""), "{text}");
     }
 
     #[tokio::test]
@@ -414,6 +470,7 @@ mod tests {
             certhash: "uEiTest".into(),
             addresses: vec!["127.0.0.1:1:uEiTest".into()],
             shutting_down: AtomicBool::new(false),
+            listener_alive: AtomicBool::new(true),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -425,6 +482,9 @@ mod tests {
             shutdown.clone(),
         ));
         probe_health(addr, Duration::from_secs(5)).await.unwrap();
+        health.listener_alive.store(false, Ordering::Relaxed);
+        assert!(probe_health(addr, Duration::from_secs(5)).await.is_err());
+        health.listener_alive.store(true, Ordering::Relaxed);
         health.shutting_down.store(true, Ordering::Relaxed);
         let err = probe_health(addr, Duration::from_secs(5))
             .await
