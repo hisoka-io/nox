@@ -31,6 +31,11 @@ jobs:
           grep -F "install -d -o 0 -g 0 -m 0755 /etc/nox" Dockerfile
           grep -F "install -d -o 10001 -g 10001 -m 0750 /var/lib/nox" Dockerfile
           grep -F "USER 10001:10001" Dockerfile
+          grep -F "useradd --uid 10002 --gid 10002" Dockerfile
+          grep -F "install -d -o 10002 -g 10002 -m 0700 /var/lib/nox-kps" Dockerfile
+          grep -F 'user: "10002:10002"' crates/nox-kps/deploy/docker-compose.kps.yml
+      - name: kps patch revs match the pinned kps release
+        run: bash scripts/check-kps-patches.sh
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
       - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
@@ -151,6 +156,27 @@ jobs:
         run: cargo test --test transaction_outbox -- --nocapture
       - name: Test chain model exports
         run: cargo test -p nox-core --test chain_exports
+      # The nox-kps soaks are #[ignore]d in the default run. Here: 200 sequential
+      # 32 KiB exchanges per transport and direction, and 20 large claim bodies
+      # (5 MiB) per transport, with zero stalls allowed. The split-process soak
+      # is a diagnostic and stays manual.
+      - name: nox-kps soaks (zero stalls)
+        run: >
+          cargo test --locked -p nox-kps --profile release-kps --test soak --
+          --ignored --skip soak_large_split_process --nocapture
+        env:
+          SOAK_REQUESTS: "200"
+          SOAK_STALL_MS: "5000"
+          SOAK_LARGE_BYTES: "5242880"
+          SOAK_LARGE_REQUESTS: "20"
+          SOAK_MAX_STALL_RATE: "0"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: nox-kps interop (@kpstreams/quic-client 0.2.1)
+        run: |
+          cargo build --locked -p nox-kps --bin nox-kps
+          cd crates/nox-kps/interop && npm ci && npm test
 
   payment-trace-safety:
     name: Payment Trace Safety
@@ -230,6 +256,29 @@ jobs:
       - name: Test root integration suites
         run: cargo nextest run -p nox-mixnet --features dev-node --no-fail-fast
 
+  container:
+    name: Container image
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        with:
+          context: .
+          load: true
+          push: false
+          tags: nox:ci
+          cache-from: type=gha
+      - name: nox-kps container smoke (init, address, check-config, run, healthcheck, restart)
+        run: bash scripts/kps-container-smoke.sh nox:ci
+
   security:
     name: Security
     runs-on: ubuntu-latest
@@ -240,3 +289,6 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check advisories licenses bans sources
+          # The root package is not a virtual manifest, so without --workspace
+          # cargo-deny would check only the nox binary's graph (not nox-kps).
+          arguments: --all-features --workspace
