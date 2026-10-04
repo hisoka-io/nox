@@ -5,7 +5,11 @@
 //! ```text
 //! cargo test --release --test soak -- --ignored --nocapture
 //! SOAK_REQUESTS=2000 SOAK_STALL_MS=5000 SOAK_OUT=soak.json cargo test --release --test soak -- --ignored --nocapture
+//! SOAK_LARGE_BYTES=5242880 SOAK_LARGE_REQUESTS=20 cargo test --release --test soak soak_large -- --ignored --nocapture
 //! ```
+//!
+//! Loopback has no loss and no delay, so these numbers bound nox-kps's own
+//! behaviour; WAN stall rates come from the canary soak (TST-502).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -254,4 +258,91 @@ async fn soak_sequential_32k_requests() {
             );
         }
     }
+}
+
+/// Large claim responses (the shape of a reply with many SURBs) over each
+/// transport: the bulk-transfer case where the Rust WebRTC stack has stalled
+/// in earlier benches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "long-running soak; run explicitly with --ignored"]
+async fn soak_large_claim_bodies() {
+    let size: usize = env_or("SOAK_LARGE_BYTES", 5 * 1024 * 1024);
+    let count: usize = env_or("SOAK_LARGE_REQUESTS", 20);
+    let stall = Duration::from_millis(env_or("SOAK_STALL_MS", 15_000));
+    let t = TestServer::start(|raw| {
+        raw.limits.claim_rate_per_ip = 1_000_000;
+        raw.limits.claim_burst = 1_000_000;
+        raw.limits.claim_response_max_bytes = size.max(1024);
+        raw.limits.upstream_claim_timeout_ms = 20_000;
+        raw.limits.stream_timeout_ms = 60_000;
+        raw.limits.conn_idle_timeout_secs = 600;
+    })
+    .await;
+    t.upstream.set_body_bytes("/api/v1/responses/claim", size);
+    t.upstream.behaviour.lock().unwrap().skip_bodies = true;
+    let req = claim_request(&t.certhash(), &[SURB_ID]);
+    let mut results = Vec::new();
+    for transport in [Transport::Quic, Transport::WebRtc] {
+        let conn = dial(&t.addr(), transport).await;
+        let (mut ok, mut stalls, mut errors) = (0usize, 0usize, Vec::new());
+        let mut ms = Vec::new();
+        // One character per exchange: '.' ok, 'S' stall, 'E' error.
+        let mut sequence = String::new();
+        for _ in 0..count {
+            let t0 = Instant::now();
+            match try_exchange(conn.as_ref(), &req, stall).await {
+                Ok(res) if res.status == 200 && res.body.len() == size => {
+                    ok += 1;
+                    sequence.push('.');
+                    ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+                }
+                Ok(res) => {
+                    sequence.push('E');
+                    errors.push(format!("status {} body {} B", res.status, res.body.len()));
+                }
+                Err(e) if e.starts_with("no response within") => {
+                    sequence.push('S');
+                    stalls += 1;
+                }
+                Err(e) => {
+                    sequence.push('E');
+                    errors.push(e);
+                }
+            }
+        }
+        println!("sequence {}: {sequence}", transport.name());
+        ms.sort_by(f64::total_cmp);
+        let mib_s = if ms.is_empty() {
+            0.0
+        } else {
+            (size as f64 / 1_048_576.0) / (pct(&ms, 0.5) / 1000.0)
+        };
+        println!(
+            "large {} {} B x {count}: {ok} ok, {stalls} stalls (>{} ms), {} errors, p50 {:.1} ms, max {:.1} ms, ~{mib_s:.1} MiB/s",
+            transport.name(),
+            size,
+            stall.as_millis(),
+            errors.len(),
+            pct(&ms, 0.5),
+            ms.last().copied().unwrap_or(0.0),
+        );
+        results.push(serde_json::json!({
+            "transport": transport.name(),
+            "bytes": size,
+            "requests": count,
+            "ok": ok,
+            "stalls": stalls,
+            "sequence": sequence,
+            "errors": errors,
+            "p50_ms": pct(&ms, 0.5),
+            "max_ms": ms.last().copied().unwrap_or(0.0),
+        }));
+        assert!(errors.is_empty(), "{} errors: {errors:?}", transport.name());
+        let _ = conn.close().await;
+    }
+    if let Ok(path) = std::env::var("SOAK_OUT") {
+        std::fs::write(&path, serde_json::to_string_pretty(&results).unwrap()).unwrap();
+        println!("results written to {path}");
+    }
+    t.stop().await;
 }

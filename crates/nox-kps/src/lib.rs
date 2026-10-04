@@ -24,6 +24,7 @@ pub mod healthcheck;
 pub mod identity;
 pub mod limits;
 pub mod metrics;
+pub mod preflight;
 pub mod proxy;
 pub mod routes;
 pub mod server;

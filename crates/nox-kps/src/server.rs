@@ -14,7 +14,7 @@
 //!    exchanges finish (bounded by the grace period).
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -113,8 +113,17 @@ impl RunningServer {
 pub async fn start(settings: Settings) -> Result<RunningServer, StartError> {
     let settings = Arc::new(settings);
     let metrics = Metrics::new();
+    match crate::preflight::scan_host() {
+        Ok(findings) => {
+            for finding in &findings {
+                warn!("{}", crate::preflight::describe(finding));
+            }
+        }
+        Err(e) => warn!(error = %e, "cannot list network interfaces for the loopback check"),
+    }
 
-    let identity = identity::load(&settings.key_file)?;
+    let identity =
+        identity::load_expected(&settings.key_file, settings.expected_certhash.as_deref())?;
     let certhash = identity.certhash.clone();
 
     let bundles = match &settings.keccak_dir {
@@ -187,6 +196,7 @@ pub async fn start(settings: Settings) -> Result<RunningServer, StartError> {
         bundles: bundles.clone(),
         metrics: Arc::clone(&metrics),
         inflight: Arc::new(Semaphore::new(l.max_inflight_upstream)),
+        bundle_streams: Arc::new(Semaphore::new(l.max_concurrent_bundle_streams)),
         conn_limiter: ConnLimiter::new(
             l.max_connections,
             l.max_connections_per_ip,
@@ -278,17 +288,51 @@ async fn accept_loop(
     info!("KPS listener closed");
 }
 
-/// Last time a stream was accepted or finished on a connection.
+/// Per-connection state shared with its stream tasks.
 #[derive(Debug)]
-struct Activity(Mutex<Instant>);
+struct Activity {
+    /// Last time a stream was accepted or finished.
+    last: Mutex<Instant>,
+    /// Streams in a row that hit `limits.stream_timeout_ms`.
+    consecutive_timeouts: AtomicUsize,
+    /// Cancelled when `limits.max_stream_timeouts_per_connection` is reached:
+    /// the transport is treated as stalled and the connection is closed, so
+    /// its buffers are released and the client redials.
+    stalled: CancellationToken,
+}
 
 impl Activity {
+    fn new() -> Self {
+        Self {
+            last: Mutex::new(Instant::now()),
+            consecutive_timeouts: AtomicUsize::new(0),
+            stalled: CancellationToken::new(),
+        }
+    }
+
     fn touch(&self) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
     }
 
     fn last(&self) -> Instant {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Records how a stream ended.
+    fn record(&self, outcome: StreamOutcome, max_timeouts: usize) {
+        match outcome {
+            StreamOutcome::StreamTimeout => {
+                let n = self.consecutive_timeouts.fetch_add(1, Ordering::Relaxed) + 1;
+                if n >= max_timeouts {
+                    self.stalled.cancel();
+                }
+            }
+            StreamOutcome::Completed => self.consecutive_timeouts.store(0, Ordering::Relaxed),
+            StreamOutcome::HeaderTimeout
+            | StreamOutcome::ProtocolError
+            | StreamOutcome::Abandoned
+            | StreamOutcome::Io => {}
+        }
     }
 }
 
@@ -298,6 +342,7 @@ enum CloseReason {
     Peer,
     Idle,
     Lifetime,
+    Stalled,
     Shutdown,
 }
 
@@ -307,6 +352,7 @@ impl CloseReason {
             Self::Peer => "peer",
             Self::Idle => "idle",
             Self::Lifetime => "lifetime",
+            Self::Stalled => "stalled",
             Self::Shutdown => "shutdown",
         }
     }
@@ -334,7 +380,7 @@ async fn handle_conn(
     let limits = &app.settings.limits;
     let max_streams = limits.max_streams_per_connection;
     let slots = Arc::new(Semaphore::new(max_streams));
-    let activity = Arc::new(Activity(Mutex::new(Instant::now())));
+    let activity = Arc::new(Activity::new());
     let idle_timeout = limits.conn_idle_timeout;
     let end_of_life = tokio::time::Instant::now() + limits.conn_max_lifetime;
 
@@ -349,6 +395,7 @@ async fn handle_conn(
             biased;
             () = shutdown.cancelled() => break CloseReason::Shutdown,
             () = tokio::time::sleep_until(end_of_life) => break CloseReason::Lifetime,
+            () = activity.stalled.cancelled() => break CloseReason::Stalled,
             accepted = conn.accept_stream() => match accepted {
                 Ok(stream) => {
                     activity.touch();
@@ -380,6 +427,8 @@ async fn handle_conn(
     let drain_limit = match reason {
         CloseReason::Shutdown => app.settings.shutdown_grace,
         CloseReason::Peer | CloseReason::Idle | CloseReason::Lifetime => limits.stream_timeout,
+        // The transport is not moving data; waiting longer only holds buffers.
+        CloseReason::Stalled => Duration::ZERO,
     };
     let _ = tokio::time::timeout(drain_limit, drain).await;
     if matches!(reason, CloseReason::Shutdown) {
@@ -390,7 +439,7 @@ async fn handle_conn(
     }
 
     let _ = match reason {
-        CloseReason::Idle | CloseReason::Lifetime => {
+        CloseReason::Idle | CloseReason::Lifetime | CloseReason::Stalled => {
             conn.close_with_error(ErrorCode::Timeout).await
         }
         CloseReason::Peer | CloseReason::Shutdown => conn.close().await,
@@ -413,6 +462,10 @@ async fn run_stream(
         Metrics::reason(&app.metrics.stream_failures, outcome.label());
     }
     app.metrics.streams_active.dec();
+    activity.record(
+        outcome,
+        app.settings.limits.max_stream_timeouts_per_connection,
+    );
     activity.touch();
     drop(slot);
 }

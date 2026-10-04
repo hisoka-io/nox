@@ -328,3 +328,56 @@ async fn inflight_upstream_cap_answers_503() {
     assert_eq!(res.status, 200);
     t.stop().await;
 }
+
+/// Opens a stream whose request promises a body that never arrives, and waits
+/// for the server to reset it at `stream_timeout_ms`.
+async fn stalled_stream(conn: &dyn kps::Conn, certhash: &str) {
+    let mut stream = conn.open_stream().await.unwrap();
+    let head = format!(
+        "POST /api/v1/packets HTTP/1.1\r\nHost: {certhash}\r\nContent-Type: application/octet-stream\r\nContent-Length: 32768\r\n\r\n"
+    );
+    tokio::io::AsyncWriteExt::write_all(&mut stream, head.as_bytes())
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    let read = timeout(Duration::from_secs(5), stream.read_to_end(&mut buf))
+        .await
+        .expect("server acts");
+    assert!(read.is_err(), "stream is reset: {read:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_stream_timeouts_close_the_connection() {
+    let t = TestServer::start(|raw| {
+        raw.limits.header_read_timeout_ms = 500;
+        raw.limits.upstream_packet_timeout_ms = 500;
+        raw.limits.upstream_claim_timeout_ms = 500;
+        raw.limits.upstream_topology_timeout_ms = 500;
+        raw.limits.upstream_health_timeout_ms = 500;
+        raw.limits.stream_timeout_ms = 800;
+        raw.limits.max_stream_timeouts_per_connection = 2;
+    })
+    .await;
+    let ch = t.certhash();
+    let conn = dial(&t.addr(), Transport::Quic).await;
+    // A completed exchange between timeouts resets the count.
+    stalled_stream(conn.as_ref(), &ch).await;
+    let ok = exchange(conn.as_ref(), &request("GET", "/topology", &ch, &[], b"")).await;
+    assert_eq!(ok.status, 200);
+    stalled_stream(conn.as_ref(), &ch).await;
+    let ok = exchange(conn.as_ref(), &request("GET", "/topology", &ch, &[], b"")).await;
+    assert_eq!(ok.status, 200, "one timeout in a row keeps the connection");
+    // Two in a row: the connection is treated as stalled and closed.
+    stalled_stream(conn.as_ref(), &ch).await;
+    stalled_stream(conn.as_ref(), &ch).await;
+    timeout(Duration::from_secs(5), conn.closed())
+        .await
+        .expect("stalled connection closed");
+    assert!(
+        closed_with(conn.as_ref(), ErrorCode::Timeout),
+        "close code: {:?}",
+        conn.err()
+    );
+    assert!(wait_for_metric(&t, "nox_kps_connections_closed_total{reason=\"stalled\"} 1").await);
+    t.stop().await;
+}

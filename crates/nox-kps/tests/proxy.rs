@@ -133,6 +133,10 @@ async fn claim_topology_and_health() {
     let res = exchange(conn.as_ref(), &claim_request(&ch, &[])).await;
     assert_eq!(res.status, 204);
     assert!(res.body.is_empty());
+    assert!(
+        res.header("content-length").is_none(),
+        "204 carries no Content-Length"
+    );
 
     let res = exchange(conn.as_ref(), &request("GET", "/topology", &ch, &[], b"")).await;
     assert_eq!(res.status, 200);

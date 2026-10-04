@@ -136,6 +136,7 @@ fn init(settings: &Settings) -> ExitCode {
         Ok(id) => {
             println!("created KPS identity {}", settings.key_file.display());
             println!("certhash: {}", id.certhash);
+            println!("config line: expected_certhash = \"{}\"", id.certhash);
             print_addresses(settings, &id.certhash);
             println!(
                 "back up the key file with the node's secrets; publish the metadataUrl with updateMetadataUrl"
@@ -193,6 +194,19 @@ fn check_config(source: &ConfigSource, settings: &Settings) -> ExitCode {
                 eprintln!("nox-kps: {e}");
                 return ExitCode::from(EXIT_CONFIG);
             }
+            if let Some(expected) = settings.expected_certhash.as_deref() {
+                if expected != id.certhash {
+                    eprintln!(
+                        "nox-kps: {}",
+                        nox_kps::error::IdentityError::CerthashMismatch {
+                            path: settings.key_file.clone(),
+                            expected: expected.to_string(),
+                            actual: id.certhash.clone(),
+                        }
+                    );
+                    return ExitCode::from(EXIT_CONFIG);
+                }
+            }
             println!(
                 "identity: {} (certhash {})",
                 settings.key_file.display(),
@@ -212,6 +226,19 @@ fn check_config(source: &ConfigSource, settings: &Settings) -> ExitCode {
             eprintln!("nox-kps: {e}");
             return ExitCode::from(EXIT_CONFIG);
         }
+    }
+    match nox_kps::preflight::scan_host() {
+        Ok(findings) => {
+            for finding in &findings {
+                println!("warning: {}", nox_kps::preflight::describe(finding));
+            }
+        }
+        Err(e) => println!("warning: cannot list network interfaces for the loopback check: {e}"),
+    }
+    if settings.expected_certhash.is_none() {
+        println!(
+            "note: expected_certhash is empty; `run` needs it (copy the certhash `init` printed)"
+        );
     }
     if let Some(dir) = &settings.keccak_dir {
         if !dir.is_dir() {

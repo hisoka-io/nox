@@ -257,3 +257,60 @@ async fn rescans_pick_up_published_and_removed_bundles() {
     assert!(eventually(T, || true).await);
     t.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_bundle_streams_are_capped() {
+    let bundles = tempfile::tempdir().unwrap();
+    // Larger than the per-stream flow window, so an unread response stays
+    // in progress (and keeps its slot) on the server.
+    let big: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 253) as u8).collect();
+    let hash = publish(bundles.path(), &big);
+    let dir = bundles.path().to_string_lossy().into_owned();
+    let t = TestServer::start(|raw| {
+        bundle_config(raw, dir, false);
+        raw.limits.max_concurrent_bundle_streams = 1;
+    })
+    .await;
+    let ch = t.certhash();
+    let path = format!("/keccak/{}/{}", &hash[..2], &hash[2..]);
+    let request = harness_get(&path, &ch, None);
+
+    // Client A asks for the bundle and does not read the response.
+    let a = dial(&t.addr(), Transport::Quic).await;
+    let mut held = a.open_stream().await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut held, &request)
+        .await
+        .unwrap();
+    held.close_write().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Client B is told to come back.
+    let b = dial(&t.addr(), Transport::Quic).await;
+    let res = exchange(b.as_ref(), &request).await;
+    assert_eq!(res.status, 503, "{}", res.text());
+    assert_eq!(res.header("retry-after"), Some("1"));
+
+    // Once A's exchange ends, the slot is free again.
+    drop(held);
+    a.close().await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let res = exchange(b.as_ref(), &request).await;
+        if res.status == 200 {
+            assert_eq!(keccak256_hex(&res.body), hash);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "slot never freed: {}",
+            res.status
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let metrics = t.metrics_text().await;
+    assert!(
+        metrics.contains("nox_kps_bundle_requests_total{result=\"busy\"}"),
+        "{metrics}"
+    );
+    t.stop().await;
+}

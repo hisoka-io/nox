@@ -44,6 +44,23 @@ pub fn load(path: &Path) -> Result<kps::Identity, IdentityError> {
     }
 }
 
+/// [`load`], then checks the certhash against `expected_certhash` (`run`).
+pub fn load_expected(path: &Path, expected: Option<&str>) -> Result<kps::Identity, IdentityError> {
+    let identity = load(path)?;
+    match expected {
+        None => Err(IdentityError::ExpectedCerthashMissing {
+            path: path.to_path_buf(),
+            actual: identity.certhash.clone(),
+        }),
+        Some(expected) if expected != identity.certhash => Err(IdentityError::CerthashMismatch {
+            path: path.to_path_buf(),
+            expected: expected.to_string(),
+            actual: identity.certhash.clone(),
+        }),
+        Some(_) => Ok(identity),
+    }
+}
+
 /// Reads an existing identity without creating one (`check-config`,
 /// `address`). `Ok(None)` when the file does not exist.
 pub fn read_existing(path: &Path) -> Result<Option<kps::Identity>, IdentityError> {
@@ -200,6 +217,27 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("chmod 600"), "{err}");
+    }
+
+    #[test]
+    fn run_requires_the_expected_certhash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kps.key");
+        let id = init(&path).unwrap();
+        assert!(matches!(
+            load_expected(&path, None),
+            Err(IdentityError::ExpectedCerthashMissing { .. })
+        ));
+        let other = kps::Identity::generate().unwrap();
+        let Err(err) = load_expected(&path, Some(&other.certhash)) else {
+            panic!("a foreign certhash must be refused");
+        };
+        assert!(err.to_string().contains(&id.certhash), "{err}");
+        assert_eq!(
+            load_expected(&path, Some(&id.certhash)).unwrap().certhash,
+            id.certhash
+        );
+        assert!(crate::config::is_certhash(&id.certhash));
     }
 
     #[test]

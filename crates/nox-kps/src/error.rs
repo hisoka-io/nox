@@ -30,6 +30,18 @@ pub enum IdentityError {
         "a KPS identity key already exists at {path}; init refuses to replace it (a new key changes the published address; delete the file deliberately to rotate)"
     )]
     AlreadyExists { path: PathBuf },
+    #[error(
+        "expected_certhash is not set; `run` serves only the identity the operator confirmed. The key at {path} has certhash {actual}: set expected_certhash = \"{actual}\" if that is the published address"
+    )]
+    ExpectedCerthashMissing { path: PathBuf, actual: String },
+    #[error(
+        "the KPS identity key at {path} has certhash {actual}, but expected_certhash is {expected}; refusing to serve under another address (restore the right key file or update expected_certhash and the published metadataUrl)"
+    )]
+    CerthashMismatch {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
     #[error("the KPS identity key at {path} has mode {mode:o}; it must be private: run chmod 600 {path}")]
     Permissions { path: PathBuf, mode: u32 },
     #[error("cannot create the identity key directory {path}: {source}")]

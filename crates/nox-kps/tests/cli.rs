@@ -375,11 +375,12 @@ async fn start_binary(
 ) -> (Running, String, String) {
     let admin_port = free_tcp_port();
     let key = dir.join("kps.key");
+    let certhash = nox_kps::identity::init(&key).unwrap().certhash;
     let cfg = write_config(
         dir,
         &format!(
             "listen = \"127.0.0.1:0\"\nadvertise = [\"127.0.0.1\"]\nallow_private_advertise = true\n\
-             key_file = \"{}\"\nkeccak_dir = \"\"\n\
+             key_file = \"{}\"\nexpected_certhash = \"{certhash}\"\nkeccak_dir = \"\"\n\
              upstream_ingress = \"{up}\"\nupstream_topology = \"{up}\"\n\
              admin_listen = \"127.0.0.1:{admin_port}\"\n{extra}\n\
              [shutdown]\ngrace_period_ms = 3000\nclose_linger_ms = 500\n",
@@ -388,7 +389,6 @@ async fn start_binary(
         ),
     );
     let cfg = cfg.to_str().unwrap().to_string();
-    nox_kps::identity::init(&key).unwrap();
     let mut running = Running::spawn(&cfg);
     let line = running.wait_for(":uEi");
     let address = line
@@ -397,6 +397,53 @@ async fn start_binary(
         .unwrap_or_else(|| panic!("no address in {line}"))
         .to_string();
     (running, cfg, address)
+}
+
+#[test]
+fn run_serves_only_the_confirmed_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("keccak")).unwrap();
+    let cfg = public_config(dir.path(), "");
+    let cfg = cfg.to_str().unwrap();
+    let init = output(nox_kps(&["--config", cfg, "init"]));
+    let stdout = text(&init.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("config line: expected_certhash = "))
+        .expect("init prints the config line");
+    let certhash = line.rsplit('"').nth(1).unwrap().to_string();
+
+    let out = output(nox_kps(&["--config", cfg, "run"]));
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "run refuses without expected_certhash"
+    );
+    assert!(
+        text(&out.stdout).contains("expected_certhash is not set"),
+        "{}",
+        text(&out.stdout)
+    );
+
+    let other = kps::Identity::generate().unwrap().certhash;
+    let wrong = public_config(dir.path(), &format!("expected_certhash = \"{other}\"\n"));
+    let out = output(nox_kps(&[
+        "--config",
+        wrong.to_str().unwrap(),
+        "check-config",
+    ]));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "check-config reports the mismatch"
+    );
+    assert!(
+        text(&out.stderr).contains(&certhash),
+        "{}",
+        text(&out.stderr)
+    );
+    let out = output(nox_kps(&["--config", wrong.to_str().unwrap(), "run"]));
+    assert_eq!(out.status.code(), Some(1), "run refuses another identity");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -457,12 +504,13 @@ async fn healthcheck_kps_dials_the_listener_end_to_end() {
     };
     let admin_port = free_tcp_port();
     let key = dir.path().join("kps.key");
-    nox_kps::identity::init(&key).unwrap();
+    let certhash = nox_kps::identity::init(&key).unwrap().certhash;
+    // The container default: a dual-stack listener, probed over IPv4 loopback.
     let cfg = write_config(
         dir.path(),
         &format!(
-            "listen = \"127.0.0.1:{port}\"\nadvertise = [\"127.0.0.1\"]\nallow_private_advertise = true\n\
-             key_file = \"{}\"\nkeccak_dir = \"\"\nupstream_ingress = \"{up}\"\nupstream_topology = \"{up}\"\n\
+            "listen = \"[::]:{port}\"\nadvertise = [\"127.0.0.1\"]\nallow_private_advertise = true\n\
+             key_file = \"{}\"\nexpected_certhash = \"{certhash}\"\nkeccak_dir = \"\"\nupstream_ingress = \"{up}\"\nupstream_topology = \"{up}\"\n\
              admin_listen = \"127.0.0.1:{admin_port}\"\n[limits]\nhealth_cache_ms = 0\n",
             key.display(),
             up = upstream.authority(),

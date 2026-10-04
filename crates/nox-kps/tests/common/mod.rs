@@ -314,8 +314,16 @@ pub async fn admin_get(addr: SocketAddr, path: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Test config for an in-process server. `expected_certhash` is taken from
+/// the key file when it exists.
 pub fn base_config(upstream: &MockUpstream, key_file: &std::path::Path) -> RawConfig {
+    let expected_certhash = nox_kps::identity::read_existing(key_file)
+        .ok()
+        .flatten()
+        .map(|id| id.certhash)
+        .unwrap_or_default();
     let mut raw = RawConfig {
+        expected_certhash,
         listen: "127.0.0.1:0".to_string(),
         advertise: vec!["127.0.0.1".to_string()],
         allow_private_advertise: true,

@@ -77,6 +77,10 @@ pub struct RawConfig {
     /// Persistent identity (combined PRIVATE KEY + CERTIFICATE PEM, mode
     /// 0600). Created once by `nox-kps init`; `run` never creates it.
     pub key_file: PathBuf,
+    /// The certhash `init` printed for `key_file`. `run` refuses to start
+    /// without it or when the loaded key has another certhash, so a swapped or
+    /// wrongly restored volume never serves under the published address.
+    pub expected_certhash: String,
     /// The node's registry address, shown in `/metadata.json` (informational).
     pub node_address: String,
     /// The node's HTTP ingress on loopback (packets, claims, health).
@@ -110,6 +114,7 @@ impl Default for RawConfig {
             advertise: Vec::new(),
             allow_private_advertise: false,
             key_file: PathBuf::from("/var/lib/nox-kps/kps.key"),
+            expected_certhash: String::new(),
             node_address: String::new(),
             upstream_ingress: "127.0.0.1:15002".to_string(),
             upstream_topology: "127.0.0.1:15003".to_string(),
@@ -151,6 +156,10 @@ pub struct LimitsConfig {
     pub header_read_timeout_ms: u64,
     /// Stream open to response written; the stream is reset after it.
     pub stream_timeout_ms: u64,
+    /// This many streams in a row hitting `stream_timeout_ms` close the
+    /// connection: its transport is treated as stalled, which frees its
+    /// buffers and lets the client redial.
+    pub max_stream_timeouts_per_connection: usize,
     /// Per-IP token buckets (requests per second and burst) per route class.
     pub packet_rate_per_ip: u32,
     pub packet_burst: u32,
@@ -189,6 +198,9 @@ pub struct LimitsConfig {
     pub max_bundle_bytes: usize,
     /// Most bundles held in memory.
     pub max_bundles: usize,
+    /// Bundle responses being written at once (each is ~0.7 MB, and WebRTC
+    /// costs ~4x QUIC CPU); beyond it clients get `503` with `Retry-After`.
+    pub max_concurrent_bundle_streams: usize,
     /// Seconds between bundle directory rescans; 0 scans only at startup.
     pub bundle_rescan_secs: u64,
     /// Serve a gzip copy to clients that list `gzip` in `Accept-Encoding`.
@@ -199,16 +211,17 @@ pub struct LimitsConfig {
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
-            max_connections: 512,
+            max_connections: 256,
             max_connections_per_ip: 16,
             ipv6_prefix_len: 64,
-            max_streams_per_connection: 64,
-            conn_idle_timeout_secs: 300,
-            conn_max_lifetime_secs: 86_400,
+            max_streams_per_connection: 32,
+            conn_idle_timeout_secs: 120,
+            conn_max_lifetime_secs: 3_600,
             header_max_bytes: 16 * 1024,
             max_headers: 64,
-            header_read_timeout_ms: 30_000,
+            header_read_timeout_ms: 10_000,
             stream_timeout_ms: 30_000,
+            max_stream_timeouts_per_connection: 2,
             packet_rate_per_ip: 20,
             packet_burst: 100,
             claim_rate_per_ip: 30,
@@ -228,11 +241,12 @@ impl Default for LimitsConfig {
             upstream_claim_timeout_ms: 10_000,
             upstream_topology_timeout_ms: 5_000,
             upstream_health_timeout_ms: 1_000,
-            max_inflight_upstream: 256,
+            max_inflight_upstream: 128,
             topology_cache_ms: 1_000,
             health_cache_ms: 1_000,
             max_bundle_bytes: 64 * 1024 * 1024,
             max_bundles: 16,
+            max_concurrent_bundle_streams: 8,
             bundle_rescan_secs: 60,
             bundle_gzip: false,
         }
@@ -354,6 +368,12 @@ impl RawConfig {
             v.err("key_file must not be empty (expected a path such as /var/lib/nox-kps/kps.key)");
         }
         let node_address = self.validate_node_address(&mut v);
+        let expected_certhash = self.expected_certhash.trim();
+        if !expected_certhash.is_empty() && !is_certhash(expected_certhash) {
+            v.err(format!(
+                "expected_certhash must be the certhash `nox-kps init` printed (\"uEi\" + 44 base64url characters) or empty (got: \"{expected_certhash}\")"
+            ));
+        }
         let ingress = parse_upstream("upstream_ingress", &self.upstream_ingress, &mut v);
         let topology = parse_upstream("upstream_topology", &self.upstream_topology, &mut v);
         let client_ip_header = parse_client_ip_header(&self.client_ip_header, &mut v);
@@ -416,6 +436,8 @@ impl RawConfig {
             listen,
             advertise,
             key_file: self.key_file.clone(),
+            expected_certhash: (!expected_certhash.is_empty())
+                .then(|| expected_certhash.to_string()),
             node_address,
             upstream_ingress: ingress,
             upstream_topology: topology,
@@ -508,6 +530,12 @@ impl LimitsConfig {
         );
         v.range(self.max_headers, 8, 1024, "limits.max_headers");
         v.range(
+            self.max_stream_timeouts_per_connection,
+            1,
+            1_000,
+            "limits.max_stream_timeouts_per_connection",
+        );
+        v.range(
             self.rate_limit_max_clients,
             16,
             100_000_000,
@@ -556,6 +584,12 @@ impl LimitsConfig {
             "limits.max_bundle_bytes",
         );
         v.range(self.max_bundles, 1, 100_000, "limits.max_bundles");
+        v.range(
+            self.max_concurrent_bundle_streams,
+            1,
+            100_000,
+            "limits.max_concurrent_bundle_streams",
+        );
         for (value, field) in [
             (self.packet_rate_per_ip, "limits.packet_rate_per_ip"),
             (self.packet_burst, "limits.packet_burst"),
@@ -665,6 +699,7 @@ impl LimitsConfig {
             max_headers: self.max_headers,
             header_read_timeout: ms(self.header_read_timeout_ms),
             stream_timeout: ms(self.stream_timeout_ms),
+            max_stream_timeouts_per_connection: self.max_stream_timeouts_per_connection,
             packet_rate: Rate::new(self.packet_rate_per_ip, self.packet_burst),
             claim_rate: Rate::new(self.claim_rate_per_ip, self.claim_burst),
             topology_rate: Rate::new(self.topology_rate_per_ip, self.topology_burst),
@@ -685,6 +720,7 @@ impl LimitsConfig {
             health_cache: ms(self.health_cache_ms),
             max_bundle_bytes: self.max_bundle_bytes,
             max_bundles: self.max_bundles,
+            max_concurrent_bundle_streams: self.max_concurrent_bundle_streams,
             bundle_rescan: (self.bundle_rescan_secs > 0)
                 .then(|| Duration::from_secs(self.bundle_rescan_secs)),
             bundle_gzip: self.bundle_gzip,
@@ -735,6 +771,16 @@ impl Validator {
     }
 }
 
+/// A KPS certhash: multibase `u` + base64url (no padding) of the 34-byte
+/// sha2-256 multihash, i.e. `uEi` followed by 44 more characters.
+#[must_use]
+pub fn is_certhash(s: &str) -> bool {
+    s.len() == 47
+        && s.starts_with("uEi")
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// `log_level` as a `tracing` filter: a bare level applies to nox-kps only.
 #[must_use]
 pub fn log_filter(level: &str) -> String {
@@ -752,6 +798,8 @@ pub struct Settings {
     pub listen: SocketAddr,
     pub advertise: Vec<IpAddr>,
     pub key_file: PathBuf,
+    /// Required by `run`; `None` only for `init`, `address` and `check-config`.
+    pub expected_certhash: Option<String>,
     /// Lowercase `0x…` registry address, when configured.
     pub node_address: Option<String>,
     pub upstream_ingress: Upstream,
@@ -805,6 +853,7 @@ pub struct Limits {
     pub max_headers: usize,
     pub header_read_timeout: Duration,
     pub stream_timeout: Duration,
+    pub max_stream_timeouts_per_connection: usize,
     pub packet_rate: Rate,
     pub claim_rate: Rate,
     pub topology_rate: Rate,
@@ -825,6 +874,7 @@ pub struct Limits {
     pub health_cache: Duration,
     pub max_bundle_bytes: usize,
     pub max_bundles: usize,
+    pub max_concurrent_bundle_streams: usize,
     pub bundle_rescan: Option<Duration>,
     pub bundle_gzip: bool,
 }
@@ -1001,10 +1051,14 @@ mod tests {
                 l.max_connections_per_ip,
                 l.max_streams_per_connection
             ),
-            (512, 16, 64)
+            (256, 16, 32)
         );
-        assert_eq!(l.conn_idle_timeout, Duration::from_secs(300));
-        assert_eq!(l.conn_max_lifetime, Duration::from_secs(86_400));
+        assert_eq!(l.conn_idle_timeout, Duration::from_mins(2));
+        assert_eq!(l.conn_max_lifetime, Duration::from_hours(1));
+        assert_eq!(l.header_read_timeout, Duration::from_secs(10));
+        assert_eq!(l.max_inflight_upstream, 128);
+        assert_eq!(l.max_concurrent_bundle_streams, 8);
+        assert!(s.expected_certhash.is_none());
         assert_eq!(l.header_max_bytes, 16_384);
         assert_eq!(l.packet_rate, Rate::new(20, 100));
         assert_eq!(l.claim_rate, Rate::new(30, 200));
@@ -1045,6 +1099,23 @@ max_connections = 512
         );
         assert_eq!(s.advertise, vec!["3.239.73.249".parse::<IpAddr>().unwrap()]);
         assert_eq!(s.log_filter, "error,nox_kps=info");
+    }
+
+    #[test]
+    fn the_shipped_example_config_is_valid_and_states_the_defaults() {
+        let raw =
+            RawConfig::from_toml_str(include_str!("../../../deploy/nox-kps.example.toml")).unwrap();
+        raw.validate().unwrap();
+        assert_eq!(raw.limits, LimitsConfig::default());
+        assert_eq!(raw.shutdown, ShutdownConfig::default());
+        assert_eq!(
+            RawConfig {
+                advertise: Vec::new(),
+                ..raw
+            },
+            RawConfig::default(),
+            "every top-level value in the example is the default"
+        );
     }
 
     #[test]
@@ -1173,6 +1244,17 @@ max_connections = 512
         assert_error(&raw, "client_ip_header must not be");
         raw.client_ip_header = "bad header".into();
         assert_error(&raw, "client_ip_header must be a valid header name");
+    }
+
+    #[test]
+    fn expected_certhash_has_the_certhash_shape() {
+        let mut raw = valid();
+        raw.expected_certhash = "uEiAm9Bz8s3aYgpiYn3xD94v1TXQyWi0gOw4Vmv7gD2DWpw".into();
+        assert!(raw.validate().unwrap().expected_certhash.is_some());
+        raw.expected_certhash = "uEi".into();
+        assert_error(&raw, "expected_certhash must be");
+        raw.expected_certhash = "sha256:abcd".into();
+        assert_error(&raw, "expected_certhash must be");
     }
 
     #[test]

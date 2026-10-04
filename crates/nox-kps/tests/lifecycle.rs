@@ -38,6 +38,29 @@ async fn identity_is_stable_across_restarts() {
 
     let created = nox_kps::identity::init(&key_file).unwrap();
     let certhash = created.certhash.clone();
+    // run serves only the confirmed identity.
+    let mut unconfirmed = base_config(&upstream, &key_file);
+    unconfirmed.expected_certhash = String::new();
+    let refused = nox_kps::start(unconfirmed.validate().unwrap()).await;
+    assert!(
+        matches!(
+            refused,
+            Err(StartError::Identity(
+                IdentityError::ExpectedCerthashMissing { .. }
+            ))
+        ),
+        "{refused:?}"
+    );
+    let mut wrong = base_config(&upstream, &key_file);
+    wrong.expected_certhash = kps::Identity::generate().unwrap().certhash;
+    let refused = nox_kps::start(wrong.validate().unwrap()).await;
+    assert!(
+        matches!(
+            refused,
+            Err(StartError::Identity(IdentityError::CerthashMismatch { .. }))
+        ),
+        "{refused:?}"
+    );
     let pem_before = std::fs::read(&key_file).unwrap();
     for round in 0..3 {
         let server = nox_kps::start(base_config(&upstream, &key_file).validate().unwrap())

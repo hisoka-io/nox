@@ -217,16 +217,6 @@ async fn refuses_requests_outside_the_profile_and_the_allowlist() {
             413,
         ),
         (
-            "body shorter than Content-Length",
-            raw_request(
-                "POST",
-                "/api/v1/packets",
-                &[("Host", ch.as_str()), octets, ("Content-Length", "32768")],
-                b"short",
-            ),
-            400,
-        ),
-        (
             "invalid Content-Length",
             raw_request(
                 "POST",
@@ -333,6 +323,17 @@ async fn refuses_requests_outside_the_profile_and_the_allowlist() {
     }
     assert_eq!(t.upstream.count(), 0, "no refused request reaches the node");
 
+    // A body shorter than its Content-Length is abandoned: reset, no response.
+    let short = raw_request(
+        "POST",
+        "/api/v1/packets",
+        &[("Host", ch.as_str()), octets, ("Content-Length", "32768")],
+        b"short",
+    );
+    let outcome = try_exchange(conn.as_ref(), &short, Duration::from_secs(10)).await;
+    assert!(outcome.is_err(), "short body is abandoned: {outcome:?}");
+    assert_eq!(t.upstream.count(), 0);
+
     // Identical duplicate Content-Length values carry one meaning; hyper merges
     // them (RFC 9112 §6.3 permits this) and the upstream request is rebuilt
     // with a single length, so no desync is possible.
@@ -365,6 +366,7 @@ async fn refuses_requests_outside_the_profile_and_the_allowlist() {
         "content_type",
         "claim_body",
         "length_required",
+        "body_length",
     ] {
         assert!(
             metrics.contains(&format!(

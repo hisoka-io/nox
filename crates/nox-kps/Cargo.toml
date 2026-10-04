@@ -22,6 +22,10 @@ path = "src/main.rs"
 # workspace root carries the [patch.crates-io] block it needs.
 kps = { git = "https://github.com/ethereum/kps", tag = "libs/rust/v0.2.2" }
 
+# Interface listing for the loopback preflight check (already in the graph
+# through kps -> webrtc; pinned to that exact version).
+webrtc-util = { version = "=0.12.0", default-features = false, features = ["ifaces"] }
+
 # Runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "io-util", "fs"] }
 tokio-util = { version = "0.7", features = ["rt"] }

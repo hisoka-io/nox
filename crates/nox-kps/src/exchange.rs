@@ -18,9 +18,8 @@
 //! - responses always carry an exact `Content-Length`, never chunked;
 //! - keep-alive off: one exchange, then the stream is finished.
 
-use std::convert::Infallible;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -33,6 +32,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use kps::ErrorCode;
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::{debug, warn};
 
 use crate::app::App;
@@ -47,6 +47,15 @@ use crate::routes::{lookup, Lookup, Route, BUNDLE_PATH_PREFIX, KNOWN_METHODS};
 /// Route label for requests that matched nothing.
 const UNMATCHED: &str = "unmatched";
 
+/// The exchange is abandoned: the stream is reset without a response (the
+/// profile's answer to a body that does not match its `Content-Length`).
+#[derive(Debug, thiserror::Error)]
+#[error("exchange abandoned: {0}")]
+pub struct Abandon(&'static str);
+
+/// A permit held until the stream is finished (bundle responses).
+type HeldPermit = Arc<Mutex<Option<OwnedSemaphorePermit>>>;
+
 /// How a stream ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamOutcome {
@@ -58,6 +67,8 @@ pub enum StreamOutcome {
     StreamTimeout,
     /// Malformed or forbidden HTTP that hyper refused before routing.
     ProtocolError,
+    /// nox-kps reset the exchange without a response (body length mismatch).
+    Abandoned,
     /// The peer reset or the transport failed mid-exchange.
     Io,
 }
@@ -70,6 +81,7 @@ impl StreamOutcome {
             Self::HeaderTimeout => "header_timeout",
             Self::StreamTimeout => "stream_timeout",
             Self::ProtocolError => "protocol_error",
+            Self::Abandoned => "abandoned",
             Self::Io => "io",
         }
     }
@@ -83,9 +95,12 @@ pub async fn serve_stream(
 ) -> StreamOutcome {
     let limits = &app.settings.limits;
     let svc_app = Arc::clone(&app);
+    let held: HeldPermit = Arc::new(Mutex::new(None));
+    let svc_held = Arc::clone(&held);
     let service = service_fn(move |req: Request<Incoming>| {
         let app = Arc::clone(&svc_app);
-        async move { Ok::<_, Infallible>(handle_request(req, &app, client_ip).await) }
+        let held = Arc::clone(&svc_held);
+        async move { handle_request(req, &app, client_ip, &held).await }
     });
     let mut builder = http1::Builder::new();
     builder
@@ -104,6 +119,7 @@ pub async fn serve_stream(
     let outcome = match served {
         Ok(Ok(())) => StreamOutcome::Completed,
         Ok(Err(e)) if e.is_timeout() => StreamOutcome::HeaderTimeout,
+        Ok(Err(e)) if e.is_user() => StreamOutcome::Abandoned,
         Ok(Err(e)) if e.is_parse() || e.is_parse_too_large() || e.is_parse_status() => {
             StreamOutcome::ProtocolError
         }
@@ -120,9 +136,13 @@ pub async fn serve_stream(
         StreamOutcome::HeaderTimeout | StreamOutcome::StreamTimeout => {
             stream.close_with_error(ErrorCode::Timeout).await
         }
-        StreamOutcome::ProtocolError => stream.close_with_error(ErrorCode::ProtocolError).await,
+        StreamOutcome::ProtocolError | StreamOutcome::Abandoned => {
+            stream.close_with_error(ErrorCode::ProtocolError).await
+        }
         StreamOutcome::Io => stream.close_with_error(ErrorCode::Cancelled).await,
     };
+    // A bundle-stream slot is released only once the response is written.
+    drop(held.lock().unwrap_or_else(PoisonError::into_inner).take());
     outcome
 }
 
@@ -131,9 +151,16 @@ async fn handle_request(
     req: Request<Incoming>,
     app: &App,
     client_ip: IpAddr,
-) -> Response<Full<Bytes>> {
+    held: &HeldPermit,
+) -> Result<Response<Full<Bytes>>, Abandon> {
     let started = Instant::now();
-    let (label, response) = dispatch(req, app, client_ip).await;
+    let (label, response) = match dispatch(req, app, client_ip, held).await {
+        Ok(answer) => answer,
+        Err(abandon) => {
+            debug!(reason = abandon.0, "exchange abandoned");
+            return Err(abandon);
+        }
+    };
     let status = response.status();
     app.metrics
         .streams
@@ -157,7 +184,7 @@ async fn handle_request(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "exchange"
     );
-    response
+    Ok(response)
 }
 
 /// A refusal under the profile: counted by kind, answered with a short text.
@@ -175,8 +202,9 @@ async fn dispatch(
     req: Request<Incoming>,
     app: &App,
     client_ip: IpAddr,
-) -> (&'static str, Response<Full<Bytes>>) {
-    let refuse = |kind, status, msg: &str| (UNMATCHED, violation(app, kind, status, msg));
+    held: &HeldPermit,
+) -> Result<(&'static str, Response<Full<Bytes>>), Abandon> {
+    let refuse = |kind, status, msg: &str| Ok((UNMATCHED, violation(app, kind, status, msg)));
     if req.version() != Version::HTTP_11 {
         return refuse(
             "http_version",
@@ -241,12 +269,12 @@ async fn dispatch(
     let bundles_enabled = app.bundles.is_some();
     let route = match lookup(req.method(), req.uri().path(), bundles_enabled) {
         Lookup::Found(route) => route,
-        Lookup::MethodNotAllowed(allow) => return (UNMATCHED, method_not_allowed(allow)),
-        Lookup::NotFound => return (UNMATCHED, text(StatusCode::NOT_FOUND, "not found")),
+        Lookup::MethodNotAllowed(allow) => return Ok((UNMATCHED, method_not_allowed(allow))),
+        Lookup::NotFound => return Ok((UNMATCHED, text(StatusCode::NOT_FOUND, "not found"))),
     };
     let label = route.label();
     if route.method() == Method::GET && declared.unwrap_or(0) > 0 {
-        return (
+        return Ok((
             label,
             violation(
                 app,
@@ -254,7 +282,7 @@ async fn dispatch(
                 StatusCode::BAD_REQUEST,
                 "GET and HEAD requests take no body",
             ),
-        );
+        ));
     }
     if let Some(limiter) = app.rate.for_route(route) {
         if let Err(why) = limiter.check(client_ip) {
@@ -266,12 +294,12 @@ async fn dispatch(
                 RateLimited::Exhausted => "rate limit exceeded; retry shortly",
                 RateLimited::TableFull => "server busy; retry shortly",
             };
-            return (label, retry_later(StatusCode::TOO_MANY_REQUESTS, msg));
+            return Ok((label, retry_later(StatusCode::TOO_MANY_REQUESTS, msg)));
         }
     }
     let response = match route {
-        Route::Packets => packets(req, app, client_ip, declared).await,
-        Route::Claim => claim(req, app, client_ip, declared).await,
+        Route::Packets => packets(req, app, client_ip, declared).await?,
+        Route::Claim => claim(req, app, client_ip, declared).await?,
         Route::Topology => topology(app).await,
         Route::Health => health(app).await,
         Route::Metadata => with_type(
@@ -279,9 +307,9 @@ async fn dispatch(
             "application/json",
             app.metadata_json.clone(),
         ),
-        Route::Bundle => bundle(&req, app),
+        Route::Bundle => bundle(&req, app, held),
     };
-    (label, response)
+    Ok((label, response))
 }
 
 /// `Content-Type` essence (`type/subtype`, lowercase, parameters dropped).
@@ -292,13 +320,17 @@ fn media_type(headers: &HeaderMap) -> Option<String> {
 }
 
 /// Reads a request body of exactly `len` bytes (already checked against the
-/// route's cap).
+/// route's cap). A body that ends early is abandoned, never answered.
 async fn read_body(
     incoming: Incoming,
     len: usize,
     app: &App,
     label: &'static str,
-) -> Result<Bytes, Response<Full<Bytes>>> {
+) -> Result<Bytes, Abandon> {
+    let short = |app: &App| {
+        app.metrics.violation("body_length");
+        Abandon("request body ended before Content-Length bytes arrived")
+    };
     match Limited::new(incoming, len).collect().await {
         Ok(collected) => {
             let body = collected.to_bytes();
@@ -306,20 +338,10 @@ async fn read_body(
             if body.len() == len {
                 Ok(body)
             } else {
-                Err(violation(
-                    app,
-                    "body_length",
-                    StatusCode::BAD_REQUEST,
-                    "request body ended before Content-Length bytes arrived",
-                ))
+                Err(short(app))
             }
         }
-        Err(_) => Err(violation(
-            app,
-            "body_length",
-            StatusCode::BAD_REQUEST,
-            "request body ended before Content-Length bytes arrived",
-        )),
+        Err(_) => Err(short(app)),
     }
 }
 
@@ -328,23 +350,23 @@ async fn packets(
     app: &App,
     client_ip: IpAddr,
     declared: Option<u64>,
-) -> Response<Full<Bytes>> {
+) -> Result<Response<Full<Bytes>>, Abandon> {
     let label = Route::Packets.label();
     if media_type(req.headers()).as_deref() != Some("application/octet-stream") {
-        return violation(
+        return Ok(violation(
             app,
             "content_type",
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "packets must be sent as application/octet-stream",
-        );
+        ));
     }
     let Some(len) = declared else {
-        return violation(
+        return Ok(violation(
             app,
             "length_required",
             StatusCode::LENGTH_REQUIRED,
             "Content-Length is required",
-        );
+        ));
     };
     if len != SPHINX_PACKET_BYTES as u64 {
         let status = if len > SPHINX_PACKET_BYTES as u64 {
@@ -352,19 +374,16 @@ async fn packets(
         } else {
             StatusCode::BAD_REQUEST
         };
-        return violation(
+        return Ok(violation(
             app,
             "packet_size",
             status,
             &format!("a packet is exactly {SPHINX_PACKET_BYTES} bytes"),
-        );
+        ));
     }
-    let body = match read_body(req.into_body(), SPHINX_PACKET_BYTES, app, label).await {
-        Ok(body) => body,
-        Err(res) => return res,
-    };
+    let body = read_body(req.into_body(), SPHINX_PACKET_BYTES, app, label).await?;
     let l = &app.settings.limits;
-    forward(
+    let forwarded = forward(
         app,
         UpstreamCall {
             route: label,
@@ -378,8 +397,10 @@ async fn packets(
             max_response_bytes: l.small_response_max_bytes,
         },
     )
-    .await
-    .map_or_else(into_client_response, into_client_response)
+    .await;
+    Ok(match forwarded {
+        Ok(res) | Err(res) => into_client_response(res),
+    })
 }
 
 async fn claim(
@@ -387,27 +408,27 @@ async fn claim(
     app: &App,
     client_ip: IpAddr,
     declared: Option<u64>,
-) -> Response<Full<Bytes>> {
+) -> Result<Response<Full<Bytes>>, Abandon> {
     let label = Route::Claim.label();
     let l = &app.settings.limits;
     if media_type(req.headers()).as_deref() != Some("application/json") {
-        return violation(
+        return Ok(violation(
             app,
             "content_type",
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "claims must be sent as application/json",
-        );
+        ));
     }
     let Some(len) = declared else {
-        return violation(
+        return Ok(violation(
             app,
             "length_required",
             StatusCode::LENGTH_REQUIRED,
             "Content-Length is required",
-        );
+        ));
     };
     if len > l.claim_request_max_bytes as u64 {
-        return violation(
+        return Ok(violation(
             app,
             "claim_size",
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -415,16 +436,13 @@ async fn claim(
                 "a claim body is at most {} bytes",
                 l.claim_request_max_bytes
             ),
-        );
+        ));
     }
-    let body = match read_body(req.into_body(), len as usize, app, label).await {
-        Ok(body) => body,
-        Err(res) => return res,
-    };
+    let body = read_body(req.into_body(), len as usize, app, label).await?;
     if let Err(msg) = check_claim_body(&body, l.claim_max_surb_ids) {
-        return violation(app, "claim_body", StatusCode::BAD_REQUEST, &msg);
+        return Ok(violation(app, "claim_body", StatusCode::BAD_REQUEST, &msg));
     }
-    forward(
+    let forwarded = forward(
         app,
         UpstreamCall {
             route: label,
@@ -438,8 +456,10 @@ async fn claim(
             max_response_bytes: l.claim_response_max_bytes,
         },
     )
-    .await
-    .map_or_else(into_client_response, into_client_response)
+    .await;
+    Ok(match forwarded {
+        Ok(res) | Err(res) => into_client_response(res),
+    })
 }
 
 /// `{"surb_ids": [<32 hex>, ...]}` with at most `max_ids` entries. The node
@@ -575,7 +595,7 @@ async fn forward(app: &App, call: UpstreamCall<'_>) -> Result<UpstreamResponse, 
     })
 }
 
-fn bundle(req: &Request<Incoming>, app: &App) -> Response<Full<Bytes>> {
+fn bundle(req: &Request<Incoming>, app: &App, held: &HeldPermit) -> Response<Full<Bytes>> {
     let miss = |app: &App| {
         app.metrics
             .bundle_requests
@@ -597,6 +617,17 @@ fn bundle(req: &Request<Incoming>, app: &App) -> Response<Full<Bytes>> {
     let Some(found) = store.get(&hash) else {
         return miss(app);
     };
+    let Ok(permit) = Arc::clone(&app.bundle_streams).try_acquire_owned() else {
+        app.metrics
+            .bundle_requests
+            .get_or_create(&ResultLabels { result: "busy" })
+            .inc();
+        return retry_later(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many bundle downloads in progress; retry shortly",
+        );
+    };
+    *held.lock().unwrap_or_else(PoisonError::into_inner) = Some(permit);
     app.metrics
         .bundle_requests
         .get_or_create(&ResultLabels { result: "hit" })

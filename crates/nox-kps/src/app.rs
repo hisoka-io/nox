@@ -25,6 +25,8 @@ pub struct App {
     pub metrics: Arc<Metrics>,
     /// Upstream requests in flight across all clients.
     pub inflight: Arc<Semaphore>,
+    /// Bundle responses being written across all clients.
+    pub bundle_streams: Arc<Semaphore>,
     pub conn_limiter: Arc<ConnLimiter>,
     pub rate: RateLimiters,
     pub topology: SharedResponse,
