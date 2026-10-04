@@ -40,6 +40,7 @@ pub fn generate_node_config(
     mix_delay_ms: f64,
     eth_rpc_url: &str,
     wire_ids: nox_node::config::WireIdMode,
+    registry: Option<&MeshRegistry>,
 ) -> Result<(PathBuf, String)> {
     let node_dir = data_dir.join(format!("node_{id}"));
     std::fs::create_dir_all(&node_dir)?;
@@ -77,6 +78,13 @@ pub fn generate_node_config(
     config.network.rate_limit.burst_penalized = 1_000;
     config.network.rate_limit.rate_penalized = 2_000;
     config.network.rate_limit.violations_before_disconnect = 1_000;
+    if let Some(registry) = registry {
+        config
+            .registry_contract_address
+            .clone_from(&registry.address);
+        config.chain_id = registry.chain_id;
+        config.block_poll_interval_secs = registry.block_poll_interval_secs;
+    }
 
     // Secret fields have #[serde(skip_serializing)] -- prepend them before
     // any [table] sections so TOML parses them as top-level keys.
@@ -243,6 +251,22 @@ pub struct MeshOptions {
     /// Another `nox` binary (for example an earlier release) and the node
     /// indices that run it.
     pub alternate_binary: Option<(PathBuf, Vec<usize>)>,
+    /// `NoxRegistry` every node's chain observer follows. The admin
+    /// registrations still wire the mesh at startup; registry events for the
+    /// same addresses then replace those entries, so `/topology` serves the
+    /// on-chain profiles at an observed block.
+    pub registry: Option<MeshRegistry>,
+}
+
+/// A `NoxRegistry` on the mesh chain (`eth_rpc_url`) for the nodes to observe.
+#[derive(Debug, Clone)]
+pub struct MeshRegistry {
+    /// Registry (proxy) address, 0x-prefixed.
+    pub address: String,
+    /// Chain id of the mesh chain.
+    pub chain_id: u64,
+    /// Chain observer poll interval.
+    pub block_poll_interval_secs: u64,
 }
 
 impl MeshOptions {
@@ -253,6 +277,7 @@ impl MeshOptions {
             wire_ids: nox_node::config::WireIdMode::Passthrough,
             roles: Vec::new(),
             alternate_binary: None,
+            registry: None,
         }
     }
 
@@ -378,6 +403,7 @@ impl ProcessMesh {
                 mix_delay_ms,
                 eth_rpc_url,
                 wire_ids,
+                options.registry.as_ref(),
             )?;
 
             let data_path = data_dir.join(format!("node_{i}"));
@@ -576,4 +602,53 @@ pub async fn inject_packet(
 
     let packet_id = resp.text().await?;
     Ok(packet_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node_config(registry: Option<&MeshRegistry>) -> Result<nox_node::NoxConfig> {
+        let dir = tempfile::tempdir()?;
+        let (_path, toml_text) = generate_node_config(
+            0,
+            30_000,
+            30_001,
+            30_002,
+            dir.path(),
+            &hex::encode([7u8; 32]),
+            &hex::encode([9u8; 32]),
+            0.0,
+            "http://127.0.0.1:8545",
+            nox_node::config::WireIdMode::PerHop,
+            registry,
+        )?;
+        Ok(toml::from_str(&toml_text)?)
+    }
+
+    #[test]
+    fn node_config_without_registry_keeps_chain_sync_off() -> Result<()> {
+        let config = node_config(None)?;
+        assert_eq!(
+            config.registry_contract_address,
+            nox_node::NoxConfig::default().registry_contract_address
+        );
+        assert!(config.benchmark_mode);
+        Ok(())
+    }
+
+    #[test]
+    fn node_config_with_registry_observes_it() -> Result<()> {
+        let registry = MeshRegistry {
+            address: "0x5fbdb2315678afecb367f032d93f642f64180aa3".into(),
+            chain_id: 31_337,
+            block_poll_interval_secs: 1,
+        };
+        let config = node_config(Some(&registry))?;
+        assert_eq!(config.registry_contract_address, registry.address);
+        assert_eq!(config.chain_id, 31_337);
+        assert_eq!(config.block_poll_interval_secs, 1);
+        assert!(config.validate().is_ok());
+        Ok(())
+    }
 }

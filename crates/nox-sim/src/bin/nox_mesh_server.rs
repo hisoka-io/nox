@@ -10,7 +10,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use anyhow::Result;
 use clap::Parser;
 use nox_node::config::WireIdMode;
-use nox_sim::process_mesh::{find_nox_binary, MeshOptions, ProcessMesh};
+use nox_sim::process_mesh::{find_nox_binary, MeshOptions, MeshRegistry, ProcessMesh};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -72,6 +72,21 @@ struct Cli {
     /// Comma-separated node indices that run `--legacy-binary`.
     #[arg(long, value_delimiter = ',', requires = "legacy_binary")]
     legacy_nodes: Vec<usize>,
+
+    /// `NoxRegistry` address on the anvil chain for every node to observe. The
+    /// mesh registers its nodes through the admin API as usual; registering the
+    /// same addresses on chain (`mesh_info.json` lists them) makes `/topology`
+    /// serve the on-chain profiles at an observed block.
+    #[arg(long, requires = "chain_id")]
+    registry_address: Option<String>,
+
+    /// Chain id of the anvil chain (required with `--registry-address`).
+    #[arg(long, requires = "registry_address")]
+    chain_id: Option<u64>,
+
+    /// Chain observer poll interval in seconds when a registry is set.
+    #[arg(long, default_value_t = 1)]
+    block_poll_interval_secs: u64,
 }
 
 fn parse_wire_ids(value: &str) -> Result<WireIdMode, String> {
@@ -129,10 +144,30 @@ async fn main() -> Result<()> {
         }
         None => None,
     };
+    let registry = match (&cli.registry_address, cli.chain_id) {
+        (Some(address), Some(chain_id)) => {
+            anyhow::ensure!(
+                address.parse::<ethers::types::Address>().is_ok(),
+                "--registry-address {address} is not a 20-byte hex address"
+            );
+            anyhow::ensure!(
+                cli.block_poll_interval_secs > 0,
+                "--block-poll-interval-secs must be at least 1"
+            );
+            info!("Nodes observe NoxRegistry {address} on chain {chain_id}");
+            Some(MeshRegistry {
+                address: address.clone(),
+                chain_id,
+                block_poll_interval_secs: cli.block_poll_interval_secs,
+            })
+        }
+        _ => None,
+    };
     let options = MeshOptions {
         wire_ids: cli.wire_ids,
         roles: cli.roles.clone(),
         alternate_binary: legacy_binary,
+        registry,
     };
     let mut mesh = ProcessMesh::build_with_options(
         cli.nodes,
