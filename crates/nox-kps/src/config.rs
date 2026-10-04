@@ -160,6 +160,9 @@ pub struct LimitsConfig {
     /// connection: its transport is treated as stalled, which frees its
     /// buffers and lets the client redial.
     pub max_stream_timeouts_per_connection: usize,
+    /// Upper bound for resetting a stream or closing a connection, so a
+    /// stalled transport cannot hold a task.
+    pub close_timeout_ms: u64,
     /// Per-IP token buckets (requests per second and burst) per route class.
     pub packet_rate_per_ip: u32,
     pub packet_burst: u32,
@@ -222,6 +225,7 @@ impl Default for LimitsConfig {
             header_read_timeout_ms: 10_000,
             stream_timeout_ms: 30_000,
             max_stream_timeouts_per_connection: 2,
+            close_timeout_ms: 1_000,
             packet_rate_per_ip: 20,
             packet_burst: 100,
             claim_rate_per_ip: 30,
@@ -625,6 +629,7 @@ impl LimitsConfig {
                 self.upstream_health_timeout_ms,
                 "limits.upstream_health_timeout_ms",
             ),
+            (self.close_timeout_ms, "limits.close_timeout_ms"),
         ] {
             v.timeout(value, field);
         }
@@ -700,6 +705,7 @@ impl LimitsConfig {
             header_read_timeout: ms(self.header_read_timeout_ms),
             stream_timeout: ms(self.stream_timeout_ms),
             max_stream_timeouts_per_connection: self.max_stream_timeouts_per_connection,
+            close_timeout: ms(self.close_timeout_ms),
             packet_rate: Rate::new(self.packet_rate_per_ip, self.packet_burst),
             claim_rate: Rate::new(self.claim_rate_per_ip, self.claim_burst),
             topology_rate: Rate::new(self.topology_rate_per_ip, self.topology_burst),
@@ -854,6 +860,7 @@ pub struct Limits {
     pub header_read_timeout: Duration,
     pub stream_timeout: Duration,
     pub max_stream_timeouts_per_connection: usize,
+    pub close_timeout: Duration,
     pub packet_rate: Rate,
     pub claim_rate: Rate,
     pub topology_rate: Rate,
@@ -1313,6 +1320,14 @@ max_connections = 512
                 "max_inflight_upstream",
             ),
             (Box::new(|r| r.limits.max_bundles = 0), "max_bundles"),
+            (
+                Box::new(|r| r.limits.close_timeout_ms = 0),
+                "close_timeout_ms",
+            ),
+            (
+                Box::new(|r| r.limits.max_stream_timeouts_per_connection = 0),
+                "max_stream_timeouts_per_connection",
+            ),
             (Box::new(|r| r.listen = "15005".into()), "listen must be"),
             (Box::new(|r| r.log_level = "=[".into()), "log_level"),
             (

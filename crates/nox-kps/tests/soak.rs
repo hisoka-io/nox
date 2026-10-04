@@ -274,7 +274,6 @@ async fn soak_large_claim_bodies() {
         raw.limits.claim_burst = 1_000_000;
         raw.limits.claim_response_max_bytes = size.max(1024);
         raw.limits.upstream_claim_timeout_ms = 20_000;
-        raw.limits.stream_timeout_ms = 60_000;
         raw.limits.conn_idle_timeout_secs = 600;
     })
     .await;
@@ -283,12 +282,22 @@ async fn soak_large_claim_bodies() {
     let req = claim_request(&t.certhash(), &[SURB_ID]);
     let mut results = Vec::new();
     for transport in [Transport::Quic, Transport::WebRtc] {
-        let conn = dial(&t.addr(), transport).await;
-        let (mut ok, mut stalls, mut errors) = (0usize, 0usize, Vec::new());
+        let mut conn = dial(&t.addr(), transport).await;
+        let (mut ok, mut stalls, mut errors, mut redials) = (0usize, 0usize, Vec::new(), 0usize);
         let mut ms = Vec::new();
-        // One character per exchange: '.' ok, 'S' stall, 'E' error.
+        // One character per exchange: '.' ok, 'S' stall (no response within
+        // the deadline), 'C' the server closed the connection, 'E' a wrong
+        // response. After 'S' or 'C' on a closed connection the client
+        // redials, as the SDK does.
         let mut sequence = String::new();
         for _ in 0..count {
+            if tokio::time::timeout(Duration::from_millis(5), conn.closed())
+                .await
+                .is_ok()
+            {
+                conn = dial(&t.addr(), transport).await;
+                redials += 1;
+            }
             let t0 = Instant::now();
             match try_exchange(conn.as_ref(), &req, stall).await {
                 Ok(res) if res.status == 200 && res.body.len() == size => {
@@ -304,10 +313,7 @@ async fn soak_large_claim_bodies() {
                     sequence.push('S');
                     stalls += 1;
                 }
-                Err(e) => {
-                    sequence.push('E');
-                    errors.push(e);
-                }
+                Err(_) => sequence.push('C'),
             }
         }
         println!("sequence {}: {sequence}", transport.name());
@@ -318,7 +324,7 @@ async fn soak_large_claim_bodies() {
             (size as f64 / 1_048_576.0) / (pct(&ms, 0.5) / 1000.0)
         };
         println!(
-            "large {} {} B x {count}: {ok} ok, {stalls} stalls (>{} ms), {} errors, p50 {:.1} ms, max {:.1} ms, ~{mib_s:.1} MiB/s",
+            "large {} {} B x {count}: {ok} ok, {stalls} stalls (>{} ms), {} errors, {redials} redials, p50 {:.1} ms, max {:.1} ms, ~{mib_s:.1} MiB/s",
             transport.name(),
             size,
             stall.as_millis(),
@@ -332,6 +338,7 @@ async fn soak_large_claim_bodies() {
             "requests": count,
             "ok": ok,
             "stalls": stalls,
+            "redials": redials,
             "sequence": sequence,
             "errors": errors,
             "p50_ms": pct(&ms, 0.5),

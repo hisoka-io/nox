@@ -370,7 +370,11 @@ async fn handle_conn(
         Err(reason) => {
             Metrics::reason(&app.metrics.connections_rejected, reason.label());
             debug!(reason = reason.label(), "KPS connection refused");
-            let _ = conn.close_with_error(ErrorCode::QueueFull).await;
+            let _ = tokio::time::timeout(
+                app.settings.limits.close_timeout,
+                conn.close_with_error(ErrorCode::QueueFull),
+            )
+            .await;
             return;
         }
     };
@@ -403,9 +407,14 @@ async fn handle_conn(
                         tracker.spawn(run_stream(stream, Arc::clone(&app), client_ip, slot, Arc::clone(&activity)));
                     } else {
                         Metrics::reason(&app.metrics.streams_rejected, "per_connection_limit");
+                        let close_timeout = limits.close_timeout;
                         tracker.spawn(async move {
                             let mut stream = stream;
-                            let _ = stream.close_with_error(ErrorCode::QueueFull).await;
+                            let _ = tokio::time::timeout(
+                                close_timeout,
+                                stream.close_with_error(ErrorCode::QueueFull),
+                            )
+                            .await;
                         });
                     }
                 }
@@ -438,11 +447,15 @@ async fn handle_conn(
         let _ = tokio::time::timeout(app.settings.shutdown_linger, conn.closed()).await;
     }
 
+    // Bounded: closing a stalled transport must not hold this task.
+    let close_timeout = limits.close_timeout;
     let _ = match reason {
         CloseReason::Idle | CloseReason::Lifetime | CloseReason::Stalled => {
-            conn.close_with_error(ErrorCode::Timeout).await
+            tokio::time::timeout(close_timeout, conn.close_with_error(ErrorCode::Timeout)).await
         }
-        CloseReason::Peer | CloseReason::Shutdown => conn.close().await,
+        CloseReason::Peer | CloseReason::Shutdown => {
+            tokio::time::timeout(close_timeout, conn.close()).await
+        }
     };
     Metrics::reason(&app.metrics.connections_closed, reason.label());
     app.metrics.connections_active.dec();

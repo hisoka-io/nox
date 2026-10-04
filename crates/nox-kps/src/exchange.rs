@@ -111,12 +111,13 @@ pub async fn serve_stream(
         .max_buf_size(limits.header_max_bytes)
         .max_headers(limits.max_headers)
         .header_read_timeout(limits.header_read_timeout);
-    let served = tokio::time::timeout(
-        limits.stream_timeout,
+    let deadline = tokio::time::Instant::now() + limits.stream_timeout;
+    let served = tokio::time::timeout_at(
+        deadline,
         builder.serve_connection(TokioIo::new(&mut stream), service),
     )
     .await;
-    let outcome = match served {
+    let mut outcome = match served {
         Ok(Ok(())) => StreamOutcome::Completed,
         Ok(Err(e)) if e.is_timeout() => StreamOutcome::HeaderTimeout,
         Ok(Err(e)) if e.is_user() => StreamOutcome::Abandoned,
@@ -129,18 +130,30 @@ pub async fn serve_stream(
         }
         Err(_) => StreamOutcome::StreamTimeout,
     };
-    // hyper already sent FIN after a complete response; `close` also stops the
-    // read half. Anything else is an abortive close, never a lenient recovery.
-    let _ = match outcome {
-        StreamOutcome::Completed => stream.close().await,
-        StreamOutcome::HeaderTimeout | StreamOutcome::StreamTimeout => {
-            stream.close_with_error(ErrorCode::Timeout).await
+    // hyper has handed the whole response to the stream; `close` queues the
+    // FIN behind it, which waits while a slow client drains the response, so
+    // it keeps the rest of the stream deadline (at least `close_timeout_ms`).
+    // A transport that does not move data within that is treated as a stream
+    // timeout. Every other end is an abortive close, never a lenient recovery,
+    // bounded by `close_timeout_ms` so a stalled transport cannot hold the task.
+    if outcome == StreamOutcome::Completed {
+        let finish_by = deadline.max(tokio::time::Instant::now() + limits.close_timeout);
+        if tokio::time::timeout_at(finish_by, stream.close())
+            .await
+            .is_err()
+        {
+            outcome = StreamOutcome::StreamTimeout;
         }
-        StreamOutcome::ProtocolError | StreamOutcome::Abandoned => {
-            stream.close_with_error(ErrorCode::ProtocolError).await
-        }
-        StreamOutcome::Io => stream.close_with_error(ErrorCode::Cancelled).await,
+    }
+    let code = match outcome {
+        StreamOutcome::Completed => None,
+        StreamOutcome::HeaderTimeout | StreamOutcome::StreamTimeout => Some(ErrorCode::Timeout),
+        StreamOutcome::ProtocolError | StreamOutcome::Abandoned => Some(ErrorCode::ProtocolError),
+        StreamOutcome::Io => Some(ErrorCode::Cancelled),
     };
+    if let Some(code) = code {
+        let _ = tokio::time::timeout(limits.close_timeout, stream.close_with_error(code)).await;
+    }
     // A bundle-stream slot is released only once the response is written.
     drop(held.lock().unwrap_or_else(PoisonError::into_inner).take());
     outcome

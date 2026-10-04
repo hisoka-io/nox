@@ -27,6 +27,7 @@ header_max_bytes = 16384
 header_read_timeout_ms = 10000
 stream_timeout_ms = 30000
 max_stream_timeouts_per_connection = 2
+close_timeout_ms = 1000
 packet_rate_per_ip = 20
 packet_burst = 100
 claim_rate_per_ip = 30
