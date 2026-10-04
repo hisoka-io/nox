@@ -1,20 +1,25 @@
-# nox-kps as an override for a Nox node's compose project (ARCHITECTURE §2.12).
+# nox-kps as an override for a Nox node's compose project. nox-kps ships in the
+# node image (NOX_IMAGE) and runs as a second container from it, as uid 10002,
+# next to the `nox` service.
 #
 #   docker compose -f docker-compose.yml -f docker-compose.kps.yml config   # validate the merge
-#   docker compose -f docker-compose.yml -f docker-compose.kps.yml run --rm nox-kps-admin nox-kps init
+#   docker compose -f docker-compose.yml -f docker-compose.kps.yml run --rm --no-deps nox-kps-admin nox-kps init
+#   (put the printed certhash in nox-kps.toml: expected_certhash = "uEi...")
 #   docker compose -f docker-compose.yml -f docker-compose.kps.yml up -d nox-kps
 #
 # Publishing a worker bundle (the long-running service mounts the bundle
 # volume read-only; the admin service mounts it read-write):
-#   docker compose -f docker-compose.yml -f docker-compose.kps.yml run --rm \
+#   docker compose -f docker-compose.yml -f docker-compose.kps.yml run --rm --no-deps \
 #     -v "$PWD/anon-rpc-worker.js:/in/anon-rpc-worker.js:ro" \
 #     nox-kps-admin nox-kps bundle add /in/anon-rpc-worker.js
 #
-# NOX_KPS_IMAGE is an immutable image reference (a digest), as NOX_IMAGE is for
-# the node. Until images are published, load one with `docker load`.
+# NOX_IMAGE is the immutable node image digest the base compose file already
+# uses, so the node and nox-kps always run the same release. The image creates
+# /var/lib/nox-kps (0700) and /var/lib/nox-kps/keccak owned by uid 10002, and
+# new named volumes start with that ownership.
 
 x-nox-kps-common: &nox-kps-common
-  image: ${NOX_KPS_IMAGE:?NOX_KPS_IMAGE must be an immutable nox-kps image digest}
+  image: ${NOX_IMAGE:?NOX_IMAGE must be an immutable ghcr.io/hisoka-io/nox digest}
   user: "10002:10002"
   read_only: true
   cap_drop: ["ALL"]
@@ -43,6 +48,7 @@ services:
       nox:
         condition: service_started
     restart: unless-stopped
+    # [shutdown] grace_period_ms (10 s) + close_linger_ms (2 s) fit inside it.
     stop_grace_period: 15s
     mem_limit: 512m
     cpus: 1.0
@@ -52,7 +58,7 @@ services:
         max-size: "50m"
         max-file: "3"
     healthcheck:
-      test: ["CMD", "nox-kps", "healthcheck"]
+      test: ["CMD", "nox-kps", "healthcheck", "--config", "/etc/nox-kps/config.toml"]
       interval: 15s
       timeout: 6s
       retries: 3
@@ -71,7 +77,7 @@ services:
           create_host_path: false
       - nox-kps-identity:/var/lib/nox-kps
       - nox-kps-bundles:/var/lib/nox-kps/keccak
-    command: ["nox-kps", "check-config"]
+    command: ["nox-kps", "check-config", "--config", "/etc/nox-kps/config.toml"]
     restart: "no"
 
 volumes:
