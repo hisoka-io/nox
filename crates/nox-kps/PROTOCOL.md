@@ -98,7 +98,7 @@ dropped). What returns to the client: status, body, `Content-Type`,
 {
   "protocol": "nox-kps-http/1",
   "software": "nox-kps",
-  "version": "0.4.0-rc.4",
+  "version": "0.4.0-rc.5",
   "node": "0x862d6b1105bde9d64dc5182fe3cd9d09f6f37463",
   "addresses": ["3.239.73.249:15005:uEiB..."],
   "capabilities": ["metadata", "health", "packets", "claim", "topology", "worker-bundles"],

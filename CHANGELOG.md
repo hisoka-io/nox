@@ -5,6 +5,16 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+## [0.4.0-rc.5] - 2026-10-04
+
+### Upgrade notes
+
+- Upgrade one node at a time; rc.4 and rc.5 nodes interoperate and the wire, fragment, FEC and SURB formats are
+  unchanged. The P2P fix below takes effect on each node as it moves to the rc.5 image.
+- `nox-kps` is opt-in. A node that does not run it behaves exactly as before. Operators enabling it follow
+  [crates/nox-kps/README.md](crates/nox-kps/README.md): open UDP 15005, run `nox-kps init` once to create the
+  identity, set `expected_certhash`, and set the node's `[ingress] client_ip_header = "x-real-ip"`.
+
 ### Added
 
 - `nox-kps` (`crates/nox-kps`), the KPS entry sidecar: browsers (WebRTC) and native clients (QUIC) reach a node
