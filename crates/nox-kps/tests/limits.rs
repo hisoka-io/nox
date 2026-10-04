@@ -381,3 +381,88 @@ async fn repeated_stream_timeouts_close_the_connection() {
     assert!(wait_for_metric(&t, "nox_kps_connections_closed_total{reason=\"stalled\"} 1").await);
     t.stop().await;
 }
+
+/// Reads one claim response slowly (`chunk` bytes, then `pause`), as a client
+/// on a slow link does. Returns the bytes read, or the read error.
+async fn slow_claim_read(
+    t: &TestServer,
+    chunk: usize,
+    pause: Duration,
+) -> Result<usize, std::io::Error> {
+    let conn = dial(&t.addr(), Transport::Quic).await;
+    let mut stream = conn.open_stream().await.unwrap();
+    let req = claim_request(&t.certhash(), &[SURB_ID]);
+    tokio::io::AsyncWriteExt::write_all(&mut stream, &req)
+        .await
+        .unwrap();
+    stream.close_write().await.unwrap();
+    let mut buf = vec![0u8; chunk];
+    let mut total = 0usize;
+    loop {
+        let n = timeout(T, stream.read(&mut buf))
+            .await
+            .expect("read acts")?;
+        if n == 0 {
+            return Ok(total);
+        }
+        total += n;
+        tokio::time::sleep(pause).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_responses_get_time_to_drain_on_slow_links() {
+    const BODY: usize = 24 * 1024 * 1024;
+    let start = |drain_rate: u64| {
+        TestServer::start(move |raw| {
+            raw.limits.header_read_timeout_ms = 500;
+            raw.limits.upstream_packet_timeout_ms = 500;
+            raw.limits.upstream_claim_timeout_ms = 500;
+            raw.limits.upstream_topology_timeout_ms = 500;
+            raw.limits.upstream_health_timeout_ms = 500;
+            raw.limits.stream_timeout_ms = 1_000;
+            raw.limits.claim_max_surb_ids = 1;
+            raw.limits.claim_response_max_bytes = 32 * 1024 * 1024;
+            raw.limits.response_min_drain_bytes_per_sec = drain_rate;
+        })
+    };
+    // About 8 MiB/s: three seconds for the body, well past the 1 s stream
+    // timeout. A 24 MiB body is larger than the QUIC stream window, so the
+    // server is still writing when the base deadline passes.
+    let (chunk, pause) = (256 * 1024, Duration::from_millis(30));
+
+    // Sized for links of at least 4 MiB/s: the deadline grows by 6 s.
+    let t = start(4 * 1024 * 1024).await;
+    t.upstream.set_body_bytes(CLAIM, BODY);
+    let started = Instant::now();
+    let read = slow_claim_read(&t, chunk, pause)
+        .await
+        .expect("response drains");
+    assert!(read > BODY, "head and body arrive ({read} bytes)");
+    assert!(
+        started.elapsed() > Duration::from_secs(1),
+        "the read outlasted the base deadline"
+    );
+    let metrics = t.metrics_text().await;
+    assert!(
+        !metrics.contains("nox_kps_stream_failures_total{reason=\"stream_timeout\"} 1"),
+        "{metrics}"
+    );
+    t.stop().await;
+
+    // Sized for a 1 GiB/s link: the same slow read runs out of time.
+    let t = start(1024 * 1024 * 1024).await;
+    t.upstream.set_body_bytes(CLAIM, BODY);
+    let read = slow_claim_read(&t, chunk, pause).await;
+    assert!(read.is_err(), "the stream is reset mid-response: {read:?}");
+    assert!(
+        wait_for_metric(
+            &t,
+            "nox_kps_stream_failures_total{reason=\"stream_timeout\"} 1"
+        )
+        .await,
+        "{}",
+        t.metrics_text().await
+    );
+    t.stop().await;
+}

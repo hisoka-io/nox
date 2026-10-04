@@ -47,7 +47,13 @@ pub fn log_summary(metrics: &Metrics, connections_active: usize) {
     );
     let stream_failures = Metrics::total(
         &metrics.stream_failures,
-        &["header_timeout", "stream_timeout", "protocol_error", "io"],
+        &[
+            "header_timeout",
+            "stream_timeout",
+            "protocol_error",
+            "abandoned",
+            "io",
+        ],
     );
     let rate_limited: u64 = crate::routes::Route::ALL
         .iter()

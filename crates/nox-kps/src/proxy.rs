@@ -30,11 +30,6 @@ const RELAYED_RESPONSE_HEADERS: [HeaderName; 3] = [
     header::RETRY_AFTER,
 ];
 
-/// Idle pooled connections to the loopback upstreams are dropped after this.
-const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Idle pooled connections kept per upstream.
-const POOL_MAX_IDLE: usize = 32;
-
 /// A pooled HTTP/1.1 client for the loopback upstreams.
 #[derive(Debug, Clone)]
 pub struct UpstreamClient {
@@ -67,16 +62,23 @@ pub struct UpstreamResponse {
 }
 
 impl UpstreamClient {
+    /// `pool_idle_timeout` and `pool_max_idle` bound the idle connections
+    /// kept open to each loopback upstream.
     #[must_use]
-    pub fn new(connect_timeout: Duration, client_ip_header: HeaderName) -> Self {
+    pub fn new(
+        connect_timeout: Duration,
+        pool_idle_timeout: Duration,
+        pool_max_idle: usize,
+        client_ip_header: HeaderName,
+    ) -> Self {
         let mut connector = HttpConnector::new();
         connector.set_connect_timeout(Some(connect_timeout));
         connector.set_nodelay(true);
         connector.enforce_http(true);
         let client = Client::builder(TokioExecutor::new())
             .pool_timer(TokioTimer::new())
-            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
-            .pool_max_idle_per_host(POOL_MAX_IDLE)
+            .pool_idle_timeout(pool_idle_timeout)
+            .pool_max_idle_per_host(pool_max_idle)
             .build(connector);
         Self {
             client,

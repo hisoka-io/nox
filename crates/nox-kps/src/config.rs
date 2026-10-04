@@ -87,7 +87,7 @@ const RESERVED_CLIENT_IP_HEADERS: &[&str] = &[
     "expect",
 ];
 
-/// The file/environment shape of the configuration (ARCHITECTURE §2.10).
+/// The file/environment shape of the configuration (`deploy/nox-kps.example.toml`).
 /// Every key has a default except `advertise`, which a node must set.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -157,7 +157,7 @@ impl Default for RawConfig {
     }
 }
 
-/// Every resource limit (ARCHITECTURE §2.6). Defaults are sized for a 2 GiB
+/// Every resource limit. Defaults are sized for a 2 GiB
 /// host running the node next to nox-kps.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -181,8 +181,15 @@ pub struct LimitsConfig {
     pub max_headers: usize,
     /// Stream open to complete request header block (KPS-HTTP/1: 30 s).
     pub header_read_timeout_ms: u64,
-    /// Stream open to response written; the stream is reset after it.
+    /// Stream open to response written; the stream is reset after it. A
+    /// response body extends it by its size at
+    /// `response_min_drain_bytes_per_sec`.
     pub stream_timeout_ms: u64,
+    /// The slowest client link a response is sized for: each response adds
+    /// `body bytes / this rate` to its stream's deadline, so a large claim
+    /// response or bundle is not cut off on a slow link (1 Mbit/s by default:
+    /// a 16 MiB claim response gets 128 s more).
+    pub response_min_drain_bytes_per_sec: u64,
     /// This many streams in a row hitting `stream_timeout_ms` close the
     /// connection: its transport is treated as stalled, which frees its
     /// buffers and lets the client redial.
@@ -202,6 +209,8 @@ pub struct LimitsConfig {
     /// Client buckets tracked per route class before idle ones are swept;
     /// when every tracked bucket is active, new clients get `429`.
     pub rate_limit_max_clients: usize,
+    /// Seconds between sweeps of idle rate-limit buckets.
+    pub rate_limit_sweep_secs: u64,
     /// Largest `POST /api/v1/responses/claim` body (nginx uses 64 KiB).
     pub claim_request_max_bytes: usize,
     /// Most SURB IDs in one claim. Bounded by `claim_response_max_bytes`:
@@ -220,6 +229,11 @@ pub struct LimitsConfig {
     pub upstream_claim_timeout_ms: u64,
     pub upstream_topology_timeout_ms: u64,
     pub upstream_health_timeout_ms: u64,
+    /// Idle pooled connections to the loopback upstreams are closed after
+    /// this long.
+    pub upstream_pool_idle_timeout_ms: u64,
+    /// Idle pooled connections kept per upstream.
+    pub upstream_pool_max_idle: usize,
     /// Upstream requests in flight at once across all clients; beyond it
     /// clients get `503` with `Retry-After`.
     pub max_inflight_upstream: usize,
@@ -227,10 +241,15 @@ pub struct LimitsConfig {
     pub topology_cache_ms: u64,
     /// One upstream health probe answers every `GET /health` for this long.
     pub health_cache_ms: u64,
-    /// Bundle files larger than this are not served (harness cap: 64 MiB).
+    /// Bundle files larger than this are not served (the anon-rpc harness
+    /// accepts up to 64 MiB; worker bundles are about 0.7 MB).
     pub max_bundle_bytes: usize,
     /// Most bundles held in memory.
     pub max_bundles: usize,
+    /// Memory the bundle store may hold: `max_bundles` x `max_bundle_bytes`
+    /// (twice that with `bundle_gzip`, which keeps a compressed copy) must
+    /// fit, so the store stays inside the container's memory limit.
+    pub bundle_memory_max_bytes: usize,
     /// Bundle responses being written at once (each is ~0.7 MB, and WebRTC
     /// costs ~4x QUIC CPU); beyond it clients get `503` with `Retry-After`.
     pub max_concurrent_bundle_streams: usize,
@@ -239,6 +258,15 @@ pub struct LimitsConfig {
     /// Serve a gzip copy to clients that list `gzip` in `Accept-Encoding`.
     /// Off in v1: identity is always acceptable (anon-rpc SPEC §4.2).
     pub bundle_gzip: bool,
+    /// Admin endpoint (`/metrics`, `/healthz`): time to send a request head.
+    pub admin_header_read_timeout_ms: u64,
+    /// Admin endpoint: total lifetime of one connection.
+    pub admin_conn_max_lifetime_ms: u64,
+    /// Admin endpoint: pause after a failed TCP accept (for example `EMFILE`)
+    /// before accepting again.
+    pub admin_accept_retry_ms: u64,
+    /// `nox-kps healthcheck`: how long each probe waits.
+    pub healthcheck_timeout_ms: u64,
 }
 
 impl Default for LimitsConfig {
@@ -254,6 +282,7 @@ impl Default for LimitsConfig {
             max_headers: 64,
             header_read_timeout_ms: 10_000,
             stream_timeout_ms: 30_000,
+            response_min_drain_bytes_per_sec: 131_072,
             max_stream_timeouts_per_connection: 2,
             close_timeout_ms: 1_000,
             packet_rate_per_ip: 20,
@@ -265,6 +294,7 @@ impl Default for LimitsConfig {
             bundle_rate_per_ip: 1,
             bundle_burst: 5,
             rate_limit_max_clients: 100_000,
+            rate_limit_sweep_secs: 60,
             claim_request_max_bytes: 64 * 1024,
             claim_max_surb_ids: 128,
             claim_response_max_bytes: 16 * 1024 * 1024,
@@ -275,14 +305,21 @@ impl Default for LimitsConfig {
             upstream_claim_timeout_ms: 10_000,
             upstream_topology_timeout_ms: 5_000,
             upstream_health_timeout_ms: 1_000,
+            upstream_pool_idle_timeout_ms: 30_000,
+            upstream_pool_max_idle: 32,
             max_inflight_upstream: 128,
             topology_cache_ms: 1_000,
             health_cache_ms: 1_000,
-            max_bundle_bytes: 64 * 1024 * 1024,
-            max_bundles: 16,
+            max_bundle_bytes: 16 * 1024 * 1024,
+            max_bundles: 8,
+            bundle_memory_max_bytes: 128 * 1024 * 1024,
             max_concurrent_bundle_streams: 8,
             bundle_rescan_secs: 60,
             bundle_gzip: false,
+            admin_header_read_timeout_ms: 5_000,
+            admin_conn_max_lifetime_ms: 30_000,
+            admin_accept_retry_ms: 100,
+            healthcheck_timeout_ms: 5_000,
         }
     }
 }
@@ -629,6 +666,44 @@ impl LimitsConfig {
         );
         v.range(self.max_bundles, 1, 100_000, "limits.max_bundles");
         v.range(
+            self.bundle_memory_max_bytes,
+            1,
+            usize::MAX,
+            "limits.bundle_memory_max_bytes",
+        );
+        let copies: usize = if self.bundle_gzip { 2 } else { 1 };
+        let bundle_memory = self
+            .max_bundles
+            .saturating_mul(self.max_bundle_bytes)
+            .saturating_mul(copies);
+        if bundle_memory > self.bundle_memory_max_bytes {
+            v.err(format!(
+                "limits.max_bundles ({}) x limits.max_bundle_bytes ({}){} is {bundle_memory} bytes, over limits.bundle_memory_max_bytes ({}); lower max_bundles or max_bundle_bytes, or raise the budget together with the container's memory limit",
+                self.max_bundles,
+                self.max_bundle_bytes,
+                if self.bundle_gzip { " x 2 (bundle_gzip keeps a compressed copy)" } else { "" },
+                self.bundle_memory_max_bytes,
+            ));
+        }
+        v.range(
+            usize::try_from(self.response_min_drain_bytes_per_sec).unwrap_or(usize::MAX),
+            1_024,
+            1_usize << 40,
+            "limits.response_min_drain_bytes_per_sec",
+        );
+        v.range(
+            self.upstream_pool_max_idle,
+            0,
+            100_000,
+            "limits.upstream_pool_max_idle",
+        );
+        v.range(
+            usize::try_from(self.rate_limit_sweep_secs).unwrap_or(usize::MAX),
+            1,
+            86_400,
+            "limits.rate_limit_sweep_secs",
+        );
+        v.range(
             self.max_concurrent_bundle_streams,
             1,
             100_000,
@@ -670,6 +745,20 @@ impl LimitsConfig {
                 "limits.upstream_health_timeout_ms",
             ),
             (self.close_timeout_ms, "limits.close_timeout_ms"),
+            (
+                self.upstream_pool_idle_timeout_ms,
+                "limits.upstream_pool_idle_timeout_ms",
+            ),
+            (
+                self.admin_header_read_timeout_ms,
+                "limits.admin_header_read_timeout_ms",
+            ),
+            (
+                self.admin_conn_max_lifetime_ms,
+                "limits.admin_conn_max_lifetime_ms",
+            ),
+            (self.admin_accept_retry_ms, "limits.admin_accept_retry_ms"),
+            (self.healthcheck_timeout_ms, "limits.healthcheck_timeout_ms"),
         ] {
             v.timeout(value, field);
         }
@@ -744,6 +833,7 @@ impl LimitsConfig {
             max_headers: self.max_headers,
             header_read_timeout: ms(self.header_read_timeout_ms),
             stream_timeout: ms(self.stream_timeout_ms),
+            response_min_drain_bytes_per_sec: self.response_min_drain_bytes_per_sec,
             max_stream_timeouts_per_connection: self.max_stream_timeouts_per_connection,
             close_timeout: ms(self.close_timeout_ms),
             packet_rate: Rate::new(self.packet_rate_per_ip, self.packet_burst),
@@ -751,6 +841,7 @@ impl LimitsConfig {
             topology_rate: Rate::new(self.topology_rate_per_ip, self.topology_burst),
             bundle_rate: Rate::new(self.bundle_rate_per_ip, self.bundle_burst),
             rate_limit_max_clients: self.rate_limit_max_clients,
+            rate_limit_sweep: Duration::from_secs(self.rate_limit_sweep_secs),
             claim_request_max_bytes: self.claim_request_max_bytes,
             claim_max_surb_ids: self.claim_max_surb_ids,
             claim_response_max_bytes: self.claim_response_max_bytes,
@@ -761,6 +852,8 @@ impl LimitsConfig {
             upstream_claim_timeout: ms(self.upstream_claim_timeout_ms),
             upstream_topology_timeout: ms(self.upstream_topology_timeout_ms),
             upstream_health_timeout: ms(self.upstream_health_timeout_ms),
+            upstream_pool_idle_timeout: ms(self.upstream_pool_idle_timeout_ms),
+            upstream_pool_max_idle: self.upstream_pool_max_idle,
             max_inflight_upstream: self.max_inflight_upstream,
             topology_cache: ms(self.topology_cache_ms),
             health_cache: ms(self.health_cache_ms),
@@ -770,6 +863,10 @@ impl LimitsConfig {
             bundle_rescan: (self.bundle_rescan_secs > 0)
                 .then(|| Duration::from_secs(self.bundle_rescan_secs)),
             bundle_gzip: self.bundle_gzip,
+            admin_header_read_timeout: ms(self.admin_header_read_timeout_ms),
+            admin_conn_max_lifetime: ms(self.admin_conn_max_lifetime_ms),
+            admin_accept_retry: ms(self.admin_accept_retry_ms),
+            healthcheck_timeout: ms(self.healthcheck_timeout_ms),
         })
     }
 }
@@ -899,6 +996,7 @@ pub struct Limits {
     pub max_headers: usize,
     pub header_read_timeout: Duration,
     pub stream_timeout: Duration,
+    pub response_min_drain_bytes_per_sec: u64,
     pub max_stream_timeouts_per_connection: usize,
     pub close_timeout: Duration,
     pub packet_rate: Rate,
@@ -906,6 +1004,7 @@ pub struct Limits {
     pub topology_rate: Rate,
     pub bundle_rate: Rate,
     pub rate_limit_max_clients: usize,
+    pub rate_limit_sweep: Duration,
     pub claim_request_max_bytes: usize,
     pub claim_max_surb_ids: usize,
     pub claim_response_max_bytes: usize,
@@ -916,6 +1015,8 @@ pub struct Limits {
     pub upstream_claim_timeout: Duration,
     pub upstream_topology_timeout: Duration,
     pub upstream_health_timeout: Duration,
+    pub upstream_pool_idle_timeout: Duration,
+    pub upstream_pool_max_idle: usize,
     pub max_inflight_upstream: usize,
     pub topology_cache: Duration,
     pub health_cache: Duration,
@@ -924,6 +1025,21 @@ pub struct Limits {
     pub max_concurrent_bundle_streams: usize,
     pub bundle_rescan: Option<Duration>,
     pub bundle_gzip: bool,
+    pub admin_header_read_timeout: Duration,
+    pub admin_conn_max_lifetime: Duration,
+    pub admin_accept_retry: Duration,
+    pub healthcheck_timeout: Duration,
+}
+
+impl Limits {
+    /// The deadline extension a response body of `bytes` earns: its transfer
+    /// time at `response_min_drain_bytes_per_sec`.
+    #[must_use]
+    pub fn drain_allowance(&self, bytes: u64) -> Duration {
+        let rate = self.response_min_drain_bytes_per_sec.max(1);
+        let millis = u128::from(bytes) * 1_000 / u128::from(rate);
+        Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
+    }
 }
 
 fn parse_upstream(field: &'static str, value: &str, v: &mut Validator) -> Option<Upstream> {
@@ -1115,8 +1231,48 @@ mod tests {
         assert_eq!(l.claim_max_surb_ids, 128);
         assert_eq!(l.claim_response_max_bytes, 16_777_216);
         assert_eq!(l.topology_response_max_bytes, 1_048_576);
-        assert_eq!(l.max_bundle_bytes, 67_108_864);
+        assert_eq!(l.max_bundle_bytes, 16_777_216);
+        assert_eq!(l.max_bundles, 8);
         assert!(!l.bundle_gzip, "v1 serves identity bytes only");
+        assert_eq!(l.response_min_drain_bytes_per_sec, 131_072);
+        assert_eq!(l.upstream_pool_idle_timeout, Duration::from_secs(30));
+        assert_eq!(l.upstream_pool_max_idle, 32);
+        assert_eq!(l.rate_limit_sweep, Duration::from_mins(1));
+        assert_eq!(l.admin_header_read_timeout, Duration::from_secs(5));
+        assert_eq!(l.admin_conn_max_lifetime, Duration::from_secs(30));
+        assert_eq!(l.admin_accept_retry, Duration::from_millis(100));
+        assert_eq!(l.healthcheck_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_bundle_store_fits_its_memory_budget() {
+        let d = LimitsConfig::default();
+        assert!(d.max_bundles * d.max_bundle_bytes <= d.bundle_memory_max_bytes);
+        let mut raw = valid();
+        raw.limits.max_bundles = 16;
+        raw.limits.max_bundle_bytes = 64 * 1024 * 1024;
+        assert_error(&raw, "over limits.bundle_memory_max_bytes");
+        let mut raw = valid();
+        raw.limits.bundle_gzip = true;
+        assert_error(&raw, "bundle_gzip keeps a compressed copy");
+        raw.limits.max_bundles = 4;
+        raw.validate().expect("4 x 16 MiB x 2 fits 128 MiB");
+    }
+
+    #[test]
+    fn responses_extend_the_stream_deadline_by_their_transfer_time() {
+        let l = valid().validate().unwrap().limits;
+        assert_eq!(l.drain_allowance(0), Duration::ZERO);
+        assert_eq!(l.drain_allowance(131_072), Duration::from_secs(1));
+        assert_eq!(
+            l.drain_allowance(16 * 1024 * 1024),
+            Duration::from_secs(128),
+            "a full claim response on a 1 Mbit/s link"
+        );
+        assert!(l.drain_allowance(u64::MAX) > Duration::from_secs(u64::from(u32::MAX)));
+        let mut raw = valid();
+        raw.limits.response_min_drain_bytes_per_sec = 512;
+        assert_error(&raw, "limits.response_min_drain_bytes_per_sec");
     }
 
     /// The node's claim JSON, built the way `nox-node` builds it
@@ -1274,6 +1430,7 @@ max_connections = 512
             ("NOX_KPS__CLIENT_IP_HEADER", "x-forwarded-for"),
             ("NOX_KPS__UPSTREAM_TOPOLOGY", "127.0.0.1:16003"),
             ("NOX_KPS__LIMITS__BUNDLE_GZIP", "true"),
+            ("NOX_KPS__LIMITS__MAX_BUNDLES", "4"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1289,6 +1446,7 @@ max_connections = 512
             "other upstream keeps its default"
         );
         assert!(raw.limits.bundle_gzip);
+        assert_eq!(raw.limits.max_bundles, 4);
         assert_eq!(raw.validate().unwrap().advertise.len(), 2);
     }
 

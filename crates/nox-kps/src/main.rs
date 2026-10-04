@@ -13,7 +13,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use nox_kps::bundles::{add_bundle, bundle_path, BundleSettings, BundleStore};
@@ -27,8 +26,6 @@ use tracing::{error, info, warn};
 const EXIT_CONFIG: u8 = 2;
 /// Exit status when the server, a probe or a bundle check fails.
 const EXIT_FAILURE: u8 = 1;
-/// How long `healthcheck` waits for each probe.
-const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Parser)]
 #[command(
@@ -422,13 +419,14 @@ async fn wait_for_signal() {
 }
 
 async fn healthcheck(settings: &Settings, kps: bool) -> ExitCode {
-    if let Err(e) = probe_health(admin_target(settings), HEALTHCHECK_TIMEOUT).await {
+    let timeout = settings.limits.healthcheck_timeout;
+    if let Err(e) = probe_health(admin_target(settings), timeout).await {
         eprintln!("nox-kps: unhealthy: {e}");
         return ExitCode::from(EXIT_FAILURE);
     }
     if kps {
         let probe = match local_kps_address(settings) {
-            Ok(addr) => probe_kps(&addr, HEALTHCHECK_TIMEOUT).await,
+            Ok(addr) => probe_kps(&addr, timeout).await,
             Err(e) => Err(e),
         };
         if let Err(e) = probe {

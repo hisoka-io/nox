@@ -19,6 +19,7 @@
 //! - keep-alive off: one exchange, then the stream is finished.
 
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
@@ -32,7 +33,8 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use kps::ErrorCode;
-use tokio::sync::OwnedSemaphorePermit;
+use prometheus_client::metrics::gauge::Gauge;
+use tokio::sync::{Notify, OwnedSemaphorePermit};
 use tracing::{debug, warn};
 
 use crate::app::App;
@@ -55,6 +57,34 @@ pub struct Abandon(&'static str);
 
 /// A permit held until the stream is finished (bundle responses).
 type HeldPermit = Arc<Mutex<Option<OwnedSemaphorePermit>>>;
+
+/// Per-stream state shared between the stream task and hyper's service.
+#[derive(Debug, Default)]
+struct StreamShared {
+    /// Bundle-stream slot, released once the response is written.
+    held: HeldPermit,
+    /// Size of the response body handed to hyper, once known.
+    response_bytes: AtomicU64,
+    /// Signalled when `response_bytes` is set.
+    response_ready: Notify,
+}
+
+/// Counts one upstream exchange in the `upstream_inflight` gauge for as long
+/// as it lives, including when the stream deadline cancels the exchange.
+struct InflightGuard<'a>(&'a Gauge);
+
+impl<'a> InflightGuard<'a> {
+    fn new(gauge: &'a Gauge) -> Self {
+        gauge.inc();
+        Self(gauge)
+    }
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
+}
 
 /// How a stream ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,12 +125,12 @@ pub async fn serve_stream(
 ) -> StreamOutcome {
     let limits = &app.settings.limits;
     let svc_app = Arc::clone(&app);
-    let held: HeldPermit = Arc::new(Mutex::new(None));
-    let svc_held = Arc::clone(&held);
+    let shared = Arc::new(StreamShared::default());
+    let svc_shared = Arc::clone(&shared);
     let service = service_fn(move |req: Request<Incoming>| {
         let app = Arc::clone(&svc_app);
-        let held = Arc::clone(&svc_held);
-        async move { handle_request(req, &app, client_ip, &held).await }
+        let shared = Arc::clone(&svc_shared);
+        async move { handle_request(req, &app, client_ip, &shared).await }
     });
     let mut builder = http1::Builder::new();
     builder
@@ -111,24 +141,42 @@ pub async fn serve_stream(
         .max_buf_size(limits.header_max_bytes)
         .max_headers(limits.max_headers)
         .header_read_timeout(limits.header_read_timeout);
-    let deadline = tokio::time::Instant::now() + limits.stream_timeout;
-    let served = tokio::time::timeout_at(
-        deadline,
-        builder.serve_connection(TokioIo::new(&mut stream), service),
-    )
-    .await;
+    // The stream deadline covers the request, the upstream exchange and
+    // writing the response. Once the response size is known, its transfer
+    // time at `limits.response_min_drain_bytes_per_sec` is added, so a large
+    // response on a slow link is not cut off.
+    let mut deadline = tokio::time::Instant::now() + limits.stream_timeout;
+    let served = {
+        let connection = builder.serve_connection(TokioIo::new(&mut stream), service);
+        tokio::pin!(connection);
+        let expiry = tokio::time::sleep_until(deadline);
+        tokio::pin!(expiry);
+        let mut extended = false;
+        loop {
+            tokio::select! {
+                result = &mut connection => break Some(result),
+                () = shared.response_ready.notified(), if !extended => {
+                    extended = true;
+                    let bytes = shared.response_bytes.load(Ordering::Relaxed);
+                    deadline += limits.drain_allowance(bytes);
+                    expiry.as_mut().reset(deadline);
+                }
+                () = &mut expiry => break None,
+            }
+        }
+    };
     let mut outcome = match served {
-        Ok(Ok(())) => StreamOutcome::Completed,
-        Ok(Err(e)) if e.is_timeout() => StreamOutcome::HeaderTimeout,
-        Ok(Err(e)) if e.is_user() => StreamOutcome::Abandoned,
-        Ok(Err(e)) if e.is_parse() || e.is_parse_too_large() || e.is_parse_status() => {
+        Some(Ok(())) => StreamOutcome::Completed,
+        Some(Err(e)) if e.is_timeout() => StreamOutcome::HeaderTimeout,
+        Some(Err(e)) if e.is_user() => StreamOutcome::Abandoned,
+        Some(Err(e)) if e.is_parse() || e.is_parse_too_large() || e.is_parse_status() => {
             StreamOutcome::ProtocolError
         }
-        Ok(Err(e)) => {
+        Some(Err(e)) => {
             debug!(error = %e, "stream ended before the exchange completed");
             StreamOutcome::Io
         }
-        Err(_) => StreamOutcome::StreamTimeout,
+        None => StreamOutcome::StreamTimeout,
     };
     // hyper has handed the whole response to the stream; `close` queues the
     // FIN behind it, which waits while a slow client drains the response, so
@@ -155,7 +203,13 @@ pub async fn serve_stream(
         let _ = tokio::time::timeout(limits.close_timeout, stream.close_with_error(code)).await;
     }
     // A bundle-stream slot is released only once the response is written.
-    drop(held.lock().unwrap_or_else(PoisonError::into_inner).take());
+    drop(
+        shared
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take(),
+    );
     outcome
 }
 
@@ -164,10 +218,10 @@ async fn handle_request(
     req: Request<Incoming>,
     app: &App,
     client_ip: IpAddr,
-    held: &HeldPermit,
+    shared: &StreamShared,
 ) -> Result<Response<Full<Bytes>>, Abandon> {
     let started = Instant::now();
-    let (label, response) = match dispatch(req, app, client_ip, held).await {
+    let (label, response) = match dispatch(req, app, client_ip, &shared.held).await {
         Ok(answer) => answer,
         Err(abandon) => {
             debug!(reason = abandon.0, "exchange abandoned");
@@ -186,11 +240,10 @@ async fn handle_request(
         .request_duration
         .get_or_create(&RouteLabels { route: label })
         .observe(started.elapsed().as_secs_f64());
-    app.metrics.add_bytes(
-        label,
-        "out",
-        response.body().size_hint().exact().unwrap_or(0) as usize,
-    );
+    let body_bytes = response.body().size_hint().exact().unwrap_or(0);
+    app.metrics.add_bytes(label, "out", body_bytes as usize);
+    shared.response_bytes.store(body_bytes, Ordering::Relaxed);
+    shared.response_ready.notify_one();
     debug!(
         route = label,
         status = status.as_u16(),
@@ -584,9 +637,10 @@ async fn forward(app: &App, call: UpstreamCall<'_>) -> Result<UpstreamResponse, 
         ));
     };
     let route = call.route;
-    app.metrics.upstream_inflight.inc();
-    let result = app.upstream.forward(call).await;
-    app.metrics.upstream_inflight.dec();
+    let result = {
+        let _counted = InflightGuard::new(&app.metrics.upstream_inflight);
+        app.upstream.forward(call).await
+    };
     result.map_err(|e| {
         app.metrics
             .upstream_errors
@@ -744,6 +798,24 @@ mod tests {
             builder = builder.header(*name, *value);
         }
         builder.body(()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_inflight_gauge_returns_to_zero_when_an_exchange_is_cancelled() {
+        let gauge = Gauge::default();
+        {
+            let _counted = InflightGuard::new(&gauge);
+            assert_eq!(gauge.get(), 1);
+        }
+        assert_eq!(gauge.get(), 0, "a completed exchange is uncounted");
+        // The stream deadline drops `forward` while it waits on the upstream.
+        let waiting = async {
+            let _counted = InflightGuard::new(&gauge);
+            std::future::pending::<()>().await;
+        };
+        let cancelled = tokio::time::timeout(std::time::Duration::from_millis(10), waiting).await;
+        assert!(cancelled.is_err());
+        assert_eq!(gauge.get(), 0, "a cancelled exchange is uncounted");
     }
 
     #[test]

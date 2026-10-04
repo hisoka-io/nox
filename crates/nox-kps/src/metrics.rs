@@ -30,11 +30,16 @@ use tracing::{debug, warn};
 
 use crate::error::HealthcheckError;
 
-/// Header read timeout and total lifetime of one metrics/health connection.
-const METRICS_CONN_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
-const METRICS_CONN_LIFETIME: Duration = Duration::from_secs(30);
-/// Back-off after a failed TCP accept (for example EMFILE) before retrying.
-const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// Timeouts of the admin endpoint (`limits.admin_*`).
+#[derive(Debug, Clone, Copy)]
+pub struct AdminTimeouts {
+    /// Time a client gets to send its request head.
+    pub header_read: Duration,
+    /// Total lifetime of one connection.
+    pub conn_lifetime: Duration,
+    /// Pause after a failed TCP accept (for example `EMFILE`) before retrying.
+    pub accept_retry: Duration,
+}
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ReasonLabels {
@@ -86,7 +91,7 @@ fn duration_histogram() -> Histogram {
     Histogram::new(exponential_buckets(0.001, 2.0, 16))
 }
 
-/// All metrics, registered under the `nox_kps` prefix (ARCHITECTURE §2.11).
+/// All metrics, registered under the `nox_kps` prefix (README.md, Observability).
 #[derive(Debug)]
 pub struct Metrics {
     registry: Registry,
@@ -280,6 +285,7 @@ pub async fn serve(
     listener: TcpListener,
     metrics: Arc<Metrics>,
     health: Arc<HealthInfo>,
+    timeouts: AdminTimeouts,
     shutdown: CancellationToken,
 ) {
     let tracker = TaskTracker::new();
@@ -291,11 +297,11 @@ pub async fn serve(
                 Ok((tcp, _)) => {
                     let metrics = Arc::clone(&metrics);
                     let health = Arc::clone(&health);
-                    tracker.spawn(serve_conn(tcp, metrics, health));
+                    tracker.spawn(serve_conn(tcp, metrics, health, timeouts));
                 }
                 Err(e) => {
                     warn!(error = %e, "metrics endpoint: accept failed; retrying");
-                    tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                    tokio::time::sleep(timeouts.accept_retry).await;
                 }
             }
         }
@@ -304,7 +310,12 @@ pub async fn serve(
     tracker.wait().await;
 }
 
-async fn serve_conn(tcp: TcpStream, metrics: Arc<Metrics>, health: Arc<HealthInfo>) {
+async fn serve_conn(
+    tcp: TcpStream,
+    metrics: Arc<Metrics>,
+    health: Arc<HealthInfo>,
+    timeouts: AdminTimeouts,
+) {
     let service = service_fn(move |req: Request<Incoming>| {
         let metrics = Arc::clone(&metrics);
         let health = Arc::clone(&health);
@@ -314,9 +325,9 @@ async fn serve_conn(tcp: TcpStream, metrics: Arc<Metrics>, health: Arc<HealthInf
     builder
         .timer(TokioTimer::new())
         .keep_alive(false)
-        .header_read_timeout(METRICS_CONN_HEADER_TIMEOUT);
+        .header_read_timeout(timeouts.header_read);
     let conn = builder.serve_connection(TokioIo::new(tcp), service);
-    match tokio::time::timeout(METRICS_CONN_LIFETIME, conn).await {
+    match tokio::time::timeout(timeouts.conn_lifetime, conn).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => debug!(error = %e, "metrics endpoint: connection error"),
         Err(_) => debug!("metrics endpoint: connection exceeded its lifetime"),
@@ -479,6 +490,11 @@ mod tests {
             listener,
             Arc::clone(&metrics),
             Arc::clone(&health),
+            AdminTimeouts {
+                header_read: Duration::from_secs(5),
+                conn_lifetime: Duration::from_secs(30),
+                accept_retry: Duration::from_millis(100),
+            },
             shutdown.clone(),
         ));
         probe_health(addr, Duration::from_secs(5)).await.unwrap();

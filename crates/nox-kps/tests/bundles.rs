@@ -45,6 +45,10 @@ fn harness_get(path: &str, certhash: &str, accept_encoding: Option<&str>) -> Vec
 fn bundle_config(raw: &mut nox_kps::RawConfig, dir: String, gzip: bool) {
     raw.keccak_dir = dir;
     raw.limits.bundle_gzip = gzip;
+    if gzip {
+        // A compressed copy doubles the store's memory; stay inside the budget.
+        raw.limits.max_bundles = 4;
+    }
     raw.limits.bundle_rate_per_ip = 1000;
     raw.limits.bundle_burst = 1000;
 }

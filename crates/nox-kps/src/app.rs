@@ -75,7 +75,7 @@ impl RateLimiters {
     }
 }
 
-/// `/metadata.json` (ARCHITECTURE §2.9), in this key order.
+/// `/metadata.json` (PROTOCOL.md §5), in this key order.
 #[derive(Debug, Serialize)]
 struct MetadataDocument<'a> {
     protocol: &'static str,

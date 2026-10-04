@@ -190,6 +190,8 @@ pub async fn start(settings: Settings) -> Result<RunningServer, StartError> {
     let app = Arc::new(App {
         upstream: UpstreamClient::new(
             l.upstream_connect_timeout,
+            l.upstream_pool_idle_timeout,
+            l.upstream_pool_max_idle,
             settings.client_ip_header.clone(),
         ),
         metadata_json,
@@ -227,6 +229,11 @@ pub async fn start(settings: Settings) -> Result<RunningServer, StartError> {
             admin_listener,
             Arc::clone(&metrics),
             Arc::clone(&health),
+            metrics::AdminTimeouts {
+                header_read: l.admin_header_read_timeout,
+                conn_lifetime: l.admin_conn_max_lifetime,
+                accept_retry: l.admin_accept_retry,
+            },
             shutdown.clone(),
         )),
         tokio::spawn(housekeeping(Arc::clone(&app), shutdown.clone())),
@@ -483,31 +490,38 @@ async fn run_stream(
     drop(slot);
 }
 
-/// Periodic work: sweep idle rate-limit buckets and log a counter summary
-/// (counts only: no addresses, no identifiers).
+/// Periodic work: sweep idle rate-limit buckets every
+/// `limits.rate_limit_sweep_secs`, and log a counter summary every
+/// `summary_interval_secs` (counts only: no addresses, no identifiers).
 async fn housekeeping(app: Arc<App>, shutdown: CancellationToken) {
-    let interval = app
-        .settings
-        .summary_interval
-        .unwrap_or(HOUSEKEEPING_FALLBACK_INTERVAL);
-    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let ticker = |interval: Duration| {
+        let mut t = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        t
+    };
+    let mut sweep = ticker(app.settings.limits.rate_limit_sweep);
+    let mut summary = app.settings.summary_interval.map(ticker);
     loop {
         tokio::select! {
             biased;
             () = shutdown.cancelled() => return,
-            _ = ticker.tick() => {
-                app.rate.sweep();
-                if app.settings.summary_interval.is_some() {
-                    crate::telemetry::log_summary(&app.metrics, app.conn_limiter.active());
-                }
+            _ = sweep.tick() => app.rate.sweep(),
+            () = next_tick(summary.as_mut()) => {
+                crate::telemetry::log_summary(&app.metrics, app.conn_limiter.active());
             }
         }
     }
 }
 
-/// Rate-limit sweep interval when the log summary is turned off.
-const HOUSEKEEPING_FALLBACK_INTERVAL: Duration = Duration::from_mins(1);
+/// The next tick of an optional interval; never ready without one.
+async fn next_tick(interval: Option<&mut tokio::time::Interval>) {
+    match interval {
+        Some(interval) => {
+            interval.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
 
 async fn rescan_loop(
     store: Arc<BundleStore>,

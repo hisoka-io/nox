@@ -1,4 +1,4 @@
-//! The route allowlist (ARCHITECTURE §2.4). It is fixed in code: an operator
+//! The route allowlist (PROTOCOL.md §4). It is fixed in code: an operator
 //! cannot expose another node route through configuration.
 //!
 //! | Method | Path | Handled by |
