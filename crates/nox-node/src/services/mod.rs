@@ -5,6 +5,7 @@ pub mod network_manager;
 pub mod profitability;
 pub mod quotes;
 pub mod relayer;
+pub mod replenishment;
 pub mod response_packer;
 pub mod security;
 pub mod token_registry;

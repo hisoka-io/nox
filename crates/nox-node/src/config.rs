@@ -436,6 +436,59 @@ impl Default for ExitWorkerConfig {
     }
 }
 
+/// Bounds on exit-side state for responses that wait for more SURBs
+/// (`ReplenishSurbs`). Both maps are filled by anonymous clients, so every
+/// dimension is capped and entries expire.
+#[derive(Debug, Deserialize, Clone, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ReplenishmentConfig {
+    /// Partial responses kept while waiting for SURBs.
+    pub max_pending_responses: usize,
+    /// Total undelivered response bytes kept across all partial responses.
+    pub max_pending_bytes: usize,
+    /// Requests for which SURBs that arrived early are kept.
+    pub max_surb_requests: usize,
+    /// SURBs kept per request; further SURBs for it are dropped.
+    pub max_surbs_per_request: usize,
+    /// Seconds an entry is kept without being used.
+    pub entry_ttl_secs: u64,
+}
+
+impl Default for ReplenishmentConfig {
+    fn default() -> Self {
+        Self {
+            max_pending_responses: 100,
+            max_pending_bytes: 128 * 1024 * 1024,
+            max_surb_requests: 100,
+            max_surbs_per_request: 512,
+            entry_ttl_secs: 300,
+        }
+    }
+}
+
+impl ReplenishmentConfig {
+    #[must_use]
+    pub fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for (name, value) in [
+            ("max_pending_responses", self.max_pending_responses),
+            ("max_pending_bytes", self.max_pending_bytes),
+            ("max_surb_requests", self.max_surb_requests),
+            ("max_surbs_per_request", self.max_surbs_per_request),
+        ] {
+            if value == 0 {
+                errors.push(format!(
+                    "exit_replenishment.{name} is 0 (partial responses could never resume)"
+                ));
+            }
+        }
+        if self.entry_ttl_secs == 0 {
+            errors.push("exit_replenishment.entry_ttl_secs is 0".into());
+        }
+        errors
+    }
+}
+
 #[derive(Deserialize, Clone, Serialize)]
 pub struct NoxConfig {
     pub eth_rpc_url: String,
@@ -477,6 +530,9 @@ pub struct NoxConfig {
     pub http: HttpConfig,
     #[serde(default)]
     pub exit_workers: ExitWorkerConfig,
+    /// Caps on partial responses waiting for more SURBs at an exit.
+    #[serde(default)]
+    pub exit_replenishment: ReplenishmentConfig,
     pub block_poll_interval_secs: u64,
     /// Minimum time between writes of the chain observer's scan cursor. The
     /// cursor is also written on graceful shutdown. After a crash the observer
@@ -567,6 +623,7 @@ impl std::fmt::Debug for NoxConfig {
             .field("node_role", &self.node_role)
             .field("http", &self.http)
             .field("exit_workers", &self.exit_workers)
+            .field("exit_replenishment", &self.exit_replenishment)
             .field("block_poll_interval_secs", &self.block_poll_interval_secs)
             .field(
                 "chain_cursor_persist_interval_secs",
@@ -651,6 +708,7 @@ impl Default for NoxConfig {
             node_role: NodeRole::default(),
             http: HttpConfig::default(),
             exit_workers: ExitWorkerConfig::default(),
+            exit_replenishment: ReplenishmentConfig::default(),
 
             block_poll_interval_secs: 12,
             chain_cursor_persist_interval_secs: default_chain_cursor_persist_interval_secs(),
@@ -744,6 +802,7 @@ impl NoxConfig {
         }
 
         errors.extend(self.ingress.validation_errors());
+        errors.extend(self.exit_replenishment.validation_errors());
 
         if self.chain_id == 0 && !self.benchmark_mode {
             errors.push("chain_id is 0 (must be set for production)".into());
@@ -1349,5 +1408,17 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.contains("missing token metadata")));
+    }
+
+    #[test]
+    fn replenishment_defaults_validate_and_zero_limits_are_rejected() {
+        assert!(ReplenishmentConfig::default().validation_errors().is_empty());
+        let replenishment = ReplenishmentConfig {
+            max_pending_responses: 0,
+            max_surbs_per_request: 0,
+            entry_ttl_secs: 0,
+            ..ReplenishmentConfig::default()
+        };
+        assert_eq!(replenishment.validation_errors().len(), 3);
     }
 }

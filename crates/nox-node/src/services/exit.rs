@@ -6,6 +6,7 @@ use crate::services::handlers::ethereum::EthereumHandler;
 use crate::services::handlers::http::HttpHandler;
 use crate::services::handlers::rpc::RpcHandler;
 use crate::services::handlers::traffic::TrafficHandler;
+use crate::services::replenishment::{PendingResponses, ReplenishmentLimits, SurbStash};
 use crate::services::response_packer::ResponsePacker;
 use crate::telemetry::metrics::MetricsService;
 use nox_core::events::NoxEvent;
@@ -22,7 +23,6 @@ use nox_core::traits::IEventSubscriber;
 use nox_core::IEventPublisher;
 use nox_crypto::sphinx::surb::Surb;
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore};
@@ -53,10 +53,10 @@ use crate::services::handlers::http::StashRemainingFn;
 use crate::services::response_packer::PendingResponseState;
 
 /// Stashed partial response state awaiting SURB replenishment from the client.
-pub type PendingReplenishments = Arc<Mutex<HashMap<u64, PendingResponseState>>>;
+pub type PendingReplenishments = Arc<Mutex<PendingResponses>>;
 
 /// SURBs that arrived via `ReplenishSurbs` before a pending state existed.
-pub type SurbAccumulator = Arc<Mutex<HashMap<u64, Vec<Surb>>>>;
+pub type SurbAccumulator = Arc<Mutex<SurbStash>>;
 
 /// Dispatch lane for a decoded exit payload. Each lane has its own bounded queue and
 /// concurrency limit (see [`ExitWorkerConfig`]).
@@ -273,8 +273,8 @@ impl ExitService {
             stale_timeout: Duration::from_secs(frag_config.timeout_seconds),
             metrics,
             cancel_token: CancellationToken::new(),
-            pending_replenishments: Arc::new(Mutex::new(HashMap::new())),
-            surb_accumulator: Arc::new(Mutex::new(HashMap::new())),
+            pending_replenishments: Self::new_pending_map(),
+            surb_accumulator: Self::new_surb_accumulator(),
             response_packer: Arc::new(ResponsePacker::new()),
             publisher: nox_core::NoopPublisher::arc(),
             workers: ExitWorkerConfig::default(),
@@ -309,8 +309,8 @@ impl ExitService {
             stale_timeout: Duration::from_secs(frag_config.timeout_seconds),
             metrics,
             cancel_token: CancellationToken::new(),
-            pending_replenishments: Arc::new(Mutex::new(HashMap::new())),
-            surb_accumulator: Arc::new(Mutex::new(HashMap::new())),
+            pending_replenishments: Self::new_pending_map(),
+            surb_accumulator: Self::new_surb_accumulator(),
             response_packer: Arc::new(ResponsePacker::new()),
             publisher: nox_core::NoopPublisher::arc(),
             workers: ExitWorkerConfig::default(),
@@ -344,8 +344,8 @@ impl ExitService {
             stale_timeout: Duration::from_secs(frag_config.timeout_seconds),
             metrics,
             cancel_token: CancellationToken::new(),
-            pending_replenishments: Arc::new(Mutex::new(HashMap::new())),
-            surb_accumulator: Arc::new(Mutex::new(HashMap::new())),
+            pending_replenishments: Self::new_pending_map(),
+            surb_accumulator: Self::new_surb_accumulator(),
             response_packer: Arc::new(ResponsePacker::new()),
             publisher: nox_core::NoopPublisher::arc(),
             workers: ExitWorkerConfig::default(),
@@ -381,8 +381,8 @@ impl ExitService {
             stale_timeout: Duration::from_secs(frag_config.timeout_seconds),
             metrics,
             cancel_token: CancellationToken::new(),
-            pending_replenishments: Arc::new(Mutex::new(HashMap::new())),
-            surb_accumulator: Arc::new(Mutex::new(HashMap::new())),
+            pending_replenishments: Self::new_pending_map(),
+            surb_accumulator: Self::new_surb_accumulator(),
             response_packer: Arc::new(ResponsePacker::new()),
             publisher: nox_core::NoopPublisher::arc(),
             workers: ExitWorkerConfig::default(),
@@ -433,14 +433,26 @@ impl ExitService {
         })
     }
 
+    /// SURB accumulator with the default [`ReplenishmentLimits`].
     #[must_use]
     pub fn new_surb_accumulator() -> SurbAccumulator {
-        Arc::new(Mutex::new(HashMap::new()))
+        Self::new_surb_accumulator_with(ReplenishmentLimits::default())
     }
 
     #[must_use]
+    pub fn new_surb_accumulator_with(limits: ReplenishmentLimits) -> SurbAccumulator {
+        Arc::new(Mutex::new(SurbStash::new(limits)))
+    }
+
+    /// Pending-response map with the default [`ReplenishmentLimits`].
+    #[must_use]
     pub fn new_pending_map() -> PendingReplenishments {
-        Arc::new(Mutex::new(HashMap::new()))
+        Self::new_pending_map_with(ReplenishmentLimits::default())
+    }
+
+    #[must_use]
+    pub fn new_pending_map_with(limits: ReplenishmentLimits) -> PendingReplenishments {
+        Arc::new(Mutex::new(PendingResponses::new(limits)))
     }
 
     #[must_use]
@@ -1095,11 +1107,12 @@ impl ExitService {
                                 Some((state, all_surbs))
                             } else {
                                 let count = surbs.len();
-                                acc.entry(request_id).or_default().extend(surbs);
+                                let dropped = acc.add(request_id, surbs);
                                 debug!(
                                     packet_id = %packet_id,
                                     request_id = request_id,
-                                    accumulated_surbs = count,
+                                    accumulated_surbs = count.saturating_sub(dropped),
+                                    dropped_surbs = dropped,
                                     "Pre-emptive ReplenishSurbs -- accumulated for future use"
                                 );
                                 None
@@ -1221,27 +1234,23 @@ fn continue_or_stash(
     }
 }
 
-/// Caps both replenishment maps. The two locks are never held together.
+/// Drops expired entries from both replenishment maps. Size caps are
+/// enforced on every insert. The two locks are never held together.
 fn prune_replenishment_maps(pending: &PendingReplenishments, accumulator: &SurbAccumulator) {
-    {
-        let mut pending = pending.lock();
-        if pending.len() > 100 {
-            let excess = pending.len() - 50;
-            let keys: Vec<u64> = pending.keys().take(excess).copied().collect();
-            for k in keys {
-                pending.remove(&k);
-            }
-            debug!(pruned = excess, "Pruned stale pending replenishments");
-        }
+    let now = std::time::Instant::now();
+    let expired_pending = pending.lock().prune_expired(now);
+    if expired_pending > 0 {
+        debug!(
+            pruned = expired_pending,
+            "Pruned expired pending replenishments"
+        );
     }
-    let mut acc = accumulator.lock();
-    if acc.len() > 100 {
-        let excess = acc.len() - 50;
-        let keys: Vec<u64> = acc.keys().take(excess).copied().collect();
-        for k in keys {
-            acc.remove(&k);
-        }
-        debug!(pruned = excess, "Pruned stale SURB accumulator entries");
+    let expired_surbs = accumulator.lock().prune_expired(now);
+    if expired_surbs > 0 {
+        debug!(
+            pruned = expired_surbs,
+            "Pruned expired SURB accumulator entries"
+        );
     }
 }
 

@@ -471,8 +471,12 @@ impl NoxNode {
                     .with_metrics(metrics_service.clone())
                     .with_reply_v2(config.relayer.surb_formats.v2_enabled()),
             );
-            let pending_map = ExitService::new_pending_map();
-            let surb_acc = ExitService::new_surb_accumulator();
+            let replenishment_limits =
+                crate::services::replenishment::ReplenishmentLimits::from(
+                    &config.exit_replenishment,
+                );
+            let pending_map = ExitService::new_pending_map_with(replenishment_limits);
+            let surb_acc = ExitService::new_surb_accumulator_with(replenishment_limits);
             let stash = ExitService::make_stash_closure(
                 pending_map.clone(),
                 surb_acc.clone(),
@@ -612,8 +616,12 @@ impl NoxNode {
                     .with_metrics(metrics_service.clone())
                     .with_reply_v2(config.relayer.surb_formats.v2_enabled()),
             );
-            let pending_map = ExitService::new_pending_map();
-            let surb_acc = ExitService::new_surb_accumulator();
+            let replenishment_limits =
+                crate::services::replenishment::ReplenishmentLimits::from(
+                    &config.exit_replenishment,
+                );
+            let pending_map = ExitService::new_pending_map_with(replenishment_limits);
+            let surb_acc = ExitService::new_surb_accumulator_with(replenishment_limits);
             let stash = ExitService::make_stash_closure(
                 pending_map.clone(),
                 surb_acc.clone(),
