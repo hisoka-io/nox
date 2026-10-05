@@ -465,10 +465,11 @@ pub struct StorageConfig {
     pub terminal_quote_retention_secs: u64,
     /// Most records one maintenance pass changes; the rest wait for the next.
     pub maintenance_batch_limit: usize,
-    /// At startup, compact the database (verified copy into a fresh sled
-    /// directory, as `nox db compact` does) when sled's blob files exceed
-    /// this many bytes. 0 = never.
-    pub compact_on_start_blob_bytes: u64,
+    /// At startup, compact the database (as `nox db compact` does) when it
+    /// holds more than this many free bytes that compaction would return to
+    /// the filesystem. Free pages are reused by later writes either way, so
+    /// this only bounds how much a large prune leaves allocated. 0 = always.
+    pub compact_on_start_fragmented_bytes: u64,
 }
 
 /// Default seconds between storage maintenance passes.
@@ -484,10 +485,8 @@ pub const DEFAULT_EXPIRED_QUOTE_RETENTION_SECS: u64 = 600;
 pub const DEFAULT_TERMINAL_QUOTE_RETENTION_SECS: u64 = 7 * 24 * 3_600;
 /// Default most records changed by one maintenance pass.
 pub const DEFAULT_STORAGE_MAINTENANCE_BATCH_LIMIT: usize = 2_000;
-/// Default blob volume that triggers compaction at startup (256 MiB). sled
-/// 0.34 forgets blob files that were pending deletion at every restart, so
-/// they accumulate even when the live data is small.
-pub const DEFAULT_COMPACT_ON_START_BLOB_BYTES: u64 = 256 * 1024 * 1024;
+/// Default free space that triggers compaction at startup (64 MiB).
+pub const DEFAULT_COMPACT_ON_START_FRAGMENTED_BYTES: u64 = 64 * 1024 * 1024;
 
 impl Default for StorageConfig {
     fn default() -> Self {
@@ -499,7 +498,7 @@ impl Default for StorageConfig {
             expired_quote_retention_secs: DEFAULT_EXPIRED_QUOTE_RETENTION_SECS,
             terminal_quote_retention_secs: DEFAULT_TERMINAL_QUOTE_RETENTION_SECS,
             maintenance_batch_limit: DEFAULT_STORAGE_MAINTENANCE_BATCH_LIMIT,
-            compact_on_start_blob_bytes: DEFAULT_COMPACT_ON_START_BLOB_BYTES,
+            compact_on_start_fragmented_bytes: DEFAULT_COMPACT_ON_START_FRAGMENTED_BYTES,
         }
     }
 }

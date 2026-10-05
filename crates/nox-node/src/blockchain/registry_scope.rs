@@ -160,7 +160,7 @@ pub async fn fetch_registry_fingerprint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infra::storage::SledRepository;
+    use crate::infra::storage::NodeStore;
     use crate::services::network_manager::TopologyManager;
     use nox_core::models::topology::RelayerNode;
     use nox_core::IEventSubscriber;
@@ -170,7 +170,7 @@ mod tests {
     const NEW_REGISTRY: &str = "0x1111111111111111111111111111111111111111";
     const CHAIN_ID: u64 = 421_614;
 
-    async fn seed_registry_state(storage: &SledRepository) {
+    async fn seed_registry_state(storage: &NodeStore) {
         storage
             .put(LAST_BLOCK_KEY, &312_313_531_u64.to_be_bytes())
             .await
@@ -195,7 +195,7 @@ mod tests {
             .unwrap();
     }
 
-    async fn seed_exit_state(storage: &SledRepository) {
+    async fn seed_exit_state(storage: &NodeStore) {
         storage.put(b"outbox:aa", b"{\"schema\":2}").await.unwrap();
         storage.put(b"tx:7", b"{\"schema\":2}").await.unwrap();
         storage
@@ -208,7 +208,7 @@ mod tests {
             .unwrap();
     }
 
-    async fn assert_exit_state_kept(storage: &SledRepository) {
+    async fn assert_exit_state_kept(storage: &NodeStore) {
         for key in [
             b"outbox:aa".as_slice(),
             b"tx:7",
@@ -219,8 +219,8 @@ mod tests {
         }
     }
 
-    fn open(dir: &tempfile::TempDir) -> SledRepository {
-        SledRepository::new(dir.path()).expect("storage")
+    fn open(dir: &tempfile::TempDir) -> NodeStore {
+        NodeStore::new(dir.path()).expect("storage")
     }
 
     #[test]

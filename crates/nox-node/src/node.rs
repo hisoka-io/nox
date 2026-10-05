@@ -7,7 +7,7 @@ use crate::blockchain::registry_sync::RegistryReconciler;
 use crate::blockchain::tx_manager::TransactionManager;
 use crate::config::NoxConfig;
 use crate::infra::event_bus::TokioEventBus;
-use crate::infra::storage::SledRepository;
+use crate::infra::storage::NodeStore;
 use crate::ingress::http_server::{IngressServer, IngressState};
 use crate::ingress::response_buffer::ResponseBuffer;
 use crate::ingress::response_router::ResponseRouter;
@@ -76,7 +76,7 @@ impl NoxNode {
 
         info!("Initializing Persistence Layer at {}...", config.db_path);
         Self::compact_on_start(&config);
-        let db = match SledRepository::new(&config.db_path) {
+        let db = match NodeStore::new(&config.db_path) {
             Ok(d) => Arc::new(d),
             Err(e) => {
                 error!("Database init failed: {}", e);
@@ -834,41 +834,28 @@ impl NoxNode {
         ))
     }
 
-    /// Compacts the database before it is opened when sled's blob files
-    /// exceed `storage.compact_on_start_blob_bytes`. A failure before the swap
-    /// leaves the database as it was and startup continues; a failure during
-    /// the swap leaves the compaction marker, and opening the database then
-    /// fails with instructions.
+    /// Imports a sled database if one is present, then compacts `nox.redb`
+    /// before it is opened when it holds more than
+    /// `storage.compact_on_start_fragmented_bytes` free bytes. A failure is
+    /// logged and startup continues; opening the database reports anything
+    /// that still blocks it.
     fn compact_on_start(config: &NoxConfig) {
-        let threshold = config.storage.compact_on_start_blob_bytes;
-        if threshold == 0 {
-            return;
-        }
         let path = std::path::Path::new(&config.db_path);
-        let blob_bytes = match crate::infra::retention::blob_usage(path) {
-            Ok((_, bytes)) => bytes,
-            Err(e) => {
-                warn!(error = %e, "Cannot measure sled blob files; skipping startup compaction");
-                return;
-            }
-        };
-        if blob_bytes <= threshold {
+        if let Err(e) = crate::infra::sled_import::import_if_present(path) {
+            error!(error = %e, "sled import failed");
             return;
         }
-        info!(
-            blob_bytes,
-            threshold, "sled blob files exceed storage.compact_on_start_blob_bytes; compacting"
-        );
-        match crate::infra::compaction::compact_database(
+        match crate::infra::compaction::compact_store_if_fragmented(
             path,
-            crate::infra::compaction::CompactionOptions { keep_backup: false },
+            config.storage.compact_on_start_fragmented_bytes,
         ) {
-            Ok(report) => info!(
+            Ok(Some(report)) => info!(
                 bytes_before = report.bytes_before,
                 bytes_after = report.bytes_after,
                 records = report.records,
                 "Startup compaction finished"
             ),
+            Ok(None) => {}
             Err(e) => error!(error = %e, "Startup compaction failed"),
         }
     }

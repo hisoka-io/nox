@@ -40,6 +40,7 @@ zeroize = { workspace = true }
 ethers = { workspace = true }
 libp2p = { version = "0.53", features = ["tcp", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros", "tokio", "cbor"] }
 sled = "0.34"
+redb = "4.3"
 prometheus-client = "0.22"
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["cors"] }

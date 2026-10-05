@@ -3,4 +3,5 @@ pub mod event_bus;
 pub mod maintenance;
 pub mod persistence;
 pub mod retention;
+pub mod sled_import;
 pub mod storage;

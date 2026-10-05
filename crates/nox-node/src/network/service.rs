@@ -1155,7 +1155,7 @@ fn load_or_generate_p2p_key(identity_path: &str) -> Result<identity::Keypair, In
 
 #[cfg(test)]
 mod tests {
-    use crate::infra::{event_bus::TokioEventBus, storage::SledRepository};
+    use crate::infra::{event_bus::TokioEventBus, storage::NodeStore};
 
     use super::*;
     use nox_core::models::topology::RelayerNode;
@@ -1164,7 +1164,7 @@ mod tests {
     #[tokio::test]
     async fn test_p2p_service_initialization() {
         let dir = tempdir().unwrap();
-        let db = Arc::new(SledRepository::new(dir.path()).unwrap());
+        let db = Arc::new(NodeStore::new(dir.path()).unwrap());
         let bus = TokioEventBus::new(10);
         let pub_bus = Arc::new(bus.clone());
         let sub_bus = Arc::new(bus.clone());
@@ -1189,7 +1189,7 @@ mod tests {
     #[tokio::test]
     async fn test_bootstrap_logic() {
         let dir = tempdir().unwrap();
-        let db = Arc::new(SledRepository::new(dir.path()).unwrap());
+        let db = Arc::new(NodeStore::new(dir.path()).unwrap());
 
         let peer_node = RelayerNode::new(
             "0x123".into(),

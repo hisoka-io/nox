@@ -36,7 +36,7 @@ use nox_node::services::relayer::RelayerService;
 use nox_node::services::response_packer::ResponsePacker;
 use nox_node::services::traffic_shaping::TrafficShapingService;
 use nox_node::telemetry::cluster::{spawn_cluster_api, NodeInfo};
-use nox_node::{NodeRole, NoxConfig, NoxNode, SledRepository, TokioEventBus};
+use nox_node::{NodeRole, NodeStore, NoxConfig, NoxNode, TokioEventBus};
 
 use nox_node::blockchain::observer::ChainObserver;
 
@@ -118,7 +118,7 @@ struct DashboardNode {
     ingress_port: u16,
     topology_api_port: u16,
     p2p_port: u16,
-    _storage: Arc<SledRepository>,
+    _storage: Arc<NodeStore>,
     _db_dir: tempfile::TempDir,
 }
 
@@ -301,7 +301,7 @@ async fn spawn_dashboard_node(
     pow_difficulty: u32,
 ) -> Result<DashboardNode> {
     let dir = tempdir()?;
-    let db = Arc::new(SledRepository::new(dir.path())?);
+    let db = Arc::new(NodeStore::new(dir.path())?);
 
     let event_bus = TokioEventBus::new(8192);
     let pub_bus: Arc<dyn IEventPublisher> = Arc::new(event_bus.clone());

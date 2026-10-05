@@ -4,8 +4,8 @@ use nox_core::{IEventPublisher, IEventSubscriber};
 use nox_node::services::network_manager::TopologyManager;
 use nox_node::services::traffic_shaping::TrafficShapingService;
 use nox_node::telemetry::metrics::MetricsService;
+use nox_node::NodeStore;
 use nox_node::NoxConfig;
-use nox_node::SledRepository;
 use nox_node::TokioEventBus;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -14,7 +14,7 @@ use tokio::time::Duration;
 #[tokio::test]
 async fn test_stratified_assignment() {
     let dir = tempdir().unwrap();
-    let db = Arc::new(SledRepository::new(dir.path()).unwrap());
+    let db = Arc::new(NodeStore::new(dir.path()).unwrap());
     let bus = TokioEventBus::new(2000);
     let sub: Arc<dyn IEventSubscriber> = Arc::new(bus.clone());
 
@@ -70,7 +70,7 @@ async fn test_stratified_assignment() {
 #[tokio::test]
 async fn test_role_based_layer_assignment() {
     let dir = tempdir().unwrap();
-    let db = Arc::new(SledRepository::new(dir.path()).unwrap());
+    let db = Arc::new(NodeStore::new(dir.path()).unwrap());
     let bus = TokioEventBus::new(2000);
     let sub: Arc<dyn IEventSubscriber> = Arc::new(bus.clone());
 
@@ -209,7 +209,7 @@ async fn test_hydrate_from_snapshot() {
     use nox_core::RelayerNode;
 
     let dir = tempdir().unwrap();
-    let db = Arc::new(SledRepository::new(dir.path()).unwrap());
+    let db = Arc::new(NodeStore::new(dir.path()).unwrap());
     let bus = TokioEventBus::new(100);
     let sub: Arc<dyn IEventSubscriber> = Arc::new(bus.clone());
 
@@ -280,7 +280,7 @@ async fn test_hydrate_overwrites_previous() {
     use nox_core::RelayerNode;
 
     let dir = tempdir().unwrap();
-    let db = Arc::new(SledRepository::new(dir.path()).unwrap());
+    let db = Arc::new(NodeStore::new(dir.path()).unwrap());
     let bus = TokioEventBus::new(100);
     let sub: Arc<dyn IEventSubscriber> = Arc::new(bus.clone());
 
@@ -402,7 +402,7 @@ async fn test_topology_node_role_propagation() {
 
 async fn setup_topology() -> (Arc<TopologyManager>, Arc<TokioEventBus>) {
     let dir = tempdir().unwrap();
-    let db = Arc::new(SledRepository::new(dir.path()).unwrap());
+    let db = Arc::new(NodeStore::new(dir.path()).unwrap());
     let bus = Arc::new(TokioEventBus::new(2000));
     let sub: Arc<dyn IEventSubscriber> = bus.clone();
 

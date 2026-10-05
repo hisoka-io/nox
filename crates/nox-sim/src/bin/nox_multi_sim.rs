@@ -30,7 +30,7 @@ use nox_node::services::response_packer::ResponsePacker;
 use nox_node::services::traffic_shaping::TrafficShapingService;
 use nox_node::telemetry::cluster::{spawn_cluster_api, NodeInfo};
 use nox_node::telemetry::metrics::MetricsService;
-use nox_node::{NodeRole, NoxConfig, NoxNode, SledRepository, TokioEventBus};
+use nox_node::{NodeRole, NodeStore, NoxConfig, NoxNode, TokioEventBus};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -79,7 +79,7 @@ struct VirtualNode {
     /// Ingress port (8080/8081/8082 for first 3 nodes, 0 otherwise)
     ingress_port: u16,
     // Keep alive
-    _storage: Arc<SledRepository>,
+    _storage: Arc<NodeStore>,
     _db_dir: tempfile::TempDir,
 }
 
@@ -110,7 +110,7 @@ async fn spawn_virtual_node(
     ingress_port: u16,
 ) -> Result<VirtualNode> {
     let dir = tempdir()?;
-    let db = Arc::new(SledRepository::new(dir.path())?);
+    let db = Arc::new(NodeStore::new(dir.path())?);
 
     // Larger bus capacity for burst traffic during 15-node startup
     let event_bus = TokioEventBus::new(8192);

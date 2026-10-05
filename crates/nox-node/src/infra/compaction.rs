@@ -1,5 +1,9 @@
 //! Offline compaction of the node database.
 //!
+//! The node database is `nox.redb` ([`compact_store`]). The rest of this
+//! module is the sled 0.34 copy-and-swap compaction, kept so a database whose
+//! sled compaction was interrupted can still be finished and then imported.
+//!
 //! sled 0.34 never reclaims some blob files: a blob that was pending deletion
 //! when the process stopped is forgotten, and nothing removes it later (nox-7
 //! kept ~390 MB of them). Which blobs are still referenced is internal to
@@ -14,7 +18,7 @@
 //! 2. Copy every tree into `compact-staging-<unix>/new` and flush.
 //! 3. Compare a digest of every tree name, key and value in both.
 //! 4. Write [`COMPACTION_MARKER`] (still holding the lock). While it exists
-//!    [`SledRepository::new`](crate::infra::storage::SledRepository::new)
+//!    [`NodeStore::new`](crate::infra::storage::NodeStore::new)
 //!    refuses to open the directory, so a node started mid-swap cannot create
 //!    an empty database in place of the real one.
 //! 5. Move the old sled files (`conf`, `db`, `snap.*`, `blobs/`) into
@@ -45,7 +49,7 @@ pub const STAGING_PREFIX: &str = "compact-staging-";
 const COPY_BATCH_RECORDS: usize = 512;
 
 /// Longest wait for sled's background work to release the database lock.
-const SLED_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const SLED_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Poll interval while waiting for the lock.
 const SLED_RELEASE_POLL: Duration = Duration::from_millis(20);
@@ -71,6 +75,121 @@ pub enum CompactionError {
     Verification { detail: String },
     #[error("compaction marker {path} is unreadable: {detail}")]
     Marker { path: PathBuf, detail: String },
+    #[error("database {context}: {detail}")]
+    Engine { context: String, detail: String },
+}
+
+fn engine_error(context: impl Into<String>, error: impl std::fmt::Display) -> CompactionError {
+    CompactionError::Engine {
+        context: context.into(),
+        detail: error.to_string(),
+    }
+}
+
+fn file_size(path: &Path) -> Result<u64, CompactionError> {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .map_err(|error| io_error("stat", path, error))
+}
+
+fn open_store_file(db_path: &Path) -> Result<redb::Database, CompactionError> {
+    if read_marker(db_path)?.is_some() {
+        compact_database(db_path, CompactionOptions::default())?;
+    }
+    crate::infra::sled_import::import_if_present(db_path)
+        .map_err(|error| engine_error("sled import", error))?;
+    let file = db_path.join(crate::infra::storage::DATABASE_FILE);
+    if !file.is_file() {
+        return Err(CompactionError::Missing(db_path.to_path_buf()));
+    }
+    redb::Database::create(&file).map_err(|error| CompactionError::Open {
+        path: file.clone(),
+        detail: error.to_string(),
+    })
+}
+
+fn store_records(db: &redb::Database) -> Result<(u64, usize), CompactionError> {
+    use redb::{ReadableDatabase, ReadableTableMetadata};
+    let transaction = db
+        .begin_read()
+        .map_err(|error| engine_error("begin read", error))?;
+    let mut records = 0_u64;
+    let tables = [
+        crate::infra::storage::DEFAULT_TABLE,
+        crate::infra::storage::OUTBOX_TABLE,
+        crate::infra::storage::REPLAY_TABLE,
+    ];
+    for definition in tables {
+        match transaction.open_table(definition) {
+            Ok(table) => {
+                records = records.saturating_add(
+                    table
+                        .len()
+                        .map_err(|error| engine_error("table length", error))?,
+                );
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(error) => return Err(engine_error("open table", error)),
+        }
+    }
+    Ok((records, tables.len()))
+}
+
+/// Bytes the database could return to the filesystem by compacting.
+pub fn fragmented_bytes(db: &redb::Database) -> Result<u64, CompactionError> {
+    let transaction = db
+        .begin_write()
+        .map_err(|error| engine_error("begin stats transaction", error))?;
+    let stats = transaction
+        .stats()
+        .map_err(|error| engine_error("read stats", error))?;
+    transaction
+        .abort()
+        .map_err(|error| engine_error("end stats transaction", error))?;
+    Ok(stats.fragmented_bytes())
+}
+
+/// Compacts `<db_path>/nox.redb` in place: free pages are returned to the
+/// filesystem. Imports a sled database first if one is there. Must run while
+/// no node uses `db_path`; the database lock makes it fail otherwise.
+pub fn compact_store(db_path: &Path) -> Result<CompactionReport, CompactionError> {
+    let mut db = open_store_file(db_path)?;
+    let file = db_path.join(crate::infra::storage::DATABASE_FILE);
+    let bytes_before = file_size(&file)?;
+    db.compact()
+        .map_err(|error| engine_error("compact", error))?;
+    let (records, trees) = store_records(&db)?;
+    drop(db);
+    Ok(CompactionReport {
+        bytes_before,
+        bytes_after: file_size(&file)?,
+        records,
+        trees,
+        backup: None,
+        resumed: false,
+    })
+}
+
+/// Runs [`compact_store`] when the database holds more than `threshold`
+/// fragmented bytes. Returns `None` when it did not compact.
+pub fn compact_store_if_fragmented(
+    db_path: &Path,
+    threshold: u64,
+) -> Result<Option<CompactionReport>, CompactionError> {
+    let file = db_path.join(crate::infra::storage::DATABASE_FILE);
+    if !file.is_file() {
+        return Ok(None);
+    }
+    let db = redb::Database::create(&file).map_err(|error| CompactionError::Open {
+        path: file.clone(),
+        detail: error.to_string(),
+    })?;
+    let fragmented = fragmented_bytes(&db)?;
+    drop(db);
+    if fragmented <= threshold {
+        return Ok(None);
+    }
+    compact_store(db_path).map(Some)
 }
 
 fn io_error(context: &'static str, path: &Path, source: std::io::Error) -> CompactionError {
@@ -191,11 +310,11 @@ fn copy_database(source: &sled::Db, target: &sled::Db) -> Result<(), CompactionE
 }
 
 /// True for the files and directories sled 0.34 owns in its directory.
-fn is_sled_entry(name: &str) -> bool {
+pub(crate) fn is_sled_entry(name: &str) -> bool {
     matches!(name, "conf" | "db" | "blobs") || name.starts_with("snap.")
 }
 
-fn sled_entries(dir: &Path) -> Result<Vec<String>, CompactionError> {
+pub(crate) fn sled_entries(dir: &Path) -> Result<Vec<String>, CompactionError> {
     let mut names = Vec::new();
     for entry in fs::read_dir(dir).map_err(|error| io_error("list directory", dir, error))? {
         let entry = entry.map_err(|error| io_error("list directory", dir, error))?;
@@ -231,7 +350,7 @@ pub fn sled_files_size(dir: &Path) -> Result<u64, CompactionError> {
     Ok(total)
 }
 
-fn sync_dir(dir: &Path) -> Result<(), CompactionError> {
+pub(crate) fn sync_dir(dir: &Path) -> Result<(), CompactionError> {
     fs::File::open(dir)
         .and_then(|handle| handle.sync_all())
         .map_err(|error| io_error("sync directory", dir, error))
@@ -449,7 +568,7 @@ fn finish_swap(
     }
 }
 
-/// Compacts the sled database in `db_path` by copying it into a fresh one.
+/// Compacts a sled database in `db_path` by copying it into a fresh one.
 /// Must run while no node uses `db_path`; sled's lock makes it fail otherwise.
 pub fn compact_database(
     db_path: &Path,
@@ -691,7 +810,7 @@ mod tests {
         fs::create_dir_all(&old_dir).unwrap();
         move_entries(dir.path(), &old_dir, &sled_entries(dir.path()).unwrap()).unwrap();
 
-        let refused = crate::infra::storage::SledRepository::new(dir.path());
+        let refused = crate::infra::storage::NodeStore::new(dir.path());
         assert!(refused.is_err());
         assert!(
             sled_entries(dir.path()).unwrap().is_empty(),
@@ -702,7 +821,7 @@ mod tests {
         assert!(report.resumed);
         assert_eq!(digest_of(dir.path()), before);
         assert!(!dir.path().join(COMPACTION_MARKER).exists());
-        assert!(crate::infra::storage::SledRepository::new(dir.path()).is_ok());
+        assert!(crate::infra::storage::NodeStore::new(dir.path()).is_ok());
     }
 
     #[test]
@@ -748,5 +867,51 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
             assert_eq!(digest_of(dir.path()), before);
         }
+    }
+
+    #[tokio::test]
+    async fn store_compaction_returns_freed_pages() {
+        use nox_core::traits::IStorageRepository;
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = crate::infra::storage::NodeStore::new(dir.path()).unwrap();
+            for index in 0..400_u32 {
+                store
+                    .put(format!("tx:{index}").as_bytes(), &vec![index as u8; 40_000])
+                    .await
+                    .unwrap();
+            }
+            for index in 0..390_u32 {
+                store
+                    .delete(format!("tx:{index}").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            store
+                .put(b"nonce:local", &7_u64.to_le_bytes())
+                .await
+                .unwrap();
+        }
+        assert!(compact_store_if_fragmented(dir.path(), u64::MAX)
+            .unwrap()
+            .is_none());
+        let report = compact_store_if_fragmented(dir.path(), 0).unwrap().unwrap();
+        assert!(report.bytes_after < report.bytes_before, "{report:?}");
+        assert_eq!(report.records, 11);
+        let store = crate::infra::storage::NodeStore::new(dir.path()).unwrap();
+        assert_eq!(store.scan(b"tx:").await.unwrap().len(), 10);
+        assert_eq!(
+            store.get(b"nonce:local").await.unwrap(),
+            Some(7_u64.to_le_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn store_compaction_imports_sled_first() {
+        let dir = tempfile::tempdir().unwrap();
+        populate(dir.path());
+        let report = compact_store(dir.path()).unwrap();
+        assert_eq!(report.records, 301);
+        assert!(sled_entries(dir.path()).unwrap().is_empty());
     }
 }

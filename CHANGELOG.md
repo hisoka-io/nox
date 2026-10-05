@@ -7,6 +7,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ### Upgrade notes
 
+- The node database moves from sled to redb (`<db_path>/nox.redb`). The first start imports the sled database,
+  verifies every record, and moves the sled files to `<db_path>/sled-backup-<unix>/`. Rolling back to an older
+  release needs those files moved back into `db_path` (records written after the upgrade are then lost).
+  `[storage] compact_on_start_blob_bytes` is replaced by `compact_on_start_fragmented_bytes`, and the
+  `nox_storage_blob_*` gauges by `nox_storage_stored_bytes` and `nox_storage_fragmented_bytes`.
+
 - Exit transaction records are written in a smaller encoding (signed bytes as hex instead of a JSON number
   array). This release reads both encodings; rc.5 and earlier cannot read the new one, so rolling an exit back
   needs the data snapshot taken before the upgrade.

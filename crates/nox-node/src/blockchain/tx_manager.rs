@@ -1,7 +1,7 @@
 use crate::blockchain::executor::{ChainExecutor, OutboxBroadcastError};
 use crate::blockchain::transaction_plan::{TransactionPlan, BASIS_POINTS};
 use crate::config::MAX_BUFFER_BPS;
-use crate::infra::storage::{decode_stored_transaction, CreateOutboxResult, SledRepository};
+use crate::infra::storage::{decode_stored_transaction, CreateOutboxResult, NodeStore};
 use crate::telemetry::metrics::MetricsService;
 use ethers::prelude::*;
 use ethers::types::transaction::eip2718::TypedTransaction;
@@ -74,7 +74,7 @@ enum NonceConflict {
 
 pub struct TransactionManager {
     executor: Arc<ChainExecutor>,
-    storage: Arc<SledRepository>,
+    storage: Arc<NodeStore>,
     pending_txs: Arc<Mutex<BTreeMap<u64, DecodedTransaction>>>,
     local_nonce: tokio::sync::Mutex<u64>,
     metrics: MetricsService,
@@ -84,7 +84,7 @@ pub struct TransactionManager {
 }
 
 impl TransactionManager {
-    pub(crate) fn quote_storage(&self) -> Arc<SledRepository> {
+    pub(crate) fn quote_storage(&self) -> Arc<NodeStore> {
         self.storage.clone()
     }
 
@@ -101,7 +101,7 @@ impl TransactionManager {
 
     pub async fn new(
         executor: Arc<ChainExecutor>,
-        storage: Arc<SledRepository>,
+        storage: Arc<NodeStore>,
         metrics: MetricsService,
         replacement_step_bps: u32,
     ) -> Result<Self, InfrastructureError> {
@@ -1048,14 +1048,14 @@ mod tests {
     use super::*;
     use crate::config::NoxConfig;
 
-    async fn dependencies() -> (Arc<ChainExecutor>, Arc<SledRepository>, MetricsService) {
+    async fn dependencies() -> (Arc<ChainExecutor>, Arc<NodeStore>, MetricsService) {
         let mut config = NoxConfig::default();
         config.chain_id = 31_337;
         config.eth_wallet_private_key =
             "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string();
         let executor = Arc::new(ChainExecutor::new(&config).await.expect("test executor"));
         let directory = tempfile::tempdir().expect("temporary directory");
-        let storage = Arc::new(SledRepository::new(directory.keep()).expect("test storage"));
+        let storage = Arc::new(NodeStore::new(directory.keep()).expect("test storage"));
         (executor, storage, MetricsService::new())
     }
 
@@ -1153,7 +1153,7 @@ mod tests {
         config.eth_wallet_private_key = hex::encode(anvil.keys()[0].to_bytes());
         let executor = Arc::new(ChainExecutor::new(&config).await.unwrap());
         let directory = tempfile::tempdir().unwrap();
-        let storage = Arc::new(SledRepository::new(directory.path()).unwrap());
+        let storage = Arc::new(NodeStore::new(directory.path()).unwrap());
         let manager = TransactionManager::new(
             executor.clone(),
             storage.clone(),
@@ -1204,7 +1204,7 @@ mod tests {
         config.eth_wallet_private_key = hex::encode(anvil.keys()[0].to_bytes());
         let executor = Arc::new(ChainExecutor::new(&config).await.unwrap());
         let directory = tempfile::tempdir().unwrap();
-        let storage = Arc::new(SledRepository::new(directory.path()).unwrap());
+        let storage = Arc::new(NodeStore::new(directory.path()).unwrap());
         let manager = TransactionManager::new(
             executor.clone(),
             storage.clone(),
@@ -1252,7 +1252,7 @@ mod tests {
         config.eth_wallet_private_key = hex::encode(anvil.keys()[0].to_bytes());
         let executor = Arc::new(ChainExecutor::new(&config).await.unwrap());
         let directory = tempfile::tempdir().unwrap();
-        let storage = Arc::new(SledRepository::new(directory.path()).unwrap());
+        let storage = Arc::new(NodeStore::new(directory.path()).unwrap());
         let manager = TransactionManager::new(
             executor.clone(),
             storage.clone(),

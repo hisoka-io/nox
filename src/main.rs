@@ -41,15 +41,10 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum DbCommand {
-    /// Copy every record into a fresh database, verify it, and swap it in.
-    /// Drops sled blob files that nothing references. Rerun it to finish a
-    /// compaction that was interrupted.
-    Compact {
-        /// Keep the old files under `<db_path>/compact-staging-<unix>/old`.
-        #[arg(long)]
-        keep_backup: bool,
-    },
-    /// Print database size, blob files and record counts per kind.
+    /// Return free pages of `nox.redb` to the filesystem. Imports a sled
+    /// database first if `db_path` still holds one.
+    Compact,
+    /// Print database size, page usage and record counts per kind.
     Stats,
 }
 
@@ -172,43 +167,37 @@ async fn run_db_command(
     db_path: Option<String>,
     action: DbCommand,
 ) -> anyhow::Result<()> {
-    use nox_node::infra::compaction::{compact_database, sled_files_size, CompactionOptions};
-    use nox_node::infra::retention::blob_usage;
-    use nox_node::infra::storage::SledRepository;
+    use nox_node::infra::compaction::compact_store;
+    use nox_node::infra::storage::{NodeStore, DATABASE_FILE};
 
     let db_path = resolve_db_path(config_path, db_path)?;
     let path = std::path::Path::new(&db_path);
-    let interrupted = path
-        .join(nox_node::infra::compaction::COMPACTION_MARKER)
-        .is_file();
-    if !interrupted && !path.join("conf").is_file() && !path.join("db").is_file() {
-        anyhow::bail!("no sled database at {db_path}");
+    if !path.is_dir() {
+        anyhow::bail!("no database directory at {db_path}");
     }
     match action {
-        DbCommand::Compact { keep_backup } => {
-            let report = compact_database(path, CompactionOptions { keep_backup })?;
+        DbCommand::Compact => {
+            let report = compact_store(path)?;
             println!("db_path: {db_path}");
-            if report.resumed {
-                println!("finished an interrupted compaction");
-            }
-            println!("trees: {}", report.trees);
             println!("records: {}", report.records);
             println!("bytes_before: {}", report.bytes_before);
             println!("bytes_after: {}", report.bytes_after);
-            match report.backup {
-                Some(backup) => println!("backup: {}", backup.display()),
-                None => println!("backup: removed after verification"),
-            }
         }
         DbCommand::Stats => {
-            let (blob_files, blob_bytes) = blob_usage(path)?;
-            let sled_bytes = sled_files_size(path)?;
-            let repository = SledRepository::new(path)?;
+            if !path.join(DATABASE_FILE).is_file()
+                && !path.join("conf").is_file()
+                && !path.join("db").is_file()
+            {
+                anyhow::bail!("no database at {db_path}");
+            }
+            let store = NodeStore::new(path)?;
+            let stats = store.stats().await?;
             println!("db_path: {db_path}");
-            println!("sled_bytes: {sled_bytes}");
-            println!("blob_files: {blob_files}");
-            println!("blob_bytes: {blob_bytes}");
-            for count in repository.record_counts().await? {
+            println!("file_bytes: {}", store.size_on_disk().await?);
+            println!("stored_bytes: {}", stats.stored_bytes);
+            println!("metadata_bytes: {}", stats.metadata_bytes);
+            println!("fragmented_bytes: {}", stats.fragmented_bytes);
+            for count in store.record_counts().await? {
                 println!(
                     "records{{tree={},kind={}}}: {}",
                     count.tree, count.kind, count.count

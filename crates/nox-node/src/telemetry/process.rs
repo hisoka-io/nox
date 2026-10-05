@@ -1,6 +1,6 @@
 //! Process metrics: polls `/proc/self/status` for memory and FD counts (Linux only).
 
-use crate::infra::storage::{DegradedFlag, SledRepository};
+use crate::infra::storage::{DegradedFlag, NodeStore};
 use crate::telemetry::metrics::MetricsService;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -12,7 +12,7 @@ pub struct ProcessMonitor {
     metrics: MetricsService,
     start_epoch: i64,
     storage_degraded: Option<DegradedFlag>,
-    storage: Option<SledRepository>,
+    storage: Option<NodeStore>,
 }
 
 impl ProcessMonitor {
@@ -35,7 +35,7 @@ impl ProcessMonitor {
 
     /// Reports the database's size in `nox_storage_size_on_disk_bytes`.
     #[must_use]
-    pub fn with_storage_size_source(mut self, storage: SledRepository) -> Self {
+    pub fn with_storage_size_source(mut self, storage: NodeStore) -> Self {
         self.storage = Some(storage);
         self
     }

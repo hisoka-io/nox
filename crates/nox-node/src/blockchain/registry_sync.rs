@@ -395,7 +395,7 @@ impl<M: Middleware + 'static> RegistryReconciler<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infra::{event_bus::TokioEventBus, storage::SledRepository};
+    use crate::infra::{event_bus::TokioEventBus, storage::NodeStore};
     use ethers::abi::Token;
     use nox_core::IEventSubscriber;
 
@@ -413,7 +413,7 @@ mod tests {
 
     fn chain() -> Chain {
         let dir = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(SledRepository::new(dir.path()).expect("storage"));
+        let storage = Arc::new(NodeStore::new(dir.path()).expect("storage"));
         let bus = Arc::new(TokioEventBus::new(8));
         let subscriber: Arc<dyn IEventSubscriber> = bus;
         let topology = Arc::new(TopologyManager::new(storage, subscriber, None));
@@ -647,7 +647,7 @@ mod tests {
     #[tokio::test]
     async fn no_chain_position_skips_the_pass() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(SledRepository::new(dir.path()).expect("storage"));
+        let storage = Arc::new(NodeStore::new(dir.path()).expect("storage"));
         let bus = Arc::new(TokioEventBus::new(8));
         let subscriber: Arc<dyn IEventSubscriber> = bus;
         let topology = Arc::new(TopologyManager::new(storage, subscriber, None));

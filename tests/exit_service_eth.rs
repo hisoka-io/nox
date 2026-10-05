@@ -18,7 +18,7 @@ use nox_node::{
         response_packer::ResponsePacker,
     },
     telemetry::metrics::MetricsService,
-    NoxConfig, SledRepository, TokioEventBus,
+    NodeStore, NoxConfig, TokioEventBus,
 };
 use std::{str::FromStr, sync::Arc, time::Duration};
 use tempfile::tempdir;
@@ -41,7 +41,7 @@ async fn make_executor() -> Arc<ChainExecutor> {
 
 async fn make_tx_manager(exec: Arc<ChainExecutor>) -> Arc<TransactionManager> {
     let dir = tempdir().expect("tempdir");
-    let storage = Arc::new(SledRepository::new(dir.path()).expect("sled"));
+    let storage = Arc::new(NodeStore::new(dir.path()).expect("sled"));
     Arc::new(
         TransactionManager::new(
             exec,
@@ -71,7 +71,7 @@ async fn make_ethereum_handler(price_uri: &str) -> Arc<EthereumHandler> {
 
 async fn make_quote_handler(
     price_uri: &str,
-) -> (Arc<EthereumHandler>, Arc<SledRepository>, tempfile::TempDir) {
+) -> (Arc<EthereumHandler>, Arc<NodeStore>, tempfile::TempDir) {
     let entry_point = Address::from_low_u64_be(11);
     let adapter = Address::from_low_u64_be(12);
     let fee_asset = Address::from_low_u64_be(13);
@@ -96,7 +96,7 @@ async fn make_quote_handler(
     }];
     let executor = Arc::new(ChainExecutor::new(&config).await.expect("executor"));
     let directory = tempdir().expect("tempdir");
-    let storage = Arc::new(SledRepository::new(directory.path()).expect("sled"));
+    let storage = Arc::new(NodeStore::new(directory.path()).expect("sled"));
     let manager = Arc::new(
         TransactionManager::new(
             executor.clone(),

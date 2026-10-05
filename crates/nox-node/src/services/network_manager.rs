@@ -779,13 +779,13 @@ impl TopologyManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infra::{event_bus::TokioEventBus, storage::SledRepository};
+    use crate::infra::{event_bus::TokioEventBus, storage::NodeStore};
     use nox_core::IEventSubscriber;
 
     #[tokio::test]
     async fn registry_ingress_is_never_synthesized_from_p2p_url() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let storage = Arc::new(NodeStore::new(directory.path()).expect("storage"));
         let bus = Arc::new(TokioEventBus::new(8));
         let subscriber: Arc<dyn IEventSubscriber> = bus;
         let manager = TopologyManager::new(storage, subscriber, None);
@@ -814,7 +814,7 @@ mod tests {
     const C: &str = "0x6774ca4baf6fff84f02898a3dee4299ed1f5ab4e";
     const STALE: &str = "0xd6831d3bd6e1c768564f5815f2d7a34312bd3067";
 
-    fn manager_on(storage: Arc<SledRepository>) -> TopologyManager {
+    fn manager_on(storage: Arc<NodeStore>) -> TopologyManager {
         let bus = Arc::new(TokioEventBus::new(8));
         let subscriber: Arc<dyn IEventSubscriber> = bus;
         TopologyManager::new(storage, subscriber, None)
@@ -852,7 +852,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_registration_events_do_not_drift_fingerprint() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let storage = Arc::new(NodeStore::new(directory.path()).expect("storage"));
         let manager = manager_on(storage);
 
         for address in [A, B, C] {
@@ -874,7 +874,7 @@ mod tests {
     #[tokio::test]
     async fn removals_of_unknown_or_already_removed_nodes_are_idempotent() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let storage = Arc::new(NodeStore::new(directory.path()).expect("storage"));
         let manager = manager_on(storage);
 
         register(&manager, A).await;
@@ -895,7 +895,7 @@ mod tests {
     #[tokio::test]
     async fn restart_hydration_then_replay_matches_chain_fingerprint() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let storage = Arc::new(NodeStore::new(directory.path()).expect("storage"));
         {
             let first_boot = manager_on(storage.clone());
             for address in [A, B, C] {
@@ -917,7 +917,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_hydration_replaces_persisted_peers_and_survives_replay() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let storage = Arc::new(NodeStore::new(directory.path()).expect("storage"));
         {
             let old = manager_on(storage.clone());
             register(&old, STALE).await;
@@ -944,7 +944,7 @@ mod tests {
     #[tokio::test]
     async fn canonical_snapshot_uses_primary_layers_and_stable_address_order() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let storage = Arc::new(NodeStore::new(directory.path()).expect("storage"));
         let bus = Arc::new(TokioEventBus::new(8));
         let subscriber: Arc<dyn IEventSubscriber> = bus;
         let manager = TopologyManager::new(storage, subscriber, None);
@@ -998,7 +998,7 @@ mod tests {
     #[tokio::test]
     async fn hydrate_from_storage_derives_layer_from_role() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let storage = Arc::new(NodeStore::new(directory.path()).expect("storage"));
         // What older versions persisted from the P2P path: layer 0 for an exit.
         let mut stale = snapshot_node(A);
         stale.role = 2;
@@ -1021,7 +1021,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_hydration_derives_layer_from_role() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let storage = Arc::new(NodeStore::new(directory.path()).expect("storage"));
         let manager = manager_on(storage);
         let mut exit = snapshot_node(A);
         exit.role = 2;
@@ -1033,7 +1033,7 @@ mod tests {
     #[tokio::test]
     async fn role_update_moves_node_to_its_new_primary_layer() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let storage = Arc::new(NodeStore::new(directory.path()).expect("storage"));
         let manager = manager_on(storage);
         register(&manager, A).await;
         manager.handle_role_update(A.to_string(), 2).await;
@@ -1046,7 +1046,7 @@ mod tests {
     #[tokio::test]
     async fn profile_sync_replaces_every_field_and_tracks_freeze() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let storage = Arc::new(NodeStore::new(directory.path()).expect("storage"));
         let manager = manager_on(storage.clone());
         register(&manager, A).await;
         register(&manager, B).await;
@@ -1086,7 +1086,7 @@ mod tests {
     #[tokio::test]
     async fn slash_event_does_not_zero_the_stake() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let storage = Arc::new(NodeStore::new(directory.path()).expect("storage"));
         let manager = manager_on(storage);
         manager.apply_profile(profile(A, peer(1), 1)).await;
         manager
@@ -1102,7 +1102,7 @@ mod tests {
     #[tokio::test]
     async fn peer_index_binds_registered_identities() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let storage = Arc::new(NodeStore::new(directory.path()).expect("storage"));
         let manager = manager_on(storage);
         manager.apply_profile(profile(A, peer(1), 1)).await;
         manager.apply_profile(profile(B, peer(2), 2)).await;
@@ -1134,7 +1134,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_is_v1_without_block_and_v2_with_liveness() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let storage = Arc::new(NodeStore::new(directory.path()).expect("storage"));
         let manager = manager_on(storage);
         manager.apply_profile(profile(B, peer(2), 2)).await;
         manager.apply_profile(profile(A, peer(1), 1)).await;
@@ -1181,7 +1181,7 @@ mod tests {
     #[tokio::test]
     async fn lagged_bus_requests_a_registry_resync() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let storage = Arc::new(NodeStore::new(directory.path()).expect("storage"));
         let bus = Arc::new(TokioEventBus::new(1));
         let subscriber: Arc<dyn IEventSubscriber> = bus.clone();
         let manager = Arc::new(TopologyManager::new(storage, subscriber, None));

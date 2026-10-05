@@ -16,22 +16,26 @@
 //! `valid_until`, when the request validation and the entry point both refuse
 //! it anyway.
 //!
-//! Every change is a compare-and-swap against the bytes that were read, so a
-//! record that changes during the sweep is left for the next pass.
-
-use std::path::Path;
+//! Records are decided and changed inside one write transaction per chunk,
+//! and redb runs one writer at a time, so no record can change between the
+//! decision and the write.
 
 use nox_core::traits::InfrastructureError;
 use nox_core::{
     DecodedTransaction, LegacyTxStatus, QuoteStatusV2, StoredQuoteV2, StoredTransactionV2,
     TxStatusV2,
 };
-use sled::transaction::{ConflictableTransactionError, TransactionError};
-use sled::Tree;
+use redb::{Database, ReadableDatabase, ReadableTable, Table};
 use tracing::warn;
 
 use crate::config::StorageConfig;
-use crate::infra::storage::{decode_stored_transaction, SledRepository};
+use crate::infra::storage::{
+    database_error, decode_stored_transaction, write_transaction, BytesTable, NodeStore,
+    WriteError, DEFAULT_TABLE, OUTBOX_TABLE, REPLAY_TABLE,
+};
+
+/// Records decided and changed per write transaction.
+const SWEEP_CHUNK_RECORDS: usize = 128;
 
 /// Thresholds for one retention sweep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,10 +97,6 @@ enum RecordAction {
     Keep,
     Slim(Vec<u8>),
     Prune,
-}
-
-fn database_error(context: &str, error: impl std::fmt::Display) -> InfrastructureError {
-    InfrastructureError::Database(format!("{context}: {error}"))
 }
 
 /// Decides what happens to one `outbox:*` or `tx:*` record.
@@ -161,22 +161,50 @@ impl Budget {
     }
 }
 
-fn prefix_keys(tree: &Tree, prefix: &[u8]) -> Result<Vec<sled::IVec>, InfrastructureError> {
-    tree.scan_prefix(prefix)
-        .keys()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| {
-            database_error(
-                &format!("retention scan of {} keys", String::from_utf8_lossy(prefix)),
-                error,
-            )
-        })
+fn sweep_error(context: &str, error: WriteError<InfrastructureError>) -> InfrastructureError {
+    match error {
+        WriteError::Abort(error) => error,
+        WriteError::Storage(error) => database_error(context, error),
+    }
+}
+
+fn prefix_keys(
+    db: &Database,
+    table: BytesTable,
+    prefix: &[u8],
+) -> Result<Vec<Vec<u8>>, InfrastructureError> {
+    let scan = || -> Result<Vec<Vec<u8>>, redb::Error> {
+        let transaction = db.begin_read()?;
+        let table = transaction.open_table(table)?;
+        let mut keys = Vec::new();
+        for item in table.range::<&[u8]>(prefix..)? {
+            let (key, _) = item?;
+            if !key.value().starts_with(prefix) {
+                break;
+            }
+            keys.push(key.value().to_vec());
+        }
+        Ok(keys)
+    };
+    scan().map_err(|error| {
+        database_error(
+            &format!("retention scan of {} keys", String::from_utf8_lossy(prefix)),
+            error,
+        )
+    })
+}
+
+fn read_value(
+    table: &Table<&'static [u8], &'static [u8]>,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>, redb::StorageError> {
+    Ok(table.get(key)?.map(|value| value.value().to_vec()))
 }
 
 /// Applies [`transaction_action`] to every record under `prefix` in the outbox
-/// tree. Returns `(slimmed, pruned)`.
+/// table. Returns `(slimmed, pruned)`.
 fn sweep_transactions(
-    tree: &Tree,
+    db: &Database,
     prefix: &[u8],
     policy: &RetentionPolicy,
     now_unix: u64,
@@ -185,45 +213,59 @@ fn sweep_transactions(
 ) -> Result<(usize, usize), InfrastructureError> {
     let mut slimmed = 0_usize;
     let mut pruned = 0_usize;
-    for key in prefix_keys(tree, prefix)? {
-        let Some(current) = tree
-            .get(&key)
-            .map_err(|error| database_error("retention read", error))?
-        else {
-            continue;
-        };
-        let action = match transaction_action(&current, policy, now_unix) {
-            Ok(action) => action,
-            Err(error) => {
-                report.undecodable += 1;
-                warn!(
-                    key = %String::from_utf8_lossy(&key),
-                    error = %error,
-                    "Retention skipped a transaction record that does not decode"
-                );
-                continue;
-            }
-        };
-        let new_value = match action {
-            RecordAction::Keep => continue,
-            RecordAction::Slim(bytes) => Some(bytes),
-            RecordAction::Prune => None,
-        };
-        if !budget.take() {
-            report.budget_exhausted = true;
+    for chunk in prefix_keys(db, OUTBOX_TABLE, prefix)?.chunks(SWEEP_CHUNK_RECORDS) {
+        if report.budget_exhausted {
             break;
         }
-        let is_prune = new_value.is_none();
-        let swapped = tree
-            .compare_and_swap(&key, Some(current.as_ref()), new_value)
-            .map_err(|error| database_error("retention compare-and-swap", error))?;
-        if swapped.is_ok() {
-            if is_prune {
-                pruned += 1;
-            } else {
-                slimmed += 1;
+        let mut chunk_report = RetentionReport::default();
+        let mut chunk_budget = Budget(budget.0);
+        let (chunk_slimmed, chunk_pruned) = write_transaction(db, |transaction| {
+            let mut table = transaction.open_table(OUTBOX_TABLE)?;
+            let mut slimmed = 0_usize;
+            let mut pruned = 0_usize;
+            for key in chunk {
+                let Some(current) = read_value(&table, key)? else {
+                    continue;
+                };
+                let action = match transaction_action(&current, policy, now_unix) {
+                    Ok(action) => action,
+                    Err(error) => {
+                        chunk_report.undecodable += 1;
+                        warn!(
+                            key = %String::from_utf8_lossy(key),
+                            error = %error,
+                            "Retention skipped a transaction record that does not decode"
+                        );
+                        continue;
+                    }
+                };
+                if action == RecordAction::Keep {
+                    continue;
+                }
+                if !chunk_budget.take() {
+                    chunk_report.budget_exhausted = true;
+                    break;
+                }
+                match action {
+                    RecordAction::Keep => {}
+                    RecordAction::Slim(bytes) => {
+                        table.insert(key.as_slice(), bytes.as_slice())?;
+                        slimmed += 1;
+                    }
+                    RecordAction::Prune => {
+                        table.remove(key.as_slice())?;
+                        pruned += 1;
+                    }
+                }
             }
-        }
+            Ok((slimmed, pruned))
+        })
+        .map_err(|error| sweep_error("retention transaction sweep", error))?;
+        budget.0 = chunk_budget.0;
+        report.undecodable += chunk_report.undecodable;
+        report.budget_exhausted |= chunk_report.budget_exhausted;
+        slimmed += chunk_slimmed;
+        pruned += chunk_pruned;
     }
     Ok((slimmed, pruned))
 }
@@ -242,37 +284,8 @@ fn quote_is_prunable(record: &StoredQuoteV2, policy: &RetentionPolicy, now_unix:
         && record.quote.valid_until_unix <= now_unix
 }
 
-/// Deletes one terminal quote and its payment index, if both are unchanged.
-/// Returns `Some(payment_index_removed)` when the quote was deleted.
-fn prune_quote(
-    tree: &Tree,
-    execution_key: &[u8],
-    expected: &[u8],
-    record: &StoredQuoteV2,
-) -> Result<Option<bool>, InfrastructureError> {
-    let payment_key = format!("quote:payment:{}", hex::encode(record.request.payment_id));
-    let execution_id = record.execution_id;
-    tree.transaction(|tx| {
-        match tx.get(execution_key)? {
-            Some(current) if current.as_ref() == expected => {}
-            _ => return Ok(None),
-        }
-        tx.remove(execution_key)?;
-        let index_matches = tx
-            .get(payment_key.as_bytes())?
-            .is_some_and(|value| value.as_ref() == execution_id.as_slice());
-        if index_matches {
-            tx.remove(payment_key.as_bytes())?;
-        }
-        Ok::<_, ConflictableTransactionError<()>>(Some(index_matches))
-    })
-    .map_err(|error: TransactionError<()>| {
-        database_error("retention quote prune", format!("{error:?}"))
-    })
-}
-
 fn sweep_quotes(
-    tree: &Tree,
+    db: &Database,
     policy: &RetentionPolicy,
     now_unix: u64,
     budget: &mut Budget,
@@ -281,118 +294,137 @@ fn sweep_quotes(
     if !policy.prune_terminal_records {
         return Ok(());
     }
-    for key in prefix_keys(tree, b"quote:execution:")? {
-        let Some(current) = tree
-            .get(&key)
-            .map_err(|error| database_error("retention quote read", error))?
-        else {
-            continue;
-        };
-        let record: StoredQuoteV2 = match serde_json::from_slice(&current) {
-            Ok(record) => record,
-            Err(error) => {
-                report.undecodable += 1;
-                warn!(
-                    key = %String::from_utf8_lossy(&key),
-                    error = %error,
-                    "Retention skipped a quote record that does not decode"
-                );
-                continue;
-            }
-        };
-        if !quote_is_prunable(&record, policy, now_unix) {
-            continue;
-        }
-        if !budget.take() {
-            report.budget_exhausted = true;
+    for chunk in prefix_keys(db, DEFAULT_TABLE, b"quote:execution:")?.chunks(SWEEP_CHUNK_RECORDS) {
+        if report.budget_exhausted {
             break;
         }
-        if let Some(index_removed) = prune_quote(tree, &key, &current, &record)? {
-            report.quotes_pruned += 1;
-            if index_removed {
-                report.payment_indexes_pruned += 1;
+        let mut chunk_report = RetentionReport::default();
+        let mut chunk_budget = Budget(budget.0);
+        write_transaction(db, |transaction| {
+            let mut table = transaction.open_table(DEFAULT_TABLE)?;
+            for key in chunk {
+                let Some(current) = read_value(&table, key)? else {
+                    continue;
+                };
+                let record: StoredQuoteV2 = match serde_json::from_slice(&current) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        chunk_report.undecodable += 1;
+                        warn!(
+                            key = %String::from_utf8_lossy(key),
+                            error = %error,
+                            "Retention skipped a quote record that does not decode"
+                        );
+                        continue;
+                    }
+                };
+                if !quote_is_prunable(&record, policy, now_unix) {
+                    continue;
+                }
+                if !chunk_budget.take() {
+                    chunk_report.budget_exhausted = true;
+                    break;
+                }
+                table.remove(key.as_slice())?;
+                chunk_report.quotes_pruned += 1;
+                let payment_key =
+                    format!("quote:payment:{}", hex::encode(record.request.payment_id));
+                let index_matches = read_value(&table, payment_key.as_bytes())?
+                    .is_some_and(|value| value == record.execution_id);
+                if index_matches {
+                    table.remove(payment_key.as_bytes())?;
+                    chunk_report.payment_indexes_pruned += 1;
+                }
             }
-        }
+            Ok(())
+        })
+        .map_err(|error| sweep_error("retention quote sweep", error))?;
+        budget.0 = chunk_budget.0;
+        report.undecodable += chunk_report.undecodable;
+        report.budget_exhausted |= chunk_report.budget_exhausted;
+        report.quotes_pruned += chunk_report.quotes_pruned;
+        report.payment_indexes_pruned += chunk_report.payment_indexes_pruned;
     }
     Ok(())
 }
 
-/// One synchronous sweep over the outbox tree and the quote records.
+/// One synchronous sweep over the outbox table and the quote records.
 fn sweep(
-    default_tree: &Tree,
-    outbox: Option<&Tree>,
+    db: &Database,
+    include_outbox: bool,
     policy: &RetentionPolicy,
     now_unix: u64,
 ) -> Result<RetentionReport, InfrastructureError> {
     let mut report = RetentionReport::default();
     let mut budget = Budget(policy.batch_limit);
-    if let Some(outbox) = outbox {
-        let (slimmed, pruned) = sweep_transactions(
-            outbox,
-            b"outbox:",
-            policy,
-            now_unix,
-            &mut budget,
-            &mut report,
-        )?;
+    if include_outbox {
+        let (slimmed, pruned) =
+            sweep_transactions(db, b"outbox:", policy, now_unix, &mut budget, &mut report)?;
         report.outbox_slimmed = slimmed;
         report.outbox_pruned = pruned;
         if !report.budget_exhausted {
             let (slimmed, pruned) =
-                sweep_transactions(outbox, b"tx:", policy, now_unix, &mut budget, &mut report)?;
+                sweep_transactions(db, b"tx:", policy, now_unix, &mut budget, &mut report)?;
             report.transactions_slimmed = slimmed;
             report.transactions_pruned = pruned;
         }
     }
     if !report.budget_exhausted {
-        sweep_quotes(default_tree, policy, now_unix, &mut budget, &mut report)?;
+        sweep_quotes(db, policy, now_unix, &mut budget, &mut report)?;
     }
     Ok(report)
 }
 
-impl SledRepository {
-    /// Slims and prunes terminal transaction and quote records, then flushes.
+impl NodeStore {
+    /// Slims and prunes terminal transaction and quote records.
     ///
-    /// When a durable outbox write has failed the outbox tree is left alone
+    /// When a durable outbox write has failed the outbox table is left alone
     /// until restart; quote records are still swept.
     pub async fn apply_retention(
         &self,
         policy: RetentionPolicy,
         now_unix: u64,
     ) -> Result<RetentionReport, InfrastructureError> {
-        let default_tree = self.default_tree().clone();
-        let outbox = (!self.is_outbox_degraded()).then(|| self.outbox_tree().clone());
-        let report = tokio::task::spawn_blocking(move || {
-            sweep(&default_tree, outbox.as_ref(), &policy, now_unix)
-        })
-        .await
-        .map_err(|error| database_error("retention task failed", error))??;
+        let db = self.database().clone();
+        let include_outbox = !self.is_outbox_degraded();
+        let report =
+            tokio::task::spawn_blocking(move || sweep(&db, include_outbox, &policy, now_unix))
+                .await
+                .map_err(|error| database_error("retention task failed", error))??;
         if report.changed() > 0 {
             self.flush_durably("retention sweep").await?;
         }
         Ok(report)
     }
 
-    /// Number of records per tree and key kind. Every known kind is listed,
+    /// Number of records per table and key kind. Every known kind is listed,
     /// with zero when absent, so a gauge that drops to zero is reported.
     pub async fn record_counts(&self) -> Result<Vec<RecordCount>, InfrastructureError> {
-        let default_tree = self.default_tree().clone();
-        let outbox = self.outbox_tree().clone();
-        let replay = self.replay_tree().clone();
+        let db = self.database().clone();
         tokio::task::spawn_blocking(move || {
+            let transaction = db
+                .begin_read()
+                .map_err(|error| database_error("record count read", error))?;
             let mut counts: Vec<RecordCount> = Vec::new();
-            for (tree_name, tree) in [
-                (TREE_LABEL_DEFAULT, &default_tree),
-                (TREE_LABEL_OUTBOX, &outbox),
-                (TREE_LABEL_REPLAY, &replay),
+            for (tree_name, definition) in [
+                (TREE_LABEL_DEFAULT, DEFAULT_TABLE),
+                (TREE_LABEL_OUTBOX, OUTBOX_TABLE),
+                (TREE_LABEL_REPLAY, REPLAY_TABLE),
             ] {
+                let table = transaction
+                    .open_table(definition)
+                    .map_err(|error| database_error("record count table", error))?;
                 let mut per_kind = [0_u64; RECORD_KINDS.len()];
-                for key in tree.iter().keys() {
-                    let key = key.map_err(|error| database_error("record count scan", error))?;
+                for item in table
+                    .iter()
+                    .map_err(|error| database_error("record count scan", error))?
+                {
+                    let (key, _) =
+                        item.map_err(|error| database_error("record count scan", error))?;
                     let kind = if tree_name == TREE_LABEL_REPLAY {
                         RECORD_KIND_REPLAY_TAG
                     } else {
-                        record_kind(&key)
+                        record_kind(key.value())
                     };
                     if let Some(index) = RECORD_KINDS.iter().position(|known| *known == kind) {
                         per_kind[index] = per_kind[index].saturating_add(1);
@@ -423,7 +455,7 @@ pub const TREE_LABEL_REPLAY: &str = "replay_tags";
 
 const RECORD_KIND_REPLAY_TAG: &str = "replay_tag";
 
-/// Key kinds reported by [`SledRepository::record_counts`].
+/// Key kinds reported by [`NodeStore::record_counts`].
 pub const RECORD_KINDS: [&str; 11] = [
     "outbox",
     "transaction",
@@ -481,33 +513,6 @@ pub struct RecordCount {
     pub tree: &'static str,
     pub kind: &'static str,
     pub count: u64,
-}
-
-/// Number and total size of sled's blob files under `db_path/blobs`.
-pub fn blob_usage(db_path: &Path) -> Result<(u64, u64), InfrastructureError> {
-    let entries = match std::fs::read_dir(db_path.join("blobs")) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
-        Err(error) => {
-            return Err(database_error(
-                &format!("read blob directory under {}", db_path.display()),
-                error,
-            ))
-        }
-    };
-    let mut files = 0_u64;
-    let mut bytes = 0_u64;
-    for entry in entries {
-        let entry = entry.map_err(|error| database_error("read blob directory entry", error))?;
-        let metadata = entry
-            .metadata()
-            .map_err(|error| database_error("read blob file metadata", error))?;
-        if metadata.is_file() {
-            files = files.saturating_add(1);
-            bytes = bytes.saturating_add(metadata.len());
-        }
-    }
-    Ok((files, bytes))
 }
 
 #[cfg(test)]
@@ -659,13 +664,47 @@ mod tests {
         assert_eq!(record_kind(b"unexpected"), "other");
     }
 
-    #[test]
-    fn blob_usage_of_a_missing_directory_is_zero() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(blob_usage(dir.path()).unwrap(), (0, 0));
-        std::fs::create_dir(dir.path().join("blobs")).unwrap();
-        std::fs::write(dir.path().join("blobs").join("12"), [0_u8; 10]).unwrap();
-        assert_eq!(blob_usage(dir.path()).unwrap(), (1, 10));
+    /// Minimal table handle for assertions, shaped like the old sled `Tree`.
+    struct TestTable<'a> {
+        db: &'a Database,
+        table: BytesTable,
+    }
+
+    fn tree(repo: &NodeStore, table: BytesTable) -> TestTable<'_> {
+        TestTable {
+            db: repo.database(),
+            table,
+        }
+    }
+
+    impl TestTable<'_> {
+        fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>, redb::Error> {
+            let transaction = self.db.begin_read()?;
+            let table = transaction.open_table(self.table)?;
+            Ok(table.get(key.as_ref())?.map(|value| value.value().to_vec()))
+        }
+
+        fn contains_key(&self, key: impl AsRef<[u8]>) -> Result<bool, redb::Error> {
+            Ok(self.get(key)?.is_some())
+        }
+
+        fn insert(
+            &self,
+            key: impl AsRef<[u8]>,
+            value: impl AsRef<[u8]>,
+        ) -> Result<(), redb::Error> {
+            let transaction = self.db.begin_write()?;
+            {
+                let mut table = transaction.open_table(self.table)?;
+                table.insert(key.as_ref(), value.as_ref())?;
+            }
+            transaction.commit()?;
+            Ok(())
+        }
+
+        fn is_empty(&self) -> bool {
+            crate::infra::storage::table_len(self.db, self.table).unwrap() == 0
+        }
     }
 
     fn quote(
@@ -722,38 +761,36 @@ mod tests {
         }
     }
 
-    fn put_quote(repo: &SledRepository, record: &StoredQuoteV2) {
-        let tree = repo.default_tree();
-        tree.insert(
-            format!("quote:execution:{}", hex::encode(record.execution_id)).as_bytes(),
-            serde_json::to_vec(record).unwrap(),
-        )
-        .unwrap();
-        tree.insert(
-            format!("quote:payment:{}", hex::encode(record.request.payment_id)).as_bytes(),
-            record.execution_id.as_slice(),
-        )
-        .unwrap();
+    fn put_quote(repo: &NodeStore, record: &StoredQuoteV2) {
+        let table = tree(repo, DEFAULT_TABLE);
+        table
+            .insert(
+                format!("quote:execution:{}", hex::encode(record.execution_id)).as_bytes(),
+                serde_json::to_vec(record).unwrap(),
+            )
+            .unwrap();
+        table
+            .insert(
+                format!("quote:payment:{}", hex::encode(record.request.payment_id)).as_bytes(),
+                record.execution_id.as_slice(),
+            )
+            .unwrap();
     }
 
-    fn has_quote(repo: &SledRepository, execution_id: [u8; 32]) -> bool {
-        repo.default_tree()
+    fn has_quote(repo: &NodeStore, execution_id: [u8; 32]) -> bool {
+        tree(repo, DEFAULT_TABLE)
             .contains_key(format!("quote:execution:{}", hex::encode(execution_id)).as_bytes())
             .unwrap()
     }
 
-    fn has_payment_index(repo: &SledRepository, payment_id: [u8; 32]) -> bool {
-        repo.default_tree()
+    fn has_payment_index(repo: &NodeStore, payment_id: [u8; 32]) -> bool {
+        tree(repo, DEFAULT_TABLE)
             .contains_key(format!("quote:payment:{}", hex::encode(payment_id)).as_bytes())
             .unwrap()
     }
 
-    fn outbox_record(
-        repo: &SledRepository,
-        execution_id: [u8; 32],
-    ) -> Option<PendingTransactionV2> {
-        let bytes = repo
-            .outbox_tree()
+    fn outbox_record(repo: &NodeStore, execution_id: [u8; 32]) -> Option<PendingTransactionV2> {
+        let bytes = tree(repo, OUTBOX_TABLE)
             .get(format!("outbox:{}", hex::encode(execution_id)).as_bytes())
             .unwrap()?;
         match decode_stored_transaction(&bytes).unwrap() {
@@ -763,7 +800,7 @@ mod tests {
     }
 
     async fn store_transaction(
-        repo: &SledRepository,
+        repo: &NodeStore,
         seed: u8,
         nonce: u64,
         status: TxStatusV2,
@@ -784,7 +821,7 @@ mod tests {
     #[tokio::test]
     async fn sweep_removes_only_finished_transactions_and_keeps_the_nonce_floor() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = SledRepository::new(dir.path()).unwrap();
+        let repo = NodeStore::new(dir.path()).unwrap();
         store_transaction(&repo, 1, 0, TxStatusV2::Mined, 0).await;
         store_transaction(&repo, 2, 1, TxStatusV2::Failed, 0).await;
         store_transaction(&repo, 3, 2, TxStatusV2::Mined, NOW - 200).await;
@@ -804,8 +841,7 @@ mod tests {
             assert!(outbox_record(&repo, [seed; 32]).is_none());
         }
         for nonce in [0, 1] {
-            assert!(!repo
-                .outbox_tree()
+            assert!(!tree(&repo, OUTBOX_TABLE)
                 .contains_key(format!("tx:{nonce}"))
                 .unwrap());
         }
@@ -817,7 +853,10 @@ mod tests {
             assert_eq!(kept.raw_signed_tx, vec![7; 64], "seed {seed}");
         }
         assert_eq!(
-            repo.default_tree().get(b"nonce:local").unwrap().unwrap(),
+            tree(&repo, DEFAULT_TABLE)
+                .get(b"nonce:local")
+                .unwrap()
+                .unwrap(),
             7_u64.to_le_bytes().as_slice()
         );
 
@@ -834,7 +873,7 @@ mod tests {
     #[tokio::test]
     async fn sweep_prunes_finished_quotes_after_valid_until_only() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = SledRepository::new(dir.path()).unwrap();
+        let repo = NodeStore::new(dir.path()).unwrap();
         let cases = [
             ([1; 32], QuoteStatusV2::Expired, NOW - 50, false),
             ([2; 32], QuoteStatusV2::Expired, NOW - 49, true),
@@ -850,7 +889,7 @@ mod tests {
             put_quote(&repo, &quote(*id, status.clone(), *valid_until));
         }
         // A payment index that points at another execution stays.
-        repo.default_tree()
+        tree(&repo, DEFAULT_TABLE)
             .insert(
                 format!("quote:payment:{}", hex::encode([1_u8; 32])).as_bytes(),
                 [42_u8; 32].as_slice(),
@@ -871,7 +910,7 @@ mod tests {
     #[tokio::test]
     async fn disabled_pruning_keeps_quotes_and_records() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = SledRepository::new(dir.path()).unwrap();
+        let repo = NodeStore::new(dir.path()).unwrap();
         store_transaction(&repo, 1, 0, TxStatusV2::Mined, 0).await;
         put_quote(&repo, &quote([2; 32], QuoteStatusV2::Expired, 0));
         let keep = RetentionPolicy {
@@ -888,7 +927,7 @@ mod tests {
     #[tokio::test]
     async fn batch_limit_spreads_work_over_passes() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = SledRepository::new(dir.path()).unwrap();
+        let repo = NodeStore::new(dir.path()).unwrap();
         for seed in 0..5_u8 {
             store_transaction(&repo, seed + 1, u64::from(seed), TxStatusV2::Mined, 0).await;
         }
@@ -900,7 +939,7 @@ mod tests {
         assert_eq!(first.changed(), 3);
         assert!(first.budget_exhausted);
         let mut passes = 1;
-        while !repo.outbox_tree().is_empty() {
+        while !tree(&repo, OUTBOX_TABLE).is_empty() {
             repo.apply_retention(limited, NOW).await.unwrap();
             passes += 1;
             assert!(passes < 10);
@@ -911,25 +950,25 @@ mod tests {
     #[tokio::test]
     async fn undecodable_records_are_left_in_place() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = SledRepository::new(dir.path()).unwrap();
-        repo.outbox_tree()
+        let repo = NodeStore::new(dir.path()).unwrap();
+        tree(&repo, OUTBOX_TABLE)
             .insert(b"tx:3", b"not json".as_slice())
             .unwrap();
-        repo.default_tree()
+        tree(&repo, DEFAULT_TABLE)
             .insert(b"quote:execution:aa", b"{}".as_slice())
             .unwrap();
         let report = repo.apply_retention(policy(), NOW).await.unwrap();
         assert_eq!(report.undecodable, 2);
-        assert!(repo.outbox_tree().contains_key(b"tx:3").unwrap());
+        assert!(tree(&repo, OUTBOX_TABLE).contains_key(b"tx:3").unwrap());
     }
 
     #[tokio::test]
     async fn record_counts_report_every_kind() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = SledRepository::new(dir.path()).unwrap();
+        let repo = NodeStore::new(dir.path()).unwrap();
         store_transaction(&repo, 1, 0, TxStatusV2::Submitted, 0).await;
         put_quote(&repo, &quote([2; 32], QuoteStatusV2::Outstanding, 0));
-        repo.default_tree()
+        tree(&repo, DEFAULT_TABLE)
             .insert(b"peer:0xabc", b"{}".as_slice())
             .unwrap();
         let counts = repo.record_counts().await.unwrap();

@@ -34,7 +34,7 @@ impl IMixStrategy for ZeroDelayMix {
 
 async fn spawn_node(id: usize) -> TestNode {
     let dir = TempDir::new().expect("tempdir");
-    let storage = Arc::new(nox_node::SledRepository::new(dir.path()).expect("sled"));
+    let storage = Arc::new(nox_node::NodeStore::new(dir.path()).expect("sled"));
     let bus = Arc::new(TokioEventBus::new(256));
 
     let mut rng = rand::thread_rng();

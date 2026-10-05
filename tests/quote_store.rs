@@ -2,7 +2,7 @@ use ethers::types::U256;
 use nox_core::{
     ExecutionQuoteV1, IStorageRepository, PaidQuoteRequestV2, QuoteStatusV2, StoredQuoteV2,
 };
-use nox_node::infra::storage::{QuoteStoreError, SledRepository};
+use nox_node::infra::storage::{NodeStore, QuoteStoreError};
 
 fn word(value: u64) -> [u8; 32] {
     let mut encoded = [0_u8; 32];
@@ -61,7 +61,7 @@ fn quote(id: u8, valid_until_unix: u64) -> StoredQuoteV2 {
     }
 }
 
-async fn counter(repository: &SledRepository, key: &[u8]) -> u64 {
+async fn counter(repository: &NodeStore, key: &[u8]) -> u64 {
     let bytes = repository.get(key).await.unwrap().unwrap();
     u64::from_le_bytes(bytes.try_into().unwrap())
 }
@@ -69,7 +69,7 @@ async fn counter(repository: &SledRepository, key: &[u8]) -> u64 {
 #[tokio::test]
 async fn terminal_release_is_symmetric_and_idempotent() {
     let directory = tempfile::tempdir().unwrap();
-    let repository = SledRepository::new(directory.path()).unwrap();
+    let repository = NodeStore::new(directory.path()).unwrap();
     let first = quote(1, 1_000);
     repository
         .create_quote_durably(&first, 1, 1_450_000, U256::from(100), 3_600, 100)
@@ -113,7 +113,7 @@ async fn terminal_release_is_symmetric_and_idempotent() {
 #[tokio::test]
 async fn expired_quotes_release_capacity_and_inflight_quotes_survive_reopen() {
     let directory = tempfile::tempdir().unwrap();
-    let repository = SledRepository::new(directory.path()).unwrap();
+    let repository = NodeStore::new(directory.path()).unwrap();
     let expired = quote(3, 100);
     repository
         .create_quote_durably(&expired, 1, 1_450_000, U256::from(100), 3_600, 90)
@@ -135,7 +135,7 @@ async fn expired_quotes_release_capacity_and_inflight_quotes_survive_reopen() {
         .unwrap();
     drop(repository);
 
-    let reopened = SledRepository::new(directory.path()).unwrap();
+    let reopened = NodeStore::new(directory.path()).unwrap();
     assert_eq!(
         reopened
             .load_quote(inflight.execution_id)
@@ -154,7 +154,7 @@ async fn expired_quotes_release_capacity_and_inflight_quotes_survive_reopen() {
 #[tokio::test]
 async fn reverted_receipt_trips_rolling_loss_at_exact_boundary() {
     let directory = tempfile::tempdir().unwrap();
-    let repository = SledRepository::new(directory.path()).unwrap();
+    let repository = NodeStore::new(directory.path()).unwrap();
     let first = quote(6, 1_000);
     repository
         .create_quote_durably(&first, 2, 2_900_000, U256::from(100), 3_600, 100)
@@ -182,7 +182,7 @@ async fn reverted_receipt_trips_rolling_loss_at_exact_boundary() {
 #[tokio::test]
 async fn quote_conflicts_and_expiry_are_typed() {
     let directory = tempfile::tempdir().unwrap();
-    let repository = SledRepository::new(directory.path()).unwrap();
+    let repository = NodeStore::new(directory.path()).unwrap();
     let reserved = quote(8, 1_000);
     repository
         .create_quote_durably(&reserved, 2, 2_900_000, U256::from(100), 3_600, 100)

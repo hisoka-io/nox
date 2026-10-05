@@ -32,7 +32,7 @@ use nox_node::services::network_manager::TopologyManager;
 use nox_node::services::relayer::RelayerService;
 use nox_node::services::response_packer::ResponsePacker;
 use nox_node::telemetry::metrics::MetricsService;
-use nox_node::{NoxConfig, SledRepository, TokioEventBus};
+use nox_node::{NodeStore, NoxConfig, TokioEventBus};
 #[cfg(feature = "hop-metrics")]
 use nox_sim::bench_common::HopBreakdown;
 use nox_sim::bench_common::{self, BenchResult, ScalePoint, ThroughputPoint};
@@ -282,7 +282,7 @@ struct BenchNode {
     bus_publisher: Arc<dyn IEventPublisher>,
     bus_subscriber: Arc<dyn IEventSubscriber>,
     // Keep alive -- dropping these tears down the node
-    _storage: Arc<SledRepository>,
+    _storage: Arc<NodeStore>,
     _db_dir: tempfile::TempDir,
 }
 
@@ -340,7 +340,7 @@ fn spawn_payload_watcher(subscriber: Arc<dyn IEventSubscriber>, registry: Payloa
 /// no cover traffic -- just Sphinx routing (`RelayerService`) + P2P + topology.
 async fn spawn_bench_node(id: usize, mix_delay_ms: f64, bus_capacity: usize) -> Result<BenchNode> {
     let dir = tempdir()?;
-    let db = Arc::new(SledRepository::new(dir.path())?);
+    let db = Arc::new(NodeStore::new(dir.path())?);
     let event_bus = TokioEventBus::new(bus_capacity);
     let pub_bus: Arc<dyn IEventPublisher> = Arc::new(event_bus.clone());
     let sub_bus: Arc<dyn IEventSubscriber> = Arc::new(event_bus.clone());

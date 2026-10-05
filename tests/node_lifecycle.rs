@@ -4,15 +4,15 @@
 use nox_core::events::NoxEvent;
 use nox_core::traits::interfaces::{IEventPublisher, IEventSubscriber};
 use nox_node::services::network_manager::TopologyManager;
-use nox_node::{SledRepository, TokioEventBus};
+use nox_node::{NodeStore, TokioEventBus};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
-fn make_storage() -> (Arc<SledRepository>, TempDir) {
+fn make_storage() -> (Arc<NodeStore>, TempDir) {
     let dir = TempDir::new().expect("tempdir");
-    let repo = Arc::new(SledRepository::new(dir.path()).expect("sled init"));
+    let repo = Arc::new(NodeStore::new(dir.path()).expect("sled init"));
     (repo, dir)
 }
 
@@ -33,7 +33,7 @@ fn registration_event(address: &str, role: u8) -> NoxEvent {
 }
 
 async fn spawn_topology_manager(
-    storage: Arc<SledRepository>,
+    storage: Arc<NodeStore>,
     bus: &Arc<TokioEventBus>,
     cancel: CancellationToken,
 ) -> Arc<TopologyManager> {

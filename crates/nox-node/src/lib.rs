@@ -13,5 +13,5 @@ pub mod telemetry;
 
 pub use config::{NodeRole, NoxConfig};
 pub use infra::event_bus::TokioEventBus;
-pub use infra::storage::SledRepository;
+pub use infra::storage::NodeStore;
 pub use node::NoxNode;

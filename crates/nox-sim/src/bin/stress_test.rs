@@ -20,7 +20,7 @@ use nox_node::services::exit::ExitService;
 use nox_node::services::mixing::PoissonMixStrategy;
 use nox_node::services::network_manager::TopologyManager;
 use nox_node::services::relayer::RelayerService;
-use nox_node::{NoxConfig, SledRepository, TokioEventBus};
+use nox_node::{NodeStore, NoxConfig, TokioEventBus};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519SecretKey};
 
 #[derive(Parser, Debug)]
@@ -44,7 +44,7 @@ struct VirtualNode {
     bus_subscriber: Arc<dyn IEventSubscriber>,
     _eth_address: Address,
     // Keep handles
-    _storage: Arc<SledRepository>,
+    _storage: Arc<NodeStore>,
     _db_dir: tempfile::TempDir,
 }
 
@@ -239,7 +239,7 @@ fn no_hop(v: &VirtualNode) -> PathHop {
 
 async fn spawn_mock_node(id: usize) -> anyhow::Result<VirtualNode> {
     let dir = tempdir()?;
-    let db = Arc::new(SledRepository::new(dir.path())?);
+    let db = Arc::new(NodeStore::new(dir.path())?);
     let event_bus = TokioEventBus::new(10000); // High capacity channel
     let pub_bus: Arc<dyn IEventPublisher> = Arc::new(event_bus.clone());
     let sub_bus: Arc<dyn IEventSubscriber> = Arc::new(event_bus.clone());

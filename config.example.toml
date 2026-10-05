@@ -264,8 +264,8 @@ terminal_transaction_retention_secs = 604800
 expired_quote_retention_secs = 600
 terminal_quote_retention_secs = 604800
 maintenance_batch_limit = 2000
-# Compact at startup when sled blob files exceed this many bytes. 0 = never.
-compact_on_start_blob_bytes = 268435456
+# Compact nox.redb at startup when it holds more free bytes than this.
+compact_on_start_fragmented_bytes = 67108864
 
 [[payment_adapters]]
 address = "0x0000000000000000000000000000000000000000"

@@ -1,5 +1,5 @@
-//! Periodic storage maintenance: retention sweep, record and blob gauges,
-//! flush. Runs on every node; on relays the sweep finds nothing to remove.
+//! Periodic storage maintenance: retention sweep, record and page-usage
+//! gauges. Runs on every node; on relays the sweep finds nothing to remove.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,12 +9,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::config::StorageConfig;
-use crate::infra::retention::{blob_usage, RetentionPolicy, RetentionReport};
-use crate::infra::storage::SledRepository;
+use crate::infra::retention::{RetentionPolicy, RetentionReport};
+use crate::infra::storage::NodeStore;
 use crate::telemetry::metrics::MetricsService;
 
 pub struct StorageMaintenance {
-    storage: Arc<SledRepository>,
+    storage: Arc<NodeStore>,
     metrics: MetricsService,
     policy: RetentionPolicy,
     interval: Duration,
@@ -27,11 +27,7 @@ fn gauge_value(value: u64) -> i64 {
 
 impl StorageMaintenance {
     #[must_use]
-    pub fn new(
-        storage: Arc<SledRepository>,
-        metrics: MetricsService,
-        config: &StorageConfig,
-    ) -> Self {
+    pub fn new(storage: Arc<NodeStore>, metrics: MetricsService, config: &StorageConfig) -> Self {
         Self {
             storage,
             metrics,
@@ -138,14 +134,13 @@ impl StorageMaintenance {
                 ])
                 .set(gauge_value(count.count));
         }
-        let path = self.storage.path().to_path_buf();
-        let (files, bytes) = tokio::task::spawn_blocking(move || blob_usage(&path))
-            .await
-            .map_err(|error| {
-                InfrastructureError::Database(format!("blob usage task failed: {error}"))
-            })??;
-        self.metrics.storage_blob_files.set(gauge_value(files));
-        self.metrics.storage_blob_bytes.set(gauge_value(bytes));
+        let stats = self.storage.stats().await?;
+        self.metrics
+            .storage_stored_bytes
+            .set(gauge_value(stats.stored_bytes));
+        self.metrics
+            .storage_fragmented_bytes
+            .set(gauge_value(stats.fragmented_bytes));
         Ok(())
     }
 }

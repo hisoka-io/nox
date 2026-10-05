@@ -94,8 +94,8 @@ pub struct MetricsService {
     pub storage_degraded: Gauge<i64, AtomicI64>,
     pub storage_size_on_disk_bytes: Gauge<i64, AtomicI64>,
     pub storage_records: Family<Vec<(String, String)>, Gauge<i64, AtomicI64>>,
-    pub storage_blob_files: Gauge<i64, AtomicI64>,
-    pub storage_blob_bytes: Gauge<i64, AtomicI64>,
+    pub storage_stored_bytes: Gauge<i64, AtomicI64>,
+    pub storage_fragmented_bytes: Gauge<i64, AtomicI64>,
     pub storage_retention_total: Family<Vec<(String, String)>, Counter>,
     pub storage_maintenance_errors_total: Counter,
     pub exit_payloads_dropped_total: Family<Vec<(String, String)>, Counter>,
@@ -568,7 +568,7 @@ impl MetricsService {
         let storage_size_on_disk_bytes = Gauge::<i64, AtomicI64>::default();
         registry.register(
             "nox_storage_size_on_disk_bytes",
-            "Bytes the sled database occupies on disk, log file plus blob files",
+            "Bytes the database file occupies on disk",
             storage_size_on_disk_bytes.clone(),
         );
 
@@ -579,18 +579,18 @@ impl MetricsService {
             storage_records.clone(),
         );
 
-        let storage_blob_files = Gauge::<i64, AtomicI64>::default();
+        let storage_stored_bytes = Gauge::<i64, AtomicI64>::default();
         registry.register(
-            "nox_storage_blob_files",
-            "Blob files in the sled blobs directory",
-            storage_blob_files.clone(),
+            "nox_storage_stored_bytes",
+            "Bytes of live keys and values in the database",
+            storage_stored_bytes.clone(),
         );
 
-        let storage_blob_bytes = Gauge::<i64, AtomicI64>::default();
+        let storage_fragmented_bytes = Gauge::<i64, AtomicI64>::default();
         registry.register(
-            "nox_storage_blob_bytes",
-            "Bytes in the sled blobs directory; growth without matching records points at leaked blobs (nox db compact)",
-            storage_blob_bytes.clone(),
+            "nox_storage_fragmented_bytes",
+            "Free bytes inside the database file; reused by later writes, returned to the filesystem by compaction",
+            storage_fragmented_bytes.clone(),
         );
 
         let storage_retention_total = Family::<Vec<(String, String)>, Counter>::default();
@@ -895,8 +895,8 @@ impl MetricsService {
             storage_degraded,
             storage_size_on_disk_bytes,
             storage_records,
-            storage_blob_files,
-            storage_blob_bytes,
+            storage_stored_bytes,
+            storage_fragmented_bytes,
             storage_retention_total,
             storage_maintenance_errors_total,
             exit_payloads_dropped_total,

@@ -3,8 +3,8 @@ use libp2p::{identity, noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder
 use nox_node::config::NetworkConfig;
 use nox_node::network::service::P2PService;
 use nox_node::services::network_manager::TopologyManager;
+use nox_node::NodeStore;
 use nox_node::NoxConfig;
-use nox_node::SledRepository;
 use nox_node::TokioEventBus;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +14,7 @@ use tokio::time::sleep;
 /// Helper to create a basic P2PService
 async fn create_service() -> (P2PService, Multiaddr) {
     let dir = tempdir().unwrap();
-    let db = Arc::new(SledRepository::new(dir.path()).unwrap());
+    let db = Arc::new(NodeStore::new(dir.path()).unwrap());
     let bus = TokioEventBus::new(100);
     let pub_bus = Arc::new(bus.clone());
     let sub_bus = Arc::new(bus.clone());

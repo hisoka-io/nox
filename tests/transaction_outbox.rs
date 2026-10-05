@@ -10,7 +10,7 @@ use nox_node::blockchain::{
     transaction_plan::TransactionPlan,
     tx_manager::{SubmitError, TransactionManager},
 };
-use nox_node::infra::storage::{decode_stored_transaction, CreateOutboxResult, SledRepository};
+use nox_node::infra::storage::{decode_stored_transaction, CreateOutboxResult, NodeStore};
 use nox_node::telemetry::metrics::MetricsService;
 use nox_node::NoxConfig;
 use std::process::Command;
@@ -160,7 +160,7 @@ fn quote_record(execution_id: ExecutionId) -> StoredQuoteV2 {
     }
 }
 
-async fn quote_counter(repository: &SledRepository, key: &[u8]) -> u64 {
+async fn quote_counter(repository: &NodeStore, key: &[u8]) -> u64 {
     let encoded = nox_core::IStorageRepository::get(repository, key)
         .await
         .unwrap()
@@ -232,7 +232,7 @@ async fn signed_record(executor: &ChainExecutor, status: TxStatusV2) -> PendingT
 #[tokio::test]
 async fn concurrent_execution_creation_has_one_durable_identity() {
     let directory = tempfile::tempdir().unwrap();
-    let repository = Arc::new(SledRepository::new(directory.path()).unwrap());
+    let repository = Arc::new(NodeStore::new(directory.path()).unwrap());
     let execution_id = [9; 32];
     let first_record = record(execution_id);
     let second_record = first_record.clone();
@@ -257,7 +257,7 @@ async fn concurrent_execution_creation_has_one_durable_identity() {
     );
 
     drop(repository);
-    let reopened = SledRepository::new(directory.path()).unwrap();
+    let reopened = NodeStore::new(directory.path()).unwrap();
     let stored = nox_core::IStorageRepository::scan(&reopened, b"tx:")
         .await
         .unwrap();
@@ -334,7 +334,7 @@ async fn outbox_crash_probe() {
         crash_record.prior_transaction_hashes = vec![format!("0x{}", "22".repeat(32))];
         crash_record.replacement_attempts = 1;
     }
-    let repository = SledRepository::new(database_path).unwrap();
+    let repository = NodeStore::new(database_path).unwrap();
     repository
         .create_outbox_durably(crash_record.execution_id, &crash_record, 1)
         .await
@@ -370,7 +370,7 @@ fn durable_crash_points_preserve_outbox() {
             .status()
             .unwrap();
         assert!(!status.success(), "crash probe must abort at {point}");
-        let repository = SledRepository::new(directory.path()).unwrap();
+        let repository = NodeStore::new(directory.path()).unwrap();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let records = runtime
             .block_on(nox_core::IStorageRepository::scan(&repository, b"tx:"))
@@ -403,7 +403,7 @@ fn durable_crash_points_preserve_outbox() {
 async fn concurrent_manager_submissions_allocate_one_nonce_and_broadcast() {
     let (_anvil, executor) = anvil_executor().await;
     let directory = tempfile::tempdir().unwrap();
-    let repository = Arc::new(SledRepository::new(directory.path()).unwrap());
+    let repository = Arc::new(NodeStore::new(directory.path()).unwrap());
     let manager = Arc::new(
         TransactionManager::new(
             executor.clone(),
@@ -449,7 +449,7 @@ async fn prepared_states_rebroadcast_the_stored_transaction_identity() {
     for prepared_status in [TxStatusV2::Prepared, TxStatusV2::ReplacementPrepared] {
         let (_anvil, executor) = anvil_executor().await;
         let directory = tempfile::tempdir().unwrap();
-        let repository = Arc::new(SledRepository::new(directory.path()).unwrap());
+        let repository = Arc::new(NodeStore::new(directory.path()).unwrap());
         let prepared = signed_record(executor.as_ref(), prepared_status.clone()).await;
         repository
             .create_outbox_durably(prepared.execution_id, &prepared, 1)
@@ -486,7 +486,7 @@ async fn prepared_states_rebroadcast_the_stored_transaction_identity() {
 async fn legacy_record_sets_nonce_floor_and_remains_monitor_only() {
     let (_anvil, executor) = anvil_executor().await;
     let directory = tempfile::tempdir().unwrap();
-    let repository = Arc::new(SledRepository::new(directory.path()).unwrap());
+    let repository = Arc::new(NodeStore::new(directory.path()).unwrap());
     let legacy = serde_json::json!({
         "id": "legacy-baseline",
         "to": "0x0000000000000000000000000000000000000001",
@@ -546,7 +546,7 @@ async fn legacy_record_sets_nonce_floor_and_remains_monitor_only() {
 async fn corrupt_v2_record_aborts_manager_startup() {
     let (_anvil, executor) = anvil_executor().await;
     let directory = tempfile::tempdir().unwrap();
-    let repository = Arc::new(SledRepository::new(directory.path()).unwrap());
+    let repository = Arc::new(NodeStore::new(directory.path()).unwrap());
     nox_core::IStorageRepository::put(
         repository.as_ref(),
         b"tx:0",
@@ -572,7 +572,7 @@ async fn replacement_case(maximum_fee_per_gas: U256) -> PendingTransactionV2 {
     config.eth_wallet_private_key = hex::encode(anvil.keys()[0].to_bytes());
     let executor = Arc::new(ChainExecutor::new(&config).await.unwrap());
     let directory = tempfile::tempdir().unwrap();
-    let repository = Arc::new(SledRepository::new(directory.path()).unwrap());
+    let repository = Arc::new(NodeStore::new(directory.path()).unwrap());
     let manager = TransactionManager::new(
         executor.clone(),
         repository.clone(),
@@ -654,7 +654,7 @@ async fn replacement_policy_applies_exact_step_and_never_exceeds_ceiling() {
 async fn capped_mined_transaction_reconciles_before_replacement() {
     let (_anvil, executor) = anvil_executor().await;
     let directory = tempfile::tempdir().unwrap();
-    let repository = Arc::new(SledRepository::new(directory.path()).unwrap());
+    let repository = Arc::new(NodeStore::new(directory.path()).unwrap());
     let manager = TransactionManager::new(
         executor.clone(),
         repository.clone(),
@@ -744,7 +744,7 @@ async fn broadcast_error_case(
         "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string();
     let executor = Arc::new(ChainExecutor::new(&config).await.unwrap());
     let directory = tempfile::tempdir().unwrap();
-    let repository = Arc::new(SledRepository::new(directory.path()).unwrap());
+    let repository = Arc::new(NodeStore::new(directory.path()).unwrap());
     let manager = TransactionManager::new(
         executor,
         repository.clone(),
@@ -829,7 +829,7 @@ async fn live_monitor_rebroadcasts_ambiguous_prepared_bytes_without_restart() {
         "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string();
     let executor = Arc::new(ChainExecutor::new(&config).await.unwrap());
     let directory = tempfile::tempdir().unwrap();
-    let repository = Arc::new(SledRepository::new(directory.path()).unwrap());
+    let repository = Arc::new(NodeStore::new(directory.path()).unwrap());
     let quote = quote_record([2; 32]);
     repository
         .create_quote_durably(&quote, 1, 100_000, U256::from(1), 3_600, 1)
@@ -950,7 +950,7 @@ async fn live_monitor_rebroadcasts_ambiguous_replacement_bytes_without_restart()
         "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string();
     let executor = Arc::new(ChainExecutor::new(&config).await.unwrap());
     let directory = tempfile::tempdir().unwrap();
-    let repository = Arc::new(SledRepository::new(directory.path()).unwrap());
+    let repository = Arc::new(NodeStore::new(directory.path()).unwrap());
     let manager = TransactionManager::new(
         executor.clone(),
         repository.clone(),
@@ -1057,7 +1057,7 @@ async fn legacy_pending_receipt_becomes_terminal_without_raw_broadcast() {
     config.eth_wallet_private_key = hex::encode(anvil.keys()[0].to_bytes());
     let executor = Arc::new(ChainExecutor::new(&config).await.unwrap());
     let directory = tempfile::tempdir().unwrap();
-    let repository = Arc::new(SledRepository::new(directory.path()).unwrap());
+    let repository = Arc::new(NodeStore::new(directory.path()).unwrap());
     let legacy = LegacyPendingTransaction {
         id: "legacy-mined".to_string(),
         to: format!("{:?}", Address::from_low_u64_be(91)),
@@ -1149,7 +1149,7 @@ async fn prepared_nonce_too_low_receipt_is_terminal_and_pruned() {
     config.eth_wallet_private_key = hex::encode(anvil.keys()[0].to_bytes());
     let recovery_executor = Arc::new(ChainExecutor::new(&config).await.unwrap());
     let directory = tempfile::tempdir().unwrap();
-    let repository = Arc::new(SledRepository::new(directory.path()).unwrap());
+    let repository = Arc::new(NodeStore::new(directory.path()).unwrap());
     let quote = quote_record(prepared.execution_id);
     repository
         .create_quote_durably(&quote, 1, 100_000, U256::from(1), 3_600, 1)
@@ -1224,7 +1224,7 @@ async fn external_wallet_transaction(executor: &ChainExecutor, nonce: u64) {
     wait_for_receipt(executor, hash).await;
 }
 
-async fn stored_v2(repository: &SledRepository, nonce: u64) -> PendingTransactionV2 {
+async fn stored_v2(repository: &NodeStore, nonce: u64) -> PendingTransactionV2 {
     let key = format!("tx:{nonce}");
     let bytes = nox_core::IStorageRepository::get(repository, key.as_bytes())
         .await
@@ -1240,7 +1240,7 @@ async fn stored_v2(repository: &SledRepository, nonce: u64) -> PendingTransactio
 async fn external_wallet_transaction_does_not_wedge_next_submission() {
     let (_anvil, executor) = anvil_executor().await;
     let directory = tempfile::tempdir().unwrap();
-    let repository = Arc::new(SledRepository::new(directory.path()).unwrap());
+    let repository = Arc::new(NodeStore::new(directory.path()).unwrap());
     let metrics = MetricsService::new();
     let manager = TransactionManager::new(
         executor.clone(),
@@ -1279,7 +1279,7 @@ async fn prepared_transaction_superseded_by_external_nonce_is_retired() {
     external_wallet_transaction(executor.as_ref(), prepared.nonce).await;
 
     let directory = tempfile::tempdir().unwrap();
-    let repository = Arc::new(SledRepository::new(directory.path()).unwrap());
+    let repository = Arc::new(NodeStore::new(directory.path()).unwrap());
     let quote = quote_record(prepared.execution_id);
     repository
         .create_quote_durably(&quote, 1, 100_000, U256::from(1), 3_600, 1)
@@ -1374,7 +1374,7 @@ async fn nonce_consumed_at_broadcast_releases_quote_and_unblocks() {
         "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string();
     let executor = Arc::new(ChainExecutor::new(&config).await.unwrap());
     let directory = tempfile::tempdir().unwrap();
-    let repository = Arc::new(SledRepository::new(directory.path()).unwrap());
+    let repository = Arc::new(NodeStore::new(directory.path()).unwrap());
     let execution_id = [4; 32];
     let quote = quote_record(execution_id);
     repository

@@ -2,7 +2,7 @@ use libp2p::multiaddr::Protocol;
 use nox_core::{IEventPublisher, IEventSubscriber, NoxEvent};
 use nox_node::network::service::P2PService;
 use nox_node::services::network_manager::TopologyManager;
-use nox_node::{NoxConfig, SledRepository, TokioEventBus};
+use nox_node::{NodeStore, NoxConfig, TokioEventBus};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -11,7 +11,7 @@ use tokio::sync::oneshot;
 #[tokio::test]
 async fn test_twin_node_handshake() -> anyhow::Result<()> {
     let dir_a = tempdir()?;
-    let db_a = Arc::new(SledRepository::new(dir_a.path())?);
+    let db_a = Arc::new(NodeStore::new(dir_a.path())?);
     let bus_a = TokioEventBus::new(100);
     let pub_a = Arc::new(bus_a.clone());
     let sub_a = Arc::new(bus_a.clone());
@@ -44,7 +44,7 @@ async fn test_twin_node_handshake() -> anyhow::Result<()> {
     .with_bind_signal(tx_a);
 
     let dir_b = tempdir()?;
-    let db_b = Arc::new(SledRepository::new(dir_b.path())?);
+    let db_b = Arc::new(NodeStore::new(dir_b.path())?);
     let bus_b = TokioEventBus::new(100);
     let pub_b = Arc::new(bus_b.clone());
     let sub_b = Arc::new(bus_b.clone());
@@ -127,7 +127,7 @@ struct TestPeer {
 
 async fn spawn_peer() -> anyhow::Result<TestPeer> {
     let dir = tempdir()?;
-    let db = Arc::new(SledRepository::new(dir.path())?);
+    let db = Arc::new(NodeStore::new(dir.path())?);
     let bus = TokioEventBus::new(1_024);
     let publisher = Arc::new(bus.clone());
     let subscriber = Arc::new(bus.clone());

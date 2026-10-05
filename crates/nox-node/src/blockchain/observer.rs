@@ -811,10 +811,10 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_writes_the_unsaved_cursor() {
-        use crate::infra::{event_bus::TokioEventBus, storage::SledRepository};
+        use crate::infra::{event_bus::TokioEventBus, storage::NodeStore};
 
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let storage = Arc::new(NodeStore::new(directory.path()).expect("storage"));
         let mut config = NoxConfig::default();
         config.eth_rpc_url = "http://127.0.0.1:1".to_string();
         config.chain_cursor_persist_interval_secs = 3_600;
