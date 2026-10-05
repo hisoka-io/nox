@@ -33,6 +33,10 @@ type RpcRateLimiter = RateLimiter<NotKeyed, InMemoryState, governor::clock::Defa
 
 const RPC_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const MAX_LOG_BLOCK_RANGE: u64 = 2000;
+/// `method` label for requests whose method is not on the allow-list. The
+/// method name comes from an anonymous client, so using it as a label would
+/// let anyone add metric series without limit.
+const OTHER_METHOD_LABEL: &str = "other";
 
 pub struct RpcHandler {
     _executor: Option<Arc<ChainExecutor>>,
@@ -185,6 +189,16 @@ impl RpcHandler {
         })
     }
 
+    /// Metric label for `method`: the method itself when it is on the
+    /// allow-list, otherwise [`OTHER_METHOD_LABEL`].
+    fn method_label(&self, method: &str) -> String {
+        if self.allowed_methods.contains(method) {
+            method.to_string()
+        } else {
+            OTHER_METHOD_LABEL.to_string()
+        }
+    }
+
     pub async fn handle_rpc_request(
         &self,
         request_id: u64,
@@ -203,7 +217,7 @@ impl RpcHandler {
             self.metrics
                 .rpc_requests_total
                 .get_or_create(&vec![
-                    ("method".into(), method.to_string()),
+                    ("method".into(), self.method_label(method)),
                     ("result".into(), "blocked".into()),
                 ])
                 .inc();
@@ -244,7 +258,7 @@ impl RpcHandler {
                         self.metrics
                             .rpc_requests_total
                             .get_or_create(&vec![
-                                ("method".into(), method.to_string()),
+                                ("method".into(), self.method_label(method)),
                                 ("result".into(), "blocked".into()),
                             ])
                             .inc();
@@ -305,7 +319,7 @@ impl RpcHandler {
         self.metrics
             .rpc_requests_total
             .get_or_create(&vec![
-                ("method".into(), method.to_string()),
+                ("method".into(), self.method_label(method)),
                 ("result".into(), result_label.into()),
             ])
             .inc();
@@ -1032,5 +1046,64 @@ mod tests {
         assert!(allowed.contains("eth_getBalance"));
         assert!(allowed.contains("eth_blockNumber"));
         assert_eq!(allowed.len(), 14);
+    }
+
+    fn simulation_handler(metrics: MetricsService) -> RpcHandler {
+        RpcHandler::new_simulation(
+            Arc::new(ResponsePacker::new()),
+            nox_core::NoopPublisher::arc(),
+            "http://127.0.0.1:1",
+            metrics,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn metric_label_keeps_allow_listed_methods_only() {
+        let handler = simulation_handler(MetricsService::new());
+        assert_eq!(handler.method_label("eth_call"), "eth_call");
+        assert_eq!(handler.method_label("eth_blockNumber"), "eth_blockNumber");
+        assert_eq!(
+            handler.method_label("x_attacker_chosen_1"),
+            OTHER_METHOD_LABEL
+        );
+        assert_eq!(handler.method_label(""), OTHER_METHOD_LABEL);
+    }
+
+    /// Client-chosen method names reach the user-URL and rate-limit paths
+    /// before the allow-list check. None of them may become a metric label.
+    #[tokio::test]
+    async fn client_method_names_never_become_metric_series() {
+        let metrics = MetricsService::new();
+        let handler = simulation_handler(metrics.clone());
+        for index in 0..50 {
+            let method = format!("x_attacker_chosen_{index}");
+            let _ = handler
+                .handle_rpc_request(
+                    index,
+                    &method,
+                    b"[]",
+                    Some("http://127.0.0.1:1/"),
+                    Vec::new(),
+                )
+                .await;
+        }
+        let mut encoded = String::new();
+        prometheus_client::encoding::text::encode(&mut encoded, &metrics.get_registry().lock())
+            .unwrap();
+        assert!(!encoded.contains("x_attacker_chosen"), "{encoded}");
+        let other_total: u64 = ["success", "error", "blocked"]
+            .into_iter()
+            .map(|result| {
+                metrics
+                    .rpc_requests_total
+                    .get_or_create(&vec![
+                        ("method".into(), OTHER_METHOD_LABEL.into()),
+                        ("result".into(), result.into()),
+                    ])
+                    .get()
+            })
+            .sum();
+        assert_eq!(other_total, 50);
     }
 }
