@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ethers::utils::keccak256;
 use nox_core::traits::InfrastructureError;
@@ -43,6 +43,12 @@ pub const STAGING_PREFIX: &str = "compact-staging-";
 
 /// Records copied per sled batch.
 const COPY_BATCH_RECORDS: usize = 512;
+
+/// Longest wait for sled's background work to release the database lock.
+const SLED_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Poll interval while waiting for the lock.
+const SLED_RELEASE_POLL: Duration = Duration::from_millis(20);
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompactionError {
@@ -324,6 +330,44 @@ pub struct CompactionReport {
     pub resumed: bool,
 }
 
+/// Waits until no sled instance holds the lock on `dir/db`.
+///
+/// Dropping a `sled::Db` does not stop its background work: log writes and
+/// snapshots run on sled's thread pool and can create `snap.*` files after
+/// the handle is gone. Each of those tasks holds sled's lock file open, so
+/// the lock is free only once all of them finished. Moving files before that
+/// could leave a snapshot of the old database next to the new one.
+pub(crate) fn wait_for_sled_release(dir: &Path, timeout: Duration) -> Result<(), CompactionError> {
+    let lock_path = dir.join("db");
+    let file = match fs::File::open(&lock_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error("open sled lock file", &lock_path, error)),
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match file.try_lock() {
+            Ok(()) => {
+                file.unlock()
+                    .map_err(|error| io_error("release sled lock", &lock_path, error))?;
+                return Ok(());
+            }
+            Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(SLED_RELEASE_POLL);
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(CompactionError::Open {
+                    path: dir.to_path_buf(),
+                    detail: format!("the sled lock is still held after {}s", timeout.as_secs()),
+                });
+            }
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(io_error("lock sled database", &lock_path, error));
+            }
+        }
+    }
+}
+
 fn open(path: &Path) -> Result<sled::Db, CompactionError> {
     sled::open(path).map_err(|error| CompactionError::Open {
         path: path.to_path_buf(),
@@ -359,16 +403,19 @@ fn finish_swap(
     let new_dir = staging.join("new");
     let old_dir = staging.join("old");
     if marker.phase == SwapPhase::MoveOld {
+        wait_for_sled_release(db_path, SLED_RELEASE_TIMEOUT)?;
         fs::create_dir_all(&old_dir).map_err(|error| io_error("create backup", &old_dir, error))?;
         move_entries(db_path, &old_dir, &sled_entries(db_path)?)?;
         marker.phase = SwapPhase::MoveNew;
         write_marker(db_path, &marker)?;
     }
+    wait_for_sled_release(&new_dir, SLED_RELEASE_TIMEOUT)?;
     move_entries(&new_dir, db_path, &sled_entries(&new_dir)?)?;
 
     let swapped = open(db_path)?;
     let digest = database_digest(&swapped)?;
     drop(swapped);
+    wait_for_sled_release(db_path, SLED_RELEASE_TIMEOUT)?;
     if hex::encode(digest.digest) != marker.digest || digest.records() != marker.records {
         return Err(CompactionError::Verification {
             detail: format!(
@@ -408,6 +455,15 @@ pub fn compact_database(
     db_path: &Path,
     options: CompactionOptions,
 ) -> Result<CompactionReport, CompactionError> {
+    compact_database_with_timeout(db_path, options, SLED_RELEASE_TIMEOUT)
+}
+
+/// [`compact_database`] with a custom wait for a busy database lock.
+fn compact_database_with_timeout(
+    db_path: &Path,
+    options: CompactionOptions,
+    lock_timeout: Duration,
+) -> Result<CompactionReport, CompactionError> {
     if !db_path.is_dir() {
         return Err(CompactionError::Missing(db_path.to_path_buf()));
     }
@@ -443,6 +499,7 @@ pub fn compact_database(
     }
     let new_dir = staging.join("new");
 
+    wait_for_sled_release(db_path, lock_timeout)?;
     let source = open(db_path)?;
     let copied = (|| {
         fs::create_dir_all(&new_dir)
@@ -517,10 +574,18 @@ mod tests {
         }
         db.open_tree(b"empty_tree").unwrap();
         db.flush().unwrap();
+        drop(outbox);
+        drop(db);
+        wait_for_sled_release(path, SLED_RELEASE_TIMEOUT).unwrap();
     }
 
     fn digest_of(path: &Path) -> DatabaseDigest {
-        database_digest(&sled::open(path).unwrap()).unwrap()
+        wait_for_sled_release(path, SLED_RELEASE_TIMEOUT).unwrap();
+        let db = sled::open(path).unwrap();
+        let digest = database_digest(&db).unwrap();
+        drop(db);
+        wait_for_sled_release(path, SLED_RELEASE_TIMEOUT).unwrap();
+        digest
     }
 
     #[test]
@@ -567,7 +632,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
         let running = sled::open(dir.path()).unwrap();
-        let error = compact_database(dir.path(), CompactionOptions::default()).unwrap_err();
+        let error = compact_database_with_timeout(
+            dir.path(),
+            CompactionOptions::default(),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
         assert!(matches!(error, CompactionError::Open { .. }), "{error}");
         drop(running);
         assert!(!dir.path().join(COMPACTION_MARKER).exists());
@@ -605,6 +675,8 @@ mod tests {
             let target = sled::open(&new_dir).unwrap();
             copy_database(&source, &target).unwrap();
         }
+        wait_for_sled_release(dir.path(), SLED_RELEASE_TIMEOUT).unwrap();
+        wait_for_sled_release(&new_dir, SLED_RELEASE_TIMEOUT).unwrap();
         write_marker(
             dir.path(),
             &Marker {
@@ -646,5 +718,35 @@ mod tests {
             compact_database(dir.path(), CompactionOptions::default()),
             Err(CompactionError::Marker { .. })
         ));
+    }
+
+    #[test]
+    fn lock_wait_returns_only_after_sled_is_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        populate(dir.path());
+        let running = sled::open(dir.path()).unwrap();
+        assert!(matches!(
+            wait_for_sled_release(dir.path(), Duration::from_millis(100)),
+            Err(CompactionError::Open { .. })
+        ));
+        drop(running);
+        wait_for_sled_release(dir.path(), SLED_RELEASE_TIMEOUT).unwrap();
+        assert!(sled::open(dir.path()).is_ok());
+        let empty = tempfile::tempdir().unwrap();
+        wait_for_sled_release(empty.path(), Duration::from_millis(1)).unwrap();
+    }
+
+    /// After a swap, no file written by the old database may land in
+    /// `db_path`: every snapshot there must belong to the new log.
+    #[test]
+    fn no_old_snapshot_reaches_the_swapped_directory() {
+        for _ in 0..5 {
+            let dir = tempfile::tempdir().unwrap();
+            populate(dir.path());
+            let before = digest_of(dir.path());
+            compact_database(dir.path(), CompactionOptions::default()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            assert_eq!(digest_of(dir.path()), before);
+        }
     }
 }
