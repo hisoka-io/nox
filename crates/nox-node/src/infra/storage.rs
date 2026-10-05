@@ -1449,6 +1449,67 @@ mod tests {
         .unwrap()
     }
 
+    /// The record exactly as rc.3 to rc.5 wrote it: `raw_signed_tx` as a
+    /// JSON array of numbers.
+    fn legacy_encoded_bytes(record: &PendingTransactionV2) -> Vec<u8> {
+        let mut value = serde_json::to_value(StoredTransactionV2 {
+            schema: 2,
+            transaction: record.clone(),
+        })
+        .unwrap();
+        value["transaction"]["raw_signed_tx"] = serde_json::Value::Array(
+            record
+                .raw_signed_tx
+                .iter()
+                .map(|byte| serde_json::Value::from(*byte))
+                .collect(),
+        );
+        serde_json::to_vec(&value).unwrap()
+    }
+
+    #[test]
+    fn records_written_by_older_nodes_still_decode() {
+        let record = large_v2_record(0x0c, 4);
+        let legacy = legacy_encoded_bytes(&record);
+        let DecodedTransaction::V2(decoded) = decode_stored_transaction(&legacy).unwrap() else {
+            panic!("expected a v2 record");
+        };
+        assert_eq!(decoded.raw_signed_tx, record.raw_signed_tx);
+        assert_eq!(decoded.tx_hash, record.tx_hash);
+
+        let compact = stored_bytes(&record);
+        let DecodedTransaction::V2(round_trip) = decode_stored_transaction(&compact).unwrap()
+        else {
+            panic!("expected a v2 record");
+        };
+        assert_eq!(round_trip.raw_signed_tx, record.raw_signed_tx);
+        assert!(
+            compact.len() * 10 < legacy.len() * 7,
+            "compact {} bytes, legacy {} bytes",
+            compact.len(),
+            legacy.len()
+        );
+
+        let legacy_record = serde_json::json!({
+            "id": "legacy",
+            "to": "0x1111111111111111111111111111111111111111",
+            "data": [1, 2, 3],
+            "nonce": 9,
+            "gas_limit": "21000",
+            "gas_price": "1",
+            "tx_hash": format!("0x{}", "ee".repeat(32)),
+            "first_sent_at": 1,
+            "last_update_at": 1,
+            "status": "Mined"
+        });
+        let DecodedTransaction::Legacy(decoded) =
+            decode_stored_transaction(&serde_json::to_vec(&legacy_record).unwrap()).unwrap()
+        else {
+            panic!("expected a legacy record");
+        };
+        assert_eq!(decoded.data, vec![1, 2, 3]);
+    }
+
     const CURSOR_KEY: &[u8] = b"chain_observer:last_block";
 
     #[tokio::test]
@@ -1646,7 +1707,7 @@ mod tests {
             let key = format!("outbox:{}", hex::encode(record.execution_id));
             legacy
                 .db
-                .insert(key.as_bytes(), stored_bytes(&record))
+                .insert(key.as_bytes(), legacy_encoded_bytes(&record))
                 .unwrap();
         }
         legacy.db.flush_async().await.unwrap();

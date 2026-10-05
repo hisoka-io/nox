@@ -32,6 +32,9 @@ pub struct PendingTransactionV2 {
     pub gas_limit: String,
     pub gas_price: String,
     pub maximum_fee_per_gas: String,
+    /// Stored as a `0x` hex string; records with a JSON number array still decode.
+    /// Empty once a terminal record has been slimmed.
+    #[serde(with = "crate::models::stored_bytes")]
     pub raw_signed_tx: Vec<u8>,
     pub tx_hash: String,
     pub prior_transaction_hashes: Vec<String>,
@@ -46,6 +49,9 @@ pub struct PendingTransactionV2 {
 pub struct LegacyPendingTransaction {
     pub id: String,
     pub to: String,
+    /// Stored as a `0x` hex string; records with a JSON number array still decode.
+    /// Empty once a terminal record has been slimmed.
+    #[serde(with = "crate::models::stored_bytes")]
     pub data: Vec<u8>,
     pub nonce: u64,
     pub gas_limit: String,
