@@ -168,9 +168,9 @@ anonymous clients, so each is capped; at a cap the oldest entry is dropped.
 ### `[storage]`
 
 A maintenance pass runs at startup and then every `maintenance_interval_secs`. It slims and
-deletes records the node never reads again, updates `nox_storage_records{tree,kind}`,
+deletes records whose work is complete, updates `nox_storage_records{tree,kind}`,
 `nox_storage_blob_files` and `nox_storage_blob_bytes`, and flushes the database. Records the
-node may still act on are kept: transactions that are not mined or failed, quotes that are
+node may still act on are kept: transactions until they are mined or failed, quotes that are
 outstanding, inflight or submitted, `nonce:local` and the quote counters. Removed records are
 counted in `nox_storage_retention_total{record,action}`.
 

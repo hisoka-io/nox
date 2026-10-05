@@ -255,7 +255,7 @@ entry_ttl_secs = 300
 
 # Database maintenance: mined/failed transactions and finished quotes are
 # slimmed, then deleted after their retention. Records the node may still act
-# on are never touched. See docs/configuration.md.
+# on are always kept. See docs/configuration.md.
 [storage]
 maintenance_interval_secs = 600
 prune_terminal_records = true
