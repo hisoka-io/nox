@@ -29,6 +29,28 @@ enum Command {
     /// Load and validate the config (file + `NOX__*` env), print the public
     /// identity it derives, and exit without starting the node.
     CheckConfig,
+    /// Offline database tools. Stop the node first: sled locks the database.
+    Db {
+        #[command(subcommand)]
+        action: DbCommand,
+        /// Database directory; defaults to `db_path` from the config.
+        #[arg(long, global = true)]
+        db_path: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DbCommand {
+    /// Copy every record into a fresh database, verify it, and swap it in.
+    /// Drops sled blob files that nothing references. Rerun it to finish a
+    /// compaction that was interrupted.
+    Compact {
+        /// Keep the old files under `<db_path>/compact-staging-<unix>/old`.
+        #[arg(long)]
+        keep_backup: bool,
+    },
+    /// Print database size, blob files and record counts per kind.
+    Stats,
 }
 
 #[tokio::main]
@@ -39,6 +61,9 @@ async fn main() -> anyhow::Result<()> {
     match args.command {
         Some(Command::Keygen) => return run_keygen(),
         Some(Command::CheckConfig) => return run_check_config(&args.config),
+        Some(Command::Db { action, db_path }) => {
+            return run_db_command(&args.config, db_path, action).await
+        }
         None => {}
     }
 
@@ -131,6 +156,69 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Prints only public values; private keys are parsed but never echoed.
+fn resolve_db_path(config_path: &str, db_path: Option<String>) -> anyhow::Result<String> {
+    if let Some(path) = db_path {
+        return Ok(path);
+    }
+    if !std::path::Path::new(config_path).is_file() {
+        anyhow::bail!("config file {config_path} not found; pass --db-path or --config");
+    }
+    let config = NoxConfig::load(config_path).map_err(|e| anyhow::anyhow!("Config error: {e}"))?;
+    Ok(config.db_path.clone())
+}
+
+async fn run_db_command(
+    config_path: &str,
+    db_path: Option<String>,
+    action: DbCommand,
+) -> anyhow::Result<()> {
+    use nox_node::infra::compaction::{compact_database, sled_files_size, CompactionOptions};
+    use nox_node::infra::retention::blob_usage;
+    use nox_node::infra::storage::SledRepository;
+
+    let db_path = resolve_db_path(config_path, db_path)?;
+    let path = std::path::Path::new(&db_path);
+    let interrupted = path
+        .join(nox_node::infra::compaction::COMPACTION_MARKER)
+        .is_file();
+    if !interrupted && !path.join("conf").is_file() && !path.join("db").is_file() {
+        anyhow::bail!("no sled database at {db_path}");
+    }
+    match action {
+        DbCommand::Compact { keep_backup } => {
+            let report = compact_database(path, CompactionOptions { keep_backup })?;
+            println!("db_path: {db_path}");
+            if report.resumed {
+                println!("finished an interrupted compaction");
+            }
+            println!("trees: {}", report.trees);
+            println!("records: {}", report.records);
+            println!("bytes_before: {}", report.bytes_before);
+            println!("bytes_after: {}", report.bytes_after);
+            match report.backup {
+                Some(backup) => println!("backup: {}", backup.display()),
+                None => println!("backup: removed after verification"),
+            }
+        }
+        DbCommand::Stats => {
+            let (blob_files, blob_bytes) = blob_usage(path)?;
+            let sled_bytes = sled_files_size(path)?;
+            let repository = SledRepository::new(path)?;
+            println!("db_path: {db_path}");
+            println!("sled_bytes: {sled_bytes}");
+            println!("blob_files: {blob_files}");
+            println!("blob_bytes: {blob_bytes}");
+            for count in repository.record_counts().await? {
+                println!(
+                    "records{{tree={},kind={}}}: {}",
+                    count.tree, count.kind, count.count
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_check_config(config_path: &str) -> anyhow::Result<()> {
     use ethers::signers::{LocalWallet, Signer};
     use x25519_dalek::PublicKey as X25519PublicKey;

@@ -93,6 +93,11 @@ pub struct MetricsService {
     pub quote_rolling_loss_gwei: Gauge<i64, AtomicI64>,
     pub storage_degraded: Gauge<i64, AtomicI64>,
     pub storage_size_on_disk_bytes: Gauge<i64, AtomicI64>,
+    pub storage_records: Family<Vec<(String, String)>, Gauge<i64, AtomicI64>>,
+    pub storage_blob_files: Gauge<i64, AtomicI64>,
+    pub storage_blob_bytes: Gauge<i64, AtomicI64>,
+    pub storage_retention_total: Family<Vec<(String, String)>, Counter>,
+    pub storage_maintenance_errors_total: Counter,
     pub exit_payloads_dropped_total: Family<Vec<(String, String)>, Counter>,
     pub exit_lane_inflight: Family<Vec<(String, String)>, Gauge<i64, AtomicI64>>,
     pub event_bus_subscriber_lag_total: Family<Vec<(String, String)>, Counter>,
@@ -567,6 +572,41 @@ impl MetricsService {
             storage_size_on_disk_bytes.clone(),
         );
 
+        let storage_records = Family::<Vec<(String, String)>, Gauge<i64, AtomicI64>>::default();
+        registry.register(
+            "nox_storage_records",
+            "Records in the node database, by sled tree and key kind",
+            storage_records.clone(),
+        );
+
+        let storage_blob_files = Gauge::<i64, AtomicI64>::default();
+        registry.register(
+            "nox_storage_blob_files",
+            "Blob files in the sled blobs directory",
+            storage_blob_files.clone(),
+        );
+
+        let storage_blob_bytes = Gauge::<i64, AtomicI64>::default();
+        registry.register(
+            "nox_storage_blob_bytes",
+            "Bytes in the sled blobs directory; growth without matching records points at leaked blobs (nox db compact)",
+            storage_blob_bytes.clone(),
+        );
+
+        let storage_retention_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_storage_retention",
+            "Terminal records slimmed or pruned by storage maintenance, by record and action",
+            storage_retention_total.clone(),
+        );
+
+        let storage_maintenance_errors_total = Counter::default();
+        registry.register(
+            "nox_storage_maintenance_errors",
+            "Storage maintenance passes that failed",
+            storage_maintenance_errors_total.clone(),
+        );
+
         let exit_payloads_dropped_total = Family::<Vec<(String, String)>, Counter>::default();
         registry.register(
             "nox_exit_payloads_dropped",
@@ -854,6 +894,11 @@ impl MetricsService {
             quote_rolling_loss_gwei,
             storage_degraded,
             storage_size_on_disk_bytes,
+            storage_records,
+            storage_blob_files,
+            storage_blob_bytes,
+            storage_retention_total,
+            storage_maintenance_errors_total,
             exit_payloads_dropped_total,
             exit_lane_inflight,
             event_bus_subscriber_lag_total,

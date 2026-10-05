@@ -5,6 +5,35 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- Exit transaction records are written in a smaller encoding (signed bytes as hex instead of a JSON number
+  array). This release reads both encodings. Rollback to rc.5 uses the data snapshot taken before the upgrade, so
+  snapshot `db_path` before the first start of each exit.
+- The first maintenance pass after the upgrade slims and removes finished records, and a node whose sled blob
+  files exceed 256 MiB compacts its database once at startup (`[storage] compact_on_start_blob_bytes`).
+
+### Added
+
+- `[storage]` maintenance on every node: mined and failed exit transactions drop their signed bytes and are
+  deleted after 7 days, expired quotes after 10 minutes, finished quotes after 7 days. Transactions that may still
+  be rebroadcast or reconciled, open quotes, the nonce floor and the quote counters are always kept.
+- `nox db compact` (offline, verified copy into a fresh database) and `nox db stats`. Compaction also runs at
+  startup when blob files pass `compact_on_start_blob_bytes`; an interrupted swap blocks startup until the command
+  finishes it.
+- Metrics `nox_storage_records{tree,kind}`, `nox_storage_blob_files`, `nox_storage_blob_bytes`,
+  `nox_storage_retention_total{record,action}` and `nox_storage_maintenance_errors_total`.
+- `[exit_replenishment]` caps for partial responses that wait for SURBs.
+
+### Fixed
+
+- The exit's SURB replenishment stores now enforce entry, byte, per-request SURB and age limits on every
+  insert (previously an entry count checked once a minute).
+- `nox_rpc_requests_total` labels methods outside the allow-list as `other`, keeping the metric series set
+  fixed regardless of client-supplied method names.
+- Replay tags written through the sled repository live in their own tree, so pruning them leaves other
+  eight-byte values such as the chain observer cursor and the nonce floor intact.
+
 ## [0.4.0-rc.5] - 2026-10-04
 
 ### Upgrade notes

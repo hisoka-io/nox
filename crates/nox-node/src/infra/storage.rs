@@ -3,7 +3,7 @@ use ethers::types::U256;
 use sled::transaction::{ConflictableTransactionError, TransactionError, Transactional};
 use sled::{Db, Tree};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -112,6 +112,12 @@ pub type DegradedFlag = Arc<AtomicBool>;
 /// so every rewrite of it produced a new blob file. A dedicated tree keeps
 /// those records in leaves that change only when a transaction does.
 pub const OUTBOX_TREE: &[u8] = b"exit_outbox";
+
+/// Name of the sled tree holding replay tags written through
+/// [`IReplayProtection`]. Kept apart from the default tree so pruning expired
+/// tags can never touch other eight-byte values such as the nonce floor or the
+/// chain observer cursor.
+pub const REPLAY_TREE: &[u8] = b"replay_tags";
 
 /// Key prefixes stored in [`OUTBOX_TREE`] instead of the default tree.
 pub const OUTBOX_KEY_PREFIXES: [&[u8]; 2] = [b"outbox:", b"tx:"];
@@ -234,8 +240,12 @@ pub fn decode_stored_transaction(bytes: &[u8]) -> Result<DecodedTransaction, Inf
 #[derive(Clone)]
 pub struct SledRepository {
     db: Db,
+    /// Directory sled was opened in.
+    path: PathBuf,
     /// [`OUTBOX_TREE`]: every `outbox:*` and `tx:*` record.
     outbox: Tree,
+    /// [`REPLAY_TREE`]: replay tags and their expiry.
+    replay: Tree,
     /// Set once an IO error survives every retry. sled cannot rebuild its
     /// allocator in-process after a disk-full condition, so once this latches the
     /// node needs a restart to recover; surfacing it stops the failure from being
@@ -251,6 +261,7 @@ pub struct SledRepository {
 impl SledRepository {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, InfrastructureError> {
         let path = path.as_ref();
+        crate::infra::compaction::ensure_no_interrupted_compaction(path)?;
         let db = sled::open(path).map_err(|e| {
             InfrastructureError::Database(format!("open sled at {}: {e}", path.display()))
         })?;
@@ -258,6 +269,12 @@ impl SledRepository {
             InfrastructureError::Database(format!(
                 "open sled tree {}: {e}",
                 String::from_utf8_lossy(OUTBOX_TREE)
+            ))
+        })?;
+        let replay = db.open_tree(REPLAY_TREE).map_err(|e| {
+            InfrastructureError::Database(format!(
+                "open sled tree {}: {e}",
+                String::from_utf8_lossy(REPLAY_TREE)
             ))
         })?;
         let migration = migrate_outbox_records(&db, &outbox)?;
@@ -275,7 +292,9 @@ impl SledRepository {
         }
         Ok(Self {
             db,
+            path: path.to_path_buf(),
             outbox,
+            replay,
             degraded: Arc::new(AtomicBool::new(false)),
             outbox_degraded: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -975,6 +994,38 @@ impl SledRepository {
         .map_err(|e| InfrastructureError::Database(format!("spawn_blocking join error: {e}")))?
     }
 
+    /// Directory the database lives in.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn default_tree(&self) -> &Tree {
+        &self.db
+    }
+
+    pub(crate) fn outbox_tree(&self) -> &Tree {
+        &self.outbox
+    }
+
+    pub(crate) fn replay_tree(&self) -> &Tree {
+        &self.replay
+    }
+
+    /// True once a durable outbox write failed; maintenance leaves the outbox
+    /// alone until the node is restarted.
+    pub(crate) fn is_outbox_degraded(&self) -> bool {
+        self.outbox_degraded.load(Ordering::SeqCst)
+    }
+
+    /// Flushes to disk and latches the degraded flag on failure.
+    pub(crate) async fn flush_durably(
+        &self,
+        operation: &'static str,
+    ) -> Result<(), InfrastructureError> {
+        self.durable_flush(operation).await
+    }
+
     /// Tree that stores `key`.
     fn tree_for(&self, key: &[u8]) -> &Tree {
         if is_outbox_key(key) {
@@ -1099,15 +1150,12 @@ impl IReplayProtection for SledRepository {
         ttl_seconds: u64,
     ) -> Result<bool, InfrastructureError> {
         // Expiry stored in milliseconds to avoid rounding issues
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_millis() as u64;
-        let expiry = now + (ttl_seconds * 1000);
+        let now = unix_millis();
+        let expiry = now.saturating_add(ttl_seconds.saturating_mul(1000));
         let expiry_bytes = expiry.to_be_bytes();
 
         if let Some(existing) = self
-            .db
+            .replay
             .get(tag)
             .map_err(|e| InfrastructureError::Database(e.to_string()))?
         {
@@ -1116,9 +1164,7 @@ impl IReplayProtection for SledRepository {
                     u64::from_be_bytes(existing.as_ref().try_into().map_err(|_| {
                         InfrastructureError::Database("Invalid expiry bytes".into())
                     })?);
-                if existing_expiry < now {
-                    // Expired, fall through to overwrite
-                } else {
+                if existing_expiry >= now {
                     return Ok(true);
                 }
             } else {
@@ -1126,38 +1172,42 @@ impl IReplayProtection for SledRepository {
             }
         }
 
-        self.db
+        self.replay
             .insert(tag, &expiry_bytes)
             .map_err(|e| InfrastructureError::Database(e.to_string()))?;
 
         Ok(false)
     }
 
+    /// Removes expired replay tags. Only [`REPLAY_TREE`] is scanned, so the
+    /// nonce floor, quote counters and chain cursor (also eight-byte values)
+    /// are never mistaken for expired tags.
     async fn prune_expired(&self) -> Result<usize, InfrastructureError> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_millis() as u64;
+        let now = unix_millis();
         let mut count = 0;
 
-        for item in self.db.iter() {
+        for item in &self.replay {
             let (key, value) = item.map_err(|e| InfrastructureError::Database(e.to_string()))?;
-
-            if value.len() == 8 {
-                if let Ok(bytes) = value.as_ref().try_into() {
-                    let expiry = u64::from_be_bytes(bytes);
-                    if expiry < now {
-                        self.db
-                            .remove(key)
-                            .map_err(|e| InfrastructureError::Database(e.to_string()))?;
-                        count += 1;
-                    }
-                }
+            let expired = <[u8; 8]>::try_from(value.as_ref())
+                .is_ok_and(|bytes| u64::from_be_bytes(bytes) < now);
+            if expired {
+                self.replay
+                    .remove(key)
+                    .map_err(|e| InfrastructureError::Database(e.to_string()))?;
+                count += 1;
             }
         }
 
         Ok(count)
     }
+}
+
+fn unix_millis() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -1253,8 +1303,33 @@ mod tests {
         let pruned = repo.prune_expired().await.unwrap();
         assert_eq!(pruned, 1, "Should prune exactly one expired item");
 
-        assert!(!repo.exists(b"old").await.unwrap());
-        assert!(repo.exists(b"fresh").await.unwrap());
+        assert!(!repo.replay.contains_key(b"old").unwrap());
+        assert!(repo.replay.contains_key(b"fresh").unwrap());
+    }
+
+    /// Pruning replay tags used to scan the default tree and delete any
+    /// eight-byte value that read as an expired timestamp, which matched the
+    /// chain cursor and zero-valued counters.
+    #[tokio::test]
+    async fn replay_pruning_never_touches_other_eight_byte_values() {
+        let repo = test_repo();
+        repo.put(CURSOR_KEY, &315_000_000_u64.to_be_bytes())
+            .await
+            .unwrap();
+        repo.put(b"nonce:local", &0_u64.to_le_bytes())
+            .await
+            .unwrap();
+        repo.put(b"quote:outstanding", &0_u64.to_le_bytes())
+            .await
+            .unwrap();
+        repo.check_and_tag(b"expired-tag", 0).await.unwrap();
+        sleep(Duration::from_millis(1_100)).await;
+
+        assert_eq!(repo.prune_expired().await.unwrap(), 1);
+        for key in [CURSOR_KEY, b"nonce:local".as_slice(), b"quote:outstanding"] {
+            assert!(repo.exists(key).await.unwrap(), "{key:?} was pruned");
+        }
+        assert!(!repo.db.contains_key(b"expired-tag").unwrap());
     }
 
     fn test_repo() -> SledRepository {
@@ -1447,6 +1522,67 @@ mod tests {
             transaction: record.clone(),
         })
         .unwrap()
+    }
+
+    /// The record exactly as rc.3 to rc.5 wrote it: `raw_signed_tx` as a
+    /// JSON array of numbers.
+    fn legacy_encoded_bytes(record: &PendingTransactionV2) -> Vec<u8> {
+        let mut value = serde_json::to_value(StoredTransactionV2 {
+            schema: 2,
+            transaction: record.clone(),
+        })
+        .unwrap();
+        value["transaction"]["raw_signed_tx"] = serde_json::Value::Array(
+            record
+                .raw_signed_tx
+                .iter()
+                .map(|byte| serde_json::Value::from(*byte))
+                .collect(),
+        );
+        serde_json::to_vec(&value).unwrap()
+    }
+
+    #[test]
+    fn records_written_by_older_nodes_still_decode() {
+        let record = large_v2_record(0x0c, 4);
+        let legacy = legacy_encoded_bytes(&record);
+        let DecodedTransaction::V2(decoded) = decode_stored_transaction(&legacy).unwrap() else {
+            panic!("expected a v2 record");
+        };
+        assert_eq!(decoded.raw_signed_tx, record.raw_signed_tx);
+        assert_eq!(decoded.tx_hash, record.tx_hash);
+
+        let compact = stored_bytes(&record);
+        let DecodedTransaction::V2(round_trip) = decode_stored_transaction(&compact).unwrap()
+        else {
+            panic!("expected a v2 record");
+        };
+        assert_eq!(round_trip.raw_signed_tx, record.raw_signed_tx);
+        assert!(
+            compact.len() * 10 < legacy.len() * 7,
+            "compact {} bytes, legacy {} bytes",
+            compact.len(),
+            legacy.len()
+        );
+
+        let legacy_record = serde_json::json!({
+            "id": "legacy",
+            "to": "0x1111111111111111111111111111111111111111",
+            "data": [1, 2, 3],
+            "nonce": 9,
+            "gas_limit": "21000",
+            "gas_price": "1",
+            "tx_hash": format!("0x{}", "ee".repeat(32)),
+            "first_sent_at": 1,
+            "last_update_at": 1,
+            "status": "Mined"
+        });
+        let DecodedTransaction::Legacy(decoded) =
+            decode_stored_transaction(&serde_json::to_vec(&legacy_record).unwrap()).unwrap()
+        else {
+            panic!("expected a legacy record");
+        };
+        assert_eq!(decoded.data, vec![1, 2, 3]);
     }
 
     const CURSOR_KEY: &[u8] = b"chain_observer:last_block";
@@ -1646,7 +1782,7 @@ mod tests {
             let key = format!("outbox:{}", hex::encode(record.execution_id));
             legacy
                 .db
-                .insert(key.as_bytes(), stored_bytes(&record))
+                .insert(key.as_bytes(), legacy_encoded_bytes(&record))
                 .unwrap();
         }
         legacy.db.flush_async().await.unwrap();

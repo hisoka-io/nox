@@ -75,6 +75,7 @@ impl NoxNode {
         let mut join_set = JoinSet::new();
 
         info!("Initializing Persistence Layer at {}...", config.db_path);
+        Self::compact_on_start(&config);
         let db = match SledRepository::new(&config.db_path) {
             Ok(d) => Arc::new(d),
             Err(e) => {
@@ -435,24 +436,14 @@ impl NoxNode {
         }
 
         {
-            let compaction_db = db.clone();
-            let compaction_shutdown = shutdown_token.clone();
+            let maintenance = crate::infra::maintenance::StorageMaintenance::new(
+                db.clone(),
+                metrics_service.clone(),
+                &config,
+            )
+            .with_cancel_token(shutdown_token.clone());
             join_set.spawn(async move {
-                const COMPACTION_INTERVAL: std::time::Duration = std::time::Duration::from_hours(6);
-                loop {
-                    tokio::select! {
-                        () = tokio::time::sleep(COMPACTION_INTERVAL) => {
-                            if let Err(e) = compaction_db.compact().await {
-                                warn!("Periodic sled flush failed: {e}");
-                            } else {
-                                info!("Periodic sled flush completed.");
-                            }
-                        }
-                        () = compaction_shutdown.cancelled() => {
-                            break;
-                        }
-                    }
-                }
+                maintenance.run().await;
             });
         }
 
@@ -471,8 +462,11 @@ impl NoxNode {
                     .with_metrics(metrics_service.clone())
                     .with_reply_v2(config.relayer.surb_formats.v2_enabled()),
             );
-            let pending_map = ExitService::new_pending_map();
-            let surb_acc = ExitService::new_surb_accumulator();
+            let replenishment_limits = crate::services::replenishment::ReplenishmentLimits::from(
+                &config.exit_replenishment,
+            );
+            let pending_map = ExitService::new_pending_map_with(replenishment_limits);
+            let surb_acc = ExitService::new_surb_accumulator_with(replenishment_limits);
             let stash = ExitService::make_stash_closure(
                 pending_map.clone(),
                 surb_acc.clone(),
@@ -612,8 +606,11 @@ impl NoxNode {
                     .with_metrics(metrics_service.clone())
                     .with_reply_v2(config.relayer.surb_formats.v2_enabled()),
             );
-            let pending_map = ExitService::new_pending_map();
-            let surb_acc = ExitService::new_surb_accumulator();
+            let replenishment_limits = crate::services::replenishment::ReplenishmentLimits::from(
+                &config.exit_replenishment,
+            );
+            let pending_map = ExitService::new_pending_map_with(replenishment_limits);
+            let surb_acc = ExitService::new_surb_accumulator_with(replenishment_limits);
             let stash = ExitService::make_stash_closure(
                 pending_map.clone(),
                 surb_acc.clone(),
@@ -835,6 +832,45 @@ impl NoxNode {
             "All {} seed URLs failed. Last: {last_error}",
             seed_urls.len()
         ))
+    }
+
+    /// Compacts the database before it is opened when sled's blob files
+    /// exceed `storage.compact_on_start_blob_bytes`. A failure before the swap
+    /// leaves the database as it was and startup continues; a failure during
+    /// the swap leaves the compaction marker, and opening the database then
+    /// fails with instructions.
+    fn compact_on_start(config: &NoxConfig) {
+        let threshold = config.storage.compact_on_start_blob_bytes;
+        if threshold == 0 {
+            return;
+        }
+        let path = std::path::Path::new(&config.db_path);
+        let blob_bytes = match crate::infra::retention::blob_usage(path) {
+            Ok((_, bytes)) => bytes,
+            Err(e) => {
+                warn!(error = %e, "Cannot measure sled blob files; skipping startup compaction");
+                return;
+            }
+        };
+        if blob_bytes <= threshold {
+            return;
+        }
+        info!(
+            blob_bytes,
+            threshold, "sled blob files exceed storage.compact_on_start_blob_bytes; compacting"
+        );
+        match crate::infra::compaction::compact_database(
+            path,
+            crate::infra::compaction::CompactionOptions { keep_backup: false },
+        ) {
+            Ok(report) => info!(
+                bytes_before = report.bytes_before,
+                bytes_after = report.bytes_after,
+                records = report.records,
+                "Startup compaction finished"
+            ),
+            Err(e) => error!(error = %e, "Startup compaction failed"),
+        }
     }
 
     pub fn spawn_metrics(
