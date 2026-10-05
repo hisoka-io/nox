@@ -263,6 +263,8 @@ slim_terminal_transactions_after_secs = 0
 terminal_transaction_retention_secs = 604800
 expired_quote_retention_secs = 600
 terminal_quote_retention_secs = 604800
+# Most transaction records one pass changes. Quotes get their own budget,
+# derived from quote_max_outstanding and quote_ttl_secs (at least this value).
 maintenance_batch_limit = 2000
 # Compact at startup when sled blob files exceed this many bytes. 0 = never.
 compact_on_start_blob_bytes = 268435456

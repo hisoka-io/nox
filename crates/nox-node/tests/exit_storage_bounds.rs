@@ -16,15 +16,17 @@
 use std::path::Path;
 
 use ethers::types::U256;
+use nox_core::traits::IStorageRepository;
 use nox_core::{
     ExecutionQuoteV1, PaidQuoteRequestV2, PendingTransactionV2, QuoteStatusV2, StoredQuoteV2,
-    TxStatusV2,
+    StoredTransactionV2, TxStatusV2,
 };
+use nox_node::config::StorageConfig;
 use nox_node::infra::compaction::{compact_database, sled_files_size, CompactionOptions};
 use nox_node::infra::retention::{
     blob_usage, RetentionPolicy, TREE_LABEL_DEFAULT, TREE_LABEL_OUTBOX,
 };
-use nox_node::infra::storage::{CreateOutboxResult, SledRepository};
+use nox_node::infra::storage::{CreateOutboxResult, QuoteStoreError, SledRepository};
 
 const EXECUTIONS: u64 = 3_000;
 /// Simulated seconds between executions.
@@ -49,6 +51,7 @@ fn policy() -> RetentionPolicy {
         expired_quote_retention_secs: 300,
         terminal_quote_retention_secs: 3_600,
         batch_limit: 100_000,
+        quote_batch_limit: 100_000,
     }
 }
 
@@ -298,7 +301,7 @@ async fn exit_storage_stays_bounded_over_thousands_of_paid_executions() {
     assert!(late_peak < 64 * 1024 * 1024, "late peak {late_peak} bytes");
 
     // Nonce recovery state survives every restart and prune.
-    let floor = nox_core::traits::IStorageRepository::get(&repo, b"nonce:local")
+    let floor = IStorageRepository::get(&repo, b"nonce:local")
         .await
         .expect("nonce floor")
         .expect("nonce floor present");
@@ -306,4 +309,190 @@ async fn exit_storage_stays_bounded_over_thousands_of_paid_executions() {
     let counters = repo.quote_counters().await.expect("counters");
     assert_eq!(counters.pending_sponsored_gas, 0);
     assert_eq!(counters.outstanding, 0);
+}
+
+/// Quote settings of the example exit config (`config.example.toml`).
+const EXAMPLE_QUOTE_TTL_SECS: u64 = 30;
+const EXAMPLE_QUOTE_MAX_OUTSTANDING: u32 = 256;
+/// Maintenance passes in the adversarial run (80 simulated minutes).
+const ADVERSARIAL_PASSES: u64 = 8;
+/// Mined transactions per pass: slimming both keys of each takes more than
+/// the default `maintenance_batch_limit` of 2,000.
+const PAID_EXECUTIONS_PER_PASS: u64 = 1_100;
+
+/// Writes a mined transaction (outbox and per-nonce key) without a flush per
+/// record; retention reads the same bytes `persist_v2_durably` writes.
+async fn store_mined(repo: &SledRepository, index: u64, now: u64) {
+    let execution_id = id(4, index);
+    let record = PendingTransactionV2 {
+        execution_id,
+        to: "0x1111111111111111111111111111111111111111".to_string(),
+        data_hash: [9; 32],
+        nonce: index,
+        gas_limit: "900000".to_string(),
+        gas_price: "100000000".to_string(),
+        maximum_fee_per_gas: "200000000".to_string(),
+        raw_signed_tx: vec![7; 64],
+        tx_hash: format!("0x{}", hex::encode(id(5, index))),
+        prior_transaction_hashes: Vec::new(),
+        replacement_attempts: 0,
+        first_sent_at: now,
+        last_update_at: now,
+        status: TxStatusV2::Mined,
+    };
+    let bytes = serde_json::to_vec(&StoredTransactionV2 {
+        schema: 2,
+        transaction: record,
+    })
+    .expect("encode transaction");
+    for key in [
+        format!("outbox:{}", hex::encode(execution_id)),
+        format!("tx:{index}"),
+    ] {
+        IStorageRepository::put(repo, key.as_bytes(), &bytes)
+            .await
+            .expect("store transaction");
+    }
+}
+
+/// Writes a quote in the state the quote service leaves it once its TTL has
+/// passed (`Expired`, payment index still present), without a flush per
+/// record.
+async fn store_expired_quote(repo: &SledRepository, execution_id: [u8; 32], valid_until: u64) {
+    let mut record = quote(execution_id, valid_until);
+    record.status = QuoteStatusV2::Expired;
+    let execution_key = format!("quote:execution:{}", hex::encode(execution_id));
+    let payment_key = format!("quote:payment:{}", hex::encode(record.request.payment_id));
+    IStorageRepository::put(
+        repo,
+        execution_key.as_bytes(),
+        &serde_json::to_vec(&record).expect("encode quote"),
+    )
+    .await
+    .expect("store quote");
+    IStorageRepository::put(repo, payment_key.as_bytes(), execution_id.as_slice())
+        .await
+        .expect("store payment index");
+}
+
+/// The fastest quote churn the cap allows: every TTL the expired quotes are
+/// released (as `admit_quote` does) and the cap is filled again, 5,120 quotes
+/// per 600 s pass at the example exit settings. At the same time paid
+/// executions use up the whole transaction budget. With the default
+/// `StorageConfig` the quote records must stay below a fixed ceiling and stop
+/// growing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quote_records_stay_bounded_at_the_quote_cap_with_default_storage_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("nox_db");
+    let repo = SledRepository::new(&path).expect("open");
+    let storage = StorageConfig::default();
+    let policy = RetentionPolicy::from_config(
+        &storage,
+        EXAMPLE_QUOTE_MAX_OUTSTANDING,
+        EXAMPLE_QUOTE_TTL_SECS,
+    );
+    assert_eq!(policy.batch_limit, storage.maintenance_batch_limit);
+    let windows_per_pass = storage.maintenance_interval_secs / EXAMPLE_QUOTE_TTL_SECS;
+    let cap = u64::from(EXAMPLE_QUOTE_MAX_OUTSTANDING);
+    let mut now = 1_800_000_000_u64;
+    let mut next_quote = 0_u64;
+
+    // The churn rate: the reservation path admits exactly the cap per TTL,
+    // and releasing expired quotes frees the whole cap again.
+    for _ in 0..2 {
+        repo.prune_expired_quotes_durably(now)
+            .await
+            .expect("release expired quotes");
+        for _ in 0..cap {
+            reserve(
+                &repo,
+                &quote(id(6, next_quote), now + EXAMPLE_QUOTE_TTL_SECS),
+                now,
+            )
+            .await;
+            next_quote += 1;
+        }
+        let over_cap = repo
+            .create_quote_durably(
+                &quote(id(7, next_quote), now + EXAMPLE_QUOTE_TTL_SECS),
+                EXAMPLE_QUOTE_MAX_OUTSTANDING,
+                u64::MAX / 2,
+                U256::from(u128::MAX),
+                3_600,
+                now,
+            )
+            .await;
+        assert!(matches!(
+            over_cap,
+            Err(QuoteStoreError::OutstandingCapacity)
+        ));
+        now += EXAMPLE_QUOTE_TTL_SECS;
+    }
+    repo.prune_expired_quotes_durably(now)
+        .await
+        .expect("release expired quotes");
+    assert_eq!(
+        repo.quote_counters().await.expect("counters").outstanding,
+        0
+    );
+
+    // Quote records not yet prunable after a pass: everything that expired
+    // within the retention, plus the windows of one interval, plus the
+    // outstanding cap. Two keys each (record and payment index).
+    let ceiling = 2
+        * cap
+        * ((storage.expired_quote_retention_secs + storage.maintenance_interval_secs)
+            / EXAMPLE_QUOTE_TTL_SECS
+            + 2);
+
+    let mut next_execution = 0_u64;
+    let mut quote_counts = Vec::new();
+    for pass in 0..ADVERSARIAL_PASSES {
+        for _ in 0..windows_per_pass {
+            for _ in 0..cap {
+                store_expired_quote(&repo, id(6, next_quote), now + EXAMPLE_QUOTE_TTL_SECS).await;
+                next_quote += 1;
+            }
+            now += EXAMPLE_QUOTE_TTL_SECS;
+        }
+        for _ in 0..PAID_EXECUTIONS_PER_PASS {
+            store_mined(&repo, next_execution, now).await;
+            next_execution += 1;
+        }
+        let report = repo.apply_retention(policy, now).await.expect("retention");
+        assert!(
+            report.budget_exhausted,
+            "pass {pass}: paid executions should use up the transaction budget"
+        );
+        assert!(
+            report.quotes_pruned < policy.quote_batch_limit,
+            "pass {pass}: quote budget ran out ({} pruned)",
+            report.quotes_pruned
+        );
+        let quote_keys = sample(&repo, &path, pass).await.quote_keys;
+        println!(
+            "pass {pass:>2}  quotes issued {next_quote:>6}  quotes pruned {:>5}  quote keys {quote_keys:>6}",
+            report.quotes_pruned
+        );
+        assert!(
+            quote_keys <= ceiling,
+            "pass {pass}: {quote_keys} quote keys, ceiling {ceiling}"
+        );
+        quote_counts.push(quote_keys);
+    }
+
+    // Steady state from the second pass on: no growth pass over pass.
+    let steady = quote_counts[1];
+    for (pass, keys) in quote_counts.iter().enumerate().skip(1) {
+        assert!(
+            *keys <= steady,
+            "quote keys grew from {steady} to {keys} by pass {pass}"
+        );
+    }
+    let issued_keys = 2 * next_quote;
+    assert!(
+        issued_keys > 3 * ceiling,
+        "the run issued only {issued_keys} quote keys"
+    );
 }

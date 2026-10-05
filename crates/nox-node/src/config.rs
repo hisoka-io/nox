@@ -463,7 +463,10 @@ pub struct StorageConfig {
     /// Seconds after `valid_until` at which a confirmed, reverted or rejected
     /// quote is deleted.
     pub terminal_quote_retention_secs: u64,
-    /// Most records one maintenance pass changes; the rest wait for the next.
+    /// Most transaction records (`outbox:*`, `tx:*`) one maintenance pass
+    /// changes; the rest wait for the next. Quotes have their own budget,
+    /// derived from `quote_max_outstanding` and `quote_ttl_secs` and never
+    /// below this value (`infra::retention::quote_batch_limit`).
     pub maintenance_batch_limit: usize,
     /// At startup, compact the database (verified copy into a fresh sled
     /// directory, as `nox db compact` does) when sled's blob files exceed

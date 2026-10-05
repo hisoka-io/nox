@@ -18,6 +18,11 @@
 //!
 //! Every change is a compare-and-swap against the bytes that were read, so a
 //! record that changes during the sweep is left for the next pass.
+//!
+//! Transactions and quotes have separate budgets. Quotes are created by
+//! anonymous clients at up to `quote_max_outstanding` per `quote_ttl_secs`,
+//! so their budget is derived from that rate ([`quote_batch_limit`]) and
+//! outbox work never uses it up.
 
 use std::path::Path;
 
@@ -43,13 +48,53 @@ pub struct RetentionPolicy {
     pub terminal_transaction_retention_secs: u64,
     pub expired_quote_retention_secs: u64,
     pub terminal_quote_retention_secs: u64,
-    /// Most records changed by one sweep.
+    /// Most transaction records (`outbox:*`, `tx:*`) changed by one sweep.
     pub batch_limit: usize,
+    /// Most quotes deleted by one sweep.
+    pub quote_batch_limit: usize,
+}
+
+/// Headroom of the quote budget over the most quotes one maintenance
+/// interval can create: covers the partial TTL window at each end of the
+/// interval and drains a backlog left by a late or failed pass.
+pub const QUOTE_BUDGET_HEADROOM: usize = 2;
+
+/// Quote budget for one sweep: `QUOTE_BUDGET_HEADROOM` times the most quotes
+/// clients can create between two passes (`quote_max_outstanding` per
+/// `quote_ttl_secs`), and never below `maintenance_batch_limit`.
+///
+/// A quote holds an outstanding slot until its `valid_until`, `quote_ttl_secs`
+/// after it was issued, so an interval of `I` seconds admits at most
+/// `quote_max_outstanding * (floor(I / ttl) + 1)` quotes, which is at most
+/// `2 * quote_max_outstanding * ceil(I / ttl)`. Pruning therefore keeps up
+/// with the fastest rate the quote cap allows. A `quote_ttl_secs` of 0 (no
+/// quote service) leaves the budget at `maintenance_batch_limit`.
+#[must_use]
+pub fn quote_batch_limit(
+    config: &StorageConfig,
+    quote_max_outstanding: u32,
+    quote_ttl_secs: u64,
+) -> usize {
+    if quote_ttl_secs == 0 {
+        return config.maintenance_batch_limit;
+    }
+    let windows = config.maintenance_interval_secs.div_ceil(quote_ttl_secs);
+    let per_interval = u64::from(quote_max_outstanding).saturating_mul(windows);
+    let derived = usize::try_from(per_interval)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(QUOTE_BUDGET_HEADROOM);
+    derived.max(config.maintenance_batch_limit)
 }
 
 impl RetentionPolicy {
+    /// `quote_max_outstanding` and `quote_ttl_secs` are the exit's quote
+    /// settings; they size the quote budget ([`quote_batch_limit`]).
     #[must_use]
-    pub fn from_config(config: &StorageConfig) -> Self {
+    pub fn from_config(
+        config: &StorageConfig,
+        quote_max_outstanding: u32,
+        quote_ttl_secs: u64,
+    ) -> Self {
         Self {
             prune_terminal_records: config.prune_terminal_records,
             slim_terminal_transactions_after_secs: config.slim_terminal_transactions_after_secs,
@@ -57,6 +102,7 @@ impl RetentionPolicy {
             expired_quote_retention_secs: config.expired_quote_retention_secs,
             terminal_quote_retention_secs: config.terminal_quote_retention_secs,
             batch_limit: config.maintenance_batch_limit,
+            quote_batch_limit: quote_batch_limit(config, quote_max_outstanding, quote_ttl_secs),
         }
     }
 }
@@ -73,7 +119,8 @@ pub struct RetentionReport {
     /// Records skipped because they did not decode. Startup hydration fails
     /// closed on the same records, so they need an operator either way.
     pub undecodable: usize,
-    /// The batch limit stopped the sweep before it saw every record.
+    /// A batch limit (transactions or quotes) stopped the sweep before it saw
+    /// every record.
     pub budget_exhausted: bool,
 }
 
@@ -326,6 +373,7 @@ fn sweep(
 ) -> Result<RetentionReport, InfrastructureError> {
     let mut report = RetentionReport::default();
     let mut budget = Budget(policy.batch_limit);
+    let mut quote_budget = Budget(policy.quote_batch_limit);
     if let Some(outbox) = outbox {
         let (slimmed, pruned) = sweep_transactions(
             outbox,
@@ -344,9 +392,13 @@ fn sweep(
             report.transactions_pruned = pruned;
         }
     }
-    if !report.budget_exhausted {
-        sweep_quotes(default_tree, policy, now_unix, &mut budget, &mut report)?;
-    }
+    sweep_quotes(
+        default_tree,
+        policy,
+        now_unix,
+        &mut quote_budget,
+        &mut report,
+    )?;
     Ok(report)
 }
 
@@ -523,6 +575,7 @@ mod tests {
             expired_quote_retention_secs: 50,
             terminal_quote_retention_secs: 500,
             batch_limit: 100,
+            quote_batch_limit: 100,
         }
     }
 
@@ -906,6 +959,61 @@ mod tests {
             assert!(passes < 10);
         }
         assert_eq!(passes, 4);
+    }
+
+    #[test]
+    fn quote_budget_covers_the_quote_cap_refilled_every_ttl() {
+        let storage = StorageConfig::default();
+        // Example exit: 256 quotes per 30 s over a 600 s interval is 5,120
+        // quotes; the budget doubles that.
+        assert_eq!(quote_batch_limit(&storage, 256, 30), 10_240);
+        // A TTL that does not divide the interval rounds the window count up.
+        assert_eq!(quote_batch_limit(&storage, 256, 7), 2 * 256 * 86);
+        // Never below maintenance_batch_limit, and relays (no quote service)
+        // keep it.
+        assert_eq!(quote_batch_limit(&storage, 4, 300), 2_000);
+        assert_eq!(quote_batch_limit(&storage, 0, 0), 2_000);
+        assert_eq!(quote_batch_limit(&storage, 256, 0), 2_000);
+        // Extreme settings saturate instead of overflowing.
+        assert!(quote_batch_limit(&storage, u32::MAX, 1) > 2_000);
+        let policy = RetentionPolicy::from_config(&storage, 256, 30);
+        assert_eq!(policy.batch_limit, 2_000);
+        assert_eq!(policy.quote_batch_limit, 10_240);
+    }
+
+    #[tokio::test]
+    async fn exhausted_transaction_budget_does_not_starve_quotes() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SledRepository::new(dir.path()).unwrap();
+        for seed in 0..5_u8 {
+            store_transaction(&repo, seed + 1, u64::from(seed), TxStatusV2::Mined, 0).await;
+        }
+        for seed in 10..14_u8 {
+            put_quote(&repo, &quote([seed; 32], QuoteStatusV2::Expired, 0));
+        }
+        let limited = RetentionPolicy {
+            batch_limit: 2,
+            quote_batch_limit: 3,
+            ..policy()
+        };
+        let first = repo.apply_retention(limited, NOW).await.unwrap();
+        assert!(first.budget_exhausted);
+        assert_eq!(
+            first.outbox_slimmed
+                + first.outbox_pruned
+                + first.transactions_slimmed
+                + first.transactions_pruned,
+            2
+        );
+        assert_eq!(first.quotes_pruned, 3);
+        assert_eq!(first.payment_indexes_pruned, 3);
+        let second = repo.apply_retention(limited, NOW).await.unwrap();
+        assert_eq!(second.quotes_pruned, 1);
+        assert!(!repo
+            .default_tree()
+            .scan_prefix(b"quote:")
+            .keys()
+            .any(|key| key.is_ok()));
     }
 
     #[tokio::test]

@@ -439,7 +439,7 @@ impl NoxNode {
             let maintenance = crate::infra::maintenance::StorageMaintenance::new(
                 db.clone(),
                 metrics_service.clone(),
-                &config.storage,
+                &config,
             )
             .with_cancel_token(shutdown_token.clone());
             join_set.spawn(async move {

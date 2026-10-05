@@ -182,7 +182,7 @@ counted in `nox_storage_retention_total{record,action}`.
 | `terminal_transaction_retention_secs` | `604800` | Age at which a mined or failed transaction record is deleted (7 days) |
 | `expired_quote_retention_secs` | `600` | Seconds after `valid_until` before an unused expired quote is deleted |
 | `terminal_quote_retention_secs` | `604800` | Seconds after `valid_until` before a confirmed, reverted or rejected quote is deleted |
-| `maintenance_batch_limit` | `2000` | Most records one pass changes |
+| `maintenance_batch_limit` | `2000` | Most transaction records one pass changes. Quotes have their own budget: twice the most quotes the cap admits per interval (`2 * quote_max_outstanding * ceil(maintenance_interval_secs / quote_ttl_secs)`, 10240 for the example exit), and at least this value |
 | `compact_on_start_blob_bytes` | `268435456` | Compact at startup when sled blob files exceed this (256 MiB); `0` = never |
 
 sled 0.34 forgets blob files that were pending deletion whenever the node stops, so blob

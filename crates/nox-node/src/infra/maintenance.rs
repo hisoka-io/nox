@@ -8,7 +8,7 @@ use nox_core::traits::InfrastructureError;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::config::StorageConfig;
+use crate::config::NoxConfig;
 use crate::infra::retention::{blob_usage, RetentionPolicy, RetentionReport};
 use crate::infra::storage::SledRepository;
 use crate::telemetry::metrics::MetricsService;
@@ -27,16 +27,16 @@ fn gauge_value(value: u64) -> i64 {
 
 impl StorageMaintenance {
     #[must_use]
-    pub fn new(
-        storage: Arc<SledRepository>,
-        metrics: MetricsService,
-        config: &StorageConfig,
-    ) -> Self {
+    pub fn new(storage: Arc<SledRepository>, metrics: MetricsService, config: &NoxConfig) -> Self {
         Self {
             storage,
             metrics,
-            policy: RetentionPolicy::from_config(config),
-            interval: Duration::from_secs(config.maintenance_interval_secs),
+            policy: RetentionPolicy::from_config(
+                &config.storage,
+                config.quote_max_outstanding,
+                config.quote_ttl_secs,
+            ),
+            interval: Duration::from_secs(config.storage.maintenance_interval_secs),
             cancel_token: CancellationToken::new(),
         }
     }
@@ -122,9 +122,7 @@ impl StorageMaintenance {
             );
         }
         if report.budget_exhausted {
-            debug!(
-                "Storage retention hit maintenance_batch_limit; the rest waits for the next pass"
-            );
+            debug!("Storage retention hit its batch limit; the rest waits for the next pass");
         }
     }
 
