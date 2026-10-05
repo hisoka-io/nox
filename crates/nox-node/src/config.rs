@@ -436,6 +436,91 @@ impl Default for ExitWorkerConfig {
     }
 }
 
+/// Retention and maintenance of the node database (`db_path`).
+///
+/// Mined and failed exit transactions and finished quotes are never read
+/// again by the node, so they are slimmed and then deleted; records the node
+/// may still act on are never touched. See `infra::retention`.
+#[derive(Debug, Deserialize, Clone, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct StorageConfig {
+    /// Seconds between maintenance passes (retention sweep, record counts,
+    /// flush). The first pass runs at startup.
+    pub maintenance_interval_secs: u64,
+    /// Delete terminal records once their retention has passed. `false`
+    /// keeps them forever (they are still slimmed) and the database then
+    /// grows with paid traffic.
+    pub prune_terminal_records: bool,
+    /// Seconds after its last update at which a mined or failed transaction
+    /// record drops its signed transaction bytes. The hash stays.
+    pub slim_terminal_transactions_after_secs: u64,
+    /// Seconds after its last update at which a mined or failed transaction
+    /// record (outbox entry and per-nonce entry) is deleted.
+    pub terminal_transaction_retention_secs: u64,
+    /// Seconds after `valid_until` at which an expired, never used quote is
+    /// deleted, which also frees its payment ID for a new quote.
+    pub expired_quote_retention_secs: u64,
+    /// Seconds after `valid_until` at which a confirmed, reverted or rejected
+    /// quote is deleted.
+    pub terminal_quote_retention_secs: u64,
+    /// Most records one maintenance pass changes; the rest wait for the next.
+    pub maintenance_batch_limit: usize,
+    /// At startup, compact the database (verified copy into a fresh sled
+    /// directory, as `nox db compact` does) when sled's blob files exceed
+    /// this many bytes. 0 = never.
+    pub compact_on_start_blob_bytes: u64,
+}
+
+/// Default seconds between storage maintenance passes.
+pub const DEFAULT_STORAGE_MAINTENANCE_INTERVAL_SECS: u64 = 600;
+/// Default age at which terminal transaction records are slimmed: at the
+/// next maintenance pass. Their signed bytes are never used again.
+pub const DEFAULT_SLIM_TERMINAL_TRANSACTIONS_AFTER_SECS: u64 = 0;
+/// Default retention of terminal transaction records (7 days).
+pub const DEFAULT_TERMINAL_TRANSACTION_RETENTION_SECS: u64 = 7 * 24 * 3_600;
+/// Default retention of expired quotes after `valid_until` (10 minutes).
+pub const DEFAULT_EXPIRED_QUOTE_RETENTION_SECS: u64 = 600;
+/// Default retention of finished quotes after `valid_until` (7 days).
+pub const DEFAULT_TERMINAL_QUOTE_RETENTION_SECS: u64 = 7 * 24 * 3_600;
+/// Default most records changed by one maintenance pass.
+pub const DEFAULT_STORAGE_MAINTENANCE_BATCH_LIMIT: usize = 2_000;
+/// Default blob volume that triggers compaction at startup (256 MiB). sled
+/// 0.34 forgets blob files that were pending deletion at every restart, so
+/// they accumulate even when the live data is small.
+pub const DEFAULT_COMPACT_ON_START_BLOB_BYTES: u64 = 256 * 1024 * 1024;
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            maintenance_interval_secs: DEFAULT_STORAGE_MAINTENANCE_INTERVAL_SECS,
+            prune_terminal_records: true,
+            slim_terminal_transactions_after_secs: DEFAULT_SLIM_TERMINAL_TRANSACTIONS_AFTER_SECS,
+            terminal_transaction_retention_secs: DEFAULT_TERMINAL_TRANSACTION_RETENTION_SECS,
+            expired_quote_retention_secs: DEFAULT_EXPIRED_QUOTE_RETENTION_SECS,
+            terminal_quote_retention_secs: DEFAULT_TERMINAL_QUOTE_RETENTION_SECS,
+            maintenance_batch_limit: DEFAULT_STORAGE_MAINTENANCE_BATCH_LIMIT,
+            compact_on_start_blob_bytes: DEFAULT_COMPACT_ON_START_BLOB_BYTES,
+        }
+    }
+}
+
+impl StorageConfig {
+    #[must_use]
+    pub fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.maintenance_interval_secs == 0 {
+            errors.push("storage.maintenance_interval_secs is 0 (maintenance would spin)".into());
+        }
+        if self.maintenance_batch_limit == 0 {
+            errors.push(
+                "storage.maintenance_batch_limit is 0 (terminal records would never be removed)"
+                    .into(),
+            );
+        }
+        errors
+    }
+}
+
 /// Bounds on exit-side state for responses that wait for more SURBs
 /// (`ReplenishSurbs`). Both maps are filled by anonymous clients, so every
 /// dimension is capped and entries expire.
@@ -533,6 +618,9 @@ pub struct NoxConfig {
     /// Caps on partial responses waiting for more SURBs at an exit.
     #[serde(default)]
     pub exit_replenishment: ReplenishmentConfig,
+    /// Retention and maintenance of the node database.
+    #[serde(default)]
+    pub storage: StorageConfig,
     pub block_poll_interval_secs: u64,
     /// Minimum time between writes of the chain observer's scan cursor. The
     /// cursor is also written on graceful shutdown. After a crash the observer
@@ -624,6 +712,7 @@ impl std::fmt::Debug for NoxConfig {
             .field("http", &self.http)
             .field("exit_workers", &self.exit_workers)
             .field("exit_replenishment", &self.exit_replenishment)
+            .field("storage", &self.storage)
             .field("block_poll_interval_secs", &self.block_poll_interval_secs)
             .field(
                 "chain_cursor_persist_interval_secs",
@@ -709,6 +798,7 @@ impl Default for NoxConfig {
             http: HttpConfig::default(),
             exit_workers: ExitWorkerConfig::default(),
             exit_replenishment: ReplenishmentConfig::default(),
+            storage: StorageConfig::default(),
 
             block_poll_interval_secs: 12,
             chain_cursor_persist_interval_secs: default_chain_cursor_persist_interval_secs(),
@@ -802,6 +892,7 @@ impl NoxConfig {
         }
 
         errors.extend(self.ingress.validation_errors());
+        errors.extend(self.storage.validation_errors());
         errors.extend(self.exit_replenishment.validation_errors());
 
         if self.chain_id == 0 && !self.benchmark_mode {
@@ -1411,8 +1502,21 @@ mod tests {
     }
 
     #[test]
-    fn replenishment_defaults_validate_and_zero_limits_are_rejected() {
-        assert!(ReplenishmentConfig::default().validation_errors().is_empty());
+    fn storage_and_replenishment_defaults_validate() {
+        assert!(StorageConfig::default().validation_errors().is_empty());
+        assert!(ReplenishmentConfig::default()
+            .validation_errors()
+            .is_empty());
+    }
+
+    #[test]
+    fn storage_and_replenishment_zero_limits_are_rejected() {
+        let storage = StorageConfig {
+            maintenance_interval_secs: 0,
+            maintenance_batch_limit: 0,
+            ..StorageConfig::default()
+        };
+        assert_eq!(storage.validation_errors().len(), 2);
         let replenishment = ReplenishmentConfig {
             max_pending_responses: 0,
             max_surbs_per_request: 0,
@@ -1420,5 +1524,30 @@ mod tests {
             ..ReplenishmentConfig::default()
         };
         assert_eq!(replenishment.validation_errors().len(), 3);
+
+        let mut config = NoxConfig::default();
+        config.storage.maintenance_interval_secs = 0;
+        let errors = config.validate().unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("storage.maintenance_interval_secs")));
+    }
+
+    #[test]
+    fn storage_section_is_optional_and_overridable_from_toml() {
+        let parsed: StorageConfig = Config::builder()
+            .add_source(config::File::from_str(
+                "terminal_transaction_retention_secs = 60",
+                config::FileFormat::Toml,
+            ))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(parsed.terminal_transaction_retention_secs, 60);
+        assert_eq!(
+            parsed.maintenance_interval_secs,
+            DEFAULT_STORAGE_MAINTENANCE_INTERVAL_SECS
+        );
     }
 }

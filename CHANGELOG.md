@@ -5,6 +5,35 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- Exit transaction records are written in a smaller encoding (signed bytes as hex instead of a JSON number
+  array). This release reads both encodings; rc.5 and earlier cannot read the new one, so rolling an exit back
+  needs the data snapshot taken before the upgrade.
+- The first maintenance pass after the upgrade slims and removes finished records, and a node whose sled blob
+  files exceed 256 MiB compacts its database once at startup (`[storage] compact_on_start_blob_bytes`).
+
+### Added
+
+- `[storage]` maintenance on every node: mined and failed exit transactions drop their signed bytes and are
+  deleted after 7 days, expired quotes after 10 minutes, finished quotes after 7 days. Transactions that may still
+  be rebroadcast or reconciled, open quotes, the nonce floor and the quote counters are never touched.
+- `nox db compact` (offline, verified copy into a fresh database) and `nox db stats`. Compaction also runs at
+  startup when blob files pass `compact_on_start_blob_bytes`; an interrupted swap blocks startup until the command
+  finishes it.
+- Metrics `nox_storage_records{tree,kind}`, `nox_storage_blob_files`, `nox_storage_blob_bytes`,
+  `nox_storage_retention_total{record,action}` and `nox_storage_maintenance_errors_total`.
+- `[exit_replenishment]` caps for partial responses that wait for SURBs.
+
+### Fixed
+
+- The exit's SURB replenishment stores were capped only by entry count, checked once a minute, and SURBs per
+  request had no cap; they now enforce entry, byte, per-request SURB and age limits on every insert.
+- `nox_rpc_requests_total` used the client-supplied method name as a label, so anonymous requests could create
+  metric series without limit; methods outside the allow-list are now labelled `other`.
+- Replay tags written through the sled repository live in their own tree, so pruning them can no longer delete
+  other eight-byte values such as the chain observer cursor or a zero nonce floor.
+
 ## [0.4.0-rc.5] - 2026-10-04
 
 ### Upgrade notes

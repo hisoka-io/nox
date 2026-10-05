@@ -244,6 +244,29 @@ proxy_concurrency = 32
 control_concurrency = 16
 queue_capacity = 256
 
+# Partial responses waiting for more SURBs at an exit. Filled by anonymous
+# clients, so every dimension is capped and entries expire.
+[exit_replenishment]
+max_pending_responses = 100
+max_pending_bytes = 134217728
+max_surb_requests = 100
+max_surbs_per_request = 512
+entry_ttl_secs = 300
+
+# Database maintenance: mined/failed transactions and finished quotes are
+# slimmed, then deleted after their retention. Records the node may still act
+# on are never touched. See docs/configuration.md.
+[storage]
+maintenance_interval_secs = 600
+prune_terminal_records = true
+slim_terminal_transactions_after_secs = 0
+terminal_transaction_retention_secs = 604800
+expired_quote_retention_secs = 600
+terminal_quote_retention_secs = 604800
+maintenance_batch_limit = 2000
+# Compact at startup when sled blob files exceed this many bytes. 0 = never.
+compact_on_start_blob_bytes = 268435456
+
 [[payment_adapters]]
 address = "0x0000000000000000000000000000000000000000"
 fee_assets = ["0x0000000000000000000000000000000000000000"]
