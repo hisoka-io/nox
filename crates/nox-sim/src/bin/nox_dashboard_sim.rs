@@ -433,6 +433,7 @@ async fn spawn_dashboard_node(
             allow_private_ips: true, // Anvil runs on localhost -- must allow for sim
             request_timeout_secs: 15,
             max_response_bytes: 128 * 1024 * 1024,
+            ..HttpConfig::default()
         };
         let pending_map = ExitService::new_pending_map();
         let surb_acc = ExitService::new_surb_accumulator();

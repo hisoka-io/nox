@@ -137,6 +137,15 @@ Three reputation tiers: Unknown, Trusted, Penalized.
 | `allow_private_ips` | `false` | **Never enable in production** |
 | `request_timeout_secs` | `10` | Proxy timeout |
 | `max_response_bytes` | `1048576` | Max response (1 MB) |
+| `pool_idle_timeout_secs` | `600` | How long an idle upstream connection stays pooled |
+| `http2_keep_alive_interval_secs` | `30` | HTTP/2 PING interval on upstream connections, also while idle (0 = off) |
+| `warm_interval_secs` | `60` | How often recently used upstream origins get a `HEAD /` to keep their connection warm (0 = off) |
+| `warm_recent_secs` | `600` | An origin counts as recently used this long after its last request |
+| `max_cached_hosts` | `256` | Upstream origins that keep a pinned client (least recently used out first) |
+
+Each upstream origin gets a client pinned to the addresses its host resolves
+to. Every address must pass the SSRF check; the client is reused while the
+host keeps resolving to addresses it was pinned to.
 
 ### `[ingress]`
 
