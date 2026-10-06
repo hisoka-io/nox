@@ -74,6 +74,8 @@ pub struct AssociationInternal {
     pub(crate) t2shutdown: Option<RtxTimer<AssociationInternal>>,
     pub(crate) t3rtx: Option<RtxTimer<AssociationInternal>>,
     pub(crate) treconfig: Option<RtxTimer<AssociationInternal>>,
+    /// nox: tail loss probe timer.
+    pub(crate) tlp: Option<RtxTimer<AssociationInternal>>,
     pub(crate) ack_timer: Option<AckTimer<AssociationInternal>>,
 
     // Chunks stored for retransmission
@@ -141,6 +143,18 @@ pub(crate) const IMMEDIATE_SACK_BURST_BYTES: u64 = 64 * 1024;
 pub(crate) const IMMEDIATE_SACK_BURST_IDLE: std::time::Duration =
     std::time::Duration::from_millis(100);
 
+/// Tail loss probe (nox, after RFC 8985 TLP): when no SACK has advanced the
+/// cumulative TSN for `2 * SRTT` (plus `TLP_DELAYED_ACK_MS` when a single
+/// chunk is outstanding, which the peer may SACK late), the earliest
+/// `TLP_PROBE_CHUNKS` unacked chunks are resent without touching cwnd. A
+/// loss at the tail of a reply has no later packet to report it, so without
+/// the probe it waits for the T3-rtx timer (1 s at least).
+pub(crate) const TLP_PROBE_CHUNKS: usize = 4;
+/// Allowance for the peer's delayed SACK of a lone chunk, ms.
+pub(crate) const TLP_DELAYED_ACK_MS: u64 = 200;
+/// Shortest probe timeout, ms.
+pub(crate) const TLP_MIN_MS: u64 = 10;
+
 /// Most lost chunks in one window that still count as random loss (nox).
 ///
 /// The loss floor is for isolated losses. When more chunks than this are
@@ -151,6 +165,61 @@ pub(crate) const IMMEDIATE_SACK_BURST_IDLE: std::time::Duration =
 pub(crate) const LOSS_FLOOR_MAX_LOSSES: u32 = 2;
 
 impl AssociationInternal {
+    /// nox: probe timeout for the outstanding data, or `None` when there is
+    /// no RTT measurement yet or the probe would not come before the T3-rtx
+    /// timer.
+    fn tlp_timeout_ms(&self) -> Option<u64> {
+        let srtt = self.rto_mgr.srtt;
+        if srtt == 0 {
+            return None;
+        }
+        let mut pto = 2 * srtt;
+        if self.unacked_chunks() == 1 {
+            pto += TLP_DELAYED_ACK_MS;
+        }
+        let pto = pto.max(TLP_MIN_MS);
+        (pto < self.rto_mgr.get_rto()).then_some(pto)
+    }
+
+    /// nox: starts the tail loss probe timer for the outstanding data
+    /// (`restart`: also when it already runs).
+    async fn arm_tlp(&self, restart: bool) {
+        let Some(tlp) = &self.tlp else {
+            return;
+        };
+        match self.tlp_timeout_ms() {
+            Some(pto) if restart => {
+                tlp.restart(pto).await;
+            }
+            Some(pto) => {
+                tlp.start(pto).await;
+            }
+            None => tlp.stop().await,
+        }
+    }
+
+    /// nox: the probe timer expired with data outstanding: resend the
+    /// earliest unacked chunks.
+    fn tlp_timeout(&mut self) {
+        let mut marked = 0;
+        for i in 0..self.inflight_queue.len() as u32 {
+            if marked == TLP_PROBE_CHUNKS {
+                break;
+            }
+            let tsn = self.cumulative_tsn_ack_point.wrapping_add(i + 1);
+            if let Some(c) = self.inflight_queue.get_mut(tsn) {
+                if !c.acked && !c.abandoned() && !c.retransmit {
+                    c.retransmit = true;
+                    marked += 1;
+                }
+            }
+        }
+        if marked > 0 {
+            log::debug!("[{}] tail loss probe: resending {} chunk(s)", self.name, marked);
+            self.awake_write_loop();
+        }
+    }
+
     /// nox: chunks sent and not yet acked (cumulatively or by a gap block).
     fn unacked_chunks(&self) -> u32 {
         let mut n = 0;
@@ -254,6 +323,7 @@ impl AssociationInternal {
             t2shutdown: None,
             t3rtx: None,
             treconfig: None,
+            tlp: None,
             ack_timer: None,
 
             stored_init: None,
@@ -393,6 +463,9 @@ impl AssociationInternal {
         if let Some(treconfig) = &self.treconfig {
             treconfig.stop().await;
         }
+        if let Some(tlp) = &self.tlp {
+            tlp.stop().await;
+        }
         if let Some(ack_timer) = &mut self.ack_timer {
             ack_timer.stop();
         }
@@ -470,6 +543,7 @@ impl AssociationInternal {
             if let Some(t3rtx) = &self.t3rtx {
                 t3rtx.start(self.rto_mgr.get_rto()).await;
             }
+            self.arm_tlp(false).await;
             for p in self.bundle_data_chunks_into_packets(chunks) {
                 raw_packets.push(p);
             }
@@ -1369,11 +1443,15 @@ impl AssociationInternal {
             if let Some(t3rtx) = &self.t3rtx {
                 t3rtx.stop().await;
             }
+            if let Some(tlp) = &self.tlp {
+                tlp.stop().await;
+            }
         } else {
             log::trace!("[{}] T3-rtx timer start (pt2)", self.name);
             if let Some(t3rtx) = &self.t3rtx {
                 t3rtx.start(self.rto_mgr.get_rto()).await;
             }
+            self.arm_tlp(true).await;
         }
 
         // Update congestion control parameters
@@ -2567,6 +2645,9 @@ impl RtxTimerObserver for AssociationInternal {
                 );
 
                 self.inflight_queue.mark_all_to_retrasmit();
+                if let Some(tlp) = &self.tlp {
+                    tlp.stop().await;
+                }
                 self.awake_write_loop();
             }
 
@@ -2574,6 +2655,8 @@ impl RtxTimerObserver for AssociationInternal {
                 self.will_retransmit_reconfig = true;
                 self.awake_write_loop();
             }
+
+            RtxTimerId::Tlp => self.tlp_timeout(),
         }
     }
 

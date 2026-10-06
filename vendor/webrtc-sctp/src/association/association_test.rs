@@ -1442,6 +1442,53 @@ async fn test_assoc_congestion_control_burst_loss_drops_the_loss_floor() -> Resu
     Ok(())
 }
 
+#[tokio::test]
+async fn test_assoc_tail_loss_probe_resends_before_the_rto() -> Result<()> {
+    const SI: u16 = 6;
+    static MSG: Bytes = Bytes::from_static(b"tail");
+
+    let (br, ca, cb) = Bridge::new(0, None, None);
+
+    let (a0, mut a1) =
+        create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::Normal, 0).await?;
+
+    let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+
+    // A 50 ms path: probe after 2 x 50 ms plus the delayed-SACK allowance
+    // for a lone chunk, well before the 1 s RTO.
+    a0.association_internal.lock().await.rto_mgr.srtt = 50;
+    br.drop_next_nwrites(0, 1); // the only packet of the "reply" is lost
+    s0.write_sctp(&MSG, PayloadProtocolIdentifier::Binary)
+        .await?;
+
+    let started = tokio::time::Instant::now();
+    let mut buf = vec![0u8; 32];
+    let mut received = None;
+    while started.elapsed() < Duration::from_millis(800) {
+        br.tick().await;
+        if let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_millis(5), s1.read_sctp(&mut buf)).await
+        {
+            assert_eq!(&buf[..n], &MSG[..]);
+            received = Some(started.elapsed());
+            break;
+        }
+    }
+    let received = received.expect("the probe should deliver the lost chunk");
+    assert!(
+        received < Duration::from_millis(600),
+        "delivered after {received:?}, expected the probe at about 300 ms"
+    );
+    {
+        let a = a0.association_internal.lock().await;
+        assert_eq!(a.stats.get_num_t3timeouts(), 0, "no RTO was needed");
+    }
+
+    close_association_pair(&br, a0, a1).await;
+
+    Ok(())
+}
+
 //use std::io::Write;
 
 #[tokio::test]
