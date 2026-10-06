@@ -88,6 +88,19 @@ pub struct AssociationInternal {
     pub(crate) ack_mode: AckMode, // for testing
 }
 
+/// Initial congestion window in bytes for `mtu` (RFC 6928 IW10 formula).
+pub(crate) fn initial_cwnd(mtu: u32) -> u32 {
+    std::cmp::min(
+        INITIAL_CWND_MTUS * mtu,
+        std::cmp::max(2 * mtu, INITIAL_CWND_FLOOR_BYTES),
+    )
+}
+
+/// Initial window, in MTUs (nox tuning; RFC 4960 uses 4).
+pub(crate) const INITIAL_CWND_MTUS: u32 = 10;
+/// Byte floor of the initial-window formula (RFC 6928).
+pub(crate) const INITIAL_CWND_FLOOR_BYTES: u32 = 14_600;
+
 impl AssociationInternal {
     pub(crate) fn new(
         config: Config,
@@ -116,13 +129,11 @@ impl AssociationInternal {
         }
 
         let mtu = INITIAL_MTU;
-        // RFC 4690 Sec 7.2.1
-        //  o  The initial cwnd before DATA transmission or after a sufficiently
-        //     long idle period MUST be set to min(4*MTU, max (2*MTU, 4380
-        //     bytes)).
-        //     TODO: Consider whether this should use `clamp`
-        #[allow(clippy::manual_clamp)]
-        let cwnd = std::cmp::min(4 * mtu, std::cmp::max(2 * mtu, 4380));
+        // nox: the initial window follows RFC 6928 (TCP IW10),
+        // min(10*MTU, max(2*MTU, 14600 bytes)), instead of RFC 4960 7.2.1's
+        // min(4*MTU, max(2*MTU, 4380 bytes)). A 32 KiB reply then needs about
+        // 3 round trips from a cold association instead of about 5.
+        let cwnd = initial_cwnd(mtu);
 
         let ret = AssociationInternal {
             name: config.name,
