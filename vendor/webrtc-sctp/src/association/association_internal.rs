@@ -91,6 +91,10 @@ pub struct AssociationInternal {
     immediate_ack_triggered: bool,
 
     pub(crate) stats: Arc<AssociationStats>,
+    /// nox: DATA bytes received in the current burst from the peer, and when
+    /// the last DATA chunk arrived.
+    rx_burst_bytes: u64,
+    rx_burst_last_data: Option<Instant>,
     /// nox: ack-train delivery-rate estimate for pacing (pacing.rs).
     delivery_rate: DeliveryRate,
     ack_state: AckState,
@@ -128,6 +132,14 @@ pub(crate) const LOSS_CWND_FLOOR_MTUS: u32 = INITIAL_CWND_MTUS;
 pub(crate) fn loss_cwnd_floor(mtu: u32) -> u32 {
     std::cmp::max(LOSS_CWND_FLOOR_MTUS * mtu, 4 * mtu)
 }
+
+/// Bytes at the start of each burst from the peer that are SACKed packet by
+/// packet (nox). A KPS request is one Sphinx packet (32,768 bytes plus
+/// framing); 64 KiB covers two.
+pub(crate) const IMMEDIATE_SACK_BURST_BYTES: u64 = 64 * 1024;
+/// A pause in DATA from the peer this long starts a new burst.
+pub(crate) const IMMEDIATE_SACK_BURST_IDLE: std::time::Duration =
+    std::time::Duration::from_millis(100);
 
 /// Most lost chunks in one window that still count as random loss (nox).
 ///
@@ -254,6 +266,8 @@ impl AssociationInternal {
             delayed_ack_triggered: false,
             immediate_ack_triggered: false,
             stats: Arc::new(AssociationStats::default()),
+            rx_burst_bytes: 0,
+            rx_burst_last_data: None,
             delivery_rate: DeliveryRate::default(),
             ack_state: AckState::default(),
             ack_mode: AckMode::default(),
@@ -1067,7 +1081,23 @@ impl AssociationInternal {
             }
         }
 
-        let immediate_sack = d.immediate_sack;
+        // nox: SACK every packet of the first IMMEDIATE_SACK_BURST_BYTES of
+        // each burst from the peer, so a sender in slow start (a browser
+        // grows cwnd by at most one MTU per SACK) opens its window twice as
+        // fast as with a SACK for every second packet.
+        let now = Instant::now();
+        if self
+            .rx_burst_last_data
+            .is_none_or(|last| now.duration_since(last) >= IMMEDIATE_SACK_BURST_IDLE)
+        {
+            self.rx_burst_bytes = 0;
+        }
+        self.rx_burst_last_data = Some(now);
+        self.rx_burst_bytes = self
+            .rx_burst_bytes
+            .saturating_add(d.user_data.len() as u64);
+        let immediate_sack =
+            d.immediate_sack || self.rx_burst_bytes <= IMMEDIATE_SACK_BURST_BYTES;
 
         if stream_handle_data {
             if let Some(s) = self.streams.get_mut(&d.stream_identifier) {

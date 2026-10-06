@@ -1570,8 +1570,11 @@ async fn test_assoc_congestion_control_congestion_avoidance() -> Result<()> {
             N_PACKETS_TO_SEND as u64,
             "packet count mismatch"
         );
+        // nox: the first IMMEDIATE_SACK_BURST_BYTES are SACKed packet by
+        // packet; after that every second packet.
+        let immediate = IMMEDIATE_SACK_BURST_BYTES / sbuf.len() as u64;
         assert!(
-            a.stats.get_num_sacks() <= N_PACKETS_TO_SEND as u64 / 2,
+            a.stats.get_num_sacks() <= N_PACKETS_TO_SEND as u64 / 2 + immediate,
             "too many sacks"
         );
         assert_eq!(a.stats.get_num_t3timeouts(), 0, "should be no retransmit");
@@ -1635,8 +1638,11 @@ async fn test_assoc_congestion_control_slow_reader() -> Result<()> {
     let mut rbuf = vec![0u8; 3000];
 
     // 1. First forward packets to receiver until rwnd becomes 0
-    // 2. Wait until the sender's T3-rtx timer has expired (nox: the first
-    //    expiry keeps cwnd at the loss floor, so cwnd no longer drops to 1 MTU)
+    // 2. (nox) Upstream waited here for an RTO (cwnd == 1 MTU). The first
+    //    expiry now keeps cwnd at the loss floor, and with the first 64 KiB
+    //    SACKed packet by packet the zero-window probes are acked before the
+    //    T3-rtx timer expires, so the test starts reading once the window
+    //    is closed.
     // 3. Stat reading a1's data
     let mut n_packets_received = 0u32;
     let mut has_rtoed = false;
@@ -1649,11 +1655,10 @@ async fn test_assoc_congestion_control_slow_reader() -> Result<()> {
         }
 
         if !has_rtoed {
-            let a = a0.association_internal.lock().await;
             let b = a1.association_internal.lock().await;
 
             let rwnd = b.get_my_receiver_window_credit().await;
-            if a.stats.get_num_t3timeouts() == 0 || rwnd > 0 {
+            if rwnd > 0 {
                 // Do not read until a1.getMyReceiverWindowCredit() becomes zero
                 continue;
             }
