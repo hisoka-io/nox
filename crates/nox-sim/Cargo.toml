@@ -39,15 +39,15 @@ tempfile = "3.10"
 toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 zeroize = { workspace = true }
-nox-core = { path = "../nox-core", version = "0.4.0-rc.6" }
+nox-core = { path = "../nox-core", version = "0.4.0-rc.7" }
 
-nox-crypto = { path = "../nox-crypto", version = "0.4.0-rc.6" }
+nox-crypto = { path = "../nox-crypto", version = "0.4.0-rc.7" }
 
-nox-client = { path = "../nox-client", version = "0.4.0-rc.6" }
+nox-client = { path = "../nox-client", version = "0.4.0-rc.7" }
 
-nox-node = { path = "../nox-node", version = "0.4.0-rc.6" }
+nox-node = { path = "../nox-node", version = "0.4.0-rc.7" }
 
-nox-test-infra = { path = "../nox-test-infra", version = "0.4.0-rc.6" }
+nox-test-infra = { path = "../nox-test-infra", version = "0.4.0-rc.7" }
 
 [lints]
 workspace = true
