@@ -97,18 +97,21 @@ pub struct AssociationInternal {
     pub(crate) ack_mode: AckMode, // for testing
 }
 
-/// Initial congestion window in bytes for `mtu` (RFC 6928 IW10 formula).
+/// Initial congestion window in bytes for `mtu`.
 pub(crate) fn initial_cwnd(mtu: u32) -> u32 {
-    std::cmp::min(
-        INITIAL_CWND_MTUS * mtu,
-        std::cmp::max(2 * mtu, INITIAL_CWND_FLOOR_BYTES),
-    )
+    INITIAL_CWND_MTUS * mtu
 }
 
-/// Initial window, in MTUs (nox tuning; RFC 4960 uses 4).
-pub(crate) const INITIAL_CWND_MTUS: u32 = 10;
-/// Byte floor of the initial-window formula (RFC 6928).
-pub(crate) const INITIAL_CWND_FLOOR_BYTES: u32 = 14_600;
+/// Initial window, in MTUs (nox tuning; RFC 4960 uses 4, RFC 6928 10).
+///
+/// Every exchange on a KPS connection is one request and one reply, and the
+/// usual reply is one or two encrypted Sphinx replies (32,402 or 64,797
+/// bytes as a claim batch). 56 MTUs (68,768 bytes at the 1,228-byte MTU)
+/// let both sizes, with HTTP and KPS framing, leave in the first flight on a
+/// new association, which saves one to two round trips on the first calls
+/// after a dial. `PACING_BURST_PACKETS` bounds the burst that goes out at
+/// once.
+pub(crate) const INITIAL_CWND_MTUS: u32 = 56;
 
 /// Lowest congestion window after a loss, in MTUs (nox tuning).
 ///
@@ -180,10 +183,8 @@ impl AssociationInternal {
         }
 
         let mtu = INITIAL_MTU;
-        // nox: the initial window follows RFC 6928 (TCP IW10),
-        // min(10*MTU, max(2*MTU, 14600 bytes)), instead of RFC 4960 7.2.1's
-        // min(4*MTU, max(2*MTU, 4380 bytes)). A 32 KiB reply then needs about
-        // 3 round trips from a cold association instead of about 5.
+        // nox: INITIAL_CWND_MTUS instead of RFC 4960 7.2.1's
+        // min(4*MTU, max(2*MTU, 4380 bytes)).
         let cwnd = initial_cwnd(mtu);
 
         let ret = AssociationInternal {
