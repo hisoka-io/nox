@@ -3,6 +3,7 @@ mod association_test;
 
 mod association_internal;
 mod association_stats;
+mod pacing;
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -475,10 +476,15 @@ impl Association {
 
         'outer: while !done.load(Ordering::Relaxed) {
             //log::debug!("[{}] gather_outbound begin", name);
-            let (packets, continue_loop) = {
+            let (packets, continue_loop, pace_bytes_per_ms) = {
                 let mut ai = association_internal.lock().await;
-                ai.gather_outbound().await
+                let (packets, continue_loop) = ai.gather_outbound().await;
+                (packets, continue_loop, ai.pacing_bytes_per_ms())
             };
+            // nox: the first PACING_BURST_PACKETS packets leave back to back,
+            // the rest at the pacing rate (pacing.rs).
+            let write_started = tokio::time::Instant::now();
+            let mut paced_bytes = 0u64;
             //log::debug!("[{}] gather_outbound done with {}", name, packets.len());
 
             let net_conn = Arc::clone(&net_conn);
@@ -486,7 +492,12 @@ impl Association {
             let name2 = Arc::clone(&name);
             let done2 = Arc::clone(&done);
             let mut buffer = None;
-            for raw in packets {
+            for (index, raw) in packets.into_iter().enumerate() {
+                if let Some(at) =
+                    pacing::send_at(write_started, index, paced_bytes, pace_bytes_per_ms)
+                {
+                    tokio::time::sleep_until(at).await;
+                }
                 let mut buf = buffer
                     .take()
                     .unwrap_or_else(|| BytesMut::with_capacity(16 * 1024));
@@ -505,6 +516,9 @@ impl Association {
                             done2.store(true, Ordering::Relaxed)
                         } else {
                             bytes_sent.fetch_add(raw.len(), Ordering::SeqCst);
+                            if index >= pacing::PACING_BURST_PACKETS {
+                                paced_bytes += raw.len() as u64;
+                            }
                         }
 
                         // Reuse allocation. Have to use options, since spawn blocking can't borrow, has to take ownership.

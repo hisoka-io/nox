@@ -3,7 +3,9 @@ mod association_internal_test;
 
 use async_trait::async_trait;
 use portable_atomic::AtomicBool;
+use std::time::Instant;
 
+use super::pacing::DeliveryRate;
 use super::*;
 use crate::param::param_forward_tsn_supported::ParamForwardTsnSupported;
 use crate::param::param_type::ParamType;
@@ -84,6 +86,8 @@ pub struct AssociationInternal {
     immediate_ack_triggered: bool,
 
     pub(crate) stats: Arc<AssociationStats>,
+    /// nox: ack-train delivery-rate estimate for pacing (pacing.rs).
+    delivery_rate: DeliveryRate,
     ack_state: AckState,
     pub(crate) ack_mode: AckMode, // for testing
 }
@@ -118,6 +122,11 @@ pub(crate) fn loss_cwnd_floor(mtu: u32) -> u32 {
 }
 
 impl AssociationInternal {
+    /// nox: pacing rate for the packets after the first burst of a write.
+    pub(crate) fn pacing_bytes_per_ms(&self) -> u64 {
+        self.delivery_rate.pacing_bytes_per_ms()
+    }
+
     pub(crate) fn new(
         config: Config,
         close_loop_ch_tx: broadcast::Sender<()>,
@@ -216,6 +225,7 @@ impl AssociationInternal {
             delayed_ack_triggered: false,
             immediate_ack_triggered: false,
             stats: Arc::new(AssociationStats::default()),
+            delivery_rate: DeliveryRate::default(),
             ack_state: AckState::default(),
             ack_mode: AckMode::default(),
         };
@@ -1296,6 +1306,7 @@ impl AssociationInternal {
                 self.name,
                 self.pending_queue.len()
             );
+            self.delivery_rate.end_train();
             if let Some(t3rtx) = &self.t3rtx {
                 t3rtx.stop().await;
             }
@@ -1482,6 +1493,10 @@ impl AssociationInternal {
         let mut total_bytes_acked = 0;
         for n_bytes_acked in bytes_acked_per_stream.values() {
             total_bytes_acked += *n_bytes_acked;
+        }
+        if total_bytes_acked > 0 {
+            self.delivery_rate
+                .on_sack(Instant::now(), total_bytes_acked as u64);
         }
 
         let mut cum_tsn_ack_point_advanced = false;
