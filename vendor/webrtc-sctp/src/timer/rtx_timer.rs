@@ -6,15 +6,13 @@ use tokio::time::Duration;
 
 use crate::association::RtxTimerId;
 
-// nox tuning (vendor/README.md): RFC 4960 recommends RTO.Initial 3 s and
-// RTO.Min 1 s. A lost chunk on a 250-300 ms browser path then stalls the
-// stream for at least a second. These follow RFC 6298's 1 s initial value and
-// a Linux-style floor instead: RTO = SRTT + max(4 * RTTVAR, RTO_VAR_FLOOR),
-// never below RTO_MIN, so the timer stays above the RTT plus a peer's 200 ms
-// delayed SACK and does not fire spuriously.
+// nox tuning (vendor/README.md): RFC 6298's 1 s initial RTO instead of RFC
+// 4960's 3 s, so a lost INIT, COOKIE or first DATA chunk on a browser link is
+// resent after 1 s. RTO.Min keeps 1 s, which gave the best reply times with
+// 1.5% emulated loss each way on a 274 ms path (a 300 ms floor triggered more
+// retransmission timeouts).
 pub(crate) const RTO_INITIAL: u64 = 1000; // msec
-pub(crate) const RTO_MIN: u64 = 300; // msec
-pub(crate) const RTO_VAR_FLOOR: u64 = 250; // msec
+pub(crate) const RTO_MIN: u64 = 1000; // msec
 pub(crate) const RTO_MAX: u64 = 60000; // msec
 pub(crate) const RTO_ALPHA: u64 = 1;
 pub(crate) const RTO_BETA: u64 = 2;
@@ -60,8 +58,7 @@ impl RtoManager {
             self.srtt = ((RTO_BASE - RTO_ALPHA) * self.srtt + RTO_ALPHA * rtt) / RTO_BASE;
         }
 
-        self.rto = (self.srtt + ((4.0 * self.rttvar) as u64).max(RTO_VAR_FLOOR))
-            .clamp(RTO_MIN, RTO_MAX);
+        self.rto = (self.srtt + (4.0 * self.rttvar) as u64).clamp(RTO_MIN, RTO_MAX);
 
         self.srtt
     }

@@ -21,12 +21,12 @@ Sender tuning added for browser links with 250-300 ms round trips:
 |---|---|---|---|
 | Initial congestion window | min(4·MTU, max(2·MTU, 4380 B)) = 4,380 B | min(10·MTU, max(2·MTU, 14,600 B)) = 12,280 B (RFC 6928 IW10) | `association_internal.rs` `initial_cwnd` |
 | RTO.Initial | 3 s | 1 s (RFC 6298) | `timer/rtx_timer.rs` |
-| RTO.Min | 1 s | 300 ms | `timer/rtx_timer.rs` |
-| RTO formula | SRTT + 4·RTTVAR | SRTT + max(4·RTTVAR, 250 ms) | `timer/rtx_timer.rs` |
 
-The 250 ms variance floor keeps the timer above one round trip plus a peer's
-200 ms delayed SACK. A retransmission timeout still resets the window to one
-MTU and halves `ssthresh`, as RFC 4960 §7.2.3 requires.
+RTO.Min keeps RFC 4960's 1 s. In a test with 1.5% random loss each way on an
+emulated 274 ms path, the 1 s floor gave the best reply times; a 300 ms floor
+(SRTT + max(4·RTTVAR, 250 ms)) triggered more retransmission timeouts. A
+retransmission timeout resets the window to one MTU and halves `ssthresh`, as
+RFC 4960 §7.2.3 requires.
 
 ## webrtc-ice 0.14.0
 

@@ -94,7 +94,7 @@ mod test_rto_manager {
     #[tokio::test]
     async fn test_rto_manager_rto_calculation_small_rtt() -> Result<()> {
         let mut m = RtoManager::new();
-        let exp = [1800, 1500, 1275, 1106, 979];
+        let exp = [1800, 1500, 1275, 1106, 1000];
 
         for i in 0..5 {
             m.set_new_rtt(600);
@@ -102,24 +102,6 @@ mod test_rto_manager {
             assert_eq!(rto, exp[i], "should be equal: {i}");
         }
 
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_rto_manager_rto_has_variance_and_absolute_floors() -> Result<()> {
-        // A steady 274 ms path: RTTVAR decays, the timer settles at
-        // SRTT + RTO_VAR_FLOOR instead of RFC 4960's 1 s minimum.
-        let mut m = RtoManager::new();
-        for _ in 0..50 {
-            m.set_new_rtt(274);
-        }
-        assert_eq!(m.get_rto(), 274 + RTO_VAR_FLOOR);
-        // A LAN path never goes below RTO_MIN.
-        let mut m = RtoManager::new();
-        for _ in 0..50 {
-            m.set_new_rtt(2);
-        }
-        assert_eq!(m.get_rto(), RTO_MIN);
         Ok(())
     }
 
