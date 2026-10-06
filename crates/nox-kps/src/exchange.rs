@@ -14,6 +14,9 @@
 //!   method `405` + `Allow`, unknown method `501`;
 //! - per-route request rules: exact packet size, media types, claim body
 //!   shape, no body on GET (`400`/`411`/`413`/`415`);
+//! - claim long-polls (`wait_ms` in a retaining claim): capped by
+//!   `limits.claim_wait_max_ms` and `limits.max_concurrent_claim_waits`, the
+//!   granted wait extends the upstream timeout and the stream deadline;
 //! - per-IP rate limits (`429` + `Retry-After`);
 //! - responses always carry an exact `Content-Length`, never chunked;
 //! - keep-alive off: one exchange, then the stream is finished.
@@ -43,7 +46,10 @@ use crate::config::{SPHINX_PACKET_BYTES, SURB_ID_HEX_LEN};
 use crate::error::ProxyError;
 use crate::limits::RateLimited;
 use crate::metrics::{ResultLabels, RouteLabels, StreamLabels, UpstreamErrorLabels};
-use crate::proxy::{into_client_response, UpstreamCall, UpstreamResponse};
+use crate::proxy::{
+    into_client_response, UpstreamCall, UpstreamResponse, CLAIM_BATCH_CONTENT_TYPE,
+    CLAIM_WAIT_MAX_HEADER,
+};
 use crate::routes::{lookup, Lookup, Route, BUNDLE_PATH_PREFIX, KNOWN_METHODS};
 
 /// Route label for requests that matched nothing.
@@ -67,6 +73,21 @@ struct StreamShared {
     response_bytes: AtomicU64,
     /// Signalled when `response_bytes` is set.
     response_ready: Notify,
+    /// Long-poll time granted to this exchange's claim, in milliseconds.
+    wait_granted_ms: AtomicU64,
+    /// Signalled when `wait_granted_ms` is set.
+    wait_granted: Notify,
+}
+
+impl StreamShared {
+    /// Grants `wait` of long-poll time: the stream deadline grows by it.
+    fn grant_wait(&self, wait: std::time::Duration) {
+        if !wait.is_zero() {
+            self.wait_granted_ms
+                .store(wait.as_millis() as u64, Ordering::Relaxed);
+            self.wait_granted.notify_one();
+        }
+    }
 }
 
 /// Counts one upstream exchange in the `upstream_inflight` gauge for as long
@@ -152,6 +173,7 @@ pub async fn serve_stream(
         let expiry = tokio::time::sleep_until(deadline);
         tokio::pin!(expiry);
         let mut extended = false;
+        let mut wait_extended = false;
         loop {
             tokio::select! {
                 result = &mut connection => break Some(result),
@@ -159,6 +181,12 @@ pub async fn serve_stream(
                     extended = true;
                     let bytes = shared.response_bytes.load(Ordering::Relaxed);
                     deadline += limits.drain_allowance(bytes);
+                    expiry.as_mut().reset(deadline);
+                }
+                () = shared.wait_granted.notified(), if !wait_extended => {
+                    wait_extended = true;
+                    let granted = shared.wait_granted_ms.load(Ordering::Relaxed);
+                    deadline += std::time::Duration::from_millis(granted);
                     expiry.as_mut().reset(deadline);
                 }
                 () = &mut expiry => break None,
@@ -221,7 +249,7 @@ async fn handle_request(
     shared: &StreamShared,
 ) -> Result<Response<Full<Bytes>>, Abandon> {
     let started = Instant::now();
-    let (label, response) = match dispatch(req, app, client_ip, &shared.held).await {
+    let (label, response) = match dispatch(req, app, client_ip, shared).await {
         Ok(answer) => answer,
         Err(abandon) => {
             debug!(reason = abandon.0, "exchange abandoned");
@@ -268,7 +296,7 @@ async fn dispatch(
     req: Request<Incoming>,
     app: &App,
     client_ip: IpAddr,
-    held: &HeldPermit,
+    shared: &StreamShared,
 ) -> Result<(&'static str, Response<Full<Bytes>>), Abandon> {
     let refuse = |kind, status, msg: &str| Ok((UNMATCHED, violation(app, kind, status, msg)));
     if req.version() != Version::HTTP_11 {
@@ -365,7 +393,7 @@ async fn dispatch(
     }
     let response = match route {
         Route::Packets => packets(req, app, client_ip, declared).await?,
-        Route::Claim => claim(req, app, client_ip, declared).await?,
+        Route::Claim => claim(req, app, client_ip, declared, shared).await?,
         Route::Topology => topology(app).await,
         Route::Health => health(app).await,
         Route::Metadata => with_type(
@@ -373,7 +401,7 @@ async fn dispatch(
             "application/json",
             app.metadata_json.clone(),
         ),
-        Route::Bundle => bundle(&req, app, held),
+        Route::Bundle => bundle(&req, app, &shared.held),
     };
     Ok((label, response))
 }
@@ -461,7 +489,9 @@ async fn packets(
             client_ip: Some(client_ip),
             timeout: l.upstream_packet_timeout,
             max_response_bytes: l.small_response_max_bytes,
+            accept: None,
         },
+        Slot::Inflight,
     )
     .await;
     Ok(match forwarded {
@@ -474,6 +504,7 @@ async fn claim(
     app: &App,
     client_ip: IpAddr,
     declared: Option<u64>,
+    shared: &StreamShared,
 ) -> Result<Response<Full<Bytes>>, Abandon> {
     let label = Route::Claim.label();
     let l = &app.settings.limits;
@@ -504,10 +535,48 @@ async fn claim(
             ),
         ));
     }
+    let accept = accepts_claim_batch(req.headers())
+        .then(|| HeaderValue::from_static(CLAIM_BATCH_CONTENT_TYPE));
     let body = read_body(req.into_body(), len as usize, app, label).await?;
-    if let Err(msg) = check_claim_body(&body, l.claim_max_surb_ids) {
-        return Ok(violation(app, "claim_body", StatusCode::BAD_REQUEST, &msg));
+    let shape = match check_claim_body(&body, l.claim_max_surb_ids) {
+        Ok(shape) => shape,
+        Err(msg) => return Ok(violation(app, "claim_body", StatusCode::BAD_REQUEST, &msg)),
+    };
+
+    // Long-poll: only a retaining claim asks the node to wait (the node
+    // ignores `wait_ms` otherwise), so only those take a wait slot.
+    let asked = if shape.retain { shape.wait_ms } else { 0 };
+    let mut wait = std::time::Duration::ZERO;
+    let mut wait_slot = None;
+    if asked > 0 {
+        let result = if l.claim_wait_max.is_zero() {
+            "off"
+        } else if let Ok(permit) = Arc::clone(&app.claim_waits).try_acquire_owned() {
+            wait = std::time::Duration::from_millis(asked).min(l.claim_wait_max);
+            wait_slot = Some(permit);
+            "granted"
+        } else {
+            "busy"
+        };
+        app.metrics
+            .claim_waits
+            .get_or_create(&ResultLabels { result })
+            .inc();
     }
+    let body = if asked == wait.as_millis() as u64 {
+        body
+    } else {
+        match with_wait_ms(&body, wait.as_millis() as u64) {
+            Ok(rewritten) => rewritten,
+            Err(msg) => return Ok(violation(app, "claim_body", StatusCode::BAD_REQUEST, &msg)),
+        }
+    };
+    shared.grant_wait(wait);
+    let slot = if wait_slot.is_some() {
+        Slot::Held
+    } else {
+        Slot::Inflight
+    };
     let forwarded = forward(
         app,
         UpstreamCall {
@@ -518,42 +587,135 @@ async fn claim(
             content_type: Some(HeaderValue::from_static("application/json")),
             body,
             client_ip: Some(client_ip),
-            timeout: l.upstream_claim_timeout,
+            timeout: l.upstream_claim_timeout + wait,
             max_response_bytes: l.claim_response_max_bytes,
+            accept,
         },
+        slot,
     )
     .await;
-    Ok(match forwarded {
-        Ok(res) | Err(res) => into_client_response(res),
-    })
+    drop(wait_slot);
+    let mut response = match forwarded {
+        Ok(res) | Err(res) => res,
+    };
+    cap_wait_header(&mut response.headers, l.claim_wait_max);
+    Ok(into_client_response(response))
 }
 
-/// `{"surb_ids": [<32 hex>, ...]}` with at most `max_ids` entries. The node
-/// re-checks every ID; this keeps malformed input off the loopback.
-pub fn check_claim_body(body: &[u8], max_ids: usize) -> Result<(), String> {
+/// Whether the client's `Accept` names the binary claim batch.
+fn accepts_claim_batch(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter_map(|range| range.split(';').next())
+        .any(|essence| {
+            essence
+                .trim()
+                .eq_ignore_ascii_case(CLAIM_BATCH_CONTENT_TYPE)
+        })
+}
+
+/// The node's `x-nox-claim-wait-max-ms`, lowered to what this relay grants.
+fn cap_wait_header(headers: &mut HeaderMap, relay_max: std::time::Duration) {
+    let relay_max = relay_max.as_millis() as u64;
+    let node_max = headers
+        .get(CLAIM_WAIT_MAX_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if let Some(node_max) = node_max {
+        headers.insert(
+            CLAIM_WAIT_MAX_HEADER,
+            HeaderValue::from(node_max.min(relay_max)),
+        );
+    }
+}
+
+/// Rewrites `wait_ms` in an already-validated claim body.
+fn with_wait_ms(body: &[u8], wait_ms: u64) -> Result<Bytes, String> {
+    let mut value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| format!("claim body must be {{\"surb_ids\":[...]}}: {e}"))?;
+    let Some(fields) = value.as_object_mut() else {
+        return Err("claim body must be a JSON object".to_string());
+    };
+    fields.insert("wait_ms".to_string(), serde_json::Value::from(wait_ms));
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|e| format!("claim body could not be re-encoded: {e}"))
+}
+
+/// What nox-kps reads from a claim body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimShape {
+    /// Number of IDs claimed.
+    pub surb_ids: usize,
+    /// Number of IDs acked.
+    pub acks: usize,
+    /// `retain` was set.
+    pub retain: bool,
+    /// `wait_ms` as sent (0 when absent).
+    pub wait_ms: u64,
+}
+
+/// `{"surb_ids": [<32 hex>, ...]}` with at most `max_ids` entries, plus the
+/// optional claim v2 fields: `ack` (at most `max_ids` IDs of 32 hex),
+/// `encoding` (a short string), `retain` (bool) and `wait_ms` (integer).
+/// Other fields are relayed untouched. The node re-checks every ID; this keeps
+/// malformed input off the loopback.
+pub fn check_claim_body(body: &[u8], max_ids: usize) -> Result<ClaimShape, String> {
     #[derive(serde::Deserialize)]
     struct Claim {
         surb_ids: Vec<String>,
+        #[serde(default)]
+        ack: Option<Vec<String>>,
+        #[serde(default)]
+        encoding: Option<String>,
+        #[serde(default)]
+        retain: Option<bool>,
+        #[serde(default)]
+        wait_ms: Option<u64>,
     }
     let claim: Claim = serde_json::from_slice(body)
         .map_err(|e| format!("claim body must be {{\"surb_ids\":[...]}}: {e}"))?;
-    if claim.surb_ids.len() > max_ids {
-        return Err(format!(
-            "a claim names at most {max_ids} SURB IDs (got {})",
-            claim.surb_ids.len()
-        ));
-    }
-    if let Some(i) = claim
-        .surb_ids
-        .iter()
-        .position(|id| id.len() != SURB_ID_HEX_LEN || !id.bytes().all(|b| b.is_ascii_hexdigit()))
+    let check_ids = |field: &str, noun: &str, ids: &[String]| -> Result<(), String> {
+        if ids.len() > max_ids {
+            return Err(format!(
+                "a claim names at most {max_ids} {noun} (got {})",
+                ids.len()
+            ));
+        }
+        if let Some(i) = ids.iter().position(|id| {
+            id.len() != SURB_ID_HEX_LEN || !id.bytes().all(|b| b.is_ascii_hexdigit())
+        }) {
+            return Err(format!(
+                "{field}[{i}] must be exactly {SURB_ID_HEX_LEN} hex characters"
+            ));
+        }
+        Ok(())
+    };
+    check_ids("surb_ids", "SURB IDs", &claim.surb_ids)?;
+    let acks = claim.ack.unwrap_or_default();
+    check_ids("ack", "ack IDs", &acks)?;
+    if claim
+        .encoding
+        .as_ref()
+        .is_some_and(|e| e.len() > CLAIM_ENCODING_MAX_LEN)
     {
         return Err(format!(
-            "surb_ids[{i}] must be exactly {SURB_ID_HEX_LEN} hex characters"
+            "encoding is at most {CLAIM_ENCODING_MAX_LEN} characters"
         ));
     }
-    Ok(())
+    Ok(ClaimShape {
+        surb_ids: claim.surb_ids.len(),
+        acks: acks.len(),
+        retain: claim.retain.unwrap_or(false),
+        wait_ms: claim.wait_ms.unwrap_or(0),
+    })
 }
+
+/// Longest `encoding` value accepted in a claim body.
+const CLAIM_ENCODING_MAX_LEN: usize = 32;
 
 async fn topology(app: &App) -> Response<Full<Bytes>> {
     let label = Route::Topology.label();
@@ -573,7 +735,9 @@ async fn topology(app: &App) -> Response<Full<Bytes>> {
                     client_ip: None,
                     timeout: l.upstream_topology_timeout,
                     max_response_bytes: l.topology_response_max_bytes,
+                    accept: None,
                 },
+                Slot::Inflight,
             )
             .await
             {
@@ -602,7 +766,9 @@ async fn health(app: &App) -> Response<Full<Bytes>> {
                     client_ip: None,
                     timeout: l.upstream_health_timeout,
                     max_response_bytes: l.small_response_max_bytes,
+                    accept: None,
                 },
+                Slot::Inflight,
             )
             .await;
             let (status, body): (StatusCode, &'static [u8]) = match probe {
@@ -627,14 +793,34 @@ async fn health(app: &App) -> Response<Full<Bytes>> {
     into_client_response(res)
 }
 
+/// Which cap an upstream exchange counts against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    /// `limits.max_inflight_upstream`.
+    Inflight,
+    /// The caller already holds a slot (a claim long-poll slot), so a held
+    /// long-poll never starves packet submits of in-flight slots.
+    Held,
+}
+
 /// Runs one upstream exchange under the in-flight cap, recording errors.
 /// `Err` carries the response to send instead (`502`, `503`, `504`).
-async fn forward(app: &App, call: UpstreamCall<'_>) -> Result<UpstreamResponse, UpstreamResponse> {
-    let Ok(_permit) = app.inflight.clone().try_acquire_owned() else {
-        return Err(retry_later_parts(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "too many requests in flight; retry shortly",
-        ));
+async fn forward(
+    app: &App,
+    call: UpstreamCall<'_>,
+    slot: Slot,
+) -> Result<UpstreamResponse, UpstreamResponse> {
+    let _permit = match slot {
+        Slot::Held => None,
+        Slot::Inflight => {
+            let Ok(permit) = app.inflight.clone().try_acquire_owned() else {
+                return Err(retry_later_parts(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "too many requests in flight; retry shortly",
+                ));
+            };
+            Some(permit)
+        }
     };
     let route = call.route;
     let result = {

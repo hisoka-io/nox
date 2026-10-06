@@ -59,6 +59,13 @@ pub const fn max_claim_response_bytes(surb_ids: usize) -> usize {
         .saturating_add(CLAIM_ARRAY_OVERHEAD_BYTES)
 }
 
+/// Default `limits.claim_wait_max_ms`.
+pub const DEFAULT_CLAIM_WAIT_MAX_MS: u64 = 20_000;
+/// Upper bound for `limits.claim_wait_max_ms`.
+pub const MAX_CLAIM_WAIT_MS: u64 = 60_000;
+/// Default `limits.max_concurrent_claim_waits`.
+pub const DEFAULT_MAX_CONCURRENT_CLAIM_WAITS: usize = 128;
+
 /// Lowest header-block cap hyper accepts (its read buffer cannot be smaller).
 pub const MIN_HEADER_BYTES: usize = 8 * 1024;
 /// Upper bound for the header-block cap; KPS-HTTP/1 recommends 16 KiB.
@@ -220,6 +227,15 @@ pub struct LimitsConfig {
     /// Largest claim response relayed (the node's JSON is up to 4x the
     /// binary size, about 127 KB per full reply).
     pub claim_response_max_bytes: usize,
+    /// Longest long-poll (`wait_ms` in a retaining claim) relayed to the
+    /// node; longer requests are capped to it. 0 turns long-polling off
+    /// (claims are relayed with `wait_ms` 0). The claim's upstream timeout and
+    /// stream deadline grow by the granted wait.
+    pub claim_wait_max_ms: u64,
+    /// Claims that may long-poll at once across all clients; beyond it a
+    /// claim is relayed with `wait_ms` 0 and answers at once. Long-polls do
+    /// not take `max_inflight_upstream` slots.
+    pub max_concurrent_claim_waits: usize,
     /// Largest topology response relayed.
     pub topology_response_max_bytes: usize,
     /// Largest packet-submit or health response relayed.
@@ -298,6 +314,8 @@ impl Default for LimitsConfig {
             claim_request_max_bytes: 64 * 1024,
             claim_max_surb_ids: 128,
             claim_response_max_bytes: 16 * 1024 * 1024,
+            claim_wait_max_ms: DEFAULT_CLAIM_WAIT_MAX_MS,
+            max_concurrent_claim_waits: DEFAULT_MAX_CONCURRENT_CLAIM_WAITS,
             topology_response_max_bytes: 1024 * 1024,
             small_response_max_bytes: 1024,
             upstream_connect_timeout_ms: 1_000,
@@ -640,6 +658,20 @@ impl LimitsConfig {
                     / MAX_CLAIM_ITEM_JSON_BYTES,
             ));
         }
+        if self.claim_wait_max_ms > MAX_CLAIM_WAIT_MS {
+            v.err(format!(
+                "limits.claim_wait_max_ms must be at most {MAX_CLAIM_WAIT_MS} (got: {})",
+                self.claim_wait_max_ms
+            ));
+        }
+        if self.claim_wait_max_ms > 0 {
+            v.range(
+                self.max_concurrent_claim_waits,
+                1,
+                1_000_000,
+                "limits.max_concurrent_claim_waits",
+            );
+        }
         v.range(
             self.topology_response_max_bytes,
             1,
@@ -845,6 +877,8 @@ impl LimitsConfig {
             claim_request_max_bytes: self.claim_request_max_bytes,
             claim_max_surb_ids: self.claim_max_surb_ids,
             claim_response_max_bytes: self.claim_response_max_bytes,
+            claim_wait_max: ms(self.claim_wait_max_ms),
+            max_concurrent_claim_waits: self.max_concurrent_claim_waits,
             topology_response_max_bytes: self.topology_response_max_bytes,
             small_response_max_bytes: self.small_response_max_bytes,
             upstream_connect_timeout: ms(self.upstream_connect_timeout_ms),
@@ -1008,6 +1042,9 @@ pub struct Limits {
     pub claim_request_max_bytes: usize,
     pub claim_max_surb_ids: usize,
     pub claim_response_max_bytes: usize,
+    /// Longest long-poll relayed; zero turns long-polling off.
+    pub claim_wait_max: Duration,
+    pub max_concurrent_claim_waits: usize,
     pub topology_response_max_bytes: usize,
     pub small_response_max_bytes: usize,
     pub upstream_connect_timeout: Duration,

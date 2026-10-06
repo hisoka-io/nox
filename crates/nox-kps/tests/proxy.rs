@@ -224,7 +224,11 @@ async fn metadata_describes_the_endpoint() {
         .iter()
         .map(|c| c.as_str().unwrap())
         .collect();
-    assert_eq!(caps, ["metadata", "health", "packets", "claim", "topology"]);
+    assert_eq!(
+        caps,
+        ["metadata", "health", "packets", "claim", "topology", "claim-v2"]
+    );
+    assert_eq!(doc["limits"]["claimWaitMaxMs"], 20_000);
     assert_eq!(t.upstream.count(), 0, "served locally, never proxied");
     t.stop().await;
 }

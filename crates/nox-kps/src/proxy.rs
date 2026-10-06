@@ -23,11 +23,21 @@ use tokio::sync::Mutex;
 use crate::config::Upstream;
 use crate::error::ProxyError;
 
+/// `Content-Type` of the node's binary claim batch (claim protocol v2).
+pub const CLAIM_BATCH_CONTENT_TYPE: &str = "application/vnd.nox.claim-batch";
+/// Node header naming its claim protocol version.
+pub const CLAIM_VERSION_HEADER: &str = "x-nox-claim-version";
+/// Node header with the longest claim long-poll it honours (nox-kps lowers it
+/// to its own `limits.claim_wait_max_ms`).
+pub const CLAIM_WAIT_MAX_HEADER: &str = "x-nox-claim-wait-max-ms";
+
 /// Response headers relayed from the node.
-const RELAYED_RESPONSE_HEADERS: [HeaderName; 3] = [
+const RELAYED_RESPONSE_HEADERS: [HeaderName; 5] = [
     header::CONTENT_TYPE,
     header::CACHE_CONTROL,
     header::RETRY_AFTER,
+    HeaderName::from_static(CLAIM_VERSION_HEADER),
+    HeaderName::from_static(CLAIM_WAIT_MAX_HEADER),
 ];
 
 /// A pooled HTTP/1.1 client for the loopback upstreams.
@@ -51,6 +61,8 @@ pub struct UpstreamCall<'a> {
     pub client_ip: Option<IpAddr>,
     pub timeout: Duration,
     pub max_response_bytes: usize,
+    /// `Accept` sent upstream (claims that ask for the binary batch).
+    pub accept: Option<HeaderValue>,
 }
 
 /// The parts of an upstream response relayed to the client.
@@ -179,6 +191,9 @@ pub fn build_upstream_request(
     if let Some(ct) = &call.content_type {
         headers.insert(header::CONTENT_TYPE, ct.clone());
     }
+    if let Some(accept) = &call.accept {
+        headers.insert(header::ACCEPT, accept.clone());
+    }
     if has_body || call.method == Method::POST {
         headers.insert(header::CONTENT_LENGTH, HeaderValue::from(call.body.len()));
     }
@@ -290,6 +305,7 @@ mod tests {
             client_ip: Some(ip.parse().unwrap()),
             timeout: Duration::from_secs(1),
             max_response_bytes: 1024,
+            accept: None,
         }
     }
 

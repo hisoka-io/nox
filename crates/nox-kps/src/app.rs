@@ -27,6 +27,8 @@ pub struct App {
     pub inflight: Arc<Semaphore>,
     /// Bundle responses being written across all clients.
     pub bundle_streams: Arc<Semaphore>,
+    /// Claims long-polling across all clients.
+    pub claim_waits: Arc<Semaphore>,
     pub conn_limiter: Arc<ConnLimiter>,
     pub rate: RateLimiters,
     pub topology: SharedResponse,
@@ -75,6 +77,9 @@ impl RateLimiters {
     }
 }
 
+/// Capability listed when claim protocol v2 is relayed.
+pub const CLAIM_V2_CAPABILITY: &str = "claim-v2";
+
 /// `/metadata.json` (PROTOCOL.md §5), in this key order.
 #[derive(Debug, Serialize)]
 struct MetadataDocument<'a> {
@@ -96,6 +101,7 @@ struct MetadataLimits {
     claim_request_max_bytes: usize,
     claim_max_surb_ids: usize,
     claim_response_max_bytes: usize,
+    claim_wait_max_ms: u64,
 }
 
 /// The capability document served at `/metadata.json`.
@@ -104,11 +110,14 @@ pub fn metadata_document(
     addresses: &[String],
     bundles_enabled: bool,
 ) -> Result<Bytes, serde_json::Error> {
-    let capabilities = Route::ALL
+    let mut capabilities: Vec<&'static str> = Route::ALL
         .iter()
         .filter(|r| bundles_enabled || **r != Route::Bundle)
         .map(|r| r.label())
         .collect();
+    // Claim protocol v2 (encoding, retain, ack) is relayed as-is; long-polls
+    // are relayed when `claimWaitMaxMs` is above zero (docs/claim-api.md).
+    capabilities.push(CLAIM_V2_CAPABILITY);
     let doc = MetadataDocument {
         protocol: crate::PROTOCOL,
         software: "nox-kps",
@@ -121,6 +130,7 @@ pub fn metadata_document(
             claim_request_max_bytes: settings.limits.claim_request_max_bytes,
             claim_max_surb_ids: settings.limits.claim_max_surb_ids,
             claim_response_max_bytes: settings.limits.claim_response_max_bytes,
+            claim_wait_max_ms: settings.limits.claim_wait_max.as_millis() as u64,
         },
         demo: false,
     };
@@ -156,8 +166,8 @@ mod tests {
                 r#"{"protocol":"nox-kps-http/1","software":"nox-kps","version":""#,
                 env!("CARGO_PKG_VERSION"),
                 r#"","node":"0x862d6b1105bde9d64dc5182fe3cd9d09f6f37463","addresses":["3.239.73.249:15005:uEiX"],"#,
-                r#""capabilities":["metadata","health","packets","claim","topology","worker-bundles"],"#,
-                r#""limits":{"packetBytes":32768,"claimRequestMaxBytes":65536,"claimMaxSurbIds":128,"claimResponseMaxBytes":16777216},"demo":false}"#
+                r#""capabilities":["metadata","health","packets","claim","topology","worker-bundles","claim-v2"],"#,
+                r#""limits":{"packetBytes":32768,"claimRequestMaxBytes":65536,"claimMaxSurbIds":128,"claimResponseMaxBytes":16777216,"claimWaitMaxMs":20000},"demo":false}"#
             )
         );
         let doc = metadata_document(&settings(""), &addrs, false).unwrap();

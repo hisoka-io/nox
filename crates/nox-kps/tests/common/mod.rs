@@ -51,7 +51,13 @@ pub struct Behaviour {
     /// Answer claims like a node holding a full-size reply for every ID
     /// (`MAX_REPLY_PAYLOAD_BYTES` of 255s, the longest JSON encoding).
     pub full_size_claims: bool,
+    /// Answer claims like a v2 node holding nothing: a retaining claim with
+    /// `wait_ms` waits that long, then `204`.
+    pub claims_wait_then_empty: bool,
 }
+
+/// `x-nox-claim-wait-max-ms` the mock advertises on claim answers.
+pub const MOCK_NODE_CLAIM_WAIT_MAX_MS: u64 = 30_000;
 
 /// A mock of the node's ingress/topology HTTP services.
 ///
@@ -177,9 +183,9 @@ async fn mock_handle(
         .map(|c| c.to_bytes())
         .unwrap_or_default();
     let path = parts.uri.path().to_string();
-    let (skip_bodies, full_size_claims) = {
+    let (skip_bodies, full_size_claims, claims_wait) = {
         let b = behaviour.lock().unwrap();
-        (b.skip_bodies, b.full_size_claims)
+        (b.skip_bodies, b.full_size_claims, b.claims_wait_then_empty)
     };
     recorded.lock().unwrap().push(Recorded {
         method: parts.method.to_string(),
@@ -217,7 +223,13 @@ async fn mock_handle(
         ("POST", "/api/v1/responses/claim") => {
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
             let ids = json["surb_ids"].as_array().cloned().unwrap_or_default();
-            if ids.is_empty() {
+            if claims_wait {
+                if json["retain"] == true {
+                    let wait = json["wait_ms"].as_u64().unwrap_or(0);
+                    tokio::time::sleep(Duration::from_millis(wait)).await;
+                }
+                (StatusCode::NO_CONTENT, "application/json", Bytes::new())
+            } else if ids.is_empty() {
                 (StatusCode::NO_CONTENT, "application/json", Bytes::new())
             } else {
                 let items: Vec<serde_json::Value> = ids
@@ -265,6 +277,13 @@ async fn mock_handle(
     h.insert("x-nox-version", "test-upstream".parse().unwrap());
     h.insert("set-cookie", "leak=1".parse().unwrap());
     h.insert("x-internal", "secret".parse().unwrap());
+    if path == "/api/v1/responses/claim" {
+        h.insert("x-nox-claim-version", "2".parse().unwrap());
+        h.insert(
+            "x-nox-claim-wait-max-ms",
+            MOCK_NODE_CLAIM_WAIT_MAX_MS.to_string().parse().unwrap(),
+        );
+    }
     res
 }
 
