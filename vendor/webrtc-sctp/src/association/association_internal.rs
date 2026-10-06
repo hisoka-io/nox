@@ -61,6 +61,11 @@ pub struct AssociationInternal {
     partial_bytes_acked: u32,
     pub(crate) in_fast_recovery: bool,
     fast_recover_exit_point: u32,
+    /// nox: cwnd when the current fast recovery began.
+    fast_recovery_entry_cwnd: u32,
+    /// nox: chunks marked lost (3 miss indications) in the current fast
+    /// recovery.
+    fast_recovery_losses: u32,
 
     // RTX & Ack timer
     pub(crate) rto_mgr: RtoManager,
@@ -121,7 +126,28 @@ pub(crate) fn loss_cwnd_floor(mtu: u32) -> u32 {
     std::cmp::max(LOSS_CWND_FLOOR_MTUS * mtu, 4 * mtu)
 }
 
+/// Most lost chunks in one window that still count as random loss (nox).
+///
+/// The loss floor is for isolated losses. When more chunks than this are
+/// lost in one fast recovery, or are outstanding when the T3-rtx timer
+/// expires, the window overran the path (for example a shallow bottleneck
+/// queue), and the sender reacts as RFC 4960 7.2.3 says: half the window,
+/// at least 4 MTU, or one MTU after a timeout.
+pub(crate) const LOSS_FLOOR_MAX_LOSSES: u32 = 2;
+
 impl AssociationInternal {
+    /// nox: chunks sent and not yet acked (cumulatively or by a gap block).
+    fn unacked_chunks(&self) -> u32 {
+        let mut n = 0;
+        for i in 0..self.inflight_queue.len() as u32 {
+            let tsn = self.cumulative_tsn_ack_point.wrapping_add(i + 1);
+            if self.inflight_queue.get(tsn).is_some_and(|c| !c.acked) {
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// nox: pacing rate for the packets after the first burst of a write.
     pub(crate) fn pacing_bytes_per_ms(&self) -> u64 {
         self.delivery_rate.pacing_bytes_per_ms()
@@ -206,6 +232,8 @@ impl AssociationInternal {
             partial_bytes_acked: 0,
             in_fast_recovery: false,
             fast_recover_exit_point: 0,
+            fast_recovery_entry_cwnd: 0,
+            fast_recovery_losses: 0,
 
             rto_mgr: RtoManager::new(),
             t1init: None,
@@ -1419,6 +1447,8 @@ impl AssociationInternal {
                             //     last sent, according to the formula described in Section 7.2.3.
                             self.in_fast_recovery = true;
                             self.fast_recover_exit_point = htna;
+                            self.fast_recovery_entry_cwnd = self.cwnd;
+                            self.fast_recovery_losses = 1;
                             // nox: floor at the loss floor instead of 4 MTU.
                             self.ssthresh =
                                 std::cmp::max(self.cwnd / 2, loss_cwnd_floor(self.mtu));
@@ -1433,6 +1463,24 @@ impl AssociationInternal {
                                 self.ssthresh,
                                 self.inflight_queue.get_num_bytes()
                             );
+                        } else if c.miss_indicator == 3 {
+                            // nox: more losses in the same window mean
+                            // congestion: drop the loss floor (RFC 4960 7.2.3).
+                            self.fast_recovery_losses += 1;
+                            if self.fast_recovery_losses == LOSS_FLOOR_MAX_LOSSES + 1 {
+                                self.ssthresh = std::cmp::max(
+                                    self.fast_recovery_entry_cwnd / 2,
+                                    4 * self.mtu,
+                                );
+                                self.cwnd = std::cmp::min(self.cwnd, self.ssthresh);
+                                log::trace!(
+                                    "[{}] updated cwnd={} ssthresh={} losses={} (FR, congestion)",
+                                    self.name,
+                                    self.cwnd,
+                                    self.ssthresh,
+                                    self.fast_recovery_losses
+                                );
+                            }
                         }
                     }
                 } else {
@@ -2427,8 +2475,16 @@ impl RtxTimerObserver for AssociationInternal {
                 // packet at the tail of a reply, which no later SACK could
                 // report) keeps cwnd at the loss floor. Repeated expiries
                 // mean the path is failing: back to one MTU as RFC 4960 says.
-                self.ssthresh = std::cmp::max(self.cwnd / 2, loss_cwnd_floor(self.mtu));
-                self.cwnd = if n_rtos <= 1 {
+                // Several chunks outstanding at the expiry means the window
+                // overran the path: no floor then either.
+                let outstanding = self.unacked_chunks();
+                let isolated = n_rtos <= 1 && outstanding <= LOSS_FLOOR_MAX_LOSSES;
+                self.ssthresh = if isolated {
+                    std::cmp::max(self.cwnd / 2, loss_cwnd_floor(self.mtu))
+                } else {
+                    std::cmp::max(self.cwnd / 2, 4 * self.mtu)
+                };
+                self.cwnd = if isolated {
                     loss_cwnd_floor(self.mtu)
                 } else {
                     self.mtu

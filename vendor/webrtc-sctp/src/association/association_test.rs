@@ -1389,6 +1389,59 @@ async fn test_assoc_congestion_control_fast_retransmission() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_assoc_congestion_control_burst_loss_drops_the_loss_floor() -> Result<()> {
+    const SI: u16 = 6;
+    let mut sbuf = vec![0u8; 1000];
+    fill(&mut sbuf[..]);
+
+    let (br, ca, cb) = Bridge::new(0, None, None);
+
+    let (a0, mut a1) =
+        create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::Normal, 0).await?;
+
+    let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+
+    let entry_cwnd = a0.association_internal.lock().await.cwnd;
+    br.drop_next_nwrites(0, 4); // four packets lost in one window: congestion
+
+    for i in 0..10u32 {
+        sbuf[0..4].copy_from_slice(&i.to_be_bytes());
+        s0.write_sctp(
+            &Bytes::from(sbuf.clone()),
+            PayloadProtocolIdentifier::Binary,
+        )
+        .await?;
+    }
+
+    for _ in 0..50 {
+        br.tick().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let mut buf = vec![0u8; 3000];
+    for i in 0..10u32 {
+        let (n, _) = s1.read_sctp(&mut buf).await?;
+        assert_eq!(n, sbuf.len(), "unexpected length of received data");
+        assert_eq!(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), i);
+    }
+
+    {
+        let a = a0.association_internal.lock().await;
+        assert!(a.stats.get_num_fast_retrans() >= 1, "should fast-retransmit");
+        assert_eq!(
+            a.ssthresh,
+            std::cmp::max(entry_cwnd / 2, 4 * a.mtu),
+            "a burst loss halves the window as RFC 4960 7.2.3 says"
+        );
+        assert!(a.ssthresh < loss_cwnd_floor(a.mtu));
+    }
+
+    close_association_pair(&br, a0, a1).await;
+
+    Ok(())
+}
+
 //use std::io::Write;
 
 #[tokio::test]
