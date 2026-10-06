@@ -65,7 +65,7 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     "https://github.com/zkpassport/noir_rs",
-    # nox-kps: the kps library and its vendored webrtc / webrtc-sctp patches (orphan
+    # nox-kps: the kps library and its webrtc patch (orphan
     # branches of the kps repository; see the workspace Cargo.toml). cargo-deny
     # normalises the ".git" suffix, so one entry covers both spellings.
     "https://github.com/ethereum/kps",

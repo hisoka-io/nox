@@ -32,6 +32,8 @@ COPY crates/nox-client/Cargo.toml crates/nox-client/Cargo.toml
 COPY crates/nox-test-infra/Cargo.toml crates/nox-test-infra/Cargo.toml
 COPY crates/nox-sim/Cargo.toml crates/nox-sim/Cargo.toml
 COPY crates/nox-kps/Cargo.toml crates/nox-kps/Cargo.toml
+# Vendored dependency sources patched in through [patch.crates-io] (vendor/README.md).
+COPY vendor vendor
 
 # Create stubs for all workspace members (cargo needs parseable src for each)
 RUN for dir in nox-core nox-crypto nox-node nox-oracle nox-client \
