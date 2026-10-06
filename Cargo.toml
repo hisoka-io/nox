@@ -168,7 +168,7 @@ panic = "unwind"
 #   - webrtc-sctp: read-shutdown drain (webrtc-rs/webrtc#816) + zero-window
 #     deadlock on tail-of-burst loss (webrtc-rs/webrtc#822). Vendored at that
 #     rev in vendor/webrtc-sctp with nox's sender tuning on top (larger initial
-#     window, lower RTO floor; vendor/README.md). scripts/check-kps-patches.sh
+#     window, 1 s initial RTO; vendor/README.md). scripts/check-kps-patches.sh
 #     checks the vendored base rev against kps.
 #   - webrtc: (1) negotiated-channel accept race: an early inbound message
 #     parsed as DCEP kills the accept loop (webrtc-rs/webrtc#821); (2) gate the

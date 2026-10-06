@@ -156,7 +156,9 @@ How a v2 client decides what to send:
    `limits.claimWaitMaxMs` as the cap. Without it, send `encoding` and
    `retain` (harmless on older entries) but not `wait_ms`.
 2. Direct HTTP: send the v2 fields; check `x-nox-claim-version` on the
-   first answer and use `x-nox-claim-wait-max-ms` as the cap.
+   first answer and use `x-nox-claim-wait-max-ms` as the cap. The ingress
+   CORS policy lists both headers in `Access-Control-Expose-Headers`, so
+   browser clients can read them.
 3. Always parse by `Content-Type`: `application/vnd.nox.claim-batch` is the
    binary batch; `application/json` items have either `data` (number array)
    or `data_b64`.

@@ -13,6 +13,7 @@ use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tracing::{debug, warn};
 
+use super::claim::{CLAIM_VERSION_HEADER, CLAIM_WAIT_MAX_HEADER};
 use crate::config::IngressConfig;
 use crate::telemetry::metrics::MetricsService;
 
@@ -144,6 +145,15 @@ pub async fn rate_limit(
     next.run(request).await
 }
 
+/// Response headers a browser client may read cross-origin: the claim
+/// protocol headers a v2 client uses to find the entry's long-poll cap.
+fn exposed_headers() -> [HeaderName; 2] {
+    [
+        HeaderName::from_static(CLAIM_VERSION_HEADER),
+        HeaderName::from_static(CLAIM_WAIT_MAX_HEADER),
+    ]
+}
+
 /// CORS for the public ports. An empty origin list allows any origin, which keeps
 /// browser clients served from any site working; a non-empty list allows only those.
 pub fn cors_layer(allowed_origins: &[String]) -> CorsLayer {
@@ -151,7 +161,8 @@ pub fn cors_layer(allowed_origins: &[String]) -> CorsLayer {
         return CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
-            .allow_headers(Any);
+            .allow_headers(Any)
+            .expose_headers(exposed_headers());
     }
     let origins: Vec<HeaderValue> = allowed_origins
         .iter()
@@ -167,6 +178,7 @@ pub fn cors_layer(allowed_origins: &[String]) -> CorsLayer {
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers(Any)
+        .expose_headers(exposed_headers())
 }
 
 #[cfg(test)]
@@ -356,5 +368,32 @@ mod tests {
             Some(HeaderValue::from_static("https://demo.example"))
         );
         assert_eq!(preflight(app, "https://other.example").await, None);
+    }
+
+    #[tokio::test]
+    async fn cors_exposes_the_claim_headers() {
+        for allowed in [Vec::new(), vec!["https://demo.example".to_string()]] {
+            let app = Router::new()
+                .route("/health", get(|| async { "ok" }))
+                .layer(cors_layer(&allowed));
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .header("origin", "https://demo.example")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            let exposed = response
+                .headers()
+                .get("access-control-expose-headers")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            assert!(exposed.contains(CLAIM_VERSION_HEADER), "{exposed}");
+            assert!(exposed.contains(CLAIM_WAIT_MAX_HEADER), "{exposed}");
+        }
     }
 }
