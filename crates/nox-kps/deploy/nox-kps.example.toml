@@ -40,6 +40,8 @@ bundle_burst = 5
 claim_request_max_bytes = 65536
 claim_max_surb_ids = 128               # each ID may match one ~127 KB JSON reply; 128 x 126,928 + 2 must fit below
 claim_response_max_bytes = 16777216
+claim_wait_max_ms = 20000              # longest claim long-poll relayed (0 = off); docs/claim-api.md
+max_concurrent_claim_waits = 128       # long-polls held at once; they do not use max_inflight_upstream slots
 topology_response_max_bytes = 1048576
 upstream_connect_timeout_ms = 1000
 upstream_packet_timeout_ms = 5000
