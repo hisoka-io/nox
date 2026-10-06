@@ -60,7 +60,7 @@ another method `405` with `Allow`; unknown method `501`.
 | Method | Path | Request rules | Served by |
 |---|---|---|---|
 | POST | `/api/v1/packets` | `Content-Type: application/octet-stream`; body exactly 32,768 bytes (shorter `400`, longer `413`) | node ingress |
-| POST | `/api/v1/responses/claim` | `Content-Type: application/json`; at most 64 KiB (`413`); `{"surb_ids":[...]}` with at most 128 IDs of exactly 32 hex characters (`400`; the operator's value is `limits.claimMaxSurbIds` in §5) | node ingress |
+| POST | `/api/v1/responses/claim` | `Content-Type: application/json`; at most 64 KiB (`413`); `{"surb_ids":[...]}` with at most 128 IDs of exactly 32 hex characters (`400`; the operator's value is `limits.claimMaxSurbIds` in §5), plus the optional claim v2 fields `encoding`, `retain`, `ack` (at most as many IDs) and `wait_ms` (`docs/claim-api.md`) | node ingress; a long-poll (`retain` with `wait_ms`) is capped to `limits.claimWaitMaxMs` and holds the stream that long |
 | GET | `/topology` | no body | node topology API; one response is shared by all clients for 1 s |
 | GET | `/health` | no body | nox-kps: `200 {"status":"ok"}` when the node ingress answers its health check, else `503 {"status":"degraded","upstream":"ingress-unreachable"}` |
 | GET, HEAD | `/metadata.json` | no body | nox-kps (§5) |
@@ -87,10 +87,18 @@ claim it accepts can be relayed whole. Clients split larger claims into
 chunks of at most `claimMaxSurbIds` IDs.
 
 What reaches the node: the route's fixed method and path, `Host`,
-`Content-Type`, `Content-Length`, the body, and one `X-Real-IP` carrying the
+`Content-Type`, `Content-Length`, the body, one `X-Real-IP` carrying the
 KPS source address of the client (any client-supplied forwarding header is
-dropped). What returns to the client: status, body, `Content-Type`,
-`Cache-Control`, `Retry-After`.
+dropped), and on claims `Accept: application/vnd.nox.claim-batch` when the
+client's `Accept` names that type. What returns to the client: status, body,
+`Content-Type`, `Cache-Control`, `Retry-After`, `x-nox-claim-version` and
+`x-nox-claim-wait-max-ms` (lowered to `claimWaitMaxMs`).
+
+Claim long-polls. A retaining claim with `wait_ms` takes one of
+`limits.max_concurrent_claim_waits` slots (128) instead of an in-flight
+upstream slot; its upstream timeout and stream deadline grow by the granted
+wait. With every slot taken, or with `claimWaitMaxMs` at 0, the body is
+relayed with `wait_ms: 0` and the claim answers at once.
 
 ## 5. `/metadata.json`
 
@@ -101,14 +109,16 @@ dropped). What returns to the client: status, body, `Content-Type`,
   "version": "0.4.0-rc.6",
   "node": "0x862d6b1105bde9d64dc5182fe3cd9d09f6f37463",
   "addresses": ["3.239.73.249:15005:uEiB..."],
-  "capabilities": ["metadata", "health", "packets", "claim", "topology", "worker-bundles"],
-  "limits": { "packetBytes": 32768, "claimRequestMaxBytes": 65536, "claimMaxSurbIds": 128, "claimResponseMaxBytes": 16777216 },
+  "capabilities": ["metadata", "health", "packets", "claim", "topology", "worker-bundles", "claim-v2"],
+  "limits": { "packetBytes": 32768, "claimRequestMaxBytes": 65536, "claimMaxSurbIds": 128, "claimResponseMaxBytes": 16777216, "claimWaitMaxMs": 20000 },
   "demo": false
 }
 ```
 
 Keys appear in this order. `version` is the nox release. `node` is `null` until `node_address` is set;
-`worker-bundles` is listed only when the bundle store is enabled.
+`worker-bundles` is listed only when the bundle store is enabled. `claim-v2`
+means this relay forwards claim protocol v2 (`docs/claim-api.md`), long-polls
+included up to `claimWaitMaxMs` (0: long-polls answer at once).
 
 ## 6. `kps:` worker bundles
 

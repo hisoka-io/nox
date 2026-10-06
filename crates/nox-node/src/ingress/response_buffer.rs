@@ -8,6 +8,13 @@
 //! Format 2 replies live in a separate [`DeliveryBuffer`] under their
 //! delivery ID. Each reply is filed under exactly one key, and a claim
 //! returns it as `reply-0-{the ID the client claimed with}`.
+//!
+//! A claim either takes a reply ([`ClaimMode::Take`], the original
+//! behaviour) or retains it ([`ClaimMode::Retain`]): the reply is returned
+//! and stays in the buffer until the client acks it or until the claim grace
+//! has passed, counted from the first retaining claim. A transfer that is cut
+//! off mid-way can then be claimed again with the same ID. Retained replies
+//! count against the same entry and byte caps and are evicted first.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -20,6 +27,9 @@ use super::delivery_buffer::{DeliveryBuffer, DeliveryLimits, DeliveryStore};
 
 /// Default TTL for buffered responses (5 minutes).
 const DEFAULT_TTL: Duration = Duration::from_mins(5);
+
+/// Default time a reply stays re-claimable after its first retaining claim.
+pub const DEFAULT_CLAIM_GRACE: Duration = Duration::from_secs(20);
 
 /// Default maximum number of buffered responses.
 ///
@@ -55,7 +65,34 @@ pub fn surb_id_from_packet_id(packet_id: &str) -> Option<SurbId> {
 struct BufferedResponse {
     data: Vec<u8>,
     created_at: Instant,
+    /// Set by the first retaining claim.
+    claimed_at: Option<Instant>,
     surb_id: Option<SurbId>,
+}
+
+impl BufferedResponse {
+    fn is_live(&self, ttl: Duration, grace: Duration) -> bool {
+        self.created_at.elapsed() < ttl && self.claimed_at.is_none_or(|at| at.elapsed() < grace)
+    }
+}
+
+/// How a claim treats the replies it returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimMode {
+    /// Remove each reply as it is returned.
+    Take,
+    /// Keep each reply until it is acked or the claim grace has passed.
+    Retain,
+}
+
+/// One reply returned by [`ResponseBuffer::claim`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedReply {
+    /// `reply-0-{claimed ID}` for format 2, the stored key for format 1.
+    pub id: String,
+    pub data: Vec<u8>,
+    /// A retaining claim had already returned this reply.
+    pub reclaimed: bool,
 }
 
 #[derive(Default)]
@@ -82,17 +119,33 @@ impl Entries {
         Some(entry)
     }
 
-    fn retain_fresh(&mut self, ttl: Duration) -> usize {
+    fn retain_fresh(&mut self, ttl: Duration, grace: Duration) -> usize {
         let expired: Vec<String> = self
             .by_packet_id
             .iter()
-            .filter(|(_, entry)| entry.created_at.elapsed() >= ttl)
+            .filter(|(_, entry)| !entry.is_live(ttl, grace))
             .map(|(key, _)| key.clone())
             .collect();
         for key in &expired {
             self.remove(key);
         }
         expired.len()
+    }
+
+    /// Entry to evict at capacity: replies already handed out by a retaining
+    /// claim go first (oldest claim first), then the oldest unclaimed reply.
+    fn eviction_candidate(&self) -> Option<String> {
+        self.by_packet_id
+            .iter()
+            .filter_map(|(key, entry)| entry.claimed_at.map(|at| (at, key)))
+            .min_by_key(|(at, _)| *at)
+            .map(|(_, key)| key.clone())
+            .or_else(|| {
+                self.by_packet_id
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.created_at)
+                    .map(|(key, _)| key.clone())
+            })
     }
 }
 
@@ -105,6 +158,8 @@ pub struct ResponseBuffer {
     entries: Mutex<Entries>,
     delivery: Mutex<DeliveryBuffer>,
     ttl: Duration,
+    /// How long a retained reply stays re-claimable after its first claim.
+    claim_grace: Duration,
     max_entries: usize,
     /// Wakes waiting handlers (WebSocket, SSE, long-poll) when a new response is stored.
     notify: Arc<Notify>,
@@ -134,6 +189,7 @@ impl ResponseBuffer {
             entries: Mutex::new(Entries::default()),
             delivery: Mutex::new(DeliveryBuffer::new(DeliveryLimits::default())),
             ttl,
+            claim_grace: DEFAULT_CLAIM_GRACE,
             max_entries,
             notify: Arc::new(Notify::new()),
         }
@@ -142,8 +198,24 @@ impl ResponseBuffer {
     /// Replace the limits of the format 2 store. Drops anything already in it.
     #[must_use]
     pub fn with_delivery_limits(self, limits: DeliveryLimits) -> Self {
-        *self.delivery.lock() = DeliveryBuffer::new(limits);
+        *self.delivery.lock() = DeliveryBuffer::new(limits).with_claim_grace(self.claim_grace);
         self
+    }
+
+    /// Set how long a reply stays re-claimable after its first retaining
+    /// claim. Drops anything already in the format 2 store.
+    #[must_use]
+    pub fn with_claim_grace(mut self, grace: Duration) -> Self {
+        self.claim_grace = grace;
+        let limits = self.delivery.lock().limits();
+        *self.delivery.lock() = DeliveryBuffer::new(limits).with_claim_grace(grace);
+        self
+    }
+
+    /// How long a retained reply stays re-claimable.
+    #[must_use]
+    pub fn claim_grace(&self) -> Duration {
+        self.claim_grace
     }
 
     /// Store a format 2 reply under its delivery ID, on behalf of the peer
@@ -181,7 +253,7 @@ impl ResponseBuffer {
                 let expired = entries
                     .by_packet_id
                     .get(&existing)
-                    .is_none_or(|entry| entry.created_at.elapsed() >= self.ttl);
+                    .is_none_or(|entry| !entry.is_live(self.ttl, self.claim_grace));
                 if expired {
                     entries.remove(&existing);
                 } else if existing != packet_id {
@@ -196,16 +268,11 @@ impl ResponseBuffer {
             && !entries.by_packet_id.contains_key(packet_id)
         {
             // First try pruning expired entries
-            entries.retain_fresh(self.ttl);
+            entries.retain_fresh(self.ttl, self.claim_grace);
 
-            // If still at capacity, evict the oldest
+            // If still at capacity, evict (claimed replies first, then the oldest)
             if entries.by_packet_id.len() >= self.max_entries {
-                if let Some(oldest_key) = entries
-                    .by_packet_id
-                    .iter()
-                    .min_by_key(|(_, entry)| entry.created_at)
-                    .map(|(key, _)| key.clone())
-                {
+                if let Some(oldest_key) = entries.eviction_candidate() {
                     warn!(
                         buffer_size = entries.by_packet_id.len(),
                         max = self.max_entries,
@@ -228,6 +295,7 @@ impl ResponseBuffer {
             BufferedResponse {
                 data,
                 created_at: Instant::now(),
+                claimed_at: None,
                 surb_id,
             },
         );
@@ -250,17 +318,31 @@ impl ResponseBuffer {
     pub fn take_response(&self, packet_id: &str) -> Option<Vec<u8>> {
         let mut entries = self.entries.lock();
         let entry = entries.remove(packet_id)?;
-        (entry.created_at.elapsed() < self.ttl).then_some(entry.data)
+        entry
+            .is_live(self.ttl, self.claim_grace)
+            .then_some(entry.data)
     }
 
     /// Claim the responses for exactly these IDs (SURB IDs for format 1,
-    /// delivery IDs for format 2). Returns `(id, data)` pairs where `id` is
-    /// `reply-0-{the claimed ID}`; matching entries are removed, all others
-    /// remain.
+    /// delivery IDs for format 2), removing them. Returns `(id, data)` pairs
+    /// where `id` is `reply-0-{the claimed ID}` for format 2; all other
+    /// entries remain.
     ///
     /// The client knows which IDs it generated and passes them here to
     /// claim only its own responses.
     pub fn claim_by_surb_ids(&self, surb_ids: &[SurbId]) -> Vec<(String, Vec<u8>)> {
+        self.claim(surb_ids, ClaimMode::Take)
+            .into_iter()
+            .map(|reply| (reply.id, reply.data))
+            .collect()
+    }
+
+    /// Claim the responses for exactly these IDs. With [`ClaimMode::Take`]
+    /// each returned reply is removed; with [`ClaimMode::Retain`] it stays
+    /// until [`ResponseBuffer::ack`] or until the claim grace has passed
+    /// since its first retaining claim, and a repeated claim returns it again
+    /// (`reclaimed`). Only the exact ID matches.
+    pub fn claim(&self, surb_ids: &[SurbId], mode: ClaimMode) -> Vec<ClaimedReply> {
         if surb_ids.is_empty() {
             return Vec::new();
         }
@@ -271,18 +353,84 @@ impl ResponseBuffer {
 
         for surb_id in surb_ids {
             if let Some(key) = entries.by_surb_id.get(surb_id).cloned() {
-                if let Some(entry) = entries.remove(&key) {
-                    if entry.created_at.elapsed() < self.ttl {
-                        claimed.push((key, entry.data));
+                let live = entries
+                    .by_packet_id
+                    .get(&key)
+                    .is_some_and(|entry| entry.is_live(self.ttl, self.claim_grace));
+                if !live {
+                    entries.remove(&key);
+                } else if mode == ClaimMode::Take {
+                    if let Some(entry) = entries.remove(&key) {
+                        claimed.push(ClaimedReply {
+                            id: key,
+                            data: entry.data,
+                            reclaimed: entry.claimed_at.is_some(),
+                        });
                     }
+                } else if let Some(entry) = entries.by_packet_id.get_mut(&key) {
+                    let reclaimed = entry.claimed_at.is_some();
+                    if !reclaimed {
+                        entry.claimed_at = Some(Instant::now());
+                    }
+                    claimed.push(ClaimedReply {
+                        id: key,
+                        data: entry.data.clone(),
+                        reclaimed,
+                    });
                 }
             }
-            if let Some(data) = delivery.take(surb_id, self.ttl) {
-                claimed.push((format!("reply-0-{}", hex::encode(surb_id)), data));
+            let from_delivery = match mode {
+                ClaimMode::Take => delivery.take(surb_id, self.ttl),
+                ClaimMode::Retain => delivery.claim_retained(surb_id, self.ttl),
+            };
+            if let Some((data, reclaimed)) = from_delivery {
+                claimed.push(ClaimedReply {
+                    id: format!("reply-0-{}", hex::encode(surb_id)),
+                    data,
+                    reclaimed,
+                });
             }
         }
 
         claimed
+    }
+
+    /// Remove the replies held under exactly these IDs: the client confirms
+    /// it has them. Returns how many were removed.
+    pub fn ack(&self, surb_ids: &[SurbId]) -> usize {
+        if surb_ids.is_empty() {
+            return 0;
+        }
+        let mut entries = self.entries.lock();
+        let mut delivery = self.delivery.lock();
+        let mut removed = 0;
+        for surb_id in surb_ids {
+            if let Some(key) = entries.by_surb_id.get(surb_id).cloned() {
+                if entries.remove(&key).is_some() {
+                    removed += 1;
+                }
+            }
+            if delivery.ack(surb_id) {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Whether a live reply is held under any of these IDs (long-poll wake-up
+    /// check; does not claim).
+    #[must_use]
+    pub fn has_any(&self, surb_ids: &[SurbId]) -> bool {
+        let entries = self.entries.lock();
+        let delivery = self.delivery.lock();
+        surb_ids.iter().any(|surb_id| {
+            entries
+                .by_surb_id
+                .get(surb_id)
+                .and_then(|key| entries.by_packet_id.get(key))
+                .is_some_and(|entry| entry.is_live(self.ttl, self.claim_grace))
+                || delivery.contains_live(surb_id, self.ttl)
+        })
     }
 
     /// Prune all expired entries. Returns the number of entries removed.
@@ -294,7 +442,7 @@ impl ResponseBuffer {
     /// Prune all expired entries. Returns the number removed from the
     /// handle-keyed and the delivery-keyed stores.
     pub fn prune_expired_by_key(&self) -> (usize, usize) {
-        let handle = self.entries.lock().retain_fresh(self.ttl);
+        let handle = self.entries.lock().retain_fresh(self.ttl, self.claim_grace);
         let delivery = self.delivery.lock().prune(self.ttl);
         (handle, delivery)
     }
@@ -619,5 +767,106 @@ mod tests {
         let buf = ResponseBuffer::with_ttl_and_capacity(Duration::from_mins(1), 1);
         assert_eq!(buf.store_response("a", vec![1]), 0);
         assert_eq!(buf.store_response("b", vec![1]), 1);
+    }
+
+    #[test]
+    fn test_retained_claim_is_reclaimable_with_the_exact_id_only() {
+        let buf = ResponseBuffer::new();
+        buf.store_response(&format!("reply-0-{SURB_A}"), vec![1, 2]);
+
+        let first = buf.claim(&[id(SURB_A)], ClaimMode::Retain);
+        assert_eq!(first.len(), 1);
+        assert!(!first[0].reclaimed);
+        assert_eq!(buf.len(), 1, "a retained reply stays buffered");
+
+        let mut near = id(SURB_A);
+        near[0] ^= 0x80;
+        assert!(buf.claim(&[near], ClaimMode::Retain).is_empty());
+        assert_eq!(buf.ack(&[near]), 0);
+
+        let again = buf.claim(&[id(SURB_A)], ClaimMode::Retain);
+        assert_eq!(again.len(), 1);
+        assert!(again[0].reclaimed);
+        assert_eq!(again[0].data, vec![1, 2]);
+
+        assert_eq!(buf.ack(&[id(SURB_A)]), 1);
+        assert!(buf.is_empty());
+        assert!(buf.claim(&[id(SURB_A)], ClaimMode::Retain).is_empty());
+    }
+
+    #[test]
+    fn test_retained_claim_expires_after_grace_from_first_claim() {
+        let buf = ResponseBuffer::new().with_claim_grace(Duration::from_millis(30));
+        buf.store_response(&format!("reply-0-{SURB_A}"), vec![1]);
+        buf.store_response(&format!("reply-0-{SURB_B}"), vec![2]);
+        assert_eq!(buf.claim(&[id(SURB_A)], ClaimMode::Retain).len(), 1);
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(
+            buf.claim(&[id(SURB_A)], ClaimMode::Retain).len(),
+            1,
+            "a re-claim inside the grace succeeds"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            buf.claim(&[id(SURB_A)], ClaimMode::Retain).is_empty(),
+            "a re-claim never extends the grace"
+        );
+        assert_eq!(buf.prune_expired(), 0);
+        assert_eq!(buf.len(), 1, "the unclaimed reply keeps its TTL");
+    }
+
+    #[test]
+    fn test_take_after_retain_removes_and_reports_reclaim() {
+        let buf = ResponseBuffer::new();
+        buf.store_response(&format!("reply-0-{SURB_A}"), vec![1]);
+        buf.claim(&[id(SURB_A)], ClaimMode::Retain);
+        let taken = buf.claim(&[id(SURB_A)], ClaimMode::Take);
+        assert_eq!(taken.len(), 1);
+        assert!(taken[0].reclaimed);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_retained_replies_respect_the_entry_cap_and_go_first() {
+        let buf = ResponseBuffer::with_ttl_and_capacity(Duration::from_mins(1), 2);
+        buf.store_response(&format!("reply-0-{SURB_A}"), vec![1]);
+        std::thread::sleep(Duration::from_millis(2));
+        buf.store_response(&format!("reply-0-{SURB_B}"), vec![2]);
+        buf.claim(&[id(SURB_B)], ClaimMode::Retain);
+        assert_eq!(buf.store_response(&format!("reply-0-{SURB_C}"), vec![3]), 1);
+        assert_eq!(buf.len(), 2);
+        assert!(
+            buf.claim(&[id(SURB_B)], ClaimMode::Retain).is_empty(),
+            "the retained reply was evicted before the older unclaimed one"
+        );
+        assert_eq!(
+            buf.claim(&[id(SURB_A), id(SURB_C)], ClaimMode::Take).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_retained_delivery_entries_and_bytes() {
+        let buf = delivery_buffer(10);
+        buf.store_delivery(id(SURB_C), "peer", vec![0; 30]);
+        let first = buf.claim(&[id(SURB_C)], ClaimMode::Retain);
+        assert_eq!(first[0].id, format!("reply-0-{SURB_C}"));
+        assert!(!first[0].reclaimed);
+        assert_eq!(buf.bytes_by_key(), (0, 30));
+        assert!(buf.claim(&[id(SURB_C)], ClaimMode::Retain)[0].reclaimed);
+        assert!(buf.has_any(&[id(SURB_C)]));
+        assert_eq!(buf.ack(&[id(SURB_C)]), 1);
+        assert_eq!(buf.bytes_by_key(), (0, 0));
+        assert!(!buf.has_any(&[id(SURB_C)]));
+    }
+
+    #[test]
+    fn test_ack_drops_unclaimed_reply_too() {
+        let buf = ResponseBuffer::new();
+        buf.store_response(&format!("reply-0-{SURB_A}"), vec![1]);
+        buf.store_response(&format!("reply-0-{SURB_B}"), vec![2]);
+        assert_eq!(buf.ack(&[id(SURB_B)]), 1);
+        assert_eq!(buf.len(), 1);
+        assert!(buf.has_any(&[id(SURB_A)]));
     }
 }

@@ -85,6 +85,7 @@ configured gas buffer, and set quote and aggregate pending-gas ceilings above th
 | `peer_admission` | `"enforce"` | `enforce`, `monitor` or `off`. Enforce refuses peers outside the registry, and banned or over-limit addresses, once membership is verified on-chain and the grace period has passed |
 | `peer_admission_grace_secs` | `120` | Delay after startup before enforcement, and how long a link to a peer that left the registry is kept |
 | `topology_liveness_window_secs` | `60` | A member is reported online in `/topology` if it answered on P2P within this window |
+| `tcp_nodelay` | `true` | Sets `TCP_NODELAY` on P2P connections, so each Sphinx packet is sent at once instead of waiting on Nagle's algorithm and the peer's delayed ACK |
 
 ### `[network.rate_limit]`
 
@@ -136,6 +137,17 @@ Three reputation tiers: Unknown, Trusted, Penalized.
 | `allow_private_ips` | `false` | **Never enable in production** |
 | `request_timeout_secs` | `10` | Proxy timeout |
 | `max_response_bytes` | `1048576` | Max response (1 MB) |
+
+### `[ingress]`
+
+| Field | Default | Description |
+|---|---|---|
+| `rate_limit_per_sec` / `rate_limit_burst` | 100 / 400 | Token bucket per client IP on `ingress_port` (0 turns the limit off) |
+| `client_ip_header` | `""` | Header naming the client IP for loopback connections (nox-kps sends `x-real-ip`) |
+| `cors_allowed_origins` | `[]` | Browser origins allowed by CORS; empty allows any |
+| `claim_retain_grace_ms` | `20000` | How long a reply returned by a retaining claim stays re-claimable after its first claim (claim protocol v2, [claim-api.md](claim-api.md)) |
+| `claim_wait_max_ms` | `20000` | Longest claim long-poll honoured; 0 answers claims at once |
+| `claim_wait_max_concurrent` | `256` | Claims that may long-poll at once |
 
 ### `[exit_workers]` (exit node)
 

@@ -44,6 +44,7 @@ impl HttpTestHarness {
             metrics: metrics.clone(),
             long_poll_timeout: Duration::from_secs(1),
             min_pow_difficulty: 0,
+            claim: nox_node::ingress::claim::ClaimSettings::default(),
         });
 
         let router = IngressServer::router(ingress_state);
@@ -327,4 +328,100 @@ async fn test_http_e2e_batch_empty() {
         .expect("batch fetch should succeed even when empty");
 
     assert!(responses.is_empty());
+}
+
+/// Claim protocol v2 over a real HTTP connection: a reply arriving through
+/// the router wakes a long-poll, comes back as a binary batch, can be claimed
+/// again after a lost transfer, and is gone once acked.
+#[tokio::test]
+async fn test_http_e2e_claim_v2_long_poll_binary_retain_ack() {
+    let harness = HttpTestHarness::start().await;
+    let http = reqwest::Client::new();
+    let url = format!("{}/api/v1/responses/claim", harness.entry_url);
+    let id = surb_hex(77);
+    let payload = vec![0x5A_u8; 31_716];
+
+    let publisher = harness.publisher.clone();
+    let reply = payload.clone();
+    let publish = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        publisher
+            .publish(NoxEvent::PayloadDecrypted {
+                packet_id: "fedcba9876543210fedcba9876543210".to_string(),
+                payload: reply,
+                reply_handle: Some([77; 16]),
+                delivery: None,
+            })
+            .expect("publish PayloadDecrypted");
+    });
+
+    let claim = serde_json::json!({
+        "surb_ids": [id], "encoding": "binary", "retain": true, "wait_ms": 10_000
+    });
+    let started = std::time::Instant::now();
+    let resp = http.post(&url).json(&claim).send().await.expect("claim");
+    publish.await.expect("publisher task");
+    assert_eq!(resp.status(), 200);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the long-poll returned when the reply landed"
+    );
+    assert_eq!(resp.headers()["x-nox-claim-version"], "2");
+    assert_eq!(
+        resp.headers()["content-type"],
+        "application/vnd.nox.claim-batch"
+    );
+    let body = resp.bytes().await.expect("body");
+    let expected_id = format!("reply-0-{id}");
+    let header_len = 3 + 1 + 2 + expected_id.len() + 4;
+    assert_eq!(body.len(), header_len + payload.len(), "one binary item");
+    assert_eq!(&body[..3], &[1, 0, 1]);
+    assert_eq!(body[3], 0, "first delivery");
+    assert_eq!(&body[6..6 + expected_id.len()], expected_id.as_bytes());
+    assert_eq!(&body[header_len..], payload.as_slice());
+
+    // The first transfer is treated as lost: the same claim returns the reply again.
+    let again = http
+        .post(&url)
+        .json(&serde_json::json!({ "surb_ids": [id], "encoding": "binary", "retain": true }))
+        .send()
+        .await
+        .expect("re-claim");
+    assert_eq!(again.status(), 200);
+    let again = again.bytes().await.expect("body");
+    assert_eq!(again[3], 1, "flagged as reclaimed");
+
+    let ack = http
+        .post(&url)
+        .json(&serde_json::json!({ "surb_ids": [id], "ack": [id], "retain": true }))
+        .send()
+        .await
+        .expect("ack");
+    assert_eq!(ack.status(), 204);
+    assert!(harness.response_buffer.is_empty());
+}
+
+/// A v1 client (the Rust `HttpPacketTransport`) still gets v1 answers from a v2 node.
+#[tokio::test]
+async fn test_http_e2e_v1_client_against_v2_node() {
+    let harness = HttpTestHarness::start().await;
+    harness
+        .publisher
+        .publish(NoxEvent::PayloadDecrypted {
+            packet_id: "00112233445566778899aabbccddeeff".to_string(),
+            payload: vec![9, 8, 7],
+            reply_handle: Some([5; 16]),
+            delivery: None,
+        })
+        .expect("publish PayloadDecrypted");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let responses = HttpPacketTransport::new()
+        .recv_responses_batch(&harness.entry_url, &[surb_hex(5)])
+        .await
+        .expect("v1 claim");
+    assert_eq!(
+        responses,
+        vec![(format!("reply-0-{}", surb_hex(5)), vec![9, 8, 7])]
+    );
+    assert!(harness.response_buffer.is_empty(), "v1 claims delete");
 }

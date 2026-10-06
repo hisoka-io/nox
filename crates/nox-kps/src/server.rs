@@ -199,6 +199,7 @@ pub async fn start(settings: Settings) -> Result<RunningServer, StartError> {
         metrics: Arc::clone(&metrics),
         inflight: Arc::new(Semaphore::new(l.max_inflight_upstream)),
         bundle_streams: Arc::new(Semaphore::new(l.max_concurrent_bundle_streams)),
+        claim_waits: Arc::new(Semaphore::new(l.max_concurrent_claim_waits)),
         conn_limiter: ConnLimiter::new(
             l.max_connections,
             l.max_connections_per_ip,

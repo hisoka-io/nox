@@ -128,7 +128,7 @@ out twice in a row is closed so the client redials.
 
 - `curl -s 127.0.0.1:15006/metrics`: connections, streams by route and status,
   profile refusals, rate limiting, upstream errors, bytes, request durations,
-  bundle hits, build info.
+  bundle hits, claim long-polls (`nox_kps_claim_waits_total`), build info.
 - `curl -s 127.0.0.1:15006/healthz`: liveness (also used by `nox-kps healthcheck`).
 - Logs are JSON lines. At `info` they carry startup facts and a counter summary
   every 60 s: route names, status codes, timings and counts only. Client

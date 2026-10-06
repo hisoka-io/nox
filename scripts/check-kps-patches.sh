@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Checks that the nox workspace [patch.crates-io] revs for webrtc and webrtc-sctp
-# equal the ones in libs/rust/Cargo.toml at the kps tag nox-kps pins,
+# equal the ones in libs/rust/Cargo.toml at the kps tag nox-kps pins (for a
+# crate vendored under vendor/<crate>, its NOX_VENDOR_BASE names the rev),
 # and that Cargo.lock resolved that tag to the commit it names upstream (a
 # moved tag fails here). A kps bump that forgets the patches fails here
 # instead of at runtime.
@@ -42,6 +43,10 @@ else
 fi
 for crate in webrtc webrtc-sctp; do
   ours="$(rev_of "$crate" "$(cat "$root/Cargo.toml")")"
+  if [[ -z "$ours" && -f "$root/vendor/$crate/NOX_VENDOR_BASE" ]] \
+    && grep -q "^$crate = { path = \"vendor/$crate\" }" "$root/Cargo.toml"; then
+    ours="$(tr -d '[:space:]' < "$root/vendor/$crate/NOX_VENDOR_BASE")"
+  fi
   theirs="$(rev_of "$crate" "$upstream")"
   if [[ -z "$ours" || -z "$theirs" ]]; then
     echo "$crate: patch rev missing (workspace: '${ours}', kps ${tag}: '${theirs}')" >&2

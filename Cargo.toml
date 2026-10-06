@@ -10,6 +10,8 @@ members = [
     "crates/nox-sim",
     "crates/nox-kps",
 ]
+# Vendored dependency sources used through [patch.crates-io] (vendor/README.md).
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.4.0-rc.6"
@@ -164,11 +166,19 @@ panic = "unwind"
 # repo: verbatim crates.io source plus fix commit(s). Only nox-kps pulls these crates
 # in, but Cargo honours [patch] only at the workspace root.
 #   - webrtc-sctp: read-shutdown drain (webrtc-rs/webrtc#816) + zero-window
-#     deadlock on tail-of-burst loss (webrtc-rs/webrtc#822)
+#     deadlock on tail-of-burst loss (webrtc-rs/webrtc#822). Vendored at that
+#     rev in vendor/webrtc-sctp with nox's sender tuning on top (larger initial
+#     window, 1 s initial RTO; vendor/README.md). scripts/check-kps-patches.sh
+#     checks the vendored base rev against kps.
 #   - webrtc: (1) negotiated-channel accept race: an early inbound message
 #     parsed as DCEP kills the accept loop (webrtc-rs/webrtc#821); (2) gate the
 #     id-reuse claim on ReadyState::Open so a stale closed channel does not
 #     shadow a reused SCTP stream id, hanging reads after ~2 streams (kps#4)
 [patch.crates-io]
-webrtc-sctp = { git = "https://github.com/ethereum/kps.git", rev = "a73a0a8f9e4f76f3b89ba1155562ec836bcf3f3b" }
+webrtc-sctp = { path = "vendor/webrtc-sctp" }
+# webrtc-ice 0.14.0 from crates.io with one change for the kps server's ICE-lite
+# agent: an authenticated connectivity check selects the pair at once instead of
+# waiting for USE-CANDIDATE, so DTLS starts on the browser's first ClientHello
+# (vendor/README.md).
+webrtc-ice = { path = "vendor/webrtc-ice" }
 webrtc = { git = "https://github.com/ethereum/kps.git", rev = "4982e1c1cdce3baa3f703a746367a5e53ca64928" }

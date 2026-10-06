@@ -110,6 +110,8 @@ pub struct Metrics {
     pub bytes: Family<BytesLabels, Counter>,
     pub rate_limited: Family<RouteLabels, Counter>,
     pub bundle_requests: Family<ResultLabels, Counter>,
+    /// Long-poll claims, by result (`granted`, `busy`, `off`).
+    pub claim_waits: Family<ResultLabels, Counter>,
     pub bundles_loaded: Gauge,
     pub build_info: Family<BuildLabels, Gauge>,
 }
@@ -135,6 +137,7 @@ impl Metrics {
             bytes: Family::default(),
             rate_limited: Family::default(),
             bundle_requests: Family::default(),
+            claim_waits: Family::default(),
             bundles_loaded: Gauge::default(),
             build_info: Family::default(),
         };
@@ -212,6 +215,11 @@ impl Metrics {
             "bundle_requests",
             "Worker bundle requests, by result (hit, miss)",
             m.bundle_requests.clone(),
+        );
+        registry.register(
+            "claim_waits",
+            "Claims that asked to long-poll, by result (granted, busy: no slot free, off: long-polling disabled)",
+            m.claim_waits.clone(),
         );
         registry.register(
             "bundles_loaded",

@@ -7420,8 +7420,6 @@ dependencies = [
 [[package]]
 name = "webrtc-ice"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69cb13fd1a373e68addc4bba0c8ca058627518e54342583d024bdcbb8ae5d97d"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -7471,7 +7469,6 @@ dependencies = [
 [[package]]
 name = "webrtc-sctp"
 version = "0.13.0"
-source = "git+https://github.com/ethereum/kps.git?rev=a73a0a8f9e4f76f3b89ba1155562ec836bcf3f3b#a73a0a8f9e4f76f3b89ba1155562ec836bcf3f3b"
 dependencies = [
  "arc-swap",
  "async-trait",

@@ -160,6 +160,7 @@ session_ttl_secs = 86400          # 24 hours
 peer_admission = "enforce"
 peer_admission_grace_secs = 120   # startup delay, and how long a link to a deregistered peer is kept
 topology_liveness_window_secs = 60  # /topology reports a member online if seen on P2P within this window
+tcp_nodelay = true                # send each Sphinx packet at once (TCP_NODELAY on P2P connections)
 
 # Graduated rate limiting (packets/sec by reputation tier)
 [network.rate_limit]
@@ -233,6 +234,14 @@ client_ip_header = ""
 # Browser origins allowed by CORS. Empty = any origin.
 # cors_allowed_origins = ["https://demo.example.org"]
 cors_allowed_origins = []
+# Reply claims, protocol v2 (docs/claim-api.md). A reply returned by a claim
+# with "retain": true stays re-claimable for this long after its first claim,
+# until the client acks it.
+claim_retain_grace_ms = 20000
+# Longest long-poll ("wait_ms") a retaining claim may ask for; 0 = answer at once.
+claim_wait_max_ms = 20000
+# Claims that may long-poll at once; beyond it a claim answers at once.
+claim_wait_max_concurrent = 256
 
 # Exit dispatch lanes: each payload type has its own queue and concurrency limit.
 # Payloads beyond queue_capacity are dropped and counted in
