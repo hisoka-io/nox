@@ -5,6 +5,25 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+### Added
+
+- Claims accept `max_replies` (return only the replies that arrived first) and treat an ack for a reply that has
+  not arrived yet as ack-ahead: the reply is dropped on arrival. Entries list both in `x-nox-claim-features`,
+  which nox-kps relays and the ingress CORS policy exposes ([docs/claim-api.md](docs/claim-api.md)).
+- `[http]` upstream warmth settings for exits: `pool_idle_timeout_secs` (600), `http2_keep_alive_interval_secs`
+  (30), `warm_interval_secs` (60), `warm_recent_secs` (600), `max_cached_hosts` (256).
+- `scripts/bench/kps-latency`: headless-Chromium bench for nox-kps over an emulated long path with loss and a
+  bottleneck link.
+
+### Changed
+
+- nox-kps SCTP sender (vendored webrtc-sctp): 56-MTU initial window, token-bucket pacing at the measured delivery
+  rate, the initial window as the floor after an isolated loss, tail loss probes, and a SACK for every packet at
+  the start of each burst ([vendor/README.md](vendor/README.md)).
+- A stored reply wakes only the long-poll claims and streams waiting for its ID.
+- Exits pin each upstream origin's client to every address its host resolves to (each one SSRF-checked), keep
+  idle connections for 10 minutes, send HTTP/2 keep-alive pings and warm recently used origins every minute.
+
 ## [0.4.0-rc.6] - 2026-10-06
 
 ### Upgrade notes
