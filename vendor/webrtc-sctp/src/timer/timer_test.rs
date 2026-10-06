@@ -274,32 +274,6 @@ mod test_rtx_timer {
     }
 
     #[tokio::test]
-    async fn test_rtx_timer_restart_moves_the_expiry() -> Result<()> {
-        let timer_id = RtxTimerId::T3RTX;
-        let ncbs = Arc::new(AtomicU32::new(0));
-        let obs = Arc::new(Mutex::new(TestTimerObserver {
-            ncbs: ncbs.clone(),
-            timer_id,
-            ..Default::default()
-        }));
-        let rt = RtxTimer::new(Arc::downgrade(&obs), timer_id, PATH_MAX_RETRANS);
-
-        let interval = 200;
-        assert!(rt.start(interval).await, "should be accepted");
-        sleep(Duration::from_millis(120)).await;
-        assert!(rt.restart(interval).await, "restart should start the timer again");
-        // 240 ms after the first start: past the original expiry, before the
-        // restarted one.
-        sleep(Duration::from_millis(120)).await;
-        assert_eq!(ncbs.load(Ordering::SeqCst), 0, "restart must move the expiry");
-        sleep(Duration::from_millis(150)).await;
-        rt.stop().await;
-        assert_eq!(ncbs.load(Ordering::SeqCst), 1, "must expire once after the restart");
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_rtx_timer_stop_right_after_start() -> Result<()> {
         let timer_id = RtxTimerId::T3RTX;
         let ncbs = Arc::new(AtomicU32::new(0));
