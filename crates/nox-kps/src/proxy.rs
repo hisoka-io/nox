@@ -30,14 +30,18 @@ pub const CLAIM_VERSION_HEADER: &str = "x-nox-claim-version";
 /// Node header with the longest claim long-poll it honours (nox-kps lowers it
 /// to its own `limits.claim_wait_max_ms`).
 pub const CLAIM_WAIT_MAX_HEADER: &str = "x-nox-claim-wait-max-ms";
+/// Node header listing its optional claim features (`max-replies`,
+/// `ack-ahead`).
+pub const CLAIM_FEATURES_HEADER: &str = "x-nox-claim-features";
 
 /// Response headers relayed from the node.
-const RELAYED_RESPONSE_HEADERS: [HeaderName; 5] = [
+const RELAYED_RESPONSE_HEADERS: [HeaderName; 6] = [
     header::CONTENT_TYPE,
     header::CACHE_CONTROL,
     header::RETRY_AFTER,
     HeaderName::from_static(CLAIM_VERSION_HEADER),
     HeaderName::from_static(CLAIM_WAIT_MAX_HEADER),
+    HeaderName::from_static(CLAIM_FEATURES_HEADER),
 ];
 
 /// A pooled HTTP/1.1 client for the loopback upstreams.

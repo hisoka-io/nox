@@ -55,6 +55,9 @@ pub enum DeliveryStore {
     SourceQuota,
     /// The reply alone is larger than the source share of the byte cap.
     TooLarge,
+    /// The client acked this ID before the reply arrived (it decoded the
+    /// request's other replies); the reply is dropped.
+    Acked,
 }
 
 struct Entry {
@@ -250,6 +253,15 @@ impl DeliveryBuffer {
         self.entries
             .get(id)
             .is_some_and(|entry| entry.is_live(ttl, self.claim_grace))
+    }
+
+    /// When the live reply for `id` was stored, if one is held.
+    #[must_use]
+    pub fn live_created_at(&self, id: &SurbId, ttl: Duration) -> Option<Instant> {
+        self.entries
+            .get(id)
+            .filter(|entry| entry.is_live(ttl, self.claim_grace))
+            .map(|entry| entry.created_at)
     }
 
     /// The limits this buffer was built with.

@@ -51,7 +51,7 @@ tempfile = "3.10"
 num_cpus = "1.17.0"
 parking_lot = { workspace = true }
 uuid = { version = "1.7", features = ["v4"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "http2"] }
 reqwest-legacy = { package = "reqwest", version = "0.11.27", default-features = false, features = ["native-tls"] }
 url = "2.5"
 http = "1"

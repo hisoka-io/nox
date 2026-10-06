@@ -1374,6 +1374,117 @@ async fn test_assoc_congestion_control_fast_retransmission() -> Result<()> {
         log::debug!("nFastRetrans: {}", a.stats.get_num_fast_retrans());
 
         assert_eq!(a.stats.get_num_fast_retrans(), 1, "should be 1");
+        // nox: a fast retransmit leaves cwnd and ssthresh at the loss floor.
+        assert!(
+            a.ssthresh >= loss_cwnd_floor(a.mtu) && a.cwnd >= loss_cwnd_floor(a.mtu),
+            "cwnd {} / ssthresh {} below the loss floor {}",
+            a.cwnd,
+            a.ssthresh,
+            loss_cwnd_floor(a.mtu)
+        );
+    }
+
+    close_association_pair(&br, a0, a1).await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_assoc_congestion_control_burst_loss_drops_the_loss_floor() -> Result<()> {
+    const SI: u16 = 6;
+    let mut sbuf = vec![0u8; 1000];
+    fill(&mut sbuf[..]);
+
+    let (br, ca, cb) = Bridge::new(0, None, None);
+
+    let (a0, mut a1) =
+        create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::Normal, 0).await?;
+
+    let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+
+    let entry_cwnd = a0.association_internal.lock().await.cwnd;
+    br.drop_next_nwrites(0, 4); // four packets lost in one window: congestion
+
+    for i in 0..10u32 {
+        sbuf[0..4].copy_from_slice(&i.to_be_bytes());
+        s0.write_sctp(
+            &Bytes::from(sbuf.clone()),
+            PayloadProtocolIdentifier::Binary,
+        )
+        .await?;
+    }
+
+    for _ in 0..50 {
+        br.tick().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let mut buf = vec![0u8; 3000];
+    for i in 0..10u32 {
+        let (n, _) = s1.read_sctp(&mut buf).await?;
+        assert_eq!(n, sbuf.len(), "unexpected length of received data");
+        assert_eq!(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), i);
+    }
+
+    {
+        let a = a0.association_internal.lock().await;
+        assert!(
+            a.stats.get_num_fast_retrans() >= 1,
+            "should fast-retransmit"
+        );
+        assert_eq!(
+            a.ssthresh,
+            std::cmp::max(entry_cwnd / 2, 4 * a.mtu),
+            "a burst loss halves the window as RFC 4960 7.2.3 says"
+        );
+        assert!(a.ssthresh < loss_cwnd_floor(a.mtu));
+    }
+
+    close_association_pair(&br, a0, a1).await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_assoc_tail_loss_probe_resends_before_the_rto() -> Result<()> {
+    const SI: u16 = 6;
+    static MSG: Bytes = Bytes::from_static(b"tail");
+
+    let (br, ca, cb) = Bridge::new(0, None, None);
+
+    let (a0, mut a1) =
+        create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::Normal, 0).await?;
+
+    let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+
+    // A 50 ms path: probe after 2 x 50 ms plus the delayed-SACK allowance
+    // for a lone chunk, well before the 1 s RTO.
+    a0.association_internal.lock().await.rto_mgr.srtt = 50;
+    br.drop_next_nwrites(0, 1); // the only packet of the "reply" is lost
+    s0.write_sctp(&MSG, PayloadProtocolIdentifier::Binary)
+        .await?;
+
+    let started = tokio::time::Instant::now();
+    let mut buf = vec![0u8; 32];
+    let mut received = None;
+    while started.elapsed() < Duration::from_millis(800) {
+        br.tick().await;
+        if let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_millis(5), s1.read_sctp(&mut buf)).await
+        {
+            assert_eq!(&buf[..n], &MSG[..]);
+            received = Some(started.elapsed());
+            break;
+        }
+    }
+    let received = received.expect("the probe should deliver the lost chunk");
+    assert!(
+        received < Duration::from_millis(600),
+        "delivered after {received:?}, expected the probe at about 300 ms"
+    );
+    {
+        let a = a0.association_internal.lock().await;
+        assert_eq!(a.stats.get_num_t3timeouts(), 0, "no RTO was needed");
     }
 
     close_association_pair(&br, a0, a1).await;
@@ -1509,8 +1620,11 @@ async fn test_assoc_congestion_control_congestion_avoidance() -> Result<()> {
             N_PACKETS_TO_SEND as u64,
             "packet count mismatch"
         );
+        // nox: the first IMMEDIATE_SACK_BURST_BYTES are SACKed packet by
+        // packet; after that every second packet.
+        let immediate = IMMEDIATE_SACK_BURST_BYTES / sbuf.len() as u64;
         assert!(
-            a.stats.get_num_sacks() <= N_PACKETS_TO_SEND as u64 / 2,
+            a.stats.get_num_sacks() <= N_PACKETS_TO_SEND as u64 / 2 + immediate,
             "too many sacks"
         );
         assert_eq!(a.stats.get_num_t3timeouts(), 0, "should be no retransmit");
@@ -1574,7 +1688,11 @@ async fn test_assoc_congestion_control_slow_reader() -> Result<()> {
     let mut rbuf = vec![0u8; 3000];
 
     // 1. First forward packets to receiver until rwnd becomes 0
-    // 2. Wait until the sender's cwnd becomes 1*MTU (RTO occurred)
+    // 2. (nox) Upstream waited here for an RTO (cwnd == 1 MTU). The first
+    //    expiry now keeps cwnd at the loss floor, and with the first 64 KiB
+    //    SACKed packet by packet the zero-window probes are acked before the
+    //    T3-rtx timer expires, so the test starts reading once the window
+    //    is closed.
     // 3. Stat reading a1's data
     let mut n_packets_received = 0u32;
     let mut has_rtoed = false;
@@ -1587,12 +1705,10 @@ async fn test_assoc_congestion_control_slow_reader() -> Result<()> {
         }
 
         if !has_rtoed {
-            let a = a0.association_internal.lock().await;
             let b = a1.association_internal.lock().await;
 
             let rwnd = b.get_my_receiver_window_credit().await;
-            let cwnd = a.cwnd;
-            if cwnd > a.mtu || rwnd > 0 {
+            if rwnd > 0 {
                 // Do not read until a1.getMyReceiverWindowCredit() becomes zero
                 continue;
             }

@@ -1,0 +1,15 @@
+{
+  "name": "nox-kps-latency-bench",
+  "private": true,
+  "type": "module",
+  "description": "Headless-Chromium latency bench for nox-kps over an emulated long path",
+  "scripts": {
+    "build": "esbuild entry.ts --bundle --format=iife --outfile=dist/bench.js",
+    "browsers": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@kpstreams/webrtc-client": "0.2.1",
+    "esbuild": "0.27.3",
+    "playwright": "1.59.1"
+  }
+}

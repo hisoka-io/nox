@@ -1,6 +1,7 @@
 //! Claim protocol v2 through nox-kps: long-poll caps and slots, the extended
 //! upstream timeout, `Accept` negotiation for the binary batch, the claim
-//! headers relayed from the node, and the v2 body checks.
+//! headers relayed from the node (version, long-poll cap, features), and the
+//! v2 body checks.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -75,6 +76,11 @@ async fn long_poll_is_capped_relayed_and_outlives_the_claim_timeout() {
     assert_eq!(sent["encoding"], "binary", "other fields relayed untouched");
     assert_eq!(sent["retain"], true);
     assert_eq!(res.header("x-nox-claim-version"), Some("2"));
+    assert_eq!(
+        res.header("x-nox-claim-features"),
+        Some("max-replies, ack-ahead"),
+        "the node's claim features are relayed"
+    );
     assert_eq!(
         res.header("x-nox-claim-wait-max-ms"),
         Some("600"),

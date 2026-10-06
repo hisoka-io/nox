@@ -223,6 +223,7 @@ async fn spawn_virtual_node(
             allow_private_ips: false,
             request_timeout_secs: 15,
             max_response_bytes: 256 * 1024, // 256 KB truncation
+            ..HttpConfig::default()
         };
         let pending_map = ExitService::new_pending_map();
         let surb_acc = ExitService::new_surb_accumulator();

@@ -18,13 +18,22 @@ use serde::{Deserialize, Serialize};
 /// Max size for deserializing inner payloads from `AnonymousRequest` (7 MB).
 const MAX_INNER_PAYLOAD_SIZE: u64 = 7 * 1024 * 1024;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::debug;
 use url::Url;
 
 const USER_AGENT: &str = "Nox-Proxy/1.0";
+/// Idle connections kept per upstream host.
+const POOL_MAX_IDLE_PER_HOST: usize = 4;
+/// TCP keepalive probe interval on upstream connections.
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+/// A missing HTTP/2 PING answer closes the connection after this long.
+const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on one warm-up request.
+const WARM_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializableHttpResponse {
@@ -78,14 +87,30 @@ use crate::services::response_packer::{ContinuationState, PendingResponseState};
 
 pub type StashRemainingFn = Arc<dyn Fn(u64, PendingResponseState) + Send + Sync>;
 
+/// Upstream origin a pinned client serves: scheme, host and port.
+type OriginKey = (String, String, u16);
+
+/// A client pinned to the validated addresses of one upstream origin. It
+/// keeps that origin's TCP+TLS connections (HTTP/2 where offered) warm
+/// across requests.
+struct PinnedUpstream {
+    client: Client,
+    /// Every address it may connect to, each one validated (sorted).
+    ips: Vec<IpAddr>,
+    /// `scheme://host:port/`, the target of warm-up requests.
+    origin: String,
+    last_used: Instant,
+}
+
 pub struct HttpHandler {
     config: HttpConfig,
     packer: Arc<ResponsePacker>,
     publisher: Arc<dyn IEventPublisher>,
     metrics: MetricsService,
     stash_remaining: Option<StashRemainingFn>,
-    /// Keyed by `(host, resolved_ip)`. Reuses TCP+TLS sessions across requests.
-    client_cache: parking_lot::Mutex<HashMap<(String, std::net::IpAddr), Client>>,
+    /// Pinned clients by origin. A client is reused while every address the
+    /// host resolves to is one it was pinned to.
+    client_cache: parking_lot::Mutex<HashMap<OriginKey, PinnedUpstream>>,
 }
 
 impl HttpHandler {
@@ -154,8 +179,8 @@ impl HttpHandler {
             .port_or_known_default()
             .unwrap_or(if scheme == "https" { 443 } else { 80 });
 
-        let resolved_ip = match security::resolve_hostname(host, port).await {
-            Ok(ip) => ip,
+        let resolved_ips = match security::resolve_hostname_all(host, port).await {
+            Ok(ips) => ips,
             Err(e) => {
                 debug!(request_id = request_id, error = %e, "DNS resolution failed");
                 return self.pack_error_response(
@@ -167,7 +192,12 @@ impl HttpHandler {
             }
         };
 
-        if let Err(e) = security::is_ip_allowed(resolved_ip, self.config.allow_private_ips) {
+        // Every address the host resolves to must pass: the pinned client may
+        // connect to any of them.
+        if let Some(e) = resolved_ips
+            .iter()
+            .find_map(|ip| security::is_ip_allowed(*ip, self.config.allow_private_ips).err())
+        {
             debug!(request_id = request_id, error = %e, "SSRF check blocked request");
             self.metrics
                 .http_proxy_requests_total
@@ -195,44 +225,26 @@ impl HttpHandler {
             request_id = request_id,
             method = %method,
             host = %host,
-            resolved_ip = %resolved_ip,
+            addresses = resolved_ips.len(),
             "HTTP request validated"
         );
 
         // DNS-pinned request: preserves TLS/SNI while preventing rebinding.
-        let cache_key = (host.to_string(), resolved_ip);
-        let cached_client = self.client_cache.lock().get(&cache_key).cloned();
-        let pinned_client = if let Some(client) = cached_client {
-            client
-        } else {
-            let client = match build_pinned_client(
-                host,
-                std::net::SocketAddr::new(resolved_ip, port),
-                Duration::from_secs(self.config.request_timeout_secs),
-            ) {
-                Ok(client) => client,
-                Err(e) => {
-                    debug!(request_id = request_id, error = %e, "Pinned HTTP client build failed");
-                    self.metrics
-                        .http_proxy_requests_total
-                        .get_or_create(&vec![("result".into(), "error".into())])
-                        .inc();
-                    return self.pack_error_response(
-                        request_id,
-                        500,
-                        "Exit HTTP client unavailable",
-                        surbs,
-                    );
-                }
-            };
-            let mut cache = self.client_cache.lock();
-            if cache.len() > 256 && !cache.contains_key(&cache_key) {
-                let keys: Vec<_> = cache.keys().take(128).cloned().collect();
-                for k in keys {
-                    cache.remove(&k);
-                }
+        let pinned_client = match self.pinned_client(scheme, host, port, &resolved_ips) {
+            Ok(client) => client,
+            Err(e) => {
+                debug!(request_id = request_id, error = %e, "Pinned HTTP client build failed");
+                self.metrics
+                    .http_proxy_requests_total
+                    .get_or_create(&vec![("result".into(), "error".into())])
+                    .inc();
+                return self.pack_error_response(
+                    request_id,
+                    500,
+                    "Exit HTTP client unavailable",
+                    surbs,
+                );
             }
-            cache.entry(cache_key).or_insert(client).clone()
         };
 
         let req_method = method
@@ -694,23 +706,152 @@ impl ServiceHandler for HttpHandler {
     }
 }
 
-/// Client for one validated host: connects only to `pinned_addr`, never follows
-/// redirects and ignores proxy environment variables.
+impl HttpHandler {
+    /// The cached client for this origin when it was pinned to every address
+    /// in `resolved_ips` (all already validated); otherwise a new client
+    /// pinned to exactly `resolved_ips`, which replaces it.
+    fn pinned_client(
+        &self,
+        scheme: &str,
+        host: &str,
+        port: u16,
+        resolved_ips: &[IpAddr],
+    ) -> Result<Client, reqwest::Error> {
+        let key: OriginKey = (scheme.to_string(), host.to_string(), port);
+        {
+            let mut cache = self.client_cache.lock();
+            if let Some(entry) = cache.get_mut(&key) {
+                if resolved_ips
+                    .iter()
+                    .all(|ip| entry.ips.binary_search(ip).is_ok())
+                {
+                    entry.last_used = Instant::now();
+                    return Ok(entry.client.clone());
+                }
+            }
+        }
+        let addrs: Vec<SocketAddr> = resolved_ips
+            .iter()
+            .map(|ip| SocketAddr::new(*ip, port))
+            .collect();
+        let client = build_pinned_client(host, &addrs, &self.config)?;
+        debug!(host = %host, addresses = addrs.len(), "New pinned upstream client");
+        let mut cache = self.client_cache.lock();
+        if !cache.contains_key(&key) && cache.len() >= self.config.max_cached_hosts.max(1) {
+            let oldest = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                cache.remove(&oldest);
+            }
+        }
+        let mut ips = resolved_ips.to_vec();
+        ips.sort_unstable();
+        cache.insert(
+            key,
+            PinnedUpstream {
+                client: client.clone(),
+                ips,
+                origin: format!("{scheme}://{}/", host_with_port(host, port)),
+                last_used: Instant::now(),
+            },
+        );
+        Ok(client)
+    }
+
+    /// Sends `HEAD /` to every upstream origin used within
+    /// `warm_recent_secs`, through its pinned client, so its pooled
+    /// connection stays open between requests. Returns how many answered.
+    pub async fn warm_recent_upstreams(&self) -> usize {
+        let recent = Duration::from_secs(self.config.warm_recent_secs);
+        let targets: Vec<(Client, String)> = self
+            .client_cache
+            .lock()
+            .values()
+            .filter(|entry| entry.last_used.elapsed() < recent)
+            .map(|entry| (entry.client.clone(), entry.origin.clone()))
+            .collect();
+        let mut answered = 0;
+        for (client, origin) in targets {
+            match client
+                .head(&origin)
+                .timeout(WARM_REQUEST_TIMEOUT)
+                .send()
+                .await
+            {
+                Ok(_) => answered += 1,
+                Err(e) => debug!(error = %e, "Upstream warm-up request failed"),
+            }
+        }
+        answered
+    }
+
+    /// Runs [`HttpHandler::warm_recent_upstreams`] every `warm_interval_secs`
+    /// until the handler is dropped. Does nothing when the interval is 0.
+    pub fn spawn_upstream_warmer(handler: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        let interval = Duration::from_secs(handler.config.warm_interval_secs);
+        if interval.is_zero() {
+            return None;
+        }
+        let weak: Weak<Self> = Arc::downgrade(handler);
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let Some(handler) = weak.upgrade() else {
+                    break;
+                };
+                let answered = handler.warm_recent_upstreams().await;
+                debug!(answered, "Upstream warm-up round");
+            }
+        }))
+    }
+
+    /// Number of upstream origins with a pinned client.
+    #[must_use]
+    pub fn cached_upstreams(&self) -> usize {
+        self.client_cache.lock().len()
+    }
+}
+
+/// `host:port`, with IPv6 literals in brackets.
+fn host_with_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Client for one validated host: connects only to `pinned_addrs`, never
+/// follows redirects and ignores proxy environment variables. Idle
+/// connections stay pooled for `pool_idle_timeout_secs`; HTTP/2 connections
+/// are kept alive with PINGs.
 fn build_pinned_client(
     host: &str,
-    pinned_addr: std::net::SocketAddr,
-    timeout: Duration,
+    pinned_addrs: &[SocketAddr],
+    config: &HttpConfig,
 ) -> Result<Client, reqwest::Error> {
-    Client::builder()
+    let mut builder = Client::builder()
         .user_agent(USER_AGENT)
-        .timeout(timeout)
+        .timeout(Duration::from_secs(config.request_timeout_secs))
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
-        .resolve(host, pinned_addr)
-        .pool_max_idle_per_host(4)
-        .pool_idle_timeout(Duration::from_secs(90))
-        .tcp_keepalive(Duration::from_secs(30))
-        .build()
+        .resolve_to_addrs(host, pinned_addrs)
+        .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+        .pool_idle_timeout(Duration::from_secs(config.pool_idle_timeout_secs))
+        .tcp_keepalive(TCP_KEEPALIVE)
+        .tcp_nodelay(true);
+    if config.http2_keep_alive_interval_secs > 0 {
+        builder = builder
+            .http2_keep_alive_interval(Duration::from_secs(config.http2_keep_alive_interval_secs))
+            .http2_keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT)
+            .http2_keep_alive_while_idle(true);
+    }
+    builder.build()
 }
 
 #[cfg(test)]
@@ -742,6 +883,98 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
         addr
+    }
+
+    fn test_handler(config: HttpConfig) -> HttpHandler {
+        HttpHandler::new(
+            config,
+            Arc::new(ResponsePacker::new()),
+            Arc::new(crate::infra::event_bus::TokioEventBus::new(16)),
+            MetricsService::new(),
+        )
+    }
+
+    #[test]
+    fn pinned_clients_are_reused_per_origin_while_addresses_match() {
+        let handler = test_handler(HttpConfig {
+            max_cached_hosts: 2,
+            ..HttpConfig::default()
+        });
+        let a: IpAddr = "203.0.113.1".parse().expect("ip");
+        let b: IpAddr = "203.0.113.2".parse().expect("ip");
+        let c: IpAddr = "203.0.113.3".parse().expect("ip");
+
+        handler
+            .pinned_client("https", "rpc.example", 443, &[b, a])
+            .expect("client");
+        // Same set in another order, and a subset: the cached client.
+        handler
+            .pinned_client("https", "rpc.example", 443, &[a, b])
+            .expect("client");
+        handler
+            .pinned_client("https", "rpc.example", 443, &[b])
+            .expect("client");
+        assert_eq!(handler.cached_upstreams(), 1);
+        let ips = |h: &HttpHandler| {
+            h.client_cache
+                .lock()
+                .get(&("https".to_string(), "rpc.example".to_string(), 443))
+                .map(|e| e.ips.clone())
+        };
+        assert_eq!(ips(&handler), Some(vec![a, b]));
+
+        // A new address replaces the client, pinned to exactly the new set.
+        handler
+            .pinned_client("https", "rpc.example", 443, &[c])
+            .expect("client");
+        assert_eq!(ips(&handler), Some(vec![c]));
+
+        // Other origins; the least recently used one is dropped at the cap.
+        handler
+            .pinned_client("https", "other.example", 443, &[a])
+            .expect("client");
+        handler
+            .pinned_client("http", "rpc.example", 80, &[a])
+            .expect("client");
+        assert_eq!(handler.cached_upstreams(), 2);
+        assert_eq!(ips(&handler), None, "the oldest origin was evicted");
+    }
+
+    #[tokio::test]
+    async fn warm_up_sends_head_to_recently_used_upstreams() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let heads = Arc::new(AtomicUsize::new(0));
+        let counted = heads.clone();
+        let upstream = serve(axum::Router::new().route(
+            "/",
+            axum::routing::head(move || {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        ))
+        .await;
+        let handler = test_handler(HttpConfig {
+            allow_private_ips: true,
+            ..HttpConfig::default()
+        });
+        handler
+            .pinned_client("http", "warm.invalid", upstream.port(), &[upstream.ip()])
+            .expect("client");
+        assert_eq!(handler.warm_recent_upstreams().await, 1);
+        assert_eq!(heads.load(Ordering::SeqCst), 1);
+
+        let idle = test_handler(HttpConfig {
+            allow_private_ips: true,
+            warm_recent_secs: 0,
+            ..HttpConfig::default()
+        });
+        idle.pinned_client("http", "warm.invalid", upstream.port(), &[upstream.ip()])
+            .expect("client");
+        assert_eq!(idle.warm_recent_upstreams().await, 0, "not used recently");
     }
 
     #[tokio::test]
@@ -777,8 +1010,8 @@ mod tests {
         .await;
 
         let host = "exit-test.invalid";
-        let client =
-            build_pinned_client(host, redirector, Duration::from_secs(5)).expect("pinned client");
+        let client = build_pinned_client(host, &[redirector], &HttpConfig::default())
+            .expect("pinned client");
         let response = client
             .post(format!("http://{host}:{}/", redirector.port()))
             .body("payload")

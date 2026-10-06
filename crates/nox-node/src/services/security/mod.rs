@@ -94,6 +94,21 @@ pub fn is_ip_allowed(ip: IpAddr, allow_private: bool) -> Result<(), SsrfError> {
     Ok(())
 }
 
+/// Every address `hostname` resolves to, deduplicated and sorted. The caller
+/// validates each one and connects only to those (DNS pinning).
+pub async fn resolve_hostname_all(hostname: &str, port: u16) -> Result<Vec<IpAddr>, SsrfError> {
+    let addrs = tokio::net::lookup_host(format!("{hostname}:{port}"))
+        .await
+        .map_err(|e| SsrfError::DnsResolutionFailed(e.to_string()))?;
+    let mut ips: Vec<IpAddr> = addrs.map(|addr| addr.ip()).collect();
+    ips.sort_unstable();
+    ips.dedup();
+    if ips.is_empty() {
+        return Err(SsrfError::DnsResolutionFailed("No addresses found".into()));
+    }
+    Ok(ips)
+}
+
 /// Single DNS resolution to prevent rebinding attacks.
 pub async fn resolve_hostname(hostname: &str, port: u16) -> Result<IpAddr, SsrfError> {
     let addr_str = format!("{hostname}:{port}");

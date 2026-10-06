@@ -36,8 +36,8 @@ use tracing::{debug, warn};
 
 use super::claim::{
     base64_item, encode_base64_json, encode_batch, encode_json, ClaimEncoding, ClaimRequest,
-    ClaimSettings, CLAIM_BATCH_CONTENT_TYPE, CLAIM_VERSION, CLAIM_VERSION_HEADER,
-    CLAIM_WAIT_MAX_HEADER,
+    ClaimSettings, CLAIM_BATCH_CONTENT_TYPE, CLAIM_FEATURES, CLAIM_FEATURES_HEADER, CLAIM_VERSION,
+    CLAIM_VERSION_HEADER, CLAIM_WAIT_MAX_HEADER,
 };
 use super::policy::{cors_layer, rate_limit, IngressRateLimiter};
 use super::response_buffer::{
@@ -357,19 +357,24 @@ async fn claim_responses(
     };
 
     let deadline = tokio::time::Instant::now() + wait;
+    let limit = body.reply_limit();
+    // Registered before the first check, so a reply stored in between still
+    // wakes the wait. Only stores under these IDs wake it.
+    let waiter = (!wait.is_zero()).then(|| state.response_buffer.waiter(&surb_ids));
     let replies = loop {
-        let notified = state.response_buffer.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        let replies = state.response_buffer.claim(&surb_ids, mode);
+        let replies = state.response_buffer.claim_at_most(&surb_ids, mode, limit);
         if !replies.is_empty() || tokio::time::Instant::now() >= deadline {
             break replies;
         }
+        let Some(waiter) = &waiter else {
+            break replies;
+        };
         tokio::select! {
-            () = &mut notified => {}
+            () = waiter.notified() => {}
             () = tokio::time::sleep_until(deadline) => {}
         }
     };
+    drop(waiter);
     if replies.is_empty() {
         if !wait.is_zero() {
             count_claim_event(&state, "wait_timeout", 1);
@@ -424,6 +429,10 @@ fn with_claim_headers(
     headers.insert(
         CLAIM_WAIT_MAX_HEADER,
         HeaderValue::from(settings.wait_max.as_millis() as u64),
+    );
+    headers.insert(
+        CLAIM_FEATURES_HEADER,
+        HeaderValue::from_static(CLAIM_FEATURES),
     );
     response
 }
@@ -661,6 +670,7 @@ async fn stream_responses(
         let start = Instant::now();
         let timeout = Duration::from_mins(1);
         let poll_interval = Duration::from_millis(100);
+        let waiter = buffer.waiter(&surb_ids);
         let mut remaining: Vec<SurbId> = surb_ids;
 
         while !remaining.is_empty() && start.elapsed() < timeout {
@@ -683,7 +693,7 @@ async fn stream_responses(
             }
 
             tokio::select! {
-                () = buffer.notified() => {}
+                () = waiter.notified() => {}
                 () = tokio::time::sleep(poll_interval) => {}
             }
         }
@@ -1524,6 +1534,84 @@ mod tests {
             "woken by the store: {elapsed:?}"
         );
         assert_eq!(state.response_buffer.len(), 1, "retained until acked");
+    }
+
+    #[tokio::test]
+    async fn test_long_poll_ignores_replies_for_other_ids() {
+        let state = wait_state(10_000, 4);
+        let buffer = Arc::clone(&state.response_buffer);
+        let store = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            buffer.store_response(&format!("reply-0-{SURB_B}"), vec![1]);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            buffer.store_response(&format!("reply-0-{SURB_A}"), vec![2]);
+        });
+        let started = Instant::now();
+        let (status, _, body) = claim_v2(
+            IngressServer::router(Arc::clone(&state)),
+            serde_json::json!({ "surb_ids": [SURB_A], "retain": true, "wait_ms": 10_000, "encoding": "binary" }),
+            None,
+        )
+        .await;
+        store.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(decode_batch(&body)[0].2, vec![2]);
+        assert!(started.elapsed() >= Duration::from_millis(240));
+        assert_eq!(
+            state.response_buffer.waiter_registrations(),
+            0,
+            "the long-poll unregisters when it answers"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claim_max_replies_returns_the_first_arrival() {
+        let state = test_state(false);
+        state
+            .response_buffer
+            .store_response(&format!("reply-0-{SURB_B}"), vec![1]);
+        std::thread::sleep(Duration::from_millis(2));
+        state
+            .response_buffer
+            .store_response(&format!("reply-0-{SURB_A}"), vec![2]);
+        let (status, headers, body) = claim_v2(
+            IngressServer::router(Arc::clone(&state)),
+            serde_json::json!({ "surb_ids": [SURB_A, SURB_B], "retain": true, "encoding": "binary", "max_replies": 1 }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[CLAIM_FEATURES_HEADER], CLAIM_FEATURES);
+        let items = decode_batch(&body);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].1, format!("reply-0-{SURB_B}"));
+
+        // Ack the reply that decoded the request and its sibling: the
+        // sibling is dropped and nothing is left to send.
+        let (status, _, _) = claim_v2(
+            IngressServer::router(Arc::clone(&state)),
+            serde_json::json!({ "surb_ids": [], "ack": [SURB_A, SURB_B], "retain": true }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(state.response_buffer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ack_ahead_drops_a_sibling_that_arrives_later() {
+        let state = test_state(false);
+        let (status, _, _) = claim_v2(
+            IngressServer::router(Arc::clone(&state)),
+            serde_json::json!({ "surb_ids": [], "ack": [SURB_B], "retain": true }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        state
+            .response_buffer
+            .store_response(&format!("reply-0-{SURB_B}"), vec![9]);
+        assert!(state.response_buffer.is_empty(), "acked ahead: dropped");
     }
 
     #[tokio::test]

@@ -490,6 +490,7 @@ impl NoxNode {
                 )
                 .with_stash_remaining(stash),
             );
+            crate::services::handlers::http::HttpHandler::spawn_upstream_warmer(&http_handler);
             let echo_handler = Arc::new(crate::services::handlers::echo::EchoHandler::new(
                 response_packer.clone(),
                 bus_publisher.clone(),
@@ -635,6 +636,7 @@ impl NoxNode {
                 )
                 .with_stash_remaining(stash),
             );
+            crate::services::handlers::http::HttpHandler::spawn_upstream_warmer(&http_handler);
             let echo_handler = Arc::new(crate::services::handlers::echo::EchoHandler::new(
                 response_packer.clone(),
                 bus_publisher.clone(),

@@ -218,6 +218,12 @@ prune_interval_seconds = 60
 allow_private_ips = false
 request_timeout_secs = 10
 max_response_bytes = 1048576      # 1 MB
+# Upstream connection warmth (exit node)
+# pool_idle_timeout_secs = 600
+# http2_keep_alive_interval_secs = 30
+# warm_interval_secs = 60
+# warm_recent_secs = 600
+# max_cached_hosts = 256
 
 # ---
 # [ingress] -- Abuse controls for ingress_port (and CORS on metrics_port)

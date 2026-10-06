@@ -3,7 +3,9 @@ mod association_internal_test;
 
 use async_trait::async_trait;
 use portable_atomic::AtomicBool;
+use std::time::Instant;
 
+use super::pacing::DeliveryRate;
 use super::*;
 use crate::param::param_forward_tsn_supported::ParamForwardTsnSupported;
 use crate::param::param_type::ParamType;
@@ -59,6 +61,11 @@ pub struct AssociationInternal {
     partial_bytes_acked: u32,
     pub(crate) in_fast_recovery: bool,
     fast_recover_exit_point: u32,
+    /// nox: cwnd when the current fast recovery began.
+    fast_recovery_entry_cwnd: u32,
+    /// nox: chunks marked lost (3 miss indications) in the current fast
+    /// recovery.
+    fast_recovery_losses: u32,
 
     // RTX & Ack timer
     pub(crate) rto_mgr: RtoManager,
@@ -67,6 +74,8 @@ pub struct AssociationInternal {
     pub(crate) t2shutdown: Option<RtxTimer<AssociationInternal>>,
     pub(crate) t3rtx: Option<RtxTimer<AssociationInternal>>,
     pub(crate) treconfig: Option<RtxTimer<AssociationInternal>>,
+    /// nox: tail loss probe timer.
+    pub(crate) tlp: Option<RtxTimer<AssociationInternal>>,
     pub(crate) ack_timer: Option<AckTimer<AssociationInternal>>,
 
     // Chunks stored for retransmission
@@ -84,24 +93,154 @@ pub struct AssociationInternal {
     immediate_ack_triggered: bool,
 
     pub(crate) stats: Arc<AssociationStats>,
+    /// nox: DATA bytes received in the current burst from the peer, and when
+    /// the last DATA chunk arrived.
+    rx_burst_bytes: u64,
+    rx_burst_last_data: Option<Instant>,
+    /// nox: ack-train delivery-rate estimate for pacing (pacing.rs).
+    delivery_rate: DeliveryRate,
     ack_state: AckState,
     pub(crate) ack_mode: AckMode, // for testing
 }
 
-/// Initial congestion window in bytes for `mtu` (RFC 6928 IW10 formula).
+/// Initial congestion window in bytes for `mtu`.
 pub(crate) fn initial_cwnd(mtu: u32) -> u32 {
-    std::cmp::min(
-        INITIAL_CWND_MTUS * mtu,
-        std::cmp::max(2 * mtu, INITIAL_CWND_FLOOR_BYTES),
-    )
+    INITIAL_CWND_MTUS * mtu
 }
 
-/// Initial window, in MTUs (nox tuning; RFC 4960 uses 4).
-pub(crate) const INITIAL_CWND_MTUS: u32 = 10;
-/// Byte floor of the initial-window formula (RFC 6928).
-pub(crate) const INITIAL_CWND_FLOOR_BYTES: u32 = 14_600;
+/// Initial window, in MTUs (nox tuning; RFC 4960 uses 4, RFC 6928 10).
+///
+/// Every exchange on a KPS connection is one request and one reply, and the
+/// usual reply is one or two encrypted Sphinx replies (32,402 or 64,797
+/// bytes as a claim batch). 56 MTUs (68,768 bytes at the 1,228-byte MTU)
+/// let both sizes, with HTTP and KPS framing, leave in the first flight on a
+/// new association, which saves one to two round trips on the first calls
+/// after a dial. The pacer (pacing.rs) bounds the burst that goes out at
+/// once.
+pub(crate) const INITIAL_CWND_MTUS: u32 = 56;
+
+/// Lowest congestion window after a loss, in MTUs (nox tuning).
+///
+/// RFC 4960 halves cwnd on a fast retransmit (floor 4 MTU) and drops it to
+/// one MTU on a retransmission timeout. On browser links most losses are
+/// random rather than congestion, and a reply is one burst per call, so the
+/// halved window made the next replies take 2-3 round trips each. The floor
+/// equals the initial window: after a loss the sender is never more cautious
+/// than a new association, and never more aggressive either.
+pub(crate) const LOSS_CWND_FLOOR_MTUS: u32 = INITIAL_CWND_MTUS;
+
+/// Congestion window floor after a fast retransmit or the first T3-rtx
+/// expiry of a series.
+pub(crate) fn loss_cwnd_floor(mtu: u32) -> u32 {
+    std::cmp::max(LOSS_CWND_FLOOR_MTUS * mtu, 4 * mtu)
+}
+
+/// Bytes at the start of each burst from the peer that are SACKed packet by
+/// packet (nox). A KPS request is one Sphinx packet (32,768 bytes plus
+/// framing); 64 KiB covers two.
+pub(crate) const IMMEDIATE_SACK_BURST_BYTES: u64 = 64 * 1024;
+/// A pause in DATA from the peer this long starts a new burst.
+pub(crate) const IMMEDIATE_SACK_BURST_IDLE: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
+/// Tail loss probe (nox, after RFC 8985 TLP): when no SACK has advanced the
+/// cumulative TSN for `2 * SRTT` (plus `TLP_DELAYED_ACK_MS` when a single
+/// chunk is outstanding, which the peer may SACK late), the earliest
+/// `TLP_PROBE_CHUNKS` unacked chunks are resent without touching cwnd. A
+/// loss at the tail of a reply has no later packet to report it, so without
+/// the probe it waits for the T3-rtx timer (1 s at least).
+pub(crate) const TLP_PROBE_CHUNKS: usize = 4;
+/// Allowance for the peer's delayed SACK of a lone chunk, ms.
+pub(crate) const TLP_DELAYED_ACK_MS: u64 = 200;
+/// Shortest probe timeout, ms.
+pub(crate) const TLP_MIN_MS: u64 = 10;
+
+/// Most lost chunks in one window that still count as random loss (nox).
+///
+/// The loss floor is for isolated losses. When more chunks than this are
+/// lost in one fast recovery, or are outstanding when the T3-rtx timer
+/// expires, the window overran the path (for example a shallow bottleneck
+/// queue), and the sender reacts as RFC 4960 7.2.3 says: half the window,
+/// at least 4 MTU, or one MTU after a timeout.
+pub(crate) const LOSS_FLOOR_MAX_LOSSES: u32 = 2;
 
 impl AssociationInternal {
+    /// nox: probe timeout for the outstanding data, or `None` when there is
+    /// no RTT measurement yet or the probe would not come before the T3-rtx
+    /// timer.
+    fn tlp_timeout_ms(&self) -> Option<u64> {
+        let srtt = self.rto_mgr.srtt;
+        if srtt == 0 {
+            return None;
+        }
+        let mut pto = 2 * srtt;
+        if self.unacked_chunks() == 1 {
+            pto += TLP_DELAYED_ACK_MS;
+        }
+        let pto = pto.max(TLP_MIN_MS);
+        (pto < self.rto_mgr.get_rto()).then_some(pto)
+    }
+
+    /// nox: starts the tail loss probe timer for the outstanding data
+    /// (`restart`: also when it already runs).
+    async fn arm_tlp(&self, restart: bool) {
+        let Some(tlp) = &self.tlp else {
+            return;
+        };
+        match self.tlp_timeout_ms() {
+            Some(pto) if restart => {
+                tlp.restart(pto).await;
+            }
+            Some(pto) => {
+                tlp.start(pto).await;
+            }
+            None => tlp.stop().await,
+        }
+    }
+
+    /// nox: the probe timer expired with data outstanding: resend the
+    /// earliest unacked chunks.
+    fn tlp_timeout(&mut self) {
+        let mut marked = 0;
+        for i in 0..self.inflight_queue.len() as u32 {
+            if marked == TLP_PROBE_CHUNKS {
+                break;
+            }
+            let tsn = self.cumulative_tsn_ack_point.wrapping_add(i + 1);
+            if let Some(c) = self.inflight_queue.get_mut(tsn) {
+                if !c.acked && !c.abandoned() && !c.retransmit {
+                    c.retransmit = true;
+                    marked += 1;
+                }
+            }
+        }
+        if marked > 0 {
+            log::debug!(
+                "[{}] tail loss probe: resending {} chunk(s)",
+                self.name,
+                marked
+            );
+            self.awake_write_loop();
+        }
+    }
+
+    /// nox: chunks sent and not yet acked (cumulatively or by a gap block).
+    fn unacked_chunks(&self) -> u32 {
+        let mut n = 0;
+        for i in 0..self.inflight_queue.len() as u32 {
+            let tsn = self.cumulative_tsn_ack_point.wrapping_add(i + 1);
+            if self.inflight_queue.get(tsn).is_some_and(|c| !c.acked) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// nox: pacing rate for the packets after the first burst of a write.
+    pub(crate) fn pacing_bytes_per_ms(&self) -> u64 {
+        self.delivery_rate.pacing_bytes_per_ms()
+    }
+
     pub(crate) fn new(
         config: Config,
         close_loop_ch_tx: broadcast::Sender<()>,
@@ -129,10 +268,8 @@ impl AssociationInternal {
         }
 
         let mtu = INITIAL_MTU;
-        // nox: the initial window follows RFC 6928 (TCP IW10),
-        // min(10*MTU, max(2*MTU, 14600 bytes)), instead of RFC 4960 7.2.1's
-        // min(4*MTU, max(2*MTU, 4380 bytes)). A 32 KiB reply then needs about
-        // 3 round trips from a cold association instead of about 5.
+        // nox: INITIAL_CWND_MTUS instead of RFC 4960 7.2.1's
+        // min(4*MTU, max(2*MTU, 4380 bytes)).
         let cwnd = initial_cwnd(mtu);
 
         let ret = AssociationInternal {
@@ -181,6 +318,8 @@ impl AssociationInternal {
             partial_bytes_acked: 0,
             in_fast_recovery: false,
             fast_recover_exit_point: 0,
+            fast_recovery_entry_cwnd: 0,
+            fast_recovery_losses: 0,
 
             rto_mgr: RtoManager::new(),
             t1init: None,
@@ -188,6 +327,7 @@ impl AssociationInternal {
             t2shutdown: None,
             t3rtx: None,
             treconfig: None,
+            tlp: None,
             ack_timer: None,
 
             stored_init: None,
@@ -200,6 +340,9 @@ impl AssociationInternal {
             delayed_ack_triggered: false,
             immediate_ack_triggered: false,
             stats: Arc::new(AssociationStats::default()),
+            rx_burst_bytes: 0,
+            rx_burst_last_data: None,
+            delivery_rate: DeliveryRate::default(),
             ack_state: AckState::default(),
             ack_mode: AckMode::default(),
         };
@@ -324,6 +467,9 @@ impl AssociationInternal {
         if let Some(treconfig) = &self.treconfig {
             treconfig.stop().await;
         }
+        if let Some(tlp) = &self.tlp {
+            tlp.stop().await;
+        }
         if let Some(ack_timer) = &mut self.ack_timer {
             ack_timer.stop();
         }
@@ -401,6 +547,7 @@ impl AssociationInternal {
             if let Some(t3rtx) = &self.t3rtx {
                 t3rtx.start(self.rto_mgr.get_rto()).await;
             }
+            self.arm_tlp(false).await;
             for p in self.bundle_data_chunks_into_packets(chunks) {
                 raw_packets.push(p);
             }
@@ -1012,7 +1159,20 @@ impl AssociationInternal {
             }
         }
 
-        let immediate_sack = d.immediate_sack;
+        // nox: SACK every packet of the first IMMEDIATE_SACK_BURST_BYTES of
+        // each burst from the peer, so a sender in slow start (a browser
+        // grows cwnd by at most one MTU per SACK) opens its window twice as
+        // fast as with a SACK for every second packet.
+        let now = Instant::now();
+        if self
+            .rx_burst_last_data
+            .is_none_or(|last| now.duration_since(last) >= IMMEDIATE_SACK_BURST_IDLE)
+        {
+            self.rx_burst_bytes = 0;
+        }
+        self.rx_burst_last_data = Some(now);
+        self.rx_burst_bytes = self.rx_burst_bytes.saturating_add(d.user_data.len() as u64);
+        let immediate_sack = d.immediate_sack || self.rx_burst_bytes <= IMMEDIATE_SACK_BURST_BYTES;
 
         if stream_handle_data {
             if let Some(s) = self.streams.get_mut(&d.stream_identifier) {
@@ -1280,14 +1440,19 @@ impl AssociationInternal {
                 self.name,
                 self.pending_queue.len()
             );
+            self.delivery_rate.end_train();
             if let Some(t3rtx) = &self.t3rtx {
                 t3rtx.stop().await;
+            }
+            if let Some(tlp) = &self.tlp {
+                tlp.stop().await;
             }
         } else {
             log::trace!("[{}] T3-rtx timer start (pt2)", self.name);
             if let Some(t3rtx) = &self.t3rtx {
                 t3rtx.start(self.rto_mgr.get_rto()).await;
             }
+            self.arm_tlp(true).await;
         }
 
         // Update congestion control parameters
@@ -1387,7 +1552,10 @@ impl AssociationInternal {
                             //     last sent, according to the formula described in Section 7.2.3.
                             self.in_fast_recovery = true;
                             self.fast_recover_exit_point = htna;
-                            self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu);
+                            self.fast_recovery_entry_cwnd = self.cwnd;
+                            self.fast_recovery_losses = 1;
+                            // nox: floor at the loss floor instead of 4 MTU.
+                            self.ssthresh = std::cmp::max(self.cwnd / 2, loss_cwnd_floor(self.mtu));
                             self.cwnd = self.ssthresh;
                             self.partial_bytes_acked = 0;
                             self.will_retransmit_fast = true;
@@ -1399,6 +1567,23 @@ impl AssociationInternal {
                                 self.ssthresh,
                                 self.inflight_queue.get_num_bytes()
                             );
+                        } else if c.miss_indicator == 3 {
+                            // nox: more losses in the same window mean
+                            // congestion: drop the loss floor (RFC 4960 7.2.3).
+                            self.fast_recovery_losses += 1;
+                            if self.fast_recovery_losses == LOSS_FLOOR_MAX_LOSSES + 1 {
+                                self.delivery_rate.on_congestion();
+                                self.ssthresh =
+                                    std::cmp::max(self.fast_recovery_entry_cwnd / 2, 4 * self.mtu);
+                                self.cwnd = std::cmp::min(self.cwnd, self.ssthresh);
+                                log::trace!(
+                                    "[{}] updated cwnd={} ssthresh={} losses={} (FR, congestion)",
+                                    self.name,
+                                    self.cwnd,
+                                    self.ssthresh,
+                                    self.fast_recovery_losses
+                                );
+                            }
                         }
                     }
                 } else {
@@ -1459,6 +1644,10 @@ impl AssociationInternal {
         let mut total_bytes_acked = 0;
         for n_bytes_acked in bytes_acked_per_stream.values() {
             total_bytes_acked += *n_bytes_acked;
+        }
+        if total_bytes_acked > 0 {
+            self.delivery_rate
+                .on_sack(Instant::now(), total_bytes_acked as u64);
         }
 
         let mut cum_tsn_ack_point_advanced = false;
@@ -2385,8 +2574,27 @@ impl RtxTimerObserver for AssociationInternal {
                 //      ssthresh = max(cwnd/2, 4*MTU)
                 //      cwnd = 1*MTU
 
-                self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu);
-                self.cwnd = self.mtu;
+                // nox: the first expiry of a series (typically one lost
+                // packet at the tail of a reply, which no later SACK could
+                // report) keeps cwnd at the loss floor. Repeated expiries
+                // mean the path is failing: back to one MTU as RFC 4960 says.
+                // Several chunks outstanding at the expiry means the window
+                // overran the path: no floor then either.
+                let outstanding = self.unacked_chunks();
+                let isolated = n_rtos <= 1 && outstanding <= LOSS_FLOOR_MAX_LOSSES;
+                self.ssthresh = if isolated {
+                    std::cmp::max(self.cwnd / 2, loss_cwnd_floor(self.mtu))
+                } else {
+                    std::cmp::max(self.cwnd / 2, 4 * self.mtu)
+                };
+                if !isolated {
+                    self.delivery_rate.on_congestion();
+                }
+                self.cwnd = if isolated {
+                    loss_cwnd_floor(self.mtu)
+                } else {
+                    self.mtu
+                };
                 log::trace!(
                     "[{}] updated cwnd={} ssthresh={} inflight={} (RTO)",
                     self.name,
@@ -2435,6 +2643,9 @@ impl RtxTimerObserver for AssociationInternal {
                 );
 
                 self.inflight_queue.mark_all_to_retrasmit();
+                if let Some(tlp) = &self.tlp {
+                    tlp.stop().await;
+                }
                 self.awake_write_loop();
             }
 
@@ -2442,6 +2653,8 @@ impl RtxTimerObserver for AssociationInternal {
                 self.will_retransmit_reconfig = true;
                 self.awake_write_loop();
             }
+
+            RtxTimerId::Tlp => self.tlp_timeout(),
         }
     }
 

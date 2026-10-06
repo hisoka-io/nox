@@ -3,6 +3,7 @@ mod association_test;
 
 mod association_internal;
 mod association_stats;
+mod pacing;
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -116,6 +117,8 @@ pub(crate) enum RtxTimerId {
     T2Shutdown,
     T3RTX,
     Reconfig,
+    /// nox: tail loss probe (association_internal.rs `tlp_timeout`).
+    Tlp,
 }
 
 impl fmt::Display for RtxTimerId {
@@ -126,6 +129,7 @@ impl fmt::Display for RtxTimerId {
             RtxTimerId::T2Shutdown => "T2Shutdown",
             RtxTimerId::T3RTX => "T3RTX",
             RtxTimerId::Reconfig => "Reconfig",
+            RtxTimerId::Tlp => "TLP",
         };
         write!(f, "{s}")
     }
@@ -357,6 +361,8 @@ impl Association {
                 RtxTimerId::Reconfig,
                 NO_MAX_RETRANS,
             )); // retransmit forever
+                // nox: one probe per arming; the second expiry only ends the timer.
+            ai.tlp = Some(RtxTimer::new(weak.clone(), RtxTimerId::Tlp, 1));
             ai.ack_timer = Some(AckTimer::new(weak, ACK_INTERVAL));
 
             tokio::spawn(Association::read_loop(
@@ -471,14 +477,17 @@ impl Association {
     ) {
         log::debug!("[{name}] write_loop entered");
         let done = Arc::new(AtomicBool::new(false));
+        let mut pacer = pacing::Pacer::new(tokio::time::Instant::now());
         let name = Arc::new(name);
 
         'outer: while !done.load(Ordering::Relaxed) {
             //log::debug!("[{}] gather_outbound begin", name);
-            let (packets, continue_loop) = {
+            let (packets, continue_loop, pace_bytes_per_ms) = {
                 let mut ai = association_internal.lock().await;
-                ai.gather_outbound().await
+                let (packets, continue_loop) = ai.gather_outbound().await;
+                (packets, continue_loop, ai.pacing_bytes_per_ms())
             };
+
             //log::debug!("[{}] gather_outbound done with {}", name, packets.len());
 
             let net_conn = Arc::clone(&net_conn);
@@ -499,6 +508,15 @@ impl Association {
                     .await
                 {
                     Ok(Ok(mut buf)) => {
+                        // nox: every packet passes the pacer's token bucket
+                        // (pacing.rs).
+                        if let Some(at) = pacer.admit(
+                            tokio::time::Instant::now(),
+                            buf.len() as u64,
+                            pace_bytes_per_ms,
+                        ) {
+                            tokio::time::sleep_until(at).await;
+                        }
                         let raw = buf.as_ref();
                         if let Err(err) = net_conn.send(raw.as_ref()).await {
                             log::warn!("[{name2}] failed to write packets on net_conn: {err}");

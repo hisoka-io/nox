@@ -198,6 +198,13 @@ impl<T: 'static + RtxTimerObserver + Send> RtxTimer<T> {
         true
     }
 
+    /// nox: stops the timer if it runs and starts it again with `rto`, so
+    /// the next expiry is `rto` from now.
+    pub(crate) async fn restart(&self, rto: u64) -> bool {
+        self.stop().await;
+        self.start(rto).await
+    }
+
     /// stop stops the timer.
     pub(crate) async fn stop(&self) {
         let mut close_tx = self.close_tx.lock().await;

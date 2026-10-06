@@ -1,13 +1,15 @@
 # Reply claims: protocol v2
 
 `POST /api/v1/responses/claim` is how a client collects the replies its SURBs
-brought back to an entry node. Version 2 adds four optional request fields:
+brought back to an entry node. Version 2 adds five optional request fields:
 
 - a compact reply encoding (binary or base64 instead of a JSON number array);
 - retain-until-ack, so a transfer that is cut off can be claimed again;
-- explicit acks;
+- explicit acks, which also drop sibling replies that have not arrived yet
+  (ack-ahead);
 - long-polling, so a claim waits at the entry for the reply instead of
-  polling every 200 ms.
+  polling every 200 ms;
+- a reply limit, so a claim returns only the first reply that arrived.
 
 Every v2 field is optional and every v1 request is answered exactly as before.
 The same API is served on the node's ingress port and through nox-kps
@@ -23,7 +25,8 @@ The same API is served on the node's ingress port and through nox-kps
   "encoding": "binary",
   "retain": true,
   "ack": ["<32 hex>", "..."],
-  "wait_ms": 15000
+  "wait_ms": 15000,
+  "max_replies": 1
 }
 ```
 
@@ -32,8 +35,9 @@ The same API is served on the node's ingress port and through nox-kps
 | `surb_ids` | array of 32-hex strings | required | Reply IDs to claim (SURB IDs for format 1, delivery IDs for format 2). Only exact matches are returned. |
 | `encoding` | string | `"json"` | `"json"`, `"base64"` or `"binary"`. Unknown values fall back to `"json"`. Overrides `Accept`. |
 | `retain` | bool | `false` | `false`: each returned reply is deleted (v1). `true`: each returned reply stays at the entry until acked, or until the claim grace (20 s by default) has passed since it was first returned. |
-| `ack` | array of 32-hex strings | `[]` | Replies the client has. They are deleted **before** the claim runs, so an ID in both lists is deleted and not returned. Acking an ID whose reply has not been claimed yet deletes it too (for example a parity reply that is no longer needed). |
+| `ack` | array of 32-hex strings | `[]` | Replies the client has, or no longer needs. They are deleted **before** the claim runs, so an ID in both lists is deleted and not returned. Acking an ID whose reply has not been claimed yet deletes it too (for example a parity reply that is no longer needed). With the `ack-ahead` feature, acking an ID whose reply has **not arrived yet** makes the entry drop that reply when it arrives (see Ack-ahead). |
 | `wait_ms` | integer | `0` | Long-poll: hold the request until at least one of `surb_ids` has a reply, or this many milliseconds have passed. Honoured only together with `retain: true`. Capped by the entry (see `x-nox-claim-wait-max-ms`). |
+| `max_replies` | integer | no limit | Return at most this many replies: the ones that arrived at the entry first. The others stay for a later claim. `0` means no limit. Needs the `max-replies` feature; older entries ignore it and return every reply. |
 
 Entries skip fields they do not know, so newer clients can add fields and
 older entries keep answering.
@@ -62,6 +66,7 @@ Every claim response carries:
 |---|---|
 | `x-nox-claim-version` | `2` |
 | `x-nox-claim-wait-max-ms` | Longest `wait_ms` honoured (through nox-kps: the lower of the node's and the relay's limit) |
+| `x-nox-claim-features` | Optional features, comma separated: `max-replies`, `ack-ahead` (nodes from 0.4.0-rc.8; through nox-kps from the same release) |
 
 An entry without these headers is a v1 entry; see Compatibility.
 
@@ -131,6 +136,40 @@ replies are dropped when the grace ends.
 Clients should not re-claim replies they already hold: acking them is what
 frees the entry's memory.
 
+## Replicas: first reply wins
+
+A request usually asks for two replies over two SURBs: the data reply and
+a parity reply, each of which decodes the answer on its own. Through
+different mix routes they reach the entry tens to hundreds of milliseconds
+apart. The fastest client flow takes whichever arrives first and never
+downloads the other:
+
+```text
+claim  {surb_ids:[d,p], encoding:"binary", retain:true, wait_ms:15000, max_replies:1}
+  <- 200 [p]                  (the parity reply arrived first; d is not sent)
+claim  {surb_ids:[...], ack:[p,d], ...}
+                              (p is deleted; d is deleted if it is there,
+                               and dropped on arrival if it is not)
+```
+
+`max_replies: 1` keeps the claim to one 32 KB reply even when both have
+arrived, which saves a round trip on long paths. On an entry without the
+`max-replies` feature the claim returns both, as before.
+
+The limit counts replies across the whole claim, not per request. A claim
+that names the IDs of several requests (one shared long-poll) should leave
+`max_replies` out, or set it to the number of requests it waits for;
+`max_replies: 1` there returns one request's reply per round trip.
+
+### Ack-ahead
+
+An ack for an ID with no reply held makes the entry remember that ID for
+the claim grace (`claim_retain_grace_ms`, 20 s by default). If its reply
+arrives in that time, the entry drops it instead of storing it. The entry
+remembers at most 10,000 such IDs (oldest forgotten first); a forgotten ID's
+reply is stored and expires with the normal 5-minute TTL, as on older
+entries.
+
 ## Long-poll: client flow
 
 Keep one long-poll claim open per entry for all IDs that are waiting, with
@@ -162,6 +201,9 @@ How a v2 client decides what to send:
 3. Always parse by `Content-Type`: `application/vnd.nox.claim-batch` is the
    binary batch; `application/json` items have either `data` (number array)
    or `data_b64`.
+4. `max_replies` and acks for replies that have not arrived are safe to send
+   to any entry: older entries ignore the field and treat such an ack as a
+   no-op. `x-nox-claim-features` says whether the entry acts on them.
 
 ## Streams
 
@@ -186,6 +228,9 @@ reply lands.
 nox-kps `[limits]`: `claim_wait_max_ms` (default 20,000, at most 60,000),
 `max_concurrent_claim_waits` (default 128).
 
+A stored reply wakes only the long-polls waiting for its ID, so the cost of
+a store does not grow with the number of open long-polls.
+
 Metrics: `nox_ingress_claim_events_total{event=...}` on the node with
 `reclaimed`, `acked`, `wait`, `wait_busy`, `wait_timeout`, and one count per
 encoding (`json`, `base64`, `binary`, counting replies sent);
@@ -203,4 +248,7 @@ encoding (`json`, `base64`, `binary`, counting replies sent);
 - A re-claim tells the entry nothing new: the entry already sees every claim
   for an ID, and a client that lost a transfer would claim the same IDs again
   under v1 too (and get `204`).
+- An ack-ahead names an ID the entry will see anyway when its reply arrives
+  or expires; remembering it changes only whether the reply is kept. Dropped
+  replies are counted in `nox_response_evicted_total{reason="acked"}`.
 - Logs and metrics carry counts only, never IDs.

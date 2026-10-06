@@ -334,6 +334,44 @@ pub struct HttpConfig {
     pub allow_private_ips: bool,
     pub request_timeout_secs: u64,
     pub max_response_bytes: usize,
+    /// How long an idle upstream connection stays pooled for reuse.
+    #[serde(default = "default_http_pool_idle_timeout_secs")]
+    pub pool_idle_timeout_secs: u64,
+    /// HTTP/2 PING interval on upstream connections, also while idle, so
+    /// they stay open through NATs and load balancers. 0 = no pings.
+    #[serde(default = "default_http2_keep_alive_interval_secs")]
+    pub http2_keep_alive_interval_secs: u64,
+    /// How often upstream hosts used recently get a `HEAD /` to keep their
+    /// pooled connection warm. 0 = no warm-up requests.
+    #[serde(default = "default_http_warm_interval_secs")]
+    pub warm_interval_secs: u64,
+    /// A host counts as recently used for this long after its last request.
+    #[serde(default = "default_http_warm_recent_secs")]
+    pub warm_recent_secs: u64,
+    /// Most upstream hosts that keep a pinned client (least recently used
+    /// first out).
+    #[serde(default = "default_http_max_cached_hosts")]
+    pub max_cached_hosts: usize,
+}
+
+fn default_http_pool_idle_timeout_secs() -> u64 {
+    600
+}
+
+fn default_http2_keep_alive_interval_secs() -> u64 {
+    30
+}
+
+fn default_http_warm_interval_secs() -> u64 {
+    60
+}
+
+fn default_http_warm_recent_secs() -> u64 {
+    600
+}
+
+fn default_http_max_cached_hosts() -> usize {
+    256
 }
 
 impl Default for HttpConfig {
@@ -343,6 +381,11 @@ impl Default for HttpConfig {
             allow_private_ips: false,
             request_timeout_secs: 10,
             max_response_bytes: 1024 * 1024,
+            pool_idle_timeout_secs: default_http_pool_idle_timeout_secs(),
+            http2_keep_alive_interval_secs: default_http2_keep_alive_interval_secs(),
+            warm_interval_secs: default_http_warm_interval_secs(),
+            warm_recent_secs: default_http_warm_recent_secs(),
+            max_cached_hosts: default_http_max_cached_hosts(),
         }
     }
 }
