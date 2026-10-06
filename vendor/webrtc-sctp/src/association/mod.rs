@@ -361,7 +361,7 @@ impl Association {
                 RtxTimerId::Reconfig,
                 NO_MAX_RETRANS,
             )); // retransmit forever
-            // nox: one probe per arming; the second expiry only ends the timer.
+                // nox: one probe per arming; the second expiry only ends the timer.
             ai.tlp = Some(RtxTimer::new(weak.clone(), RtxTimerId::Tlp, 1));
             ai.ack_timer = Some(AckTimer::new(weak, ACK_INTERVAL));
 

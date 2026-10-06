@@ -215,7 +215,11 @@ impl AssociationInternal {
             }
         }
         if marked > 0 {
-            log::debug!("[{}] tail loss probe: resending {} chunk(s)", self.name, marked);
+            log::debug!(
+                "[{}] tail loss probe: resending {} chunk(s)",
+                self.name,
+                marked
+            );
             self.awake_write_loop();
         }
     }
@@ -1167,11 +1171,8 @@ impl AssociationInternal {
             self.rx_burst_bytes = 0;
         }
         self.rx_burst_last_data = Some(now);
-        self.rx_burst_bytes = self
-            .rx_burst_bytes
-            .saturating_add(d.user_data.len() as u64);
-        let immediate_sack =
-            d.immediate_sack || self.rx_burst_bytes <= IMMEDIATE_SACK_BURST_BYTES;
+        self.rx_burst_bytes = self.rx_burst_bytes.saturating_add(d.user_data.len() as u64);
+        let immediate_sack = d.immediate_sack || self.rx_burst_bytes <= IMMEDIATE_SACK_BURST_BYTES;
 
         if stream_handle_data {
             if let Some(s) = self.streams.get_mut(&d.stream_identifier) {
@@ -1554,8 +1555,7 @@ impl AssociationInternal {
                             self.fast_recovery_entry_cwnd = self.cwnd;
                             self.fast_recovery_losses = 1;
                             // nox: floor at the loss floor instead of 4 MTU.
-                            self.ssthresh =
-                                std::cmp::max(self.cwnd / 2, loss_cwnd_floor(self.mtu));
+                            self.ssthresh = std::cmp::max(self.cwnd / 2, loss_cwnd_floor(self.mtu));
                             self.cwnd = self.ssthresh;
                             self.partial_bytes_acked = 0;
                             self.will_retransmit_fast = true;
@@ -1573,10 +1573,8 @@ impl AssociationInternal {
                             self.fast_recovery_losses += 1;
                             if self.fast_recovery_losses == LOSS_FLOOR_MAX_LOSSES + 1 {
                                 self.delivery_rate.on_congestion();
-                                self.ssthresh = std::cmp::max(
-                                    self.fast_recovery_entry_cwnd / 2,
-                                    4 * self.mtu,
-                                );
+                                self.ssthresh =
+                                    std::cmp::max(self.fast_recovery_entry_cwnd / 2, 4 * self.mtu);
                                 self.cwnd = std::cmp::min(self.cwnd, self.ssthresh);
                                 log::trace!(
                                     "[{}] updated cwnd={} ssthresh={} losses={} (FR, congestion)",

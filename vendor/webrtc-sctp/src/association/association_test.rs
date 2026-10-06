@@ -1428,7 +1428,10 @@ async fn test_assoc_congestion_control_burst_loss_drops_the_loss_floor() -> Resu
 
     {
         let a = a0.association_internal.lock().await;
-        assert!(a.stats.get_num_fast_retrans() >= 1, "should fast-retransmit");
+        assert!(
+            a.stats.get_num_fast_retrans() >= 1,
+            "should fast-retransmit"
+        );
         assert_eq!(
             a.ssthresh,
             std::cmp::max(entry_cwnd / 2, 4 * a.mtu),

@@ -69,7 +69,10 @@ impl Train {
         if self.acked < ACK_TRAIN_MIN_BYTES {
             return None;
         }
-        let span = self.last.duration_since(self.started).max(ACK_TRAIN_MIN_SPAN);
+        let span = self
+            .last
+            .duration_since(self.started)
+            .max(ACK_TRAIN_MIN_SPAN);
         let micros = span.as_micros().max(1) as u64;
         Some(self.acked.saturating_mul(1_000) / micros)
     }
@@ -213,7 +216,10 @@ mod tests {
         }
         rate.end_train();
         let pace = rate.pacing_bytes_per_ms();
-        assert!((3_000..=3_300).contains(&pace), "pace {pace} should be about 1.25 x 2,500");
+        assert!(
+            (3_000..=3_300).contains(&pace),
+            "pace {pace} should be about 1.25 x 2,500"
+        );
     }
 
     #[test]
@@ -295,8 +301,14 @@ mod tests {
             assert!(pacer.admit(start, 1_228, 1_228).is_none());
         }
         // One packet per ms at 1,228 bytes/ms, across writes.
-        assert_eq!(pacer.admit(start, 1_228, 1_228), Some(start + Duration::from_millis(1)));
-        assert_eq!(pacer.admit(start, 1_228, 1_228), Some(start + Duration::from_millis(2)));
+        assert_eq!(
+            pacer.admit(start, 1_228, 1_228),
+            Some(start + Duration::from_millis(1))
+        );
+        assert_eq!(
+            pacer.admit(start, 1_228, 1_228),
+            Some(start + Duration::from_millis(2))
+        );
         // After an idle period the burst allowance is back, capped.
         let later = start + Duration::from_secs(1);
         for _ in 0..10 {
