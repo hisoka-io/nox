@@ -4055,7 +4055,7 @@ checksum = "38bf9645c8b145698bb0b18a4637dcacbc421ea49bef2317e4fd8065a387cf21"
 
 [[package]]
 name = "nox-client"
-version = "0.4.0-rc.7"
+version = "0.4.0-rc.8"
 dependencies = [
  "async-trait",
  "bincode",
@@ -4081,7 +4081,7 @@ dependencies = [
 
 [[package]]
 name = "nox-core"
-version = "0.4.0-rc.7"
+version = "0.4.0-rc.8"
 dependencies = [
  "async-trait",
  "bincode",
@@ -4103,7 +4103,7 @@ dependencies = [
 
 [[package]]
 name = "nox-crypto"
-version = "0.4.0-rc.7"
+version = "0.4.0-rc.8"
 dependencies = [
  "blake3",
  "chacha20",
@@ -4127,7 +4127,7 @@ dependencies = [
 
 [[package]]
 name = "nox-kps"
-version = "0.4.0-rc.7"
+version = "0.4.0-rc.8"
 dependencies = [
  "bytes",
  "clap",
@@ -4155,7 +4155,7 @@ dependencies = [
 
 [[package]]
 name = "nox-mixnet"
-version = "0.4.0-rc.7"
+version = "0.4.0-rc.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4196,7 +4196,7 @@ dependencies = [
 
 [[package]]
 name = "nox-node"
-version = "0.4.0-rc.7"
+version = "0.4.0-rc.8"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -4243,7 +4243,7 @@ dependencies = [
 
 [[package]]
 name = "nox-oracle"
-version = "0.4.0-rc.7"
+version = "0.4.0-rc.8"
 dependencies = [
  "async-trait",
  "axum",
@@ -4261,7 +4261,7 @@ dependencies = [
 
 [[package]]
 name = "nox-sim"
-version = "0.4.0-rc.7"
+version = "0.4.0-rc.8"
 dependencies = [
  "anyhow",
  "axum",
@@ -4295,7 +4295,7 @@ dependencies = [
 
 [[package]]
 name = "nox-test-infra"
-version = "0.4.0-rc.7"
+version = "0.4.0-rc.8"
 dependencies = [
  "ethers",
  "serde",
