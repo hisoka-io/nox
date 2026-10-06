@@ -1374,6 +1374,14 @@ async fn test_assoc_congestion_control_fast_retransmission() -> Result<()> {
         log::debug!("nFastRetrans: {}", a.stats.get_num_fast_retrans());
 
         assert_eq!(a.stats.get_num_fast_retrans(), 1, "should be 1");
+        // nox: a fast retransmit leaves cwnd and ssthresh at the loss floor.
+        assert!(
+            a.ssthresh >= loss_cwnd_floor(a.mtu) && a.cwnd >= loss_cwnd_floor(a.mtu),
+            "cwnd {} / ssthresh {} below the loss floor {}",
+            a.cwnd,
+            a.ssthresh,
+            loss_cwnd_floor(a.mtu)
+        );
     }
 
     close_association_pair(&br, a0, a1).await;
@@ -1574,7 +1582,8 @@ async fn test_assoc_congestion_control_slow_reader() -> Result<()> {
     let mut rbuf = vec![0u8; 3000];
 
     // 1. First forward packets to receiver until rwnd becomes 0
-    // 2. Wait until the sender's cwnd becomes 1*MTU (RTO occurred)
+    // 2. Wait until the sender's T3-rtx timer has expired (nox: the first
+    //    expiry keeps cwnd at the loss floor, so cwnd no longer drops to 1 MTU)
     // 3. Stat reading a1's data
     let mut n_packets_received = 0u32;
     let mut has_rtoed = false;
@@ -1591,8 +1600,7 @@ async fn test_assoc_congestion_control_slow_reader() -> Result<()> {
             let b = a1.association_internal.lock().await;
 
             let rwnd = b.get_my_receiver_window_credit().await;
-            let cwnd = a.cwnd;
-            if cwnd > a.mtu || rwnd > 0 {
+            if a.stats.get_num_t3timeouts() == 0 || rwnd > 0 {
                 // Do not read until a1.getMyReceiverWindowCredit() becomes zero
                 continue;
             }

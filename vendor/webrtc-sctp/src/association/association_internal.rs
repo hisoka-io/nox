@@ -101,6 +101,22 @@ pub(crate) const INITIAL_CWND_MTUS: u32 = 10;
 /// Byte floor of the initial-window formula (RFC 6928).
 pub(crate) const INITIAL_CWND_FLOOR_BYTES: u32 = 14_600;
 
+/// Lowest congestion window after a loss, in MTUs (nox tuning).
+///
+/// RFC 4960 halves cwnd on a fast retransmit (floor 4 MTU) and drops it to
+/// one MTU on a retransmission timeout. On browser links most losses are
+/// random rather than congestion, and a reply is one burst per call, so the
+/// halved window made the next replies take 2-3 round trips each. The floor
+/// equals the initial window: after a loss the sender is never more cautious
+/// than a new association, and never more aggressive either.
+pub(crate) const LOSS_CWND_FLOOR_MTUS: u32 = INITIAL_CWND_MTUS;
+
+/// Congestion window floor after a fast retransmit or the first T3-rtx
+/// expiry of a series.
+pub(crate) fn loss_cwnd_floor(mtu: u32) -> u32 {
+    std::cmp::max(LOSS_CWND_FLOOR_MTUS * mtu, 4 * mtu)
+}
+
 impl AssociationInternal {
     pub(crate) fn new(
         config: Config,
@@ -1392,7 +1408,9 @@ impl AssociationInternal {
                             //     last sent, according to the formula described in Section 7.2.3.
                             self.in_fast_recovery = true;
                             self.fast_recover_exit_point = htna;
-                            self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu);
+                            // nox: floor at the loss floor instead of 4 MTU.
+                            self.ssthresh =
+                                std::cmp::max(self.cwnd / 2, loss_cwnd_floor(self.mtu));
                             self.cwnd = self.ssthresh;
                             self.partial_bytes_acked = 0;
                             self.will_retransmit_fast = true;
@@ -2390,8 +2408,16 @@ impl RtxTimerObserver for AssociationInternal {
                 //      ssthresh = max(cwnd/2, 4*MTU)
                 //      cwnd = 1*MTU
 
-                self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu);
-                self.cwnd = self.mtu;
+                // nox: the first expiry of a series (typically one lost
+                // packet at the tail of a reply, which no later SACK could
+                // report) keeps cwnd at the loss floor. Repeated expiries
+                // mean the path is failing: back to one MTU as RFC 4960 says.
+                self.ssthresh = std::cmp::max(self.cwnd / 2, loss_cwnd_floor(self.mtu));
+                self.cwnd = if n_rtos <= 1 {
+                    loss_cwnd_floor(self.mtu)
+                } else {
+                    self.mtu
+                };
                 log::trace!(
                     "[{}] updated cwnd={} ssthresh={} inflight={} (RTO)",
                     self.name,
