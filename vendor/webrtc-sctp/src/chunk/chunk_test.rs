@@ -206,6 +206,22 @@ fn test_chunk_forward_tsn_success() -> Result<()> {
 }
 
 #[test]
+fn test_chunk_forward_tsn_ignores_bytes_after_the_chunk() -> Result<()> {
+    // A FORWARD-TSN bundled ahead of another chunk: the parser must stop at
+    // the chunk's own length instead of reading into the next chunk.
+    let chunk: &[u8] = &[0xc0, 0x0, 0x0, 0xc, 0x0, 0x0, 0x0, 0x3, 0x0, 0x4, 0x0, 0x5];
+    let next_chunk: &[u8] = &[0x0, 0x3, 0x0, 0x10, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0];
+    let bundled = Bytes::from([chunk, next_chunk].concat());
+
+    let actual = ChunkForwardTsn::unmarshal(&bundled)?;
+    assert_eq!(actual.new_cumulative_tsn, 3);
+    assert_eq!(actual.streams.len(), 1);
+    assert_eq!(actual.marshal()?, Bytes::from_static(chunk));
+
+    Ok(())
+}
+
+#[test]
 fn test_chunk_forward_tsn_unmarshal_failure() -> Result<()> {
     let tests = vec![
         ("chunk header to short", Bytes::from_static(&[0xc0])),

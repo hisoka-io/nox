@@ -66,22 +66,21 @@ impl Chunk for ChunkForwardTsn {
             return Err(Error::ErrChunkTypeNotForwardTsn);
         }
 
+        // `buf` may run past this chunk (other chunks bundled after it in the
+        // same packet), so every bound below is the chunk's own length.
+        let end = CHUNK_HEADER_SIZE + header.value_length();
         let mut offset = CHUNK_HEADER_SIZE + NEW_CUMULATIVE_TSN_LENGTH;
-        if buf.len() < offset {
+        if end < offset || buf.len() < end {
             return Err(Error::ErrChunkTooShort);
         }
 
-        let reader = &mut buf.slice(CHUNK_HEADER_SIZE..CHUNK_HEADER_SIZE + header.value_length());
+        let reader = &mut buf.slice(CHUNK_HEADER_SIZE..end);
         let new_cumulative_tsn = reader.get_u32();
 
         let mut streams = vec![];
-        let mut remaining = buf.len() - offset;
-        while remaining > 0 {
-            let s = ChunkForwardTsnStream::unmarshal(
-                &buf.slice(offset..CHUNK_HEADER_SIZE + header.value_length()),
-            )?;
+        while offset < end {
+            let s = ChunkForwardTsnStream::unmarshal(&buf.slice(offset..end))?;
             offset += s.value_length();
-            remaining -= s.value_length();
             streams.push(s);
         }
 
