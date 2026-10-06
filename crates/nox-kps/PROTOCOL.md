@@ -106,7 +106,7 @@ relayed with `wait_ms: 0` and the claim answers at once.
 {
   "protocol": "nox-kps-http/1",
   "software": "nox-kps",
-  "version": "0.4.0-rc.6",
+  "version": "0.4.0-rc.7",
   "node": "0x862d6b1105bde9d64dc5182fe3cd9d09f6f37463",
   "addresses": ["3.239.73.249:15005:uEiB..."],
   "capabilities": ["metadata", "health", "packets", "claim", "topology", "worker-bundles", "claim-v2"],

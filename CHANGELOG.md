@@ -24,6 +24,37 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 - Exits pin each upstream origin's client to every address its host resolves to (each one SSRF-checked), keep
   idle connections for 10 minutes, send HTTP/2 keep-alive pings and warm recently used origins every minute.
 
+## [0.4.0-rc.7] - 2026-10-06
+
+### Upgrade notes
+
+- Upgrade one node at a time; rc.6 and rc.7 nodes, nox-kps relays and all published clients interoperate. The
+  Sphinx wire, fragment, FEC and SURB formats are unchanged. Claim protocol v2 is additive: a v1 claim gets the
+  same JSON answer as before, and clients turn v2 on per entry once `/metadata.json` lists `claim-v2`.
+- Upgrade each entry's node and nox-kps together (they ship in the same image), so the advertised `claim-v2`
+  capability and the node behind it always match.
+
+### Added
+
+- Claim protocol v2 on `POST /api/v1/responses/claim` (`docs/claim-api.md`): binary
+  (`application/vnd.nox.claim-batch`) and base64 reply encodings, retain-until-ack re-claims within
+  `[ingress] claim_retain_grace_ms` (20 s), explicit acks, and long-poll claims (`wait_ms`, capped by
+  `claim_wait_max_ms` with `claim_wait_max_concurrent` slots). Responses carry `x-nox-claim-version` and
+  `x-nox-claim-wait-max-ms`, readable from browsers through CORS.
+- nox-kps relays v2 claims, including long-polls in their own slots (`[limits] claim_wait_max_ms`,
+  `max_concurrent_claim_waits`), and lists `claim-v2` and `limits.claimWaitMaxMs` in `/metadata.json`.
+- Metrics `nox_ingress_claim_events_total{event}` and `nox_kps_claim_waits_total{result}`.
+- `[network] tcp_nodelay` (default on) for node-to-node P2P connections.
+
+### Changed
+
+- Browser connections to nox-kps complete faster: the ICE-lite agent selects the candidate pair on the first
+  authenticated connectivity check, so the DTLS handshake no longer waits for the browser's nomination.
+- The SCTP sender in nox-kps starts with a 10-packet window (12,280 B instead of 4,380 B) and a 1 s initial
+  retransmission timeout (was 3 s). The 1 s minimum timeout is unchanged.
+- `webrtc-sctp` (kps fork rev a73a0a8) and `webrtc-ice` 0.14.0 are vendored under `vendor/` and patched there;
+  each crate was committed verbatim first, so `git log vendor/` shows every change made on top.
+
 ## [0.4.0-rc.6] - 2026-10-06
 
 ### Upgrade notes
