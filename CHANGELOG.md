@@ -5,8 +5,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+## [0.4.0-rc.6] - 2026-10-06
+
 ### Upgrade notes
 
+- Upgrade one node at a time; rc.5 and rc.6 nodes interoperate and the wire, fragment, FEC and SURB formats are
+  unchanged. The changes in this release stay inside each node: storage, SURB replenishment limits and metrics.
 - Exit transaction records are written in a smaller encoding (signed bytes as hex instead of a JSON number
   array). This release reads both encodings. Rollback to rc.5 uses the data snapshot taken before the upgrade, so
   snapshot `db_path` before the first start of each exit.

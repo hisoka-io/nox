@@ -9,7 +9,7 @@ license = "Apache-2.0"
 repository = "https://github.com/hisoka-io/nox"
 
 [dependencies]
-nox-crypto = { path = "../nox-crypto", version = "0.4.0-rc.5" }
+nox-crypto = { path = "../nox-crypto", version = "0.4.0-rc.6" }
 
 serde = { workspace = true }
 thiserror = { workspace = true }
