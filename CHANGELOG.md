@@ -5,6 +5,20 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+## [0.4.0-rc.8] - 2026-10-06
+
+### Upgrade notes
+
+- Upgrade one node at a time; rc.6, rc.7 and rc.8 nodes, nox-kps relays and all published clients interoperate.
+  The Sphinx wire, fragment, FEC and SURB formats are unchanged; the claim additions are optional fields and a
+  response header.
+- Exits enable HTTP/2 to upstream RPC endpoints (reqwest `http2`), which the new keep-alive pings use.
+
+### Fixed
+
+- nox-kps parses a FORWARD-TSN chunk within its own length, so a packet that bundles it with other chunks is no
+  longer dropped (vendored webrtc-sctp).
+
 ### Added
 
 - Claims accept `max_replies` (return only the replies that arrived first) and treat an ack for a reply that has
