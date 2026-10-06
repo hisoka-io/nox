@@ -280,6 +280,10 @@ async fn mock_handle(
     if path == "/api/v1/responses/claim" {
         h.insert("x-nox-claim-version", "2".parse().unwrap());
         h.insert(
+            "x-nox-claim-features",
+            "max-replies, ack-ahead".parse().unwrap(),
+        );
+        h.insert(
             "x-nox-claim-wait-max-ms",
             MOCK_NODE_CLAIM_WAIT_MAX_MS.to_string().parse().unwrap(),
         );
