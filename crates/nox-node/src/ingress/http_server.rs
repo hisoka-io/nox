@@ -2,7 +2,9 @@
 //!
 //! ## Endpoints
 //! - `POST /api/v1/packets` - Inject a raw Sphinx packet (body = raw bytes)
-//! - `POST /api/v1/responses/claim` - Claim responses by SURB ID (session-safe)
+//! - `POST /api/v1/responses/claim` - Claim responses by SURB ID (session-safe).
+//!   Optional v2 fields select a compact encoding, retain-until-ack and
+//!   long-polling; see [`super::claim`] and `docs/claim-api.md`.
 //! - `GET /api/v1/responses/stream` - SSE stream for SURB responses (push-based)
 //! - `GET /api/v1/ws` - WebSocket stream for SURB responses
 //! - `GET /api/v1/responses/pending` - Removed; returns 410 Gone
@@ -19,7 +21,7 @@ use std::time::{Duration, Instant};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -32,9 +34,15 @@ use nox_crypto::sphinx::SphinxHeader;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
+use super::claim::{
+    base64_item, encode_base64_json, encode_batch, encode_json, ClaimEncoding, ClaimRequest,
+    ClaimSettings, CLAIM_BATCH_CONTENT_TYPE, CLAIM_VERSION, CLAIM_VERSION_HEADER,
+    CLAIM_WAIT_MAX_HEADER,
+};
 use super::policy::{cors_layer, rate_limit, IngressRateLimiter};
 use super::response_buffer::{
-    parse_surb_id, surb_id_from_packet_id, ResponseBuffer, SurbId, SURB_ID_HEX_LEN,
+    parse_surb_id, surb_id_from_packet_id, ClaimMode, ClaimedReply, ResponseBuffer, SurbId,
+    SURB_ID_HEX_LEN,
 };
 use crate::config::IngressConfig;
 use crate::telemetry::metrics::MetricsService;
@@ -53,6 +61,8 @@ pub struct IngressState {
     /// `PoW` difficulty required for externally submitted packets (HTTP ingress).
     /// Packets received via P2P are already validated by the entry node.
     pub min_pow_difficulty: u32,
+    /// Long-poll limits for `POST /api/v1/responses/claim`.
+    pub claim: ClaimSettings,
 }
 
 /// HTTP ingress server wrapping an axum `Router`.
@@ -89,24 +99,33 @@ impl IngressServer {
 #[derive(Deserialize)]
 struct StreamQuery {
     surb_ids: String,
+    /// `base64` sends `{"id","data_b64","reclaimed"}` events instead of
+    /// number arrays.
+    #[serde(default)]
+    encoding: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct ClaimRequest {
-    /// SURB IDs to claim, each exactly 32 hex characters.
-    surb_ids: Vec<String>,
-}
-
-/// Parses every ID or names the first invalid one.
-fn parse_surb_ids(ids: &[String]) -> Result<Vec<SurbId>, String> {
+/// Parses every ID or names the first invalid one (`field` names the list).
+fn parse_surb_ids(field: &str, ids: &[String]) -> Result<Vec<SurbId>, String> {
     ids.iter()
         .enumerate()
         .map(|(i, id)| {
             parse_surb_id(id).ok_or_else(|| {
-                format!("surb_ids[{i}] must be exactly {SURB_ID_HEX_LEN} hex characters")
+                format!("{field}[{i}] must be exactly {SURB_ID_HEX_LEN} hex characters")
             })
         })
         .collect()
+}
+
+/// Counts one claim event (`reclaimed`, `acked`, `wait`, `wait_busy`, ...).
+fn count_claim_event(state: &IngressState, event: &str, n: u64) {
+    if n > 0 {
+        state
+            .metrics
+            .ingress_claim_events_total
+            .get_or_create(&vec![("event".to_string(), event.to_string())])
+            .inc_by(n);
+    }
 }
 
 /// Keeps the valid IDs, for streaming endpoints that have no error channel.
@@ -237,28 +256,45 @@ fn ws_message_surb_ids(msg: &serde_json::Value) -> Vec<SurbId> {
 ///
 /// The client sends a JSON body with `surb_ids` -- the hex-encoded SURB IDs
 /// it generated (32 hex characters each). Only responses for exactly those
-/// SURB IDs are returned and removed from the buffer; all others remain.
+/// SURB IDs are returned; all others remain.
 ///
-/// Returns JSON array of `{"id": "...", "data": [bytes...]}`.
+/// v1 body (`{"surb_ids":[...]}`): returns a JSON array of
+/// `{"id": "...", "data": [bytes...]}` and removes the returned replies.
+/// Optional v2 fields (see [`ClaimRequest`]): `encoding` (`json`, `base64`,
+/// `binary`; `Accept: application/vnd.nox.claim-batch` also selects binary),
+/// `retain` (keep replies until acked or the claim grace passes), `ack`
+/// (remove replies the client has; applied first) and `wait_ms` (long-poll,
+/// only with `retain`).
+///
 /// Returns 204 No Content if no matching responses are found, and 400 if any
-/// SURB ID is malformed.
+/// SURB ID is malformed. Every answer carries `x-nox-claim-version` and
+/// `x-nox-claim-wait-max-ms`.
 async fn claim_responses(
     State(state): State<Arc<IngressState>>,
+    headers: HeaderMap,
     Json(body): Json<ClaimRequest>,
-) -> impl IntoResponse {
-    let surb_ids = match parse_surb_ids(&body.surb_ids) {
+) -> axum::response::Response {
+    let rejected = |state: &IngressState, message: String| {
+        state
+            .metrics
+            .ingress_http_requests_total
+            .get_or_create(&vec![
+                ("endpoint".to_string(), "claim".to_string()),
+                ("status".to_string(), "rejected".to_string()),
+            ])
+            .inc();
+        with_claim_headers(
+            &state.claim,
+            (StatusCode::BAD_REQUEST, message).into_response(),
+        )
+    };
+    let surb_ids = match parse_surb_ids("surb_ids", &body.surb_ids) {
         Ok(ids) => ids,
-        Err(message) => {
-            state
-                .metrics
-                .ingress_http_requests_total
-                .get_or_create(&vec![
-                    ("endpoint".to_string(), "claim".to_string()),
-                    ("status".to_string(), "rejected".to_string()),
-                ])
-                .inc();
-            return (StatusCode::BAD_REQUEST, message).into_response();
-        }
+        Err(message) => return rejected(&state, message),
+    };
+    let ack_ids = match parse_surb_ids("ack", &body.ack) {
+        Ok(ids) => ids,
+        Err(message) => return rejected(&state, message),
     };
 
     state
@@ -270,26 +306,126 @@ async fn claim_responses(
         ])
         .inc();
 
+    let acked = state.response_buffer.ack(&ack_ids);
+    count_claim_event(&state, "acked", acked as u64);
+
+    let encoding = body.encoding.as_deref().map_or_else(
+        || {
+            headers
+                .get(header::ACCEPT)
+                .and_then(|v| v.to_str().ok())
+                .map_or(ClaimEncoding::Json, ClaimEncoding::from_accept)
+        },
+        ClaimEncoding::from_field,
+    );
+    let mode = if body.retain {
+        ClaimMode::Retain
+    } else {
+        ClaimMode::Take
+    };
+
     if surb_ids.is_empty() {
-        return (StatusCode::NO_CONTENT, axum::Json(serde_json::Value::Null)).into_response();
+        return with_claim_headers(&state.claim, no_content());
     }
 
-    let responses = state.response_buffer.claim_by_surb_ids(&surb_ids);
-    if responses.is_empty() {
-        return (StatusCode::NO_CONTENT, axum::Json(serde_json::Value::Null)).into_response();
+    // Long-poll only for retaining claims: a reply claimed for a client that
+    // has gone away stays claimable for the grace instead of being lost.
+    let requested_wait = if body.retain {
+        Duration::from_millis(body.wait_ms).min(state.claim.wait_max)
+    } else {
+        Duration::ZERO
+    };
+    let wait_permit = if requested_wait.is_zero() {
+        None
+    } else {
+        let permit = state.claim.wait_slots.clone().try_acquire_owned().ok();
+        count_claim_event(
+            &state,
+            if permit.is_some() {
+                "wait"
+            } else {
+                "wait_busy"
+            },
+            1,
+        );
+        permit
+    };
+    let wait = if wait_permit.is_some() {
+        requested_wait
+    } else {
+        Duration::ZERO
+    };
+
+    let deadline = tokio::time::Instant::now() + wait;
+    let replies = loop {
+        let notified = state.response_buffer.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let replies = state.response_buffer.claim(&surb_ids, mode);
+        if !replies.is_empty() || tokio::time::Instant::now() >= deadline {
+            break replies;
+        }
+        tokio::select! {
+            () = &mut notified => {}
+            () = tokio::time::sleep_until(deadline) => {}
+        }
+    };
+    if replies.is_empty() {
+        if !wait.is_zero() {
+            count_claim_event(&state, "wait_timeout", 1);
+        }
+        return with_claim_headers(&state.claim, no_content());
     }
 
-    let items: Vec<serde_json::Value> = responses
-        .into_iter()
-        .map(|(id, data)| serde_json::json!({ "id": id, "data": data }))
-        .collect();
-
+    let reclaimed = replies.iter().filter(|reply| reply.reclaimed).count();
+    count_claim_event(&state, "reclaimed", reclaimed as u64);
+    count_claim_event(&state, encoding.label(), replies.len() as u64);
     debug!(
-        count = items.len(),
+        count = replies.len(),
+        reclaimed,
+        acked,
         surb_ids = surb_ids.len(),
+        encoding = encoding.label(),
+        retain = body.retain,
         "HTTP ingress: delivering claimed responses"
     );
-    (StatusCode::OK, axum::Json(serde_json::json!(items))).into_response()
+    let response = match encoding {
+        ClaimEncoding::Json => (StatusCode::OK, axum::Json(encode_json(&replies))).into_response(),
+        ClaimEncoding::Base64 => {
+            (StatusCode::OK, axum::Json(encode_base64_json(&replies))).into_response()
+        }
+        ClaimEncoding::Binary => (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(CLAIM_BATCH_CONTENT_TYPE),
+            )],
+            encode_batch(&replies),
+        )
+            .into_response(),
+    };
+    with_claim_headers(&state.claim, response)
+}
+
+fn no_content() -> axum::response::Response {
+    (StatusCode::NO_CONTENT, axum::Json(serde_json::Value::Null)).into_response()
+}
+
+/// Adds the claim capability headers.
+fn with_claim_headers(
+    settings: &ClaimSettings,
+    mut response: axum::response::Response,
+) -> axum::response::Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        CLAIM_VERSION_HEADER,
+        HeaderValue::from_static(CLAIM_VERSION),
+    );
+    headers.insert(
+        CLAIM_WAIT_MAX_HEADER,
+        HeaderValue::from(settings.wait_max.as_millis() as u64),
+    );
+    response
 }
 
 /// `GET /api/v1/responses/pending` -- Removed. Responses are claimed by SURB ID
@@ -379,9 +515,11 @@ async fn health(State(state): State<Arc<IngressState>>) -> impl IntoResponse {
 /// Client messages:
 ///   `{"type":"subscribe","surb_ids":["id1","id2"]}`  - add SURB IDs to watch set
 ///   `{"type":"unsubscribe","surb_ids":["id1"]}`      - remove consumed SURB IDs
+///   A message with `"encoding":"base64"` switches later responses to base64.
 ///
 /// Server messages:
 ///   `{"type":"response","id":"echo-100-aabb","data":[1,2,3]}`  - SURB response
+///   `{"type":"response","id":"...","data_b64":"...","reclaimed":false}` - base64
 async fn ws_upgrade(
     State(state): State<Arc<IngressState>>,
     ws: WebSocketUpgrade,
@@ -399,6 +537,7 @@ async fn ws_upgrade(
 
 async fn ws_handler(mut socket: WebSocket, state: Arc<IngressState>) {
     let mut subscribed: HashSet<SurbId> = HashSet::new();
+    let mut base64 = false;
     let poll_interval = Duration::from_millis(100);
     let ping_interval = Duration::from_secs(15);
     let timeout = Duration::from_mins(5);
@@ -426,6 +565,9 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<IngressState>) {
                         if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) {
                             let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
                             let ids = ws_message_surb_ids(&msg);
+                            if let Some(encoding) = msg.get("encoding").and_then(|v| v.as_str()) {
+                                base64 = ClaimEncoding::from_field(encoding) == ClaimEncoding::Base64;
+                            }
 
                             match msg_type {
                                 "subscribe" => {
@@ -462,11 +604,23 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<IngressState>) {
                 subscribed.remove(&surb_id);
             }
 
-            let msg = serde_json::json!({
-                "type": "response",
-                "id": id,
-                "data": data,
-            });
+            let msg = if base64 {
+                let mut item = base64_item(&ClaimedReply {
+                    id,
+                    data,
+                    reclaimed: false,
+                });
+                if let Some(fields) = item.as_object_mut() {
+                    fields.insert("type".to_string(), serde_json::json!("response"));
+                }
+                item
+            } else {
+                serde_json::json!({
+                    "type": "response",
+                    "id": id,
+                    "data": data,
+                })
+            };
 
             if socket.send(Message::Text(msg.to_string())).await.is_err() {
                 return;
@@ -487,6 +641,10 @@ async fn stream_responses(
     Query(query): Query<StreamQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let surb_ids = valid_surb_ids(query.surb_ids.split(',').map(str::trim));
+    let base64 = query
+        .encoding
+        .as_deref()
+        .is_some_and(|e| ClaimEncoding::from_field(e) == ClaimEncoding::Base64);
 
     let buffer = state.response_buffer.clone();
 
@@ -509,7 +667,11 @@ async fn stream_responses(
             let responses = buffer.claim_by_surb_ids(&remaining);
 
             for (id, data) in &responses {
-                let json = serde_json::json!({ "id": id, "data": data });
+                let json = if base64 {
+                    base64_item(&ClaimedReply { id: id.clone(), data: data.clone(), reclaimed: false })
+                } else {
+                    serde_json::json!({ "id": id, "data": data })
+                };
                 yield Ok(Event::default().data(json.to_string()));
 
                 let consumed = surb_id_from_packet_id(id);
@@ -560,6 +722,7 @@ mod tests {
             metrics: MetricsService::new(),
             long_poll_timeout: Duration::from_secs(30),
             min_pow_difficulty: 0,
+            claim: ClaimSettings::default(),
         })
     }
 
@@ -1118,4 +1281,308 @@ mod tests {
             .take_response(&format!("echo-2-{SURB_B}"))
             .is_some());
     }
+
+    async fn claim_v2(
+        app: Router,
+        body: serde_json::Value,
+        accept: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/responses/claim")
+            .header("content-type", "application/json");
+        if let Some(accept) = accept {
+            req = req.header("accept", accept);
+        }
+        let req = req
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, headers, bytes.to_vec())
+    }
+
+    /// Decodes a binary claim batch into `(flags, id, data)` items.
+    fn decode_batch(body: &[u8]) -> Vec<(u8, String, Vec<u8>)> {
+        assert_eq!(body[0], 1, "batch version");
+        let count = u16::from_be_bytes([body[1], body[2]]) as usize;
+        let mut at = 3;
+        let mut items = Vec::new();
+        for _ in 0..count {
+            let flags = body[at];
+            let id_len = u16::from_be_bytes([body[at + 1], body[at + 2]]) as usize;
+            at += 3;
+            let id = String::from_utf8(body[at..at + id_len].to_vec()).unwrap();
+            at += id_len;
+            let len = u32::from_be_bytes(body[at..at + 4].try_into().unwrap()) as usize;
+            at += 4;
+            items.push((flags, id, body[at..at + len].to_vec()));
+            at += len;
+        }
+        assert_eq!(at, body.len(), "no trailing bytes");
+        items
+    }
+
+    #[tokio::test]
+    async fn test_claim_v1_body_keeps_v1_answer_and_deletes() {
+        let state = test_state(false);
+        state
+            .response_buffer
+            .store_response(&format!("reply-0-{SURB_A}"), vec![1, 2, 3]);
+        let app = IngressServer::router(Arc::clone(&state));
+        let (status, headers, body) =
+            claim_v2(app, serde_json::json!({ "surb_ids": [SURB_A] }), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["content-type"], "application/json");
+        assert_eq!(headers[CLAIM_VERSION_HEADER], "2");
+        assert_eq!(headers[CLAIM_WAIT_MAX_HEADER], "20000");
+        let items: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            items,
+            serde_json::json!([{ "id": format!("reply-0-{SURB_A}"), "data": [1, 2, 3] }])
+        );
+        assert!(state.response_buffer.is_empty(), "v1 claims delete");
+    }
+
+    #[tokio::test]
+    async fn test_claim_binary_by_body_field_and_by_accept() {
+        let state = test_state(false);
+        let reply = vec![0xabu8; 31_716];
+        state
+            .response_buffer
+            .store_response(&format!("reply-0-{SURB_A}"), reply.clone());
+        state
+            .response_buffer
+            .store_response(&format!("reply-0-{SURB_B}"), vec![9]);
+
+        let app = IngressServer::router(Arc::clone(&state));
+        let (status, headers, body) = claim_v2(
+            app,
+            serde_json::json!({ "surb_ids": [SURB_A], "encoding": "binary" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["content-type"], CLAIM_BATCH_CONTENT_TYPE);
+        let items = decode_batch(&body);
+        assert_eq!(items, vec![(0, format!("reply-0-{SURB_A}"), reply)]);
+        assert!(
+            body.len() < 31_716 + 64,
+            "binary is about the payload size, JSON would be ~3.6x"
+        );
+
+        let app = IngressServer::router(Arc::clone(&state));
+        let (_, headers, body) = claim_v2(
+            app,
+            serde_json::json!({ "surb_ids": [SURB_B] }),
+            Some("application/vnd.nox.claim-batch"),
+        )
+        .await;
+        assert_eq!(headers["content-type"], CLAIM_BATCH_CONTENT_TYPE);
+        assert_eq!(decode_batch(&body)[0].2, vec![9]);
+    }
+
+    #[tokio::test]
+    async fn test_claim_body_encoding_overrides_accept() {
+        let state = test_state(false);
+        state
+            .response_buffer
+            .store_response(&format!("reply-0-{SURB_A}"), vec![0xfb, 0xff]);
+        let app = IngressServer::router(Arc::clone(&state));
+        let (_, headers, body) = claim_v2(
+            app,
+            serde_json::json!({ "surb_ids": [SURB_A], "encoding": "base64" }),
+            Some("application/vnd.nox.claim-batch"),
+        )
+        .await;
+        assert_eq!(headers["content-type"], "application/json");
+        let items: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(items[0]["data_b64"], "+/8=");
+        assert_eq!(items[0]["reclaimed"], false);
+    }
+
+    #[tokio::test]
+    async fn test_claim_retain_reclaim_then_ack() {
+        let state = test_state(false);
+        state
+            .response_buffer
+            .store_response(&format!("reply-0-{SURB_A}"), vec![5]);
+        let body =
+            serde_json::json!({ "surb_ids": [SURB_A], "encoding": "binary", "retain": true });
+
+        let (_, _, first) = claim_v2(
+            IngressServer::router(Arc::clone(&state)),
+            body.clone(),
+            None,
+        )
+        .await;
+        assert_eq!(decode_batch(&first)[0].0, 0);
+        // The first transfer was lost: the client claims again with the same ID.
+        let (status, _, again) = claim_v2(
+            IngressServer::router(Arc::clone(&state)),
+            body.clone(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            decode_batch(&again)[0].0,
+            CLAIM_ITEM_FLAG_RECLAIMED_FOR_TESTS
+        );
+        assert_eq!(decode_batch(&again)[0].2, vec![5]);
+
+        let ack = serde_json::json!({ "surb_ids": [SURB_A], "ack": [SURB_A], "retain": true });
+        let (status, _, _) = claim_v2(IngressServer::router(Arc::clone(&state)), ack, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "ack runs before the claim");
+        assert!(state.response_buffer.is_empty());
+        let metrics = state.metrics.ingress_claim_events_total.clone();
+        let event = |name: &str| {
+            metrics
+                .get_or_create(&vec![("event".to_string(), name.to_string())])
+                .get()
+        };
+        assert_eq!(event("reclaimed"), 1);
+        assert_eq!(event("acked"), 1);
+        assert_eq!(event("binary"), 2);
+    }
+
+    #[tokio::test]
+    async fn test_claim_rejects_malformed_ack_ids() {
+        let state = test_state(false);
+        state
+            .response_buffer
+            .store_response(&format!("reply-0-{SURB_A}"), vec![5]);
+        let (status, headers, body) = claim_v2(
+            IngressServer::router(Arc::clone(&state)),
+            serde_json::json!({ "surb_ids": [SURB_A], "ack": ["zz"] }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(headers[CLAIM_VERSION_HEADER], "2");
+        assert!(String::from_utf8_lossy(&body).contains("ack[0]"));
+        assert_eq!(state.response_buffer.len(), 1);
+    }
+
+    fn wait_state(wait_max_ms: u64, slots: usize) -> Arc<IngressState> {
+        Arc::new(IngressState {
+            event_publisher: Arc::new(MockPublisher { should_fail: false }),
+            response_buffer: Arc::new(ResponseBuffer::new()),
+            metrics: MetricsService::new(),
+            long_poll_timeout: Duration::from_secs(30),
+            min_pow_difficulty: 0,
+            claim: ClaimSettings::new(Duration::from_millis(wait_max_ms), slots),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_long_poll_times_out_with_204_after_the_capped_wait() {
+        let state = wait_state(300, 4);
+        let started = Instant::now();
+        let (status, headers, _) = claim_v2(
+            IngressServer::router(Arc::clone(&state)),
+            serde_json::json!({ "surb_ids": [SURB_A], "retain": true, "wait_ms": 60_000 }),
+            None,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(headers[CLAIM_WAIT_MAX_HEADER], "300");
+        assert!(elapsed >= Duration::from_millis(290), "{elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "capped at wait_max: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_long_poll_returns_as_soon_as_a_reply_lands() {
+        let state = wait_state(10_000, 4);
+        let buffer = Arc::clone(&state.response_buffer);
+        let store = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            buffer.store_response(&format!("reply-0-{SURB_A}"), vec![42]);
+        });
+        let started = Instant::now();
+        let (status, _, body) = claim_v2(
+            IngressServer::router(Arc::clone(&state)),
+            serde_json::json!({ "surb_ids": [SURB_A], "retain": true, "wait_ms": 10_000, "encoding": "binary" }),
+            None,
+        )
+        .await;
+        store.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(decode_batch(&body)[0].2, vec![42]);
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(140), "{elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "woken by the store: {elapsed:?}"
+        );
+        assert_eq!(state.response_buffer.len(), 1, "retained until acked");
+    }
+
+    #[tokio::test]
+    async fn test_wait_needs_retain_and_a_free_slot() {
+        let state = wait_state(5_000, 1);
+        let started = Instant::now();
+        let (status, _, _) = claim_v2(
+            IngressServer::router(Arc::clone(&state)),
+            serde_json::json!({ "surb_ids": [SURB_A], "wait_ms": 5_000 }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "no wait without retain"
+        );
+
+        let _held = state.claim.wait_slots.clone().try_acquire_owned().unwrap();
+        let started = Instant::now();
+        let (status, _, _) = claim_v2(
+            IngressServer::router(Arc::clone(&state)),
+            serde_json::json!({ "surb_ids": [SURB_A], "retain": true, "wait_ms": 5_000 }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "no slot: answers at once"
+        );
+        let busy = state
+            .metrics
+            .ingress_claim_events_total
+            .get_or_create(&vec![("event".to_string(), "wait_busy".to_string())])
+            .get();
+        assert_eq!(busy, 1);
+    }
+
+    #[tokio::test]
+    async fn test_stream_base64_encoding() {
+        let state = test_state(false);
+        state
+            .response_buffer
+            .store_response(&format!("reply-0-{SURB_A}"), vec![0xfb, 0xff]);
+        let app = IngressServer::router(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/api/v1/responses/stream?surb_ids={SURB_A}&encoding=base64"
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("\"data_b64\":\"+/8=\""), "{text}");
+    }
+
+    const CLAIM_ITEM_FLAG_RECLAIMED_FOR_TESTS: u8 =
+        crate::ingress::claim::CLAIM_ITEM_FLAG_RECLAIMED;
 }

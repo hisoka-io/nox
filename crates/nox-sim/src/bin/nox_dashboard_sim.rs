@@ -503,6 +503,7 @@ async fn spawn_dashboard_node(
             metrics: metrics.clone(),
             long_poll_timeout: Duration::from_secs(30),
             min_pow_difficulty: 0,
+            claim: nox_node::ingress::claim::ClaimSettings::default(),
         });
         let router = nox_node::ingress::http_server::IngressServer::router(ingress_state);
         let ingress_addr: std::net::SocketAddr =

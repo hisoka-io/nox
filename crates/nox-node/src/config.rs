@@ -193,6 +193,14 @@ pub struct NetworkConfig {
     /// (connection or ping) within this many seconds.
     #[serde(default = "default_topology_liveness_window_secs")]
     pub topology_liveness_window_secs: u64,
+    /// Sets `TCP_NODELAY` on P2P connections, so each Sphinx packet leaves at
+    /// once instead of waiting on Nagle's algorithm and the peer's delayed ACK.
+    #[serde(default = "default_tcp_nodelay")]
+    pub tcp_nodelay: bool,
+}
+
+fn default_tcp_nodelay() -> bool {
+    true
 }
 
 impl Default for NetworkConfig {
@@ -211,6 +219,7 @@ impl Default for NetworkConfig {
             peer_admission: PeerAdmissionMode::default(),
             peer_admission_grace_secs: default_peer_admission_grace_secs(),
             topology_liveness_window_secs: default_topology_liveness_window_secs(),
+            tcp_nodelay: default_tcp_nodelay(),
         }
     }
 }
@@ -359,7 +368,23 @@ pub struct IngressConfig {
     /// Browser origins allowed by CORS on the ingress and API ports, for example
     /// `https://demo.nox.hisoka.io`. Empty allows any origin.
     pub cors_allowed_origins: Vec<String>,
+    /// How long a reply returned by a retaining claim (`"retain": true`) stays
+    /// re-claimable, counted from its first claim and never extended. It still
+    /// counts against the response buffer caps and is evicted first.
+    pub claim_retain_grace_ms: u64,
+    /// Longest long-poll (`wait_ms`) a retaining claim may ask for. 0 turns
+    /// long-polling off (claims answer at once).
+    pub claim_wait_max_ms: u64,
+    /// Claims that may long-poll at once; beyond it a claim answers at once.
+    pub claim_wait_max_concurrent: usize,
 }
+
+/// Default for `ingress.claim_retain_grace_ms`.
+pub const DEFAULT_CLAIM_RETAIN_GRACE_MS: u64 = 20_000;
+/// Upper bound for `ingress.claim_retain_grace_ms` (the response TTL).
+pub const MAX_CLAIM_RETAIN_GRACE_MS: u64 = 300_000;
+/// Upper bound for `ingress.claim_wait_max_ms`.
+pub const MAX_CLAIM_WAIT_MS: u64 = 60_000;
 
 impl Default for IngressConfig {
     fn default() -> Self {
@@ -368,6 +393,9 @@ impl Default for IngressConfig {
             rate_limit_burst: DEFAULT_INGRESS_RATE_LIMIT_BURST,
             client_ip_header: String::new(),
             cors_allowed_origins: Vec::new(),
+            claim_retain_grace_ms: DEFAULT_CLAIM_RETAIN_GRACE_MS,
+            claim_wait_max_ms: crate::ingress::claim::DEFAULT_CLAIM_WAIT_MAX_MS,
+            claim_wait_max_concurrent: crate::ingress::claim::DEFAULT_CLAIM_WAIT_MAX_CONCURRENT,
         }
     }
 }
@@ -390,6 +418,25 @@ impl IngressConfig {
                 "ingress.client_ip_header is not a valid header name (got: \"{}\")",
                 self.client_ip_header
             ));
+        }
+        if self.claim_retain_grace_ms == 0 || self.claim_retain_grace_ms > MAX_CLAIM_RETAIN_GRACE_MS
+        {
+            errors.push(format!(
+                "ingress.claim_retain_grace_ms must be between 1 and {MAX_CLAIM_RETAIN_GRACE_MS} (got: {})",
+                self.claim_retain_grace_ms
+            ));
+        }
+        if self.claim_wait_max_ms > MAX_CLAIM_WAIT_MS {
+            errors.push(format!(
+                "ingress.claim_wait_max_ms must be at most {MAX_CLAIM_WAIT_MS} (got: {})",
+                self.claim_wait_max_ms
+            ));
+        }
+        if self.claim_wait_max_ms > 0 && self.claim_wait_max_concurrent == 0 {
+            errors.push(
+                "ingress.claim_wait_max_concurrent must be at least 1 when ingress.claim_wait_max_ms is set"
+                    .to_string(),
+            );
         }
         for origin in &self.cors_allowed_origins {
             let is_http_origin = (origin.starts_with("https://") || origin.starts_with("http://"))
@@ -1208,6 +1255,25 @@ mod tests {
     }
 
     #[test]
+    fn ingress_claim_limits_are_validated() {
+        assert!(IngressConfig::default().validation_errors().is_empty());
+        let ingress = IngressConfig {
+            claim_retain_grace_ms: 0,
+            claim_wait_max_ms: MAX_CLAIM_WAIT_MS + 1,
+            claim_wait_max_concurrent: 0,
+            ..IngressConfig::default()
+        };
+        let errors = ingress.validation_errors();
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        let off = IngressConfig {
+            claim_wait_max_ms: 0,
+            claim_wait_max_concurrent: 0,
+            ..IngressConfig::default()
+        };
+        assert!(off.validation_errors().is_empty());
+    }
+
+    #[test]
     fn ingress_policy_rejects_malformed_values() {
         let ingress = IngressConfig {
             rate_limit_per_sec: 10,
@@ -1218,6 +1284,7 @@ mod tests {
                 "https://demo.example/".to_string(),
                 "demo.example".to_string(),
             ],
+            ..IngressConfig::default()
         };
         let errors = ingress.validation_errors();
         assert_eq!(errors.len(), 4, "{errors:?}");

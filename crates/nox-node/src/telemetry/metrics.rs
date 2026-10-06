@@ -58,6 +58,9 @@ pub struct MetricsService {
     pub egress_routed_total: Family<Vec<(String, String)>, Counter>,
     pub node_start_time_seconds: Gauge<i64, AtomicI64>,
     pub ingress_http_requests_total: Family<Vec<(String, String)>, Counter>,
+    /// Claim events: replies `reclaimed`, `acked`, long-polls (`wait`,
+    /// `wait_busy`, `wait_timeout`) and replies sent per encoding.
+    pub ingress_claim_events_total: Family<Vec<(String, String)>, Counter>,
     pub ingress_response_buffer_entries: Gauge<i64, AtomicI64>,
     pub ingress_responses_pruned_total: Counter,
     pub p2p_rate_limit_total: Family<Vec<(String, String)>, Counter>,
@@ -323,6 +326,13 @@ impl MetricsService {
             "nox_ingress_http_requests_total",
             "HTTP ingress requests by endpoint and status",
             ingress_http_requests_total.clone(),
+        );
+
+        let ingress_claim_events_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_ingress_claim_events",
+            "Claim events: re-claimed and acked replies, long-polls, replies per encoding",
+            ingress_claim_events_total.clone(),
         );
 
         let ingress_response_buffer_entries = Gauge::<i64, AtomicI64>::default();
@@ -861,6 +871,7 @@ impl MetricsService {
             egress_routed_total,
             node_start_time_seconds,
             ingress_http_requests_total,
+            ingress_claim_events_total,
             ingress_response_buffer_entries,
             ingress_responses_pruned_total,
             p2p_rate_limit_total,

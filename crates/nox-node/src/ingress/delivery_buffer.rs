@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use super::response_buffer::SurbId;
+use super::response_buffer::{SurbId, DEFAULT_CLAIM_GRACE};
 
 /// Default entry cap.
 pub const DEFAULT_DELIVERY_MAX_ENTRIES: usize = 1_000;
@@ -60,7 +60,16 @@ pub enum DeliveryStore {
 struct Entry {
     data: Vec<u8>,
     created_at: Instant,
+    /// Set by the first retaining claim; the entry then lives until acked or
+    /// until the claim grace has passed.
+    claimed_at: Option<Instant>,
     source: String,
+}
+
+impl Entry {
+    fn is_live(&self, ttl: Duration, grace: Duration) -> bool {
+        self.created_at.elapsed() < ttl && self.claimed_at.is_none_or(|at| at.elapsed() < grace)
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -75,6 +84,7 @@ pub struct DeliveryBuffer {
     per_source: HashMap<String, Usage>,
     bytes: usize,
     limits: DeliveryLimits,
+    claim_grace: Duration,
 }
 
 impl DeliveryBuffer {
@@ -85,7 +95,31 @@ impl DeliveryBuffer {
             per_source: HashMap::new(),
             bytes: 0,
             limits,
+            claim_grace: DEFAULT_CLAIM_GRACE,
         }
+    }
+
+    /// How long a reply stays re-claimable after its first retaining claim.
+    #[must_use]
+    pub fn with_claim_grace(mut self, grace: Duration) -> Self {
+        self.claim_grace = grace;
+        self
+    }
+
+    /// Oldest entry to evict: replies already handed out by a retaining claim
+    /// go first (oldest claim first), then the oldest unclaimed reply.
+    fn eviction_candidate(&self) -> Option<SurbId> {
+        self.entries
+            .iter()
+            .filter_map(|(id, entry)| entry.claimed_at.map(|at| (at, *id)))
+            .min_by_key(|(at, _)| *at)
+            .map(|(_, id)| id)
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.created_at)
+                    .map(|(id, _)| *id)
+            })
     }
 
     fn remove(&mut self, id: &SurbId) -> Option<Entry> {
@@ -101,12 +135,14 @@ impl DeliveryBuffer {
         Some(entry)
     }
 
-    /// Removes entries older than `ttl`. Returns how many were removed.
+    /// Removes entries older than `ttl` and claimed entries past the claim
+    /// grace. Returns how many were removed.
     pub fn prune(&mut self, ttl: Duration) -> usize {
+        let grace = self.claim_grace;
         let expired: Vec<SurbId> = self
             .entries
             .iter()
-            .filter(|(_, entry)| entry.created_at.elapsed() >= ttl)
+            .filter(|(_, entry)| !entry.is_live(ttl, grace))
             .map(|(id, _)| *id)
             .collect();
         for id in &expired {
@@ -129,7 +165,7 @@ impl DeliveryBuffer {
             return DeliveryStore::TooLarge;
         }
         if let Some(existing) = self.entries.get(&id) {
-            if existing.created_at.elapsed() < ttl {
+            if existing.is_live(ttl, self.claim_grace) {
                 return DeliveryStore::Duplicate;
             }
             self.remove(&id);
@@ -156,12 +192,7 @@ impl DeliveryBuffer {
             while self.entries.len() + 1 > self.limits.max_entries
                 || self.bytes + size > self.limits.max_bytes
             {
-                let Some(oldest) = self
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, entry)| entry.created_at)
-                    .map(|(id, _)| *id)
-                else {
+                let Some(oldest) = self.eviction_candidate() else {
                     break;
                 };
                 self.remove(&oldest);
@@ -178,16 +209,59 @@ impl DeliveryBuffer {
             Entry {
                 data,
                 created_at: Instant::now(),
+                claimed_at: None,
                 source: source.to_string(),
             },
         );
         DeliveryStore::Stored { evicted }
     }
 
-    /// Removes and returns the reply for `id` if it is younger than `ttl`.
-    pub fn take(&mut self, id: &SurbId, ttl: Duration) -> Option<Vec<u8>> {
+    /// Removes and returns the reply for `id` if it is still live. The flag
+    /// says whether a retaining claim had already handed it out.
+    pub fn take(&mut self, id: &SurbId, ttl: Duration) -> Option<(Vec<u8>, bool)> {
         let entry = self.remove(id)?;
-        (entry.created_at.elapsed() < ttl).then_some(entry.data)
+        let reclaimed = entry.claimed_at.is_some();
+        entry
+            .is_live(ttl, self.claim_grace)
+            .then_some((entry.data, reclaimed))
+    }
+
+    /// Returns a copy of the reply for `id` and keeps it until it is acked or
+    /// the claim grace has passed (counted from the first such claim, never
+    /// extended). The flag says whether it had been handed out before.
+    pub fn claim_retained(&mut self, id: &SurbId, ttl: Duration) -> Option<(Vec<u8>, bool)> {
+        let grace = self.claim_grace;
+        let live = self.entries.get(id)?.is_live(ttl, grace);
+        if !live {
+            self.remove(id);
+            return None;
+        }
+        let entry = self.entries.get_mut(id)?;
+        let reclaimed = entry.claimed_at.is_some();
+        if !reclaimed {
+            entry.claimed_at = Some(Instant::now());
+        }
+        Some((entry.data.clone(), reclaimed))
+    }
+
+    /// Whether a live reply is held for `id`.
+    #[must_use]
+    pub fn contains_live(&self, id: &SurbId, ttl: Duration) -> bool {
+        self.entries
+            .get(id)
+            .is_some_and(|entry| entry.is_live(ttl, self.claim_grace))
+    }
+
+    /// The limits this buffer was built with.
+    #[must_use]
+    pub fn limits(&self) -> DeliveryLimits {
+        self.limits
+    }
+
+    /// Removes the reply for `id` (the client has it). Returns whether one
+    /// was held.
+    pub fn ack(&mut self, id: &SurbId) -> bool {
+        self.remove(id).is_some()
     }
 
     #[must_use]
@@ -286,7 +360,7 @@ mod tests {
             buf.store(id(2), "a", vec![1], TTL),
             DeliveryStore::SourceQuota
         );
-        assert_eq!(buf.take(&id(1), TTL), Some(vec![1]));
+        assert_eq!(buf.take(&id(1), TTL), Some((vec![1], false)));
         assert_eq!(
             buf.store(id(2), "a", vec![1], TTL),
             DeliveryStore::Stored { evicted: 0 }
@@ -310,7 +384,7 @@ mod tests {
         );
         assert_eq!(buf.len(), 4);
         assert!(buf.take(&id(0), TTL).is_none());
-        assert_eq!(buf.take(&id(9), TTL), Some(vec![2]));
+        assert_eq!(buf.take(&id(9), TTL), Some((vec![2], false)));
     }
 
     #[test]
@@ -339,7 +413,7 @@ mod tests {
             buf.store(id(1), "b", vec![2], TTL),
             DeliveryStore::Duplicate
         );
-        assert_eq!(buf.take(&id(1), TTL), Some(vec![1]));
+        assert_eq!(buf.take(&id(1), TTL), Some((vec![1], false)));
     }
 
     #[test]
@@ -353,5 +427,50 @@ mod tests {
         assert_eq!(buf.prune(ttl), 1);
         assert!(buf.is_empty());
         assert_eq!(buf.bytes(), 0);
+    }
+
+    #[test]
+    fn retained_claim_is_reclaimable_until_acked() {
+        let mut buf = DeliveryBuffer::new(DeliveryLimits::default());
+        buf.store(id(1), "a", vec![7], TTL);
+        assert_eq!(buf.claim_retained(&id(1), TTL), Some((vec![7], false)));
+        assert_eq!(buf.claim_retained(&id(1), TTL), Some((vec![7], true)));
+        assert_eq!(buf.len(), 1);
+        assert!(buf.ack(&id(1)));
+        assert!(!buf.ack(&id(1)));
+        assert!(buf.claim_retained(&id(1), TTL).is_none());
+        assert_eq!(buf.bytes(), 0);
+    }
+
+    #[test]
+    fn retained_claim_expires_after_the_grace() {
+        let mut buf = DeliveryBuffer::new(DeliveryLimits::default())
+            .with_claim_grace(Duration::from_millis(5));
+        buf.store(id(1), "a", vec![7], TTL);
+        buf.store(id(2), "a", vec![8], TTL);
+        assert!(buf.claim_retained(&id(1), TTL).is_some());
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(buf.claim_retained(&id(1), TTL).is_none());
+        assert_eq!(buf.prune(TTL), 0, "the expired claim was dropped on access");
+        assert_eq!(buf.len(), 1, "the unclaimed reply keeps its full TTL");
+    }
+
+    #[test]
+    fn claimed_replies_are_evicted_before_unclaimed_ones() {
+        let mut buf = DeliveryBuffer::new(DeliveryLimits {
+            max_entries: 2,
+            max_bytes: 1 << 20,
+            source_share_percent: 100,
+        });
+        buf.store(id(1), "a", vec![1], TTL);
+        std::thread::sleep(Duration::from_millis(2));
+        buf.store(id(2), "b", vec![2], TTL);
+        assert!(buf.claim_retained(&id(2), TTL).is_some());
+        assert_eq!(
+            buf.store(id(3), "c", vec![3], TTL),
+            DeliveryStore::Stored { evicted: 1 }
+        );
+        assert!(buf.claim_retained(&id(2), TTL).is_none());
+        assert_eq!(buf.take(&id(1), TTL), Some((vec![1], false)));
     }
 }

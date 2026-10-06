@@ -184,6 +184,7 @@ mod tests {
             rate_limit_burst: burst,
             client_ip_header: header.to_string(),
             cors_allowed_origins: Vec::new(),
+            ..IngressConfig::default()
         }
     }
 

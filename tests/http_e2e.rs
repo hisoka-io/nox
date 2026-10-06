@@ -44,6 +44,7 @@ impl HttpTestHarness {
             metrics: metrics.clone(),
             long_poll_timeout: Duration::from_secs(1),
             min_pow_difficulty: 0,
+            claim: nox_node::ingress::claim::ClaimSettings::default(),
         });
 
         let router = IngressServer::router(ingress_state);

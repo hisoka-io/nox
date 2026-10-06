@@ -8,6 +8,7 @@ use crate::blockchain::tx_manager::TransactionManager;
 use crate::config::NoxConfig;
 use crate::infra::event_bus::TokioEventBus;
 use crate::infra::storage::SledRepository;
+use crate::ingress::claim::ClaimSettings;
 use crate::ingress::http_server::{IngressServer, IngressState};
 use crate::ingress::response_buffer::ResponseBuffer;
 use crate::ingress::response_router::ResponseRouter;
@@ -161,7 +162,10 @@ impl NoxNode {
             process_monitor.run().await;
         });
 
-        let response_buffer = Arc::new(ResponseBuffer::new());
+        let response_buffer = Arc::new(
+            ResponseBuffer::new()
+                .with_claim_grace(Duration::from_millis(config.ingress.claim_retain_grace_ms)),
+        );
         if config.ingress_port > 0 {
             let ingress_state = Arc::new(IngressState {
                 event_publisher: bus_publisher.clone(),
@@ -169,6 +173,10 @@ impl NoxNode {
                 metrics: metrics_service.clone(),
                 long_poll_timeout: Duration::from_secs(30),
                 min_pow_difficulty: config.min_pow_difficulty,
+                claim: ClaimSettings::new(
+                    Duration::from_millis(config.ingress.claim_wait_max_ms),
+                    config.ingress.claim_wait_max_concurrent,
+                ),
             });
             let ingress_router = IngressServer::router_with_policy(ingress_state, &config.ingress)
                 .layer(middleware::from_fn(
