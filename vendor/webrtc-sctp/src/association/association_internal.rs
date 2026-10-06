@@ -109,7 +109,7 @@ pub(crate) fn initial_cwnd(mtu: u32) -> u32 {
 /// bytes as a claim batch). 56 MTUs (68,768 bytes at the 1,228-byte MTU)
 /// let both sizes, with HTTP and KPS framing, leave in the first flight on a
 /// new association, which saves one to two round trips on the first calls
-/// after a dial. `PACING_BURST_PACKETS` bounds the burst that goes out at
+/// after a dial. The pacer (pacing.rs) bounds the burst that goes out at
 /// once.
 pub(crate) const INITIAL_CWND_MTUS: u32 = 56;
 
@@ -1469,6 +1469,7 @@ impl AssociationInternal {
                             // congestion: drop the loss floor (RFC 4960 7.2.3).
                             self.fast_recovery_losses += 1;
                             if self.fast_recovery_losses == LOSS_FLOOR_MAX_LOSSES + 1 {
+                                self.delivery_rate.on_congestion();
                                 self.ssthresh = std::cmp::max(
                                     self.fast_recovery_entry_cwnd / 2,
                                     4 * self.mtu,
@@ -2485,6 +2486,9 @@ impl RtxTimerObserver for AssociationInternal {
                 } else {
                     std::cmp::max(self.cwnd / 2, 4 * self.mtu)
                 };
+                if !isolated {
+                    self.delivery_rate.on_congestion();
+                }
                 self.cwnd = if isolated {
                     loss_cwnd_floor(self.mtu)
                 } else {

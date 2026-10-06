@@ -472,6 +472,7 @@ impl Association {
     ) {
         log::debug!("[{name}] write_loop entered");
         let done = Arc::new(AtomicBool::new(false));
+        let mut pacer = pacing::Pacer::new(tokio::time::Instant::now());
         let name = Arc::new(name);
 
         'outer: while !done.load(Ordering::Relaxed) {
@@ -481,10 +482,7 @@ impl Association {
                 let (packets, continue_loop) = ai.gather_outbound().await;
                 (packets, continue_loop, ai.pacing_bytes_per_ms())
             };
-            // nox: the first PACING_BURST_PACKETS packets leave back to back,
-            // the rest at the pacing rate (pacing.rs).
-            let write_started = tokio::time::Instant::now();
-            let mut paced_bytes = 0u64;
+
             //log::debug!("[{}] gather_outbound done with {}", name, packets.len());
 
             let net_conn = Arc::clone(&net_conn);
@@ -492,12 +490,7 @@ impl Association {
             let name2 = Arc::clone(&name);
             let done2 = Arc::clone(&done);
             let mut buffer = None;
-            for (index, raw) in packets.into_iter().enumerate() {
-                if let Some(at) =
-                    pacing::send_at(write_started, index, paced_bytes, pace_bytes_per_ms)
-                {
-                    tokio::time::sleep_until(at).await;
-                }
+            for raw in packets {
                 let mut buf = buffer
                     .take()
                     .unwrap_or_else(|| BytesMut::with_capacity(16 * 1024));
@@ -510,15 +503,21 @@ impl Association {
                     .await
                 {
                     Ok(Ok(mut buf)) => {
+                        // nox: every packet passes the pacer's token bucket
+                        // (pacing.rs).
+                        if let Some(at) = pacer.admit(
+                            tokio::time::Instant::now(),
+                            buf.len() as u64,
+                            pace_bytes_per_ms,
+                        ) {
+                            tokio::time::sleep_until(at).await;
+                        }
                         let raw = buf.as_ref();
                         if let Err(err) = net_conn.send(raw.as_ref()).await {
                             log::warn!("[{name2}] failed to write packets on net_conn: {err}");
                             done2.store(true, Ordering::Relaxed)
                         } else {
                             bytes_sent.fetch_add(raw.len(), Ordering::SeqCst);
-                            if index >= pacing::PACING_BURST_PACKETS {
-                                paced_bytes += raw.len() as u64;
-                            }
                         }
 
                         // Reuse allocation. Have to use options, since spawn blocking can't borrow, has to take ownership.
