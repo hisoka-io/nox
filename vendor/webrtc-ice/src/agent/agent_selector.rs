@@ -532,6 +532,29 @@ impl ControlledSelector for AgentInternal {
                 }
             }
 
+            // nox: a lite agent has a single host candidate and runs no checks
+            // of its own (RFC 8445 §2.5), so an authenticated check from the
+            // controlling peer is enough to start using the pair. Selecting it
+            // here lets DTLS start on the peer's first ClientHello instead of
+            // waiting for USE-CANDIDATE, which browsers send on a later ping
+            // (1-2.6 s later). A later nomination of another pair still wins.
+            if self.lite.load(Ordering::SeqCst) {
+                let selected = self.agent_conn.get_selected_pair();
+                let switch = match &selected {
+                    None => true,
+                    Some(current) => use_candidate && !Arc::ptr_eq(current, &p),
+                };
+                if switch {
+                    // The caller marks the remote as seen only after this
+                    // returns; mark it now so the selected-pair check that
+                    // runs next does not find it silent and fail the agent.
+                    remote.seen(false);
+                    p.state
+                        .store(CandidatePairState::Succeeded as u8, Ordering::SeqCst);
+                    self.set_selected_pair(Some(Arc::clone(&p))).await;
+                }
+            }
+
             self.send_binding_success(m, local, remote).await;
             self.ping_candidate(local, remote).await;
         }
