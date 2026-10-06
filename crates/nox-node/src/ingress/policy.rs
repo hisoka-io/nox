@@ -13,7 +13,7 @@ use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tracing::{debug, warn};
 
-use super::claim::{CLAIM_VERSION_HEADER, CLAIM_WAIT_MAX_HEADER};
+use super::claim::{CLAIM_FEATURES_HEADER, CLAIM_VERSION_HEADER, CLAIM_WAIT_MAX_HEADER};
 use crate::config::IngressConfig;
 use crate::telemetry::metrics::MetricsService;
 
@@ -147,10 +147,11 @@ pub async fn rate_limit(
 
 /// Response headers a browser client may read cross-origin: the claim
 /// protocol headers a v2 client uses to find the entry's long-poll cap.
-fn exposed_headers() -> [HeaderName; 2] {
+fn exposed_headers() -> [HeaderName; 3] {
     [
         HeaderName::from_static(CLAIM_VERSION_HEADER),
         HeaderName::from_static(CLAIM_WAIT_MAX_HEADER),
+        HeaderName::from_static(CLAIM_FEATURES_HEADER),
     ]
 }
 
@@ -394,6 +395,7 @@ mod tests {
                 .to_ascii_lowercase();
             assert!(exposed.contains(CLAIM_VERSION_HEADER), "{exposed}");
             assert!(exposed.contains(CLAIM_WAIT_MAX_HEADER), "{exposed}");
+            assert!(exposed.contains(CLAIM_FEATURES_HEADER), "{exposed}");
         }
     }
 }

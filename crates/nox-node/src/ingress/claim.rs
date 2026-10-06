@@ -28,6 +28,12 @@ pub const CLAIM_VERSION_HEADER: &str = "x-nox-claim-version";
 pub const CLAIM_VERSION: &str = "2";
 /// Response header with the longest `wait_ms` the node honours.
 pub const CLAIM_WAIT_MAX_HEADER: &str = "x-nox-claim-wait-max-ms";
+/// Response header listing the optional claim features this node supports.
+pub const CLAIM_FEATURES_HEADER: &str = "x-nox-claim-features";
+/// Optional claim features this node supports: `max-replies` (the
+/// `max_replies` field) and `ack-ahead` (an ack for a reply that has not
+/// arrived yet drops it when it arrives).
+pub const CLAIM_FEATURES: &str = "max-replies, ack-ahead";
 
 /// Default longest long-poll a claim may ask for.
 pub const DEFAULT_CLAIM_WAIT_MAX_MS: u64 = 20_000;
@@ -107,6 +113,21 @@ pub struct ClaimRequest {
     /// `retain`, so a reply is never lost to a client that left mid-wait.
     #[serde(default)]
     pub wait_ms: u64,
+    /// Return at most this many replies, the ones that arrived first; the
+    /// rest stay for a later claim. Absent or 0: no limit.
+    #[serde(default)]
+    pub max_replies: Option<usize>,
+}
+
+impl ClaimRequest {
+    /// Largest number of replies to return.
+    #[must_use]
+    pub fn reply_limit(&self) -> usize {
+        match self.max_replies {
+            None | Some(0) => usize::MAX,
+            Some(n) => n,
+        }
+    }
 }
 
 /// Long-poll limits shared by every claim.

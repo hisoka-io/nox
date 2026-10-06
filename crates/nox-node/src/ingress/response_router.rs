@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::delivery_buffer::DeliveryStore;
-use super::response_buffer::ResponseBuffer;
+use super::response_buffer::{ReplyStore, ResponseBuffer};
 use nox_core::models::wire_id::{reply_wire_id, ReplyDelivery, ReplyHandle};
 
 /// Whether a decrypted payload is a SURB reply that a client of this node can claim.
@@ -97,6 +97,7 @@ impl ResponseRouter {
             DeliveryStore::Duplicate => self.count("delivery", Some("duplicate"), 0),
             DeliveryStore::SourceQuota => self.count("delivery", Some("source_quota"), 0),
             DeliveryStore::TooLarge => self.count("delivery", Some("too_large"), 0),
+            DeliveryStore::Acked => self.count("delivery", Some("acked"), 0),
         }
     }
 
@@ -174,8 +175,11 @@ impl ResponseRouter {
                                 continue;
                             };
                             debug!("ResponseRouter: buffering SURB response");
-                            let evicted = self.response_buffer.store_response(&key, payload);
-                            self.count("handle", None, evicted);
+                            match self.response_buffer.store_reply(&key, payload) {
+                                ReplyStore::Stored { evicted } => self.count("handle", None, evicted),
+                                ReplyStore::Duplicate => self.count("handle", Some("duplicate"), 0),
+                                ReplyStore::Acked => self.count("handle", Some("acked"), 0),
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             warn!("ResponseRouter: bus lagged by {n} events");

@@ -17,7 +17,7 @@
 //! count against the same entry and byte caps and are evicted first.
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -36,6 +36,10 @@ pub const DEFAULT_CLAIM_GRACE: Duration = Duration::from_secs(20);
 /// Prevents unbounded memory growth between prune cycles.
 /// At ~1 KB average response size, 10 000 entries ≈ 10 MB.
 const DEFAULT_MAX_ENTRIES: usize = 10_000;
+
+/// Default number of IDs remembered as acked before their reply arrived.
+/// Each costs about 50 bytes; they expire after the claim grace.
+const DEFAULT_MAX_ACKED_AHEAD: usize = 10_000;
 
 /// SURB identifier: 16 bytes, written as 32 hex characters on the wire.
 pub type SurbId = [u8; 16];
@@ -149,6 +153,110 @@ impl Entries {
     }
 }
 
+/// IDs the client acked before any reply was held under them. A reply that
+/// arrives for one of them later is dropped instead of being buffered: the
+/// client already decoded its request from the other replies (claim v2
+/// ack-ahead). Bounded in count and age.
+#[derive(Default)]
+struct AckedAhead {
+    at: HashMap<SurbId, Instant>,
+    order: VecDeque<(SurbId, Instant)>,
+}
+
+impl AckedAhead {
+    fn insert(&mut self, id: SurbId, max: usize) {
+        if max == 0 {
+            return;
+        }
+        // `order` also holds stale positions of IDs taken or re-acked since;
+        // bound both.
+        while self.at.len() >= max || self.order.len() >= 2 * max {
+            if !self.pop_oldest() {
+                break;
+            }
+        }
+        let now = Instant::now();
+        self.at.insert(id, now);
+        self.order.push_back((id, now));
+    }
+
+    fn pop_oldest(&mut self) -> bool {
+        let Some((id, at)) = self.order.pop_front() else {
+            return false;
+        };
+        if self.at.get(&id) == Some(&at) {
+            self.at.remove(&id);
+        }
+        true
+    }
+
+    /// Removes `id` and returns whether it was acked within `grace`.
+    fn take(&mut self, id: &SurbId, grace: Duration) -> bool {
+        self.at.remove(id).is_some_and(|at| at.elapsed() < grace)
+    }
+
+    fn prune(&mut self, grace: Duration) {
+        while self
+            .order
+            .front()
+            .is_some_and(|(_, at)| at.elapsed() >= grace)
+        {
+            self.pop_oldest();
+        }
+    }
+}
+
+/// Long-poll waiters by reply ID, so a stored reply wakes only the claims
+/// that wait for it.
+#[derive(Default)]
+struct Waiters {
+    next_key: u64,
+    by_id: HashMap<SurbId, Vec<(u64, Arc<Notify>)>>,
+}
+
+/// A registration that is woken when a reply is stored under one of its IDs.
+/// Dropping it unregisters.
+pub struct ReplyWaiter {
+    waiters: Arc<Mutex<Waiters>>,
+    key: u64,
+    ids: Vec<SurbId>,
+    notify: Arc<Notify>,
+}
+
+impl ReplyWaiter {
+    /// Completes when a reply has been stored under one of the IDs since
+    /// the registration or since the previous wake-up. A store that happens
+    /// before this is awaited is not lost.
+    pub async fn notified(&self) {
+        self.notify.notified().await;
+    }
+}
+
+impl Drop for ReplyWaiter {
+    fn drop(&mut self) {
+        let mut waiters = self.waiters.lock();
+        for id in &self.ids {
+            if let Some(list) = waiters.by_id.get_mut(id) {
+                list.retain(|(key, _)| *key != self.key);
+                if list.is_empty() {
+                    waiters.by_id.remove(id);
+                }
+            }
+        }
+    }
+}
+
+/// Outcome of [`ResponseBuffer::store_reply`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyStore {
+    /// Stored. `evicted` older entries were removed to make room.
+    Stored { evicted: usize },
+    /// A reply for this SURB ID is already buffered; the new one is dropped.
+    Duplicate,
+    /// The client acked this ID before the reply arrived; it is dropped.
+    Acked,
+}
+
 /// Thread-safe buffer for SURB responses.
 ///
 /// Responses are stored with a TTL and automatically pruned on access.
@@ -161,8 +269,13 @@ pub struct ResponseBuffer {
     /// How long a retained reply stays re-claimable after its first claim.
     claim_grace: Duration,
     max_entries: usize,
-    /// Wakes waiting handlers (WebSocket, SSE, long-poll) when a new response is stored.
+    /// Wakes the WebSocket and by-packet-ID poll handlers when any response
+    /// is stored.
     notify: Arc<Notify>,
+    /// Long-poll claims and SSE streams, woken per reply ID.
+    waiters: Arc<Mutex<Waiters>>,
+    acked_ahead: Mutex<AckedAhead>,
+    max_acked_ahead: usize,
 }
 
 impl Default for ResponseBuffer {
@@ -192,6 +305,9 @@ impl ResponseBuffer {
             claim_grace: DEFAULT_CLAIM_GRACE,
             max_entries,
             notify: Arc::new(Notify::new()),
+            waiters: Arc::new(Mutex::new(Waiters::default())),
+            acked_ahead: Mutex::new(AckedAhead::default()),
+            max_acked_ahead: DEFAULT_MAX_ACKED_AHEAD,
         }
     }
 
@@ -226,26 +342,46 @@ impl ResponseBuffer {
         source_peer: &str,
         data: Vec<u8>,
     ) -> DeliveryStore {
+        if self.acked_ahead.lock().take(&delivery_id, self.claim_grace) {
+            debug!("Dropping a format 2 reply the client acked before it arrived");
+            return DeliveryStore::Acked;
+        }
         let outcome = self
             .delivery
             .lock()
             .store(delivery_id, source_peer, data, self.ttl);
         if matches!(outcome, DeliveryStore::Stored { .. }) {
             debug!("Buffered format 2 reply");
+            self.wake(&delivery_id);
             self.notify.notify_waiters();
         }
         outcome
     }
 
     /// Store a response under its `packet_id`. Returns how many older entries
-    /// were evicted to make room.
+    /// were evicted to make room (see [`ResponseBuffer::store_reply`]).
+    pub fn store_response(&self, packet_id: &str, data: Vec<u8>) -> usize {
+        match self.store_reply(packet_id, data) {
+            ReplyStore::Stored { evicted } => evicted,
+            ReplyStore::Duplicate | ReplyStore::Acked => 0,
+        }
+    }
+
+    /// Store a response under its `packet_id`.
     ///
     /// If the buffer is at capacity, the oldest entry is evicted first. If a
     /// response for the same SURB ID is already buffered under another
-    /// `packet_id`, the new one is dropped: a SURB is single-use.
-    pub fn store_response(&self, packet_id: &str, data: Vec<u8>) -> usize {
+    /// `packet_id`, the new one is dropped: a SURB is single-use. A response
+    /// whose SURB ID the client acked before it arrived is dropped too.
+    pub fn store_reply(&self, packet_id: &str, data: Vec<u8>) -> ReplyStore {
         let mut evicted = 0;
         let surb_id = surb_id_from_packet_id(packet_id);
+        if let Some(id) = surb_id {
+            if self.acked_ahead.lock().take(&id, self.claim_grace) {
+                debug!("Dropping a response the client acked before it arrived");
+                return ReplyStore::Acked;
+            }
+        }
         let mut entries = self.entries.lock();
 
         if let Some(id) = surb_id {
@@ -258,7 +394,7 @@ impl ResponseBuffer {
                     entries.remove(&existing);
                 } else if existing != packet_id {
                     debug!("Dropping response for a SURB ID that is already buffered");
-                    return 0;
+                    return ReplyStore::Duplicate;
                 }
             }
         }
@@ -300,17 +436,68 @@ impl ResponseBuffer {
             },
         );
 
-        // Wake any waiting handlers (WebSocket, SSE, long-poll) immediately.
+        drop(entries);
+
+        // Wake the claims waiting for this ID, then the handlers that watch
+        // every store.
+        if let Some(id) = surb_id {
+            self.wake(&id);
+        }
         self.notify.notify_waiters();
-        evicted
+        ReplyStore::Stored { evicted }
     }
 
-    /// Returns a future that completes when a new response is stored.
+    /// Returns a future that completes when any new response is stored.
     ///
-    /// Used by WebSocket, SSE, and long-poll handlers to wake immediately
-    /// on new data instead of fixed-interval polling.
+    /// Used by the WebSocket and by-packet-ID poll handlers. Claims and
+    /// streams with known IDs use [`ResponseBuffer::waiter`], which wakes
+    /// only for their own IDs.
     pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.notify.notified()
+    }
+
+    /// Registers a waiter that is woken when a reply is stored under one of
+    /// `surb_ids`. Register before checking the buffer, then await
+    /// [`ReplyWaiter::notified`]: a reply stored in between is not missed.
+    #[must_use]
+    pub fn waiter(&self, surb_ids: &[SurbId]) -> ReplyWaiter {
+        let notify = Arc::new(Notify::new());
+        let mut ids = surb_ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut waiters = self.waiters.lock();
+        let key = waiters.next_key;
+        waiters.next_key = waiters.next_key.wrapping_add(1);
+        for id in &ids {
+            waiters
+                .by_id
+                .entry(*id)
+                .or_default()
+                .push((key, Arc::clone(&notify)));
+        }
+        drop(waiters);
+        ReplyWaiter {
+            waiters: Arc::clone(&self.waiters),
+            key,
+            ids,
+            notify,
+        }
+    }
+
+    /// Wakes the waiters registered for `id`.
+    fn wake(&self, id: &SurbId) {
+        let waiters = self.waiters.lock();
+        if let Some(list) = waiters.by_id.get(id) {
+            for (_, notify) in list {
+                notify.notify_one();
+            }
+        }
+    }
+
+    /// Number of (waiter, ID) registrations, for tests and metrics.
+    #[must_use]
+    pub fn waiter_registrations(&self) -> usize {
+        self.waiters.lock().by_id.values().map(Vec::len).sum()
     }
 
     /// Take (remove and return) the response stored under exactly `packet_id`.
@@ -343,13 +530,55 @@ impl ResponseBuffer {
     /// since its first retaining claim, and a repeated claim returns it again
     /// (`reclaimed`). Only the exact ID matches.
     pub fn claim(&self, surb_ids: &[SurbId], mode: ClaimMode) -> Vec<ClaimedReply> {
-        if surb_ids.is_empty() {
+        self.claim_at_most(surb_ids, mode, usize::MAX)
+    }
+
+    /// [`ResponseBuffer::claim`], returning at most `max_replies` replies:
+    /// the ones that arrived first, in arrival order. The others stay for a
+    /// later claim.
+    pub fn claim_at_most(
+        &self,
+        surb_ids: &[SurbId],
+        mode: ClaimMode,
+        max_replies: usize,
+    ) -> Vec<ClaimedReply> {
+        if surb_ids.is_empty() || max_replies == 0 {
             return Vec::new();
         }
 
         let mut entries = self.entries.lock();
         let mut delivery = self.delivery.lock();
         let mut claimed = Vec::new();
+
+        let limited: Vec<SurbId>;
+        let surb_ids = if max_replies < surb_ids.len() {
+            let mut arrived: Vec<(Instant, SurbId)> = surb_ids
+                .iter()
+                .filter_map(|surb_id| {
+                    let handle = entries
+                        .by_surb_id
+                        .get(surb_id)
+                        .and_then(|key| entries.by_packet_id.get(key))
+                        .filter(|entry| entry.is_live(self.ttl, self.claim_grace))
+                        .map(|entry| entry.created_at);
+                    let format2 = delivery.live_created_at(surb_id, self.ttl);
+                    handle
+                        .into_iter()
+                        .chain(format2)
+                        .min()
+                        .map(|at| (at, *surb_id))
+                })
+                .collect();
+            arrived.sort_unstable_by_key(|(at, _)| *at);
+            limited = arrived
+                .into_iter()
+                .take(max_replies)
+                .map(|(_, id)| id)
+                .collect();
+            limited.as_slice()
+        } else {
+            surb_ids
+        };
 
         for surb_id in surb_ids {
             if let Some(key) = entries.by_surb_id.get(surb_id).cloned() {
@@ -392,29 +621,48 @@ impl ResponseBuffer {
             }
         }
 
+        claimed.truncate(max_replies);
         claimed
     }
 
     /// Remove the replies held under exactly these IDs: the client confirms
-    /// it has them. Returns how many were removed.
+    /// it has them, or no longer needs them. Returns how many were removed.
+    ///
+    /// An ID with no reply held yet is remembered for the claim grace, and a
+    /// reply that arrives for it in that time is dropped (ack-ahead: the
+    /// client acks the sibling replies of a request it already decoded).
     pub fn ack(&self, surb_ids: &[SurbId]) -> usize {
         if surb_ids.is_empty() {
             return 0;
         }
         let mut entries = self.entries.lock();
         let mut delivery = self.delivery.lock();
+        let mut acked_ahead = self.acked_ahead.lock();
         let mut removed = 0;
         for surb_id in surb_ids {
+            let mut held = false;
             if let Some(key) = entries.by_surb_id.get(surb_id).cloned() {
                 if entries.remove(&key).is_some() {
                     removed += 1;
+                    held = true;
                 }
             }
             if delivery.ack(surb_id) {
                 removed += 1;
+                held = true;
+            }
+            if !held {
+                acked_ahead.insert(*surb_id, self.max_acked_ahead);
             }
         }
         removed
+    }
+
+    /// Number of IDs acked before their reply arrived that are still
+    /// remembered.
+    #[must_use]
+    pub fn acked_ahead_len(&self) -> usize {
+        self.acked_ahead.lock().at.len()
     }
 
     /// Whether a live reply is held under any of these IDs (long-poll wake-up
@@ -442,6 +690,7 @@ impl ResponseBuffer {
     /// Prune all expired entries. Returns the number removed from the
     /// handle-keyed and the delivery-keyed stores.
     pub fn prune_expired_by_key(&self) -> (usize, usize) {
+        self.acked_ahead.lock().prune(self.claim_grace);
         let handle = self.entries.lock().retain_fresh(self.ttl, self.claim_grace);
         let delivery = self.delivery.lock().prune(self.ttl);
         (handle, delivery)
@@ -858,6 +1107,113 @@ mod tests {
         assert_eq!(buf.ack(&[id(SURB_C)]), 1);
         assert_eq!(buf.bytes_by_key(), (0, 0));
         assert!(!buf.has_any(&[id(SURB_C)]));
+    }
+
+    #[tokio::test]
+    async fn test_waiter_wakes_only_for_its_ids() {
+        let buf = ResponseBuffer::new();
+        let waiter = buf.waiter(&[id(SURB_A), id(SURB_A)]);
+        assert_eq!(buf.waiter_registrations(), 1, "duplicate IDs register once");
+
+        buf.store_response(&format!("reply-0-{SURB_B}"), vec![1]);
+        let woken = tokio::time::timeout(Duration::from_millis(50), waiter.notified()).await;
+        assert!(woken.is_err(), "a reply for another ID must not wake it");
+
+        // Stored before the wait starts: the permit is kept.
+        buf.store_response(&format!("reply-0-{SURB_A}"), vec![2]);
+        let woken = tokio::time::timeout(Duration::from_millis(50), waiter.notified()).await;
+        assert!(woken.is_ok(), "a reply for its ID wakes it");
+
+        drop(waiter);
+        assert_eq!(buf.waiter_registrations(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_waiter_wakes_for_format_2_replies() {
+        let buf = delivery_buffer(8);
+        let waiter = buf.waiter(&[id(SURB_C)]);
+        buf.store_delivery(id(SURB_C), "peer-1", vec![7]);
+        let woken = tokio::time::timeout(Duration::from_millis(50), waiter.notified()).await;
+        assert!(woken.is_ok());
+    }
+
+    #[test]
+    fn test_ack_ahead_drops_replies_of_both_formats() {
+        let buf = delivery_buffer(8);
+        assert_eq!(buf.ack(&[id(SURB_A), id(SURB_C)]), 0);
+        assert_eq!(buf.acked_ahead_len(), 2);
+        assert_eq!(
+            buf.store_reply(&format!("reply-0-{SURB_A}"), vec![1]),
+            ReplyStore::Acked
+        );
+        assert_eq!(
+            buf.store_delivery(id(SURB_C), "peer-1", vec![2]),
+            DeliveryStore::Acked
+        );
+        assert!(buf.is_empty());
+        assert_eq!(buf.acked_ahead_len(), 0, "each ack-ahead drops one reply");
+
+        // An ID acked after its reply was taken is not remembered twice.
+        buf.store_response(&format!("reply-0-{SURB_B}"), vec![3]);
+        assert_eq!(buf.ack(&[id(SURB_B)]), 1);
+        assert_eq!(buf.acked_ahead_len(), 0);
+    }
+
+    #[test]
+    fn test_ack_ahead_expires_after_the_claim_grace() {
+        let buf = ResponseBuffer::new().with_claim_grace(Duration::from_millis(5));
+        buf.ack(&[id(SURB_A)]);
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(
+            buf.store_reply(&format!("reply-0-{SURB_A}"), vec![1]),
+            ReplyStore::Stored { evicted: 0 }
+        );
+        buf.ack(&[id(SURB_B)]);
+        std::thread::sleep(Duration::from_millis(10));
+        buf.prune_expired();
+        assert_eq!(buf.acked_ahead_len(), 0);
+    }
+
+    #[test]
+    fn test_ack_ahead_is_bounded() {
+        let mut buf = ResponseBuffer::new();
+        buf.max_acked_ahead = 3;
+        for i in 0..10u8 {
+            buf.ack(&[[i; 16]]);
+        }
+        assert_eq!(buf.acked_ahead_len(), 3);
+        assert_eq!(
+            buf.store_reply("reply-0-09090909090909090909090909090909", vec![1]),
+            ReplyStore::Acked
+        );
+        assert_eq!(
+            buf.store_reply("reply-0-00000000000000000000000000000000", vec![1]),
+            ReplyStore::Stored { evicted: 0 },
+            "the oldest ack-ahead was forgotten"
+        );
+    }
+
+    #[test]
+    fn test_claim_at_most_returns_the_earliest_replies() {
+        let buf = delivery_buffer(8);
+        buf.store_response(&format!("reply-0-{SURB_B}"), vec![1]);
+        std::thread::sleep(Duration::from_millis(2));
+        buf.store_delivery(id(SURB_C), "peer-1", vec![2]);
+        std::thread::sleep(Duration::from_millis(2));
+        buf.store_response(&format!("reply-0-{SURB_A}"), vec![3]);
+
+        let ids = [id(SURB_A), id(SURB_C), id(SURB_B), id(SURB_D)];
+        let first = buf.claim_at_most(&ids, ClaimMode::Take, 1);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].data, vec![1]);
+        let next = buf.claim_at_most(&ids, ClaimMode::Take, 2);
+        assert_eq!(
+            next.iter().map(|r| r.data.clone()).collect::<Vec<_>>(),
+            vec![vec![2], vec![3]],
+            "the two earliest, in arrival order"
+        );
+        assert!(buf.claim_at_most(&ids, ClaimMode::Take, 0).is_empty());
+        assert!(buf.is_empty());
     }
 
     #[test]
