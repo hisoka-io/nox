@@ -156,6 +156,11 @@ claim  {surb_ids:[...], ack:[p,d], ...}
 arrived, which saves a round trip on long paths. On an entry without the
 `max-replies` feature the claim returns both, as before.
 
+The limit counts replies across the whole claim, not per request. A claim
+that names the IDs of several requests (one shared long-poll) should leave
+`max_replies` out, or set it to the number of requests it waits for;
+`max_replies: 1` there returns one request's reply per round trip.
+
 ### Ack-ahead
 
 An ack for an ID with no reply held makes the entry remember that ID for

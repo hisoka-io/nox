@@ -581,6 +581,10 @@ impl ResponseBuffer {
         };
 
         for surb_id in surb_ids {
+            // Stop before taking a reply that would not be returned.
+            if claimed.len() >= max_replies {
+                break;
+            }
             if let Some(key) = entries.by_surb_id.get(surb_id).cloned() {
                 let live = entries
                     .by_packet_id
@@ -608,6 +612,9 @@ impl ResponseBuffer {
                     });
                 }
             }
+            if claimed.len() >= max_replies {
+                break;
+            }
             let from_delivery = match mode {
                 ClaimMode::Take => delivery.take(surb_id, self.ttl),
                 ClaimMode::Retain => delivery.claim_retained(surb_id, self.ttl),
@@ -621,7 +628,6 @@ impl ResponseBuffer {
             }
         }
 
-        claimed.truncate(max_replies);
         claimed
     }
 
@@ -1213,6 +1219,20 @@ mod tests {
             "the two earliest, in arrival order"
         );
         assert!(buf.claim_at_most(&ids, ClaimMode::Take, 0).is_empty());
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_claim_at_most_never_takes_a_reply_it_does_not_return() {
+        // One ID with a reply in both stores: a take limited to one reply
+        // must leave the second in place for the next claim.
+        let buf = delivery_buffer(8);
+        buf.store_response(&format!("reply-0-{SURB_A}"), vec![1]);
+        buf.store_delivery(id(SURB_A), "peer-1", vec![2]);
+        let first = buf.claim_at_most(&[id(SURB_A)], ClaimMode::Take, 1);
+        assert_eq!(first.len(), 1);
+        let next = buf.claim_at_most(&[id(SURB_A)], ClaimMode::Take, 1);
+        assert_eq!(next.len(), 1, "the other reply was kept");
         assert!(buf.is_empty());
     }
 
