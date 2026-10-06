@@ -1284,9 +1284,14 @@ impl AssociationInternal {
                 t3rtx.stop().await;
             }
         } else {
-            log::trace!("[{}] T3-rtx timer start (pt2)", self.name);
+            // nox: RFC 4960 6.3.2 R3 restarts the timer whenever the earliest
+            // outstanding TSN is acked. `start` alone is a no-op on a running
+            // timer, so the timer kept counting from the first transmission
+            // and expired mid-transfer on long paths (spurious timeout:
+            // cwnd <- 1 MTU and every outstanding chunk resent).
+            log::trace!("[{}] T3-rtx timer restart (pt2)", self.name);
             if let Some(t3rtx) = &self.t3rtx {
-                t3rtx.start(self.rto_mgr.get_rto()).await;
+                t3rtx.restart(self.rto_mgr.get_rto()).await;
             }
         }
 
