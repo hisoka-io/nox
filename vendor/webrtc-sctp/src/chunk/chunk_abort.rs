@@ -60,12 +60,13 @@ impl Chunk for ChunkAbort {
             return Err(Error::ErrChunkTypeNotAbort);
         }
 
+        // `raw` may run past this chunk (other chunks after it in the same
+        // packet), so every bound below is the chunk's own length.
+        let end = CHUNK_HEADER_SIZE + header.value_length();
         let mut error_causes = vec![];
         let mut offset = CHUNK_HEADER_SIZE;
-        while offset + 4 <= raw.len() {
-            let e = ErrorCause::unmarshal(
-                &raw.slice(offset..CHUNK_HEADER_SIZE + header.value_length()),
-            )?;
+        while offset + ERROR_CAUSE_HEADER_LENGTH <= end {
+            let e = ErrorCause::unmarshal(&raw.slice(offset..end))?;
             offset += e.length();
             error_causes.push(e);
         }

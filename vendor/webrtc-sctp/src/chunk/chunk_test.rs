@@ -859,3 +859,37 @@ fn test_shutdown_followed_by_a_chunk() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_abort_ignores_bytes_after_the_chunk() -> Result<()> {
+    let abort: &[u8] = &[0x06, 0x00, 0x00, 0x08, 0x00, 0x0d, 0x00, 0x04];
+    let raw_pkt = packet_with_checksum(&[abort, COOKIE_ACK].concat());
+
+    let pkt = Packet::unmarshal(&raw_pkt)?;
+    assert_eq!(pkt.chunks.len(), 2);
+    let c = pkt.chunks[0]
+        .as_any()
+        .downcast_ref::<ChunkAbort>()
+        .expect("first chunk is ABORT");
+    assert_eq!(c.error_causes.len(), 1);
+    assert_eq!(c.error_causes[0].error_cause_code(), PROTOCOL_VIOLATION);
+
+    Ok(())
+}
+
+#[test]
+fn test_error_ignores_bytes_after_the_chunk() -> Result<()> {
+    let error: &[u8] = &[0x09, 0x00, 0x00, 0x08, 0x00, 0x0d, 0x00, 0x04];
+    let raw_pkt = packet_with_checksum(&[error, COOKIE_ACK].concat());
+
+    let pkt = Packet::unmarshal(&raw_pkt)?;
+    assert_eq!(pkt.chunks.len(), 2);
+    let c = pkt.chunks[0]
+        .as_any()
+        .downcast_ref::<ChunkError>()
+        .expect("first chunk is ERROR");
+    assert_eq!(c.error_causes.len(), 1);
+    assert_eq!(c.error_causes[0].error_cause_code(), PROTOCOL_VIOLATION);
+
+    Ok(())
+}
