@@ -160,7 +160,7 @@ host keeps resolving to addresses it was pinned to.
 
 ### `[exit_workers]` (exit node)
 
-Decoded exit payloads go to one of four lanes, each with its own bounded queue and
+Decoded exit payloads go to one of five lanes, each with its own bounded queue and
 concurrency limit. A full lane drops new payloads and counts them in
 `nox_exit_payloads_dropped_total{lane,reason}`; the other lanes keep running.
 
@@ -170,6 +170,7 @@ concurrency limit. A full lane drops new payloads and counts them in
 | `quote_concurrency` | `8` | Paid quote requests |
 | `proxy_concurrency` | `32` | HTTP, RPC and signed-transaction broadcast |
 | `control_concurrency` | `16` | Echo and cover traffic |
+| `tunnel_concurrency` | `64` | TLS tunnel requests (checked, then handed to the tunnel's own task) |
 | `queue_capacity` | `256` | Payloads waiting per lane |
 
 ### `[exit_replenishment]` (exit node)
@@ -185,6 +186,32 @@ anonymous clients, so each is capped; at a cap the oldest entry is dropped.
 | `max_surb_requests` | `100` | Requests with early SURBs kept |
 | `max_surbs_per_request` | `512` | SURBs kept per request |
 | `entry_ttl_secs` | `300` | Seconds an unused entry is kept |
+
+### `[tunnel]` (exit node)
+
+End-to-end TLS tunnels (`ServiceRequest::TunnelV1`): the client runs TLS and the
+exit relays TLS records between it and one upstream host. Destinations follow
+`[http].allowed_domains` (matched against the TLS server name) and
+`allow_private_ips`. With `enabled = true` the exit lists `tunnel_v1` in its
+`/metrics/json` capabilities. See [tunnel.md](tunnel.md).
+
+| Field | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Accept tunnels and advertise `tunnel_v1` |
+| `allowed_ports` | `[443]` | Upstream ports a tunnel may reach |
+| `max_sessions` | `4096` | Open tunnels; when full, the longest-idle tunnel with nothing in flight makes room. Each holds one socket |
+| `opens_per_sec` / `opens_burst` | 50 / 200 | Token bucket for tunnel opens across the exit |
+| `connect_timeout_ms` | `5000` | DNS lookup, and connecting across the resolved addresses |
+| `min_hold_ms` / `max_hold_ms` | 1000 / 30000 | Clamp for how long the exit holds an exchange's SURBs |
+| `flush_idle_ms` / `flush_max_ms` | 3 / 25 | A part that is not full goes out after this much upstream silence, or this long after its first byte (`flush_max_ms` at most `max_hold_ms`) |
+| `session_idle_secs` | `60` | A tunnel with no client request for this long closes |
+| `session_max_secs` | `600` | A tunnel closes this long after it opened; its ID is refused for the same time (at most 86400) |
+| `max_session_bytes` | `67108864` | Bytes per tunnel, both directions (64 MiB) |
+| `max_window_bytes` | `1048576` | Downstream bytes kept per tunnel until acknowledged; at least `max_surbs_per_exchange` × 30656 |
+| `max_total_buffered_bytes` | `134217728` | Downstream bytes kept across all tunnels (128 MiB); at least `max_window_bytes` |
+| `max_write_bytes` | `4259840` | Largest write in one request |
+| `max_surbs_per_exchange` | `32` | SURBs used from one request |
+| `session_queue` | `8` | Requests waiting per tunnel |
 
 ### `[storage]`
 
