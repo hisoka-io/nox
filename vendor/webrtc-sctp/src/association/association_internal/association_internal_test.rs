@@ -275,7 +275,11 @@ async fn test_peer_reset_answered_with_one_outgoing_reset() -> Result<()> {
             }
         }
     }
-    assert_eq!(reset_streams, vec![4], "stream 2 was already reset by this side");
+    assert_eq!(
+        reset_streams,
+        vec![4],
+        "stream 2 was already reset by this side"
+    );
     assert!(a.streams.is_empty());
 
     Ok(())
