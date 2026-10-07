@@ -821,8 +821,11 @@ impl P2PService {
                     OutboundFailure::UnsupportedProtocols => "unsupported_protocols",
                     OutboundFailure::Io(_) => "io",
                 };
-                debug!(peer = %peer, error = %error, "Outbound packet request failed");
-                self.count_outbound_drop(reason);
+                debug!(peer = %peer, error = %error, "Outbound request failed");
+                // Handshake, resume and topology requests fail here too; only packets count.
+                if self.outbound.owns(&request_id) {
+                    self.count_outbound_drop(reason);
+                }
                 self.complete_packet(request_id);
             }
             NoxBehaviourEvent::Ping(libp2p::ping::Event { peer, result, .. }) => {

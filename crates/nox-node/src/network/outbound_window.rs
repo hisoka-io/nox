@@ -89,6 +89,12 @@ impl<I: Hash + Eq, M> OutboundWindow<I, M> {
         None
     }
 
+    /// Whether `id` is an open request this window sent.
+    #[must_use]
+    pub fn owns(&self, id: &I) -> bool {
+        self.owners.contains_key(id)
+    }
+
     /// Packets held across all peers.
     #[must_use]
     pub fn queued(&self) -> usize {
@@ -155,6 +161,7 @@ mod tests {
         let p = peer();
         assert_eq!(w.submit(p, 0), Submit::Send(0));
         w.sent(1, p);
+        assert!(w.owns(&1) && !w.owns(&99));
         assert_eq!(w.complete(&99), None);
         assert_eq!(w.submit(p, 1), Submit::Queued);
         assert_eq!(w.complete(&1), Some((p, 1)));
