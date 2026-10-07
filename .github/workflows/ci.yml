@@ -156,6 +156,8 @@ jobs:
         run: cargo test --test transaction_outbox -- --nocapture
       - name: Test chain model exports
         run: cargo test -p nox-core --test chain_exports
+      - name: Test vendored webrtc-sctp
+        run: scripts/test-vendored-sctp.sh
       # The nox-kps soaks are #[ignore]d in the default run. Here: 200 sequential
       # 32 KiB exchanges per transport and direction, and 20 large claim bodies
       # (5 MiB) per transport, with zero stalls allowed. The split-process soak

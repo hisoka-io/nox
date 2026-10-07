@@ -9,6 +9,9 @@ commits, so `git log -p vendor/` shows exactly what differs from upstream.
 Only nox-kps (the browser-facing entry sidecar) links these crates. The node
 binaries do not use them.
 
+The webrtc-sctp unit tests, including the regression tests for the nox
+changes, run in CI through `scripts/test-vendored-sctp.sh`.
+
 ## webrtc-sctp 0.13.0
 
 Base: the kps fork at `a73a0a8f9e4f76f3b89ba1155562ec836bcf3f3b`, which is the
