@@ -119,8 +119,9 @@ fn reserved_ipv4_range(octets: [u8; 4]) -> Option<&'static str> {
     }
 }
 
-/// The IPv4 address carried by a NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`) or 6to4 (`2002::/16`)
-/// address. Those prefixes reach whatever IPv4 address they embed.
+/// The IPv4 address carried by a well-known-prefix NAT64 (`64:ff9b::/96`) or 6to4 (`2002::/16`)
+/// address. Those prefixes reach whatever IPv4 address they embed. The local-use NAT64 prefix
+/// `64:ff9b:1::/48` places the IPv4 address by a site-chosen prefix length, so it is blocked whole.
 fn embedded_ipv4(segments: [u16; 8]) -> Option<std::net::Ipv4Addr> {
     let from_pair = |high: u16, low: u16| {
         let [a, b] = high.to_be_bytes();
@@ -128,10 +129,9 @@ fn embedded_ipv4(segments: [u16; 8]) -> Option<std::net::Ipv4Addr> {
         std::net::Ipv4Addr::new(a, b, c, d)
     };
     match segments {
-        [0x0064, 0xff9b, 0, 0, 0, 0, high, low] | [0x0064, 0xff9b, 0x0001, _, _, _, high, low] => {
+        [0x0064, 0xff9b, 0, 0, 0, 0, high, low] | [0x2002, high, low, ..] => {
             Some(from_pair(high, low))
         }
-        [0x2002, high, low, ..] => Some(from_pair(high, low)),
         _ => None,
     }
 }
@@ -333,6 +333,8 @@ mod tests {
             "::1.2.3.4",
             "64:ff9b::a00:1",
             "64:ff9b:1::a00:1",
+            "64:ff9b:1::808:808",
+            "64:ff9b:1:a00:1::808:808",
             "2002:a00:1::",
             "2001::1",
             "2001:db8::1",
