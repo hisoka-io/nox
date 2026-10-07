@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Summarizes bench result files: first call after the dial ("cold") and the
-rest ("warm") per label, pooled over every file given for that label.
+rest ("warm") per label, pooled over every file given for that label, and
+how many connections lost a call (each file is one connection).
 
 Usage: summarize.py [LABEL=]FILE... (files with the same label are pooled;
 FILE may be a quoted glob such as 'after=/tmp/after-*.json')
@@ -25,23 +26,28 @@ def main():
         groups.setdefault(label or pattern, []).extend(paths)
     for label, paths in groups.items():
         cold, warm, errors = [], [], 0  # errors: failed calls and failed dials
+        dead = 0  # connections with a failed call, or that never dialed
         for path in paths:
             with open(path) as f:
                 res = json.load(f)["res"]
             calls = res["calls"]
             errors += len(res.get("dialErrors", []))
             done = [c["done"] for c in calls if "done" in c]
-            errors += sum(1 for c in calls if "err" in c)
+            failed = sum(1 for c in calls if "err" in c)
+            errors += failed
+            if failed or not calls:
+                dead += 1
             if done:
                 cold.append(done[0])
                 warm.extend(done[1:])
         if not warm:
-            print(f"{label}: no completed calls ({errors} errors)")
+            print(f"{label}: no completed calls ({errors} errors, {dead}/{len(paths)} connections dead)")
             continue
         print(
             f"{label}: runs {len(paths)} warm n {len(warm)} p50 {statistics.median(warm):.0f} "
             f"p90 {pct(warm, 0.9):.0f} mean {statistics.mean(warm):.0f} max {max(warm):.0f} | "
-            f"cold p50 {statistics.median(cold):.0f} mean {statistics.mean(cold):.0f} | errors {errors}"
+            f"cold p50 {statistics.median(cold):.0f} mean {statistics.mean(cold):.0f} | errors {errors} "
+            f"| dead connections {dead}/{len(paths)}"
         )
 
 
