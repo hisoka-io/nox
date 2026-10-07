@@ -1,9 +1,9 @@
 # End-to-end TLS tunnels
 
 With a tunnel, the client runs TLS itself and the exit relays TLS records between the client and one
-upstream host. Requests, responses and the sender's identity stay end-to-end encrypted between the
-client and its RPC provider. Exits relay TLS ciphertext and see the provider's host name, timing and
-sizes.
+upstream host. Requests and responses stay end-to-end encrypted between the client and its RPC
+provider, and the mixnet keeps the sender's identity hidden from both the exit and the provider. Exits
+relay TLS ciphertext and see the provider's host name, timing and sizes.
 
 `ServiceRequest::TunnelV1` (bincode tag 8) carries one exchange. Exits that accept it list `tunnel_v1`
 in the `capabilities` array of `/metrics/json`; clients send it only to those exits. Every other request
@@ -22,6 +22,11 @@ type works as before.
 
 Content stays confidential and tamper-evident end to end. The client confirms a response is complete
 from HTTP framing or the TLS `close_notify`; the exit's end-of-stream marker is a transport hint.
+
+The exit sees when each tunnel opens, so at low traffic the timing of one client's sequential tunnels
+can link its calls; more traffic through each exit widens the crowd they hide in. The TLS key exchange
+is classical X25519; a post-quantum hybrid key exchange, which keeps recorded tunnels confidential
+against future quantum computers, is the next milestone.
 
 ## Wire format
 
@@ -59,7 +64,10 @@ most 30,656 bytes. Pinned byte vectors for both types are in `crates/nox-core/sr
   resends from its `ack_offset`.
 - When `hold_ms` (clamped to `min_hold_ms`..`max_hold_ms`) passes with SURBs left, the exit sends one
   empty part with `Expired` and releases the rest.
-- A request with `close` and no SURBs ends the tunnel.
+- A request with `close` and no SURBs ends the tunnel (any seq after 0).
+- The exit takes a seq's data once the upstream has read the previous seq's data. Data on a new seq
+  after the upstream closed, or while the previous write is still unread, ends the tunnel with
+  `UpstreamClosed` and is never written.
 - Closed tunnel IDs are answered with `Expired` until `session_max_secs` after the open, so each tunnel
   ID opens at most one upstream connection.
 
@@ -68,13 +76,16 @@ most 30,656 bytes. Pinned byte vectors for both types are in `crates/nox-core/sr
 On open, before any connection:
 
 - the port is in `tunnel.allowed_ports` (default `[443]`);
-- the host is a DNS name (ASCII, internationalized names as punycode, no IP literal, no trailing dot)
-  and passes `http.allowed_domains`;
+- the host is a DNS name (ASCII, internationalized names as punycode, no trailing dot) and passes
+  `http.allowed_domains`. IP literals are refused, including names whose last label is a number
+  (`134744072`, `8.8.2056`, `0x08080808`), which system resolvers read as IPv4 addresses;
 - the first bytes are one complete TLS `ClientHello` whose server name equals the host, whose ALPN list
-  is exactly `http/1.1`, and which offers no early data and no pre-shared key.
+  is exactly `http/1.1`, and which offers no early data, no pre-shared key and no TLS 1.2 session
+  ticket.
 
 Then the exit resolves the host, checks every address with the same SSRF rules as the HTTP proxy, and
-connects only to those addresses. For the rest of the tunnel every client byte must follow TLS record
+connects only to those addresses, with one `connect_timeout_ms` deadline for both steps. Rejection
+details name the rule, never a resolved address. For the rest of the tunnel every client byte must follow TLS record
 framing (content types 20-23, record versions 0x0301 or 0x0303, lengths up to 16,640).
 
 Rejections carry a `TunnelRejectCodeV1`: `Malformed`, `Disabled`, `PortNotAllowed`, `HostNotAllowed`,
@@ -87,14 +98,19 @@ Rejections carry a `TunnelRejectCodeV1`: `Malformed`, `Disabled`, `PortNotAllowe
 - Turn tunnels on with `[tunnel] enabled = true` ([configuration.md](configuration.md#tunnel-exit-node)).
 - Each open tunnel holds one TCP socket. Keep `max_sessions` well below the process file-descriptor
   limit, with headroom for P2P and HTTP connections.
-- Buffered downstream data is bounded by `max_total_buffered_bytes` across all tunnels (128 MiB by
-  default). Downstream bandwidth per exchange is bounded by the SURBs the client supplies, as on the HTTP
-  proxy path.
+- Downstream data waiting for acknowledgement is kept within `max_total_buffered_bytes` across all
+  tunnels (128 MiB by default). When that is reached, the longest-idle tunnels holding bytes close to
+  make room, and each tunnel with an exchange in flight keeps reading up to its fair share (the limit
+  divided by the open tunnels, at least one part). Downstream bandwidth per exchange is bounded by the
+  SURBs the client supplies, as on the HTTP proxy path.
+- Upstream data waiting to be written is at most one client write (`max_write_bytes`) per tunnel.
+- Once the upstream closes, a tunnel closes after `closed_linger_ms` without a client request.
 - `http.allowed_domains` applies to the TLS server name. Hosts behind a shared CDN front are reached as
   the CDN routes them.
 - Opens are rate-limited exit-wide (`opens_per_sec`, `opens_burst`). When `max_sessions` is reached the
-  longest-idle tunnel with nothing in flight is closed to make room; clients move to another tunnel exit
-  on `SessionLimit` or `RateLimited`.
+  longest-idle tunnel with nothing in flight is closed to make room, or else the tunnel whose upstream
+  has been silent longest, past `stall_evict_ms`; clients move to another tunnel exit on `SessionLimit`
+  or `RateLimited`.
 
 ### Metrics
 
