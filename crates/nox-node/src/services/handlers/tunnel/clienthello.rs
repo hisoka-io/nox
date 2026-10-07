@@ -7,6 +7,7 @@ const RECORD_HANDSHAKE: u8 = 22;
 const HANDSHAKE_CLIENT_HELLO: u8 = 1;
 const EXT_SERVER_NAME: u16 = 0;
 const EXT_ALPN: u16 = 16;
+const EXT_SESSION_TICKET: u16 = 35;
 const EXT_PRE_SHARED_KEY: u16 = 41;
 const EXT_EARLY_DATA: u16 = 42;
 const SNI_HOST_NAME: u8 = 0;
@@ -40,6 +41,8 @@ pub enum ClientHelloError {
     EarlyData,
     #[error("ClientHello offers a pre-shared key")]
     PreSharedKey,
+    #[error("ClientHello offers a session ticket")]
+    SessionTicket,
 }
 
 impl ClientHelloError {
@@ -56,11 +59,12 @@ struct Summary {
     alpn: Option<Vec<Vec<u8>>>,
     offers_psk: bool,
     offers_early_data: bool,
+    offers_ticket: bool,
 }
 
 /// Accepts `data` when it starts with a complete `ClientHello` whose server name equals
 /// `host` (ASCII case-insensitive), whose ALPN list is exactly `http/1.1`, and which offers
-/// neither early data nor a pre-shared key.
+/// no early data, no pre-shared key and no TLS 1.2 session ticket.
 pub fn check_client_hello(data: &[u8], host: &str) -> Result<(), ClientHelloError> {
     let summary = parse(data)?;
     let server_name = summary.server_name.ok_or(ClientHelloError::MissingSni)?;
@@ -76,6 +80,9 @@ pub fn check_client_hello(data: &[u8], host: &str) -> Result<(), ClientHelloErro
     }
     if summary.offers_psk {
         return Err(ClientHelloError::PreSharedKey);
+    }
+    if summary.offers_ticket {
+        return Err(ClientHelloError::SessionTicket);
     }
     Ok(())
 }
@@ -214,6 +221,7 @@ fn parse_body(body: &[u8]) -> Result<Summary, ClientHelloError> {
             EXT_ALPN => summary.alpn = Some(parse_alpn(data)?),
             EXT_PRE_SHARED_KEY => summary.offers_psk = true,
             EXT_EARLY_DATA => summary.offers_early_data = true,
+            EXT_SESSION_TICKET => summary.offers_ticket |= !data.is_empty(),
             _ => {}
         }
     }
@@ -252,8 +260,8 @@ fn parse_alpn(data: &[u8]) -> Result<Vec<Vec<u8>>, ClientHelloError> {
 mod tests {
     use super::*;
 
-    /// A `ClientHello` from the worker's TLS client (rustls, ring, ALPN http/1.1, resumption
-    /// off) for the server name `rpc.example`.
+    /// The worker's `ClientHello` for `rpc.example`: the output of
+    /// `cargo run -p nox-tls --example client_hello` in hisoka-io/nox-sdk (rustls 0.23.45).
     const WORKER_CLIENT_HELLO: &str = include_str!("worker_client_hello.hex");
     const WORKER_HOST: &str = "rpc.example";
 
@@ -394,6 +402,26 @@ mod tests {
                 ]),
                 WORKER_HOST,
                 Err(ClientHelloError::PreSharedKey),
+            ),
+            (
+                "empty session ticket extension",
+                hello_with(&[
+                    good[0].clone(),
+                    good[1].clone(),
+                    (EXT_SESSION_TICKET, Vec::new()),
+                ]),
+                WORKER_HOST,
+                Ok(()),
+            ),
+            (
+                "session ticket",
+                hello_with(&[
+                    good[0].clone(),
+                    good[1].clone(),
+                    (EXT_SESSION_TICKET, vec![0; 16]),
+                ]),
+                WORKER_HOST,
+                Err(ClientHelloError::SessionTicket),
             ),
             (
                 "plaintext HTTP",
