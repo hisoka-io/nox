@@ -17,8 +17,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
   timeout.
 - nox-kps no longer resets a stream twice when the browser and the server close it at the same time (vendored
   webrtc-sctp). Chrome reuses the stream identifier for the next call, and the late second reset closed that new
-  call's channel: in the `scripts/bench/kps-latency` bench at 1.5% loss, 5 to 9 of every 48 connections died within 20
-  calls before the fix and 0 of 96 with it.
+  call's channel: in the `scripts/bench/kps-latency` bench at 1.5% loss, 5 to 9 of every 48 connections died
+  within 20 calls before the fix and 0 of 96 with it.
 
 ## [0.4.0-rc.8] - 2026-10-06
 
