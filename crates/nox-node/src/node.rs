@@ -495,6 +495,13 @@ impl NoxNode {
                 response_packer.clone(),
                 bus_publisher.clone(),
             ));
+            let tunnel_handler = Self::tunnel_handler(
+                &config,
+                &metrics_service,
+                response_packer.clone(),
+                bus_publisher.clone(),
+                shutdown_token.clone(),
+            );
 
             let exit_service = if has_rpc {
                 let rpc_handler = crate::services::handlers::rpc::RpcHandler::new_simulation(
@@ -524,6 +531,7 @@ impl NoxNode {
             };
 
             let exit_service = exit_service
+                .with_tunnel_handler(tunnel_handler)
                 .with_worker_config(config.exit_workers.clone())
                 .with_pending_replenishments(pending_map)
                 .with_surb_accumulator(surb_acc)
@@ -641,6 +649,13 @@ impl NoxNode {
                 response_packer.clone(),
                 bus_publisher.clone(),
             ));
+            let tunnel_handler = Self::tunnel_handler(
+                &config,
+                &metrics_service,
+                response_packer.clone(),
+                bus_publisher.clone(),
+                shutdown_token.clone(),
+            );
             let rpc_handler = Arc::new(
                 crate::services::handlers::rpc::RpcHandler::new(
                     executor.clone(),
@@ -663,6 +678,7 @@ impl NoxNode {
                 metrics_service.clone(),
             )
             .with_publisher(bus_publisher.clone())
+            .with_tunnel_handler(tunnel_handler)
             .with_worker_config(config.exit_workers.clone())
             .with_pending_replenishments(pending_map)
             .with_surb_accumulator(surb_acc)
@@ -841,6 +857,33 @@ impl NoxNode {
         Err(format!(
             "All {} seed URLs failed. Last: {last_error}",
             seed_urls.len()
+        ))
+    }
+
+    /// Tunnel handler for an exit. With `tunnel.enabled` the node advertises `tunnel_v1`;
+    /// otherwise tunnel requests are answered with `Disabled`.
+    fn tunnel_handler(
+        config: &NoxConfig,
+        metrics: &MetricsService,
+        packer: Arc<crate::services::response_packer::ResponsePacker>,
+        publisher: Arc<dyn IEventPublisher>,
+        shutdown: CancellationToken,
+    ) -> Arc<crate::services::handlers::tunnel::TunnelHandler> {
+        if config.tunnel.enabled {
+            metrics.add_capability(nox_core::TUNNEL_V1_CAPABILITY);
+            info!(
+                ports = ?config.tunnel.allowed_ports,
+                max_sessions = config.tunnel.max_sessions,
+                "End-to-end TLS tunnels enabled"
+            );
+        }
+        Arc::new(crate::services::handlers::tunnel::TunnelHandler::new(
+            config.tunnel.clone(),
+            &config.http,
+            packer,
+            publisher,
+            metrics.clone(),
+            shutdown,
         ))
     }
 

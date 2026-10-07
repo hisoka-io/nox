@@ -95,6 +95,11 @@ impl EchoHandler {
                     "Echo handler cannot process ReplenishSurbs requests".into(),
                 ));
             }
+            Ok(ServiceRequest::TunnelV1(_)) => {
+                return Err(ServiceError::ProcessingFailed(
+                    "Echo handler cannot process TunnelV1 requests".into(),
+                ));
+            }
             Err(_) => {
                 debug!(request_id = request_id, "Treating inner as raw echo data");
                 inner.to_vec()

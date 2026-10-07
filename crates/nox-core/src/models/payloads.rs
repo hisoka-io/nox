@@ -263,6 +263,156 @@ pub enum ServiceRequest {
     },
     PaidTransactionV2(PaidTransactionRequestV2),
     PaidQuoteRequestV2(PaidQuoteRequestV2),
+    /// One exchange on an end-to-end TLS tunnel. Exits advertise [`TUNNEL_V1_CAPABILITY`].
+    TunnelV1(TunnelRequestV1),
+}
+
+/// Capability an exit lists in `/metrics/json` when it accepts [`ServiceRequest::TunnelV1`].
+pub const TUNNEL_V1_CAPABILITY: &str = "tunnel_v1";
+/// Length of the client-chosen tunnel ID.
+pub const TUNNEL_ID_LEN: usize = 16;
+/// Most `data` bytes in one [`TunnelReplyV1::Data`] part, sized so a part fits one SURB.
+pub const TUNNEL_PART_MAX_DATA: usize = 30_656;
+/// Most bytes of [`TunnelReplyV1::Rejected`] `detail`.
+pub const TUNNEL_REJECT_DETAIL_MAX: usize = 256;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TunnelRequestV1 {
+    pub tunnel_id: [u8; TUNNEL_ID_LEN],
+    /// 0 opens the tunnel; each new write or close adds one. A copy repeats the seq.
+    pub seq: u32,
+    /// Present exactly when `seq` is 0.
+    pub open: Option<TunnelOpenV1>,
+    /// Contiguous downstream bytes the client holds.
+    pub ack_offset: u64,
+    /// TLS records to write upstream, identical on every copy of one seq.
+    pub data: Vec<u8>,
+    /// Half-close the upstream write side after writing `data`.
+    pub close: bool,
+    /// How long the exit may hold this exchange's SURBs, clamped by the exit.
+    pub hold_ms: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TunnelOpenV1 {
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TunnelReplyV1 {
+    Data {
+        seq: u32,
+        offset: u64,
+        data: Vec<u8>,
+        fin: Option<TunnelFinV1>,
+    },
+    Rejected {
+        seq: u32,
+        code: TunnelRejectCodeV1,
+        retryable: bool,
+        detail: String,
+    },
+}
+
+/// Transport hint on a part. Response completeness comes from HTTP framing or TLS
+/// `close_notify`, never from `Eof` alone.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TunnelFinV1 {
+    /// The upstream closed and this part reaches its last byte.
+    Eof,
+    /// Bytes are waiting and this was the exchange's last SURB.
+    NeedSurbs,
+    /// The hold deadline passed; the remaining SURBs were dropped.
+    Expired,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TunnelRejectCodeV1 {
+    Malformed,
+    Disabled,
+    PortNotAllowed,
+    HostNotAllowed,
+    NotTls,
+    DestinationBlocked,
+    DnsFailed,
+    ConnectFailed,
+    SessionLimit,
+    RateLimited,
+    UnknownSession,
+    OutOfOrder,
+    ByteLimit,
+    UpstreamClosed,
+    Expired,
+}
+
+impl TunnelRejectCodeV1 {
+    /// Whether the client may retry the same open on this or another exit.
+    #[must_use]
+    pub const fn retryable(self) -> bool {
+        matches!(
+            self,
+            Self::DnsFailed | Self::ConnectFailed | Self::SessionLimit | Self::RateLimited
+        )
+    }
+
+    /// Metric label for the code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Malformed => "malformed",
+            Self::Disabled => "disabled",
+            Self::PortNotAllowed => "port_not_allowed",
+            Self::HostNotAllowed => "host_not_allowed",
+            Self::NotTls => "not_tls",
+            Self::DestinationBlocked => "destination_blocked",
+            Self::DnsFailed => "dns_failed",
+            Self::ConnectFailed => "connect_failed",
+            Self::SessionLimit => "session_limit",
+            Self::RateLimited => "rate_limited",
+            Self::UnknownSession => "unknown_session",
+            Self::OutOfOrder => "out_of_order",
+            Self::ByteLimit => "byte_limit",
+            Self::UpstreamClosed => "upstream_closed",
+            Self::Expired => "expired",
+        }
+    }
+
+    pub const ALL: [Self; 15] = [
+        Self::Malformed,
+        Self::Disabled,
+        Self::PortNotAllowed,
+        Self::HostNotAllowed,
+        Self::NotTls,
+        Self::DestinationBlocked,
+        Self::DnsFailed,
+        Self::ConnectFailed,
+        Self::SessionLimit,
+        Self::RateLimited,
+        Self::UnknownSession,
+        Self::OutOfOrder,
+        Self::ByteLimit,
+        Self::UpstreamClosed,
+        Self::Expired,
+    ];
+}
+
+impl TunnelReplyV1 {
+    /// A rejection whose `detail` is cut to [`TUNNEL_REJECT_DETAIL_MAX`] bytes on a char
+    /// boundary.
+    #[must_use]
+    pub fn rejected(seq: u32, code: TunnelRejectCodeV1, detail: &str) -> Self {
+        let mut end = detail.len().min(TUNNEL_REJECT_DETAIL_MAX);
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        Self::Rejected {
+            seq,
+            code,
+            retryable: code.retryable(),
+            detail: detail[..end].to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -532,6 +682,133 @@ mod tests {
         quote.push(0xff);
         assert!(decode_payload::<ServiceRequest>(&quote).is_err());
         assert!(decode_payload_limited::<ServiceRequest>(&quote, 1_024).is_err());
+    }
+
+    fn tunnel_id() -> [u8; TUNNEL_ID_LEN] {
+        std::array::from_fn(|i| i as u8)
+    }
+
+    #[test]
+    fn tunnel_requests_have_pinned_wire_vectors() {
+        let open = ServiceRequest::TunnelV1(TunnelRequestV1 {
+            tunnel_id: tunnel_id(),
+            seq: 0,
+            open: Some(TunnelOpenV1 {
+                host: "rpc.example".to_string(),
+                port: 443,
+            }),
+            ack_offset: 0,
+            data: vec![0x16, 0x03, 0x01, 0x00, 0x02, 0x01, 0x00],
+            close: false,
+            hold_ms: 20_000,
+        });
+        let close = ServiceRequest::TunnelV1(TunnelRequestV1 {
+            tunnel_id: tunnel_id(),
+            seq: 3,
+            open: None,
+            ack_offset: 5_123,
+            data: Vec::new(),
+            close: true,
+            hold_ms: 20_000,
+        });
+        for (request, expected) in [
+            (
+                &open,
+                "0108000000000102030405060708090a0b0c0d0e0f00000000010b000000000000007270632e6578616d706c65bb01000000000000000007000000000000001603010002010000204e0000",
+            ),
+            (
+                &close,
+                "0108000000000102030405060708090a0b0c0d0e0f03000000000314000000000000000000000000000001204e0000",
+            ),
+        ] {
+            let encoded = encode_payload(request).unwrap();
+            assert_eq!(hex::encode(&encoded), expected);
+            assert_eq!(&encoded[1..5], 8_u32.to_le_bytes().as_slice());
+            let decoded: ServiceRequest = decode_payload(&encoded).unwrap();
+            assert!(matches!(
+                (decoded, request),
+                (ServiceRequest::TunnelV1(a), ServiceRequest::TunnelV1(b)) if a == *b
+            ));
+        }
+    }
+
+    #[test]
+    fn tunnel_replies_have_pinned_wire_vectors() {
+        for (reply, expected) in [
+            (
+                TunnelReplyV1::Data {
+                    seq: 1,
+                    offset: 4_096,
+                    data: vec![0x17, 0x03, 0x03, 0x00, 0x01, 0x55],
+                    fin: Some(TunnelFinV1::Eof),
+                },
+                "010000000001000000001000000000000006000000000000001703030001550100000000",
+            ),
+            (
+                TunnelReplyV1::Data {
+                    seq: 2,
+                    offset: 0,
+                    data: vec![0x16, 0x03, 0x03, 0x00, 0x02],
+                    fin: None,
+                },
+                "01000000000200000000000000000000000500000000000000160303000200",
+            ),
+            (
+                TunnelReplyV1::rejected(0, TunnelRejectCodeV1::DestinationBlocked, "blocked"),
+                "01010000000000000005000000000700000000000000626c6f636b6564",
+            ),
+        ] {
+            let encoded = encode_payload(&reply).unwrap();
+            assert_eq!(hex::encode(&encoded), expected);
+            assert_eq!(decode_payload::<TunnelReplyV1>(&encoded).unwrap(), reply);
+        }
+    }
+
+    #[test]
+    fn tunnel_reply_decoding_rejects_trailing_bytes_and_unknown_indices() {
+        let mut encoded = encode_payload(&TunnelReplyV1::Data {
+            seq: 2,
+            offset: 0,
+            data: vec![1],
+            fin: None,
+        })
+        .unwrap();
+        encoded.push(0);
+        assert!(decode_payload::<TunnelReplyV1>(&encoded).is_err());
+
+        let unknown_variant = hex::decode("0102000000").unwrap();
+        assert!(decode_payload::<TunnelReplyV1>(&unknown_variant).is_err());
+
+        let mut unknown_fin = encode_payload(&TunnelReplyV1::Data {
+            seq: 1,
+            offset: 0,
+            data: Vec::new(),
+            fin: Some(TunnelFinV1::Eof),
+        })
+        .unwrap();
+        let fin_index = unknown_fin.len() - 4;
+        unknown_fin[fin_index] = 3;
+        assert!(decode_payload::<TunnelReplyV1>(&unknown_fin).is_err());
+
+        let mut unknown_code =
+            encode_payload(&TunnelReplyV1::rejected(0, TunnelRejectCodeV1::Expired, "")).unwrap();
+        unknown_code[9] = 15;
+        assert!(decode_payload::<TunnelReplyV1>(&unknown_code).is_err());
+        unknown_code[9] = 14;
+        assert!(decode_payload::<TunnelReplyV1>(&unknown_code).is_ok());
+    }
+
+    #[test]
+    fn tunnel_reject_detail_is_cut_on_a_char_boundary() {
+        let detail = "é".repeat(TUNNEL_REJECT_DETAIL_MAX);
+        let TunnelReplyV1::Rejected {
+            detail, retryable, ..
+        } = TunnelReplyV1::rejected(0, TunnelRejectCodeV1::RateLimited, &detail)
+        else {
+            panic!("expected a rejection");
+        };
+        assert_eq!(detail.len(), TUNNEL_REJECT_DETAIL_MAX);
+        assert!(retryable);
     }
 
     #[test]
