@@ -7,18 +7,21 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ### Fixed
 
-- Large replies no longer lose fragments at the next hop (NOX-180). A node keeps at most
+- Large replies arrive whole at the next hop (NOX-180). A node keeps at most
   `network.max_packets_in_flight_per_peer` (48) packet requests open to each peer and holds the rest in order
-  (`max_queued_packets_per_peer`, 512), instead of opening one stream per fragment at once; a receiver drops the
-  streams above its `max_concurrent_streams`. That default rises from 100 to 256 for bursts from older nodes.
-  New metrics: `nox_p2p_outbound_queued`, `nox_p2p_outbound_queue_depth`, `nox_p2p_outbound_dropped{reason}`.
+  (`max_queued_packets_per_peer`, 512), where it used to open one stream per fragment at once while a receiver
+  serves at most `max_concurrent_streams` of them. That default rises from 100 to 256 for bursts from older
+  nodes. New metrics: `nox_p2p_outbound_queued`, `nox_p2p_outbound_queue_depth`,
+  `nox_p2p_outbound_dropped{reason}` (packet requests only).
 - nox-kps times SCTP chunks with a monotonic clock (vendored webrtc-sctp). A step back of the system clock while
   data was in flight made the association reject every later SACK, and the connection stalled until its idle
   timeout.
-- nox-kps no longer resets a stream twice when the browser and the server close it at the same time (vendored
-  webrtc-sctp). Chrome reuses the stream identifier for the next call, and the late second reset closed that new
-  call's channel: in the `scripts/bench/kps-latency` bench at 1.5% loss, 5 to 9 of every 48 connections died
-  within 20 calls before the fix and 0 of 96 with it.
+- nox-kps answers a stream reset with a single reset when the browser and the server close a stream at the same
+  time (vendored webrtc-sctp). Chrome reuses the stream identifier for the next call, and a late second reset
+  closed that new call's channel: in the `scripts/bench/kps-latency` bench at 1.5% loss, 5 to 9 of every 48
+  connections died within 20 calls before the fix and 0 of 96 with it.
+- nox-kps parses SCTP INIT parameters, SHUTDOWN chunks and ABORT and ERROR causes within each chunk's own length
+  (vendored webrtc-sctp).
 
 ## [0.4.0-rc.8] - 2026-10-06
 
