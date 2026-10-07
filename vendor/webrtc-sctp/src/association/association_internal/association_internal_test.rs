@@ -1,5 +1,5 @@
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Shutdown, SocketAddr};
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -228,6 +228,55 @@ async fn test_sack_with_send_time_ahead_of_now() -> Result<()> {
     .await?;
     assert_eq!(a.cumulative_tsn_ack_point, 13);
     assert_eq!(a.inflight_queue.len(), 0);
+
+    Ok(())
+}
+
+/// nox: the peer's reset of a stream is answered with this side's own reset
+/// only when this side has not queued one already.
+#[tokio::test]
+async fn test_peer_reset_answered_with_one_outgoing_reset() -> Result<()> {
+    let mut a = create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        name: "server".to_owned(),
+        local_port: 5000,
+        remote_port: 5000,
+    });
+    a.set_state(AssociationState::Established);
+    let closed_here = a.create_stream(2, false).expect("stream 2");
+    a.create_stream(4, false).expect("stream 4");
+    closed_here.shutdown(Shutdown::Both).await?;
+
+    let mut reply = vec![];
+    for (rsn, si) in [(100, 2), (101, 4)] {
+        let request = ParamOutgoingResetRequest {
+            reconfig_request_sequence_number: rsn,
+            sender_last_tsn: a.peer_last_tsn,
+            stream_identifiers: vec![si],
+            ..Default::default()
+        };
+        a.reset_streams_if_any(&request, true, &mut reply)?;
+    }
+
+    let mut reset_streams = vec![];
+    for packet in &reply {
+        for chunk in &packet.chunks {
+            let Some(c) = chunk.as_any().downcast_ref::<ChunkReconfig>() else {
+                continue;
+            };
+            if let Some(r) = c
+                .param_a
+                .as_ref()
+                .and_then(|p| p.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+            {
+                reset_streams.extend(r.stream_identifiers.iter().copied());
+            }
+        }
+    }
+    assert_eq!(reset_streams, vec![4], "stream 2 was already reset by this side");
+    assert!(a.streams.is_empty());
 
     Ok(())
 }

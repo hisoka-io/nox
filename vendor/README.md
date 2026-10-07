@@ -46,6 +46,14 @@ association stalled until the connection's idle timeout. A clock step of a
 few tens of milliseconds while a chunk is in flight is enough; NTP steps, VM
 time sync and WSL hosts all produce them.
 
+When the peer resets a stream (RFC 6525) whose outgoing direction this side
+has already reset, the answer carries no second reset of the same stream.
+Chrome reuses a data channel identifier as soon as its own reset is answered;
+upstream's second reset, or a retransmission of it after a loss, then reached
+Chrome after the reuse and closed the new channel. nox-kps closes its side of
+every stream after the reply, so on a lossy path about one connection in
+eight died this way within 20 calls.
+
 ## webrtc-ice 0.14.0
 
 Base: crates.io `webrtc-ice` 0.14.0, the version webrtc 0.14 resolves.

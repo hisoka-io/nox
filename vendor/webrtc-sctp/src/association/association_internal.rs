@@ -2025,7 +2025,12 @@ impl AssociationInternal {
             for id in &p.stream_identifiers {
                 if let Some(s) = self.streams.get(id) {
                     let stream_identifier = s.stream_identifier;
-                    if respond {
+                    // nox: a stream whose outgoing reset this side already
+                    // queued is not reset a second time. The peer may reuse
+                    // the identifier once its own reset is answered, and a
+                    // second reset that arrives after that (or its
+                    // retransmission) closes the peer's new stream.
+                    if respond && !s.reset_requested.load(Ordering::SeqCst) {
                         sis_to_reset.push(*id);
                     }
                     self.unregister_stream(stream_identifier);
