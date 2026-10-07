@@ -38,6 +38,16 @@ The numbers behind each setting come from `scripts/bench/kps-latency`
 (headless Chromium, 274 ms RTT, with and without 1.5% loss and a 20 Mbit/s
 bottleneck with a 32 KiB queue).
 
+Chunk parsing: `Packet::unmarshal` hands each chunk the rest of the packet, so
+every parser reads only up to its own chunk length.
+
+| Chunk | Change | Where |
+|---|---|---|
+| FORWARD-TSN | stream entries end at the chunk length | `chunk/chunk_forward_tsn.rs` |
+| INIT, INIT ACK | optional parameters end at the chunk length | `chunk/chunk_init.rs` |
+| SHUTDOWN | size checked against the chunk length | `chunk/chunk_shutdown.rs` |
+| ABORT, ERROR | error causes end at the chunk length | `chunk/chunk_abort.rs`, `chunk/chunk_error.rs` |
+
 ## webrtc-ice 0.14.0
 
 Base: crates.io `webrtc-ice` 0.14.0, the version webrtc 0.14 resolves.
