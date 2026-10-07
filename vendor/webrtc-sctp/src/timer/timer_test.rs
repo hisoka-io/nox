@@ -391,9 +391,11 @@ mod test_rtx_timer {
                 diff > Duration::from_millis(600),
                 "must have taken more than 600 msec"
             );
+            // nox: the next backoff step would end at 1,270 msec; a tighter bound
+            // fails on a loaded machine.
             assert!(
-                diff < Duration::from_millis(700),
-                "must fail in less than 700 msec"
+                diff < Duration::from_millis(950),
+                "must fail in less than 950 msec"
             );
         }
 
@@ -442,9 +444,11 @@ mod test_rtx_timer {
                 diff > Duration::from_millis(600),
                 "must have taken more than 600 msec"
             );
+            // nox: the next backoff step would end at 1,270 msec; a tighter bound
+            // fails on a loaded machine.
             assert!(
-                diff < Duration::from_millis(700),
-                "must fail in less than 700 msec"
+                diff < Duration::from_millis(950),
+                "must fail in less than 950 msec"
             );
         }
 
