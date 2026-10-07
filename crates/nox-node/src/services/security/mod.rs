@@ -69,6 +69,11 @@ pub fn is_ip_allowed(ip: IpAddr, allow_private: bool) -> Result<(), SsrfError> {
                         reason: format!("CGNAT IPv4 {ip} blocked"),
                     });
                 }
+                if let Some(range) = reserved_ipv4_range(octets) {
+                    return Err(SsrfError::Blocked {
+                        reason: format!("{range} IPv4 {ip} blocked"),
+                    });
+                }
             }
             IpAddr::V6(ipv6) => {
                 if ipv6.is_multicast() {
@@ -87,11 +92,60 @@ pub fn is_ip_allowed(ip: IpAddr, allow_private: bool) -> Result<(), SsrfError> {
                         reason: format!("IPv6 link-local {ip} blocked"),
                     });
                 }
+                if let Some(embedded) = embedded_ipv4(segments) {
+                    return is_ip_allowed(IpAddr::V4(embedded), allow_private);
+                }
+                if let Some(range) = reserved_ipv6_range(segments) {
+                    return Err(SsrfError::Blocked {
+                        reason: format!("{range} IPv6 {ip} blocked"),
+                    });
+                }
             }
         }
     }
 
     Ok(())
+}
+
+/// Non-routable IPv4 ranges not covered by the std predicates.
+fn reserved_ipv4_range(octets: [u8; 4]) -> Option<&'static str> {
+    match octets {
+        [0, ..] => Some("this-network (0.0.0.0/8)"),
+        [224..=239, ..] => Some("multicast"),
+        [240..=255, ..] => Some("reserved (240.0.0.0/4)"),
+        [192, 0, 0, _] => Some("IETF protocol assignment (192.0.0.0/24)"),
+        [198, 18 | 19, ..] => Some("benchmarking (198.18.0.0/15)"),
+        _ => None,
+    }
+}
+
+/// The IPv4 address carried by a NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`) or 6to4 (`2002::/16`)
+/// address. Those prefixes reach whatever IPv4 address they embed.
+fn embedded_ipv4(segments: [u16; 8]) -> Option<std::net::Ipv4Addr> {
+    let from_pair = |high: u16, low: u16| {
+        let [a, b] = high.to_be_bytes();
+        let [c, d] = low.to_be_bytes();
+        std::net::Ipv4Addr::new(a, b, c, d)
+    };
+    match segments {
+        [0x0064, 0xff9b, 0, 0, 0, 0, high, low] | [0x0064, 0xff9b, 0x0001, _, _, _, high, low] => {
+            Some(from_pair(high, low))
+        }
+        [0x2002, high, low, ..] => Some(from_pair(high, low)),
+        _ => None,
+    }
+}
+
+/// Non-routable or tunnelling IPv6 ranges not covered by the std predicates.
+fn reserved_ipv6_range(segments: [u16; 8]) -> Option<&'static str> {
+    match segments {
+        [0, 0, 0, 0, 0, 0, _, _] => Some("IPv4-compatible (::/96)"),
+        [0x0064, 0xff9b, ..] => Some("NAT64"),
+        [0x2001, 0x0db8, ..] => Some("documentation (2001:db8::/32)"),
+        [0x2001, 0x0000, ..] => Some("Teredo (2001::/32)"),
+        [0x0100, 0, 0, 0, ..] => Some("discard-only (100::/64)"),
+        _ => None,
+    }
 }
 
 /// Every address `hostname` resolves to, deduplicated and sorted. The caller
@@ -263,6 +317,50 @@ mod tests {
         // Just outside the range -- should be allowed
         assert!(is_ip_allowed(IpAddr::V4(Ipv4Addr::new(100, 128, 0, 0)), false).is_ok());
         assert!(is_ip_allowed(IpAddr::V4(Ipv4Addr::new(100, 63, 255, 255)), false).is_ok());
+    }
+
+    #[test]
+    fn reserved_and_translated_ranges_are_blocked() {
+        let blocked = [
+            "0.1.2.3",
+            "224.0.0.1",
+            "239.255.255.255",
+            "240.0.0.1",
+            "255.255.255.255",
+            "192.0.0.8",
+            "198.18.0.1",
+            "198.19.255.255",
+            "::1.2.3.4",
+            "64:ff9b::a00:1",
+            "64:ff9b:1::a00:1",
+            "2002:a00:1::",
+            "2001::1",
+            "2001:db8::1",
+            "100::1",
+            "ff02::1",
+        ];
+        for address in blocked {
+            let ip: IpAddr = address.parse().expect("valid test address");
+            assert!(
+                is_ip_allowed(ip, false).is_err(),
+                "{address} must be blocked"
+            );
+        }
+        for address in [
+            "198.20.0.1",
+            "223.255.255.255",
+            "192.0.1.1",
+            "2001:4860::8888",
+            "2600::1",
+            "64:ff9b::808:808",
+            "2002:808:808::",
+        ] {
+            let ip: IpAddr = address.parse().expect("valid test address");
+            assert!(
+                is_ip_allowed(ip, false).is_ok(),
+                "{address} must be allowed"
+            );
+        }
     }
 
     #[test]

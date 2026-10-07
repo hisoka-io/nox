@@ -5,6 +5,13 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+### Changed
+
+- The exit SSRF check also blocks 0.0.0.0/8, 224.0.0.0/4, 240.0.0.0/4, 192.0.0.0/24, 198.18.0.0/15,
+  ::/96, 2001::/32, 2001:db8::/32 and 100::/64, and checks the IPv4 address inside NAT64
+  (64:ff9b::/96, 64:ff9b:1::/48) and 6to4 (2002::/16) addresses, on the HTTP, RPC and broadcast proxy
+  paths.
+
 ## [0.4.0-rc.8] - 2026-10-06
 
 ### Upgrade notes
