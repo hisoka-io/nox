@@ -1346,10 +1346,7 @@ impl AssociationInternal {
                     //        chunk or for a later instance)
                     if c.nsent == 1 && sna32gte(c.tsn, self.min_tsn2measure_rtt) {
                         self.min_tsn2measure_rtt = self.my_next_tsn;
-                        let rtt = match SystemTime::now().duration_since(c.since) {
-                            Ok(rtt) => rtt,
-                            Err(_) => return Err(Error::ErrInvalidSystemTime),
-                        };
+                        let rtt = c.since.elapsed();
                         let srtt = self.rto_mgr.set_new_rtt(rtt.as_millis() as u64);
                         log::trace!(
                             "[{}] SACK: measured-rtt={} srtt={} new-rto={}",
@@ -1403,10 +1400,7 @@ impl AssociationInternal {
 
                         if c.nsent == 1 {
                             self.min_tsn2measure_rtt = self.my_next_tsn;
-                            let rtt = match SystemTime::now().duration_since(c.since) {
-                                Ok(rtt) => rtt,
-                                Err(_) => return Err(Error::ErrInvalidSystemTime),
-                            };
+                            let rtt = c.since.elapsed();
                             let srtt = self.rto_mgr.set_new_rtt(rtt.as_millis() as u64);
                             log::trace!(
                                 "[{}] SACK: measured-rtt={} srtt={} new-rto={}",
@@ -2101,7 +2095,7 @@ impl AssociationInternal {
             // Assign TSN
             c.tsn = self.generate_next_tsn();
 
-            c.since = SystemTime::now(); // use to calculate RTT and also for maxPacketLifeTime
+            c.since = Instant::now(); // use to calculate RTT and also for maxPacketLifeTime
             c.nsent = 1; // being sent for the first time
 
             self.check_partial_reliability_status(&c);
@@ -2263,17 +2257,16 @@ impl AssociationInternal {
                     );
                 }
             } else if reliability_type == ReliabilityType::Timed {
-                if let Ok(elapsed) = SystemTime::now().duration_since(c.since) {
-                    if elapsed.as_millis() as u32 >= reliability_value {
-                        c.set_abandoned(true);
-                        log::trace!(
-                            "[{}] marked as abandoned: tsn={} ppi={} (timed: {:?})",
-                            self.name,
-                            c.tsn,
-                            c.payload_type,
-                            elapsed
-                        );
-                    }
+                let elapsed = c.since.elapsed();
+                if elapsed.as_millis() as u32 >= reliability_value {
+                    c.set_abandoned(true);
+                    log::trace!(
+                        "[{}] marked as abandoned: tsn={} ppi={} (timed: {:?})",
+                        self.name,
+                        c.tsn,
+                        c.payload_type,
+                        elapsed
+                    );
                 }
             }
         } else {

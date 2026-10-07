@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::Instant;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use portable_atomic::AtomicBool;
@@ -110,7 +110,11 @@ pub struct ChunkPayloadData {
     pub(crate) miss_indicator: u32,
 
     /// Partial-reliability parameters used only by sender
-    pub(crate) since: SystemTime,
+    ///
+    /// nox: monotonic. With the wall clock, a step back while the chunk was
+    /// in flight failed the RTT sample after the chunk had already left the
+    /// inflight queue, and every later SACK was rejected.
+    pub(crate) since: Instant,
     /// number of transmission made for this chunk
     pub(crate) nsent: u32,
 
@@ -138,7 +142,7 @@ impl Default for ChunkPayloadData {
             user_data: Bytes::new(),
             acked: false,
             miss_indicator: 0,
-            since: SystemTime::now(),
+            since: Instant::now(),
             nsent: 0,
             abandoned: Arc::new(AtomicBool::new(false)),
             all_inflight: Arc::new(AtomicBool::new(false)),
@@ -217,7 +221,7 @@ impl Chunk for ChunkPayloadData {
             user_data,
             acked: false,
             miss_indicator: 0,
-            since: SystemTime::now(),
+            since: Instant::now(),
             nsent: 0,
             abandoned: Arc::new(AtomicBool::new(false)),
             all_inflight: Arc::new(AtomicBool::new(false)),

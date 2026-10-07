@@ -1,7 +1,9 @@
 use std::io;
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 use super::*;
+use crate::chunk::chunk_selective_ack::GapAckBlock;
 
 type Result<T> = std::result::Result<T, util::Error>;
 
@@ -170,6 +172,62 @@ fn test_create_forward_tsn_forward_two_abandoned_with_the_same_si() -> Result<()
     }
     assert!(si1ok, "si=1 should be present");
     assert!(si2ok, "si=2 should be present");
+
+    Ok(())
+}
+
+/// nox: a SACK for chunks whose send time is later than now, as after a
+/// step back of the wall clock, still advances the cumulative TSN ack point
+/// and pops every acked chunk. With wall-clock send times the RTT sample
+/// failed after the first chunk had been popped, and each later SACK then
+/// failed on the missing chunk.
+#[tokio::test]
+async fn test_sack_with_send_time_ahead_of_now() -> Result<()> {
+    let mut a = create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        name: "client".to_owned(),
+        local_port: 5000,
+        remote_port: 5000,
+    });
+    a.set_state(AssociationState::Established);
+    a.cumulative_tsn_ack_point = 9;
+    a.min_tsn2measure_rtt = 10;
+    let ahead = Instant::now() + Duration::from_secs(60);
+    for tsn in 10..=13 {
+        a.inflight_queue.push_no_check(ChunkPayloadData {
+            beginning_fragment: true,
+            ending_fragment: true,
+            tsn,
+            stream_identifier: 1,
+            user_data: Bytes::from_static(b"ABC"),
+            nsent: 1,
+            since: ahead,
+            ..Default::default()
+        });
+    }
+
+    // TSN 10 and 11 cumulatively, 13 in a gap block.
+    a.handle_sack(&ChunkSelectiveAck {
+        cumulative_tsn_ack: 11,
+        advertised_receiver_window_credit: 65536,
+        gap_ack_blocks: vec![GapAckBlock { start: 2, end: 2 }],
+        duplicate_tsn: vec![],
+    })
+    .await?;
+    assert_eq!(a.cumulative_tsn_ack_point, 11);
+    assert_eq!(a.inflight_queue.len(), 2);
+
+    a.handle_sack(&ChunkSelectiveAck {
+        cumulative_tsn_ack: 13,
+        advertised_receiver_window_credit: 65536,
+        gap_ack_blocks: vec![],
+        duplicate_tsn: vec![],
+    })
+    .await?;
+    assert_eq!(a.cumulative_tsn_ack_point, 13);
+    assert_eq!(a.inflight_queue.len(), 0);
 
     Ok(())
 }

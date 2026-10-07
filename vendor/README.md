@@ -38,6 +38,14 @@ The numbers behind each setting come from `scripts/bench/kps-latency`
 (headless Chromium, 274 ms RTT, with and without 1.5% loss and a 20 Mbit/s
 bottleneck with a 32 KiB queue).
 
+Send times of DATA chunks (RTT samples, timed partial reliability) use a
+monotonic clock instead of the wall clock. Upstream, an RTT sample taken after
+the system clock stepped back failed the whole SACK after the acked chunk had
+already left the inflight queue, so every later SACK was rejected and the
+association stalled until the connection's idle timeout. A clock step of a
+few tens of milliseconds while a chunk is in flight is enough; NTP steps, VM
+time sync and WSL hosts all produce them.
+
 ## webrtc-ice 0.14.0
 
 Base: crates.io `webrtc-ice` 0.14.0, the version webrtc 0.14 resolves.
