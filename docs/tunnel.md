@@ -20,8 +20,8 @@ type works as before.
 | | Response content |
 | | The sender |
 
-The exit can neither read nor change the content. A client detects a cut-short response from HTTP
-framing or the TLS `close_notify`, never from the exit's end-of-stream marker alone.
+Content stays confidential and tamper-evident end to end. The client confirms a response is complete
+from HTTP framing or the TLS `close_notify`; the exit's end-of-stream marker is a transport hint.
 
 ## Wire format
 
@@ -49,7 +49,8 @@ most 30,656 bytes. Pinned byte vectors for both types are in `crates/nox-core/sr
 ### Exchanges
 
 - Seq 0 opens the tunnel and carries the TLS `ClientHello`. Each later seq carries the next client
-  records; a copy of a seq (for more SURBs, or after a loss) is never written upstream twice.
+  records. The exit writes each seq upstream exactly once; a copy (for more SURBs, or after a loss)
+  only brings fresh SURBs and an updated `ack_offset`.
 - Downstream bytes are numbered from 0 for the life of the tunnel. The exit keeps them from the
   client's `ack_offset` on, up to `max_window_bytes`, and pauses reading the upstream when that window
   or the exit-wide budget is full.
@@ -59,8 +60,8 @@ most 30,656 bytes. Pinned byte vectors for both types are in `crates/nox-core/sr
 - When `hold_ms` (clamped to `min_hold_ms`..`max_hold_ms`) passes with SURBs left, the exit sends one
   empty part with `Expired` and releases the rest.
 - A request with `close` and no SURBs ends the tunnel.
-- Closed tunnel IDs are answered with `Expired` until `session_max_secs` after the open, so a replayed
-  open never reaches the upstream twice.
+- Closed tunnel IDs are answered with `Expired` until `session_max_secs` after the open, so each tunnel
+  ID opens at most one upstream connection.
 
 ## Checks at the exit
 
@@ -109,5 +110,5 @@ Prometheus (`/metrics`):
 | `nox_tunnel_closes_total` | `reason`: `eof`, `client`, `idle`, `lifetime`, `evicted`, `byte_limit`, `not_tls`, `upstream` |
 
 `/metrics/json` adds `tunnelSessionsActive`, `tunnelOpened`, `tunnelOpenRejected` and `tunnelClosed`.
-No metric or log line above `debug` names a host, address or tunnel; debug lines name a tunnel by the
-first 4 bytes of its ID and never include relayed bytes.
+Metrics and log lines above `debug` carry counts only. Debug lines name a tunnel by the first 4 bytes
+of its ID and leave relayed bytes out.
