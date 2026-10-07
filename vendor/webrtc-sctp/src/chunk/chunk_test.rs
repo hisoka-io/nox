@@ -766,3 +766,69 @@ fn test_select_ack_chunk_followed_by_a_payload_data_chunk() -> Result<()> {
     );
     Ok(())
 }
+
+///////////////////////////////////////////////////////////////////
+//chunk length bounds
+///////////////////////////////////////////////////////////////////
+use super::chunk_cookie_ack::ChunkCookieAck;
+
+/// An SCTP packet carrying `chunks`, with a valid checksum.
+fn packet_with_checksum(chunks: &[u8]) -> Bytes {
+    let mut raw = BytesMut::new();
+    raw.extend_from_slice(&[0x13, 0x88, 0x13, 0x88, 0x00, 0x00, 0x00, 0x01, 0, 0, 0, 0]);
+    raw.extend_from_slice(chunks);
+    let raw = raw.freeze();
+    let checksum = crate::util::generate_packet_checksum(&raw);
+    let mut raw = BytesMut::from(&raw[..]);
+    raw[8..12].copy_from_slice(&checksum.to_le_bytes());
+    raw.freeze()
+}
+
+const COOKIE_ACK: &[u8] = &[0x0b, 0x00, 0x00, 0x04];
+
+#[test]
+fn test_init_unaligned_last_param_followed_by_a_chunk() -> Result<()> {
+    // INIT whose last parameter (RANDOM, 1 byte of value) has a length that is
+    // not a multiple of 4, then the chunk padding and another chunk. Parsing
+    // must stop at the INIT's own length.
+    let init: &[u8] = &[
+        0x01, 0x00, 0x00, 0x19, // INIT, length 25
+        0x00, 0x00, 0x00, 0x01, // initiate tag
+        0x00, 0x01, 0x00, 0x00, // a_rwnd
+        0x00, 0x01, 0x00, 0x01, // streams
+        0x00, 0x00, 0x00, 0x01, // initial TSN
+        0x80, 0x02, 0x00, 0x05, 0xaa, // RANDOM, length 5
+        0x00, 0x00, 0x00, // chunk padding
+    ];
+    let raw_pkt = packet_with_checksum(&[init, COOKIE_ACK].concat());
+
+    let pkt = Packet::unmarshal(&raw_pkt)?;
+    assert_eq!(pkt.chunks.len(), 2);
+    let c = pkt.chunks[0]
+        .as_any()
+        .downcast_ref::<ChunkInit>()
+        .expect("first chunk is INIT");
+    assert_eq!(c.params.len(), 1);
+    assert!(pkt.chunks[1]
+        .as_any()
+        .downcast_ref::<ChunkCookieAck>()
+        .is_some());
+
+    Ok(())
+}
+
+#[test]
+fn test_init_ignores_bytes_after_the_chunk() -> Result<()> {
+    // INIT with no parameters followed by another chunk.
+    let init: &[u8] = &[
+        0x01, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x01,
+    ];
+    let bundled = Bytes::from([init, COOKIE_ACK].concat());
+
+    let actual = ChunkInit::unmarshal(&bundled)?;
+    assert!(actual.params.is_empty());
+    assert_eq!(actual.marshal()?, Bytes::from_static(init));
+
+    Ok(())
+}
