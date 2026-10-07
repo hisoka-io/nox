@@ -40,6 +40,7 @@ pub struct OutboundWindow<I, M> {
 impl<I: Hash + Eq, M> OutboundWindow<I, M> {
     /// `limit` open requests per peer (at least 1), `queue_limit` packets
     /// held per peer beyond those.
+    #[must_use]
     pub fn new(limit: usize, queue_limit: usize) -> Self {
         Self {
             limit: limit.max(1),
@@ -89,6 +90,7 @@ impl<I: Hash + Eq, M> OutboundWindow<I, M> {
     }
 
     /// Packets held across all peers.
+    #[must_use]
     pub fn queued(&self) -> usize {
         self.peers.values().map(|s| s.queued.len()).sum()
     }
