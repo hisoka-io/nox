@@ -787,3 +787,108 @@ async fn tunnels_that_never_acknowledge_cannot_stall_a_fresh_one() {
         "the longest-idle hoarder was closed to free the buffer"
     );
 }
+
+/// A plain TCP upstream on 127.0.0.1 that reads the ClientHello, sends `greeting`, then resets
+/// the connection once `reset` is notified.
+async fn resetting_upstream(greeting: &'static [u8], reset: Arc<tokio::sync::Notify>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("address").port();
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buffer = [0_u8; 4096];
+        let _ = stream.read(&mut buffer).await;
+        let _ = stream.write_all(greeting).await;
+        reset.notified().await;
+        let _ = stream.set_linger(Some(Duration::ZERO));
+    });
+    port
+}
+
+fn end_of_stream(reply: &TunnelReplyV1) -> u32 {
+    match reply {
+        TunnelReplyV1::Data {
+            seq,
+            fin: Some(TunnelFinV1::Eof),
+            ..
+        } => *seq,
+        _ => panic!("expected the end of the stream, got {reply:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_reset_after_the_write_was_read_ends_the_stream() {
+    let ca = start_upstream(1).await.ca;
+    let reset = Arc::new(tokio::sync::Notify::new());
+    reset.notify_one();
+    let port = resetting_upstream(b"", reset).await;
+    let mut exit = start_exit(tunnel_config(port), true);
+    let mut client = Client::new(&ca, HOST);
+    let hello = client.tls_out();
+    let (request, surbs) = client.request(Some(port), hello, 1);
+    exit.handler.handle(request, surbs);
+    assert_eq!(end_of_stream(&client.reply(&mut exit).await), 0);
+    wait_until("the tunnel closes", || exit.handler.sessions() == 0).await;
+}
+
+#[tokio::test]
+async fn a_reset_before_the_seq_was_written_is_refused_unwritten() {
+    let ca = start_upstream(1).await.ca;
+    let reset = Arc::new(tokio::sync::Notify::new());
+    const GREETING: &[u8] = &[22, 3, 3, 0, 4, 2, 0, 0, 0];
+    let port = resetting_upstream(GREETING, reset.clone()).await;
+    let mut exit = start_exit(tunnel_config(port), true);
+    let mut client = Client::new(&ca, HOST);
+    let hello = client.tls_out();
+    let (request, surbs) = client.request(Some(port), hello, 2);
+    exit.handler.handle(request, surbs);
+    let greeting = client.reply(&mut exit).await;
+    assert!(
+        matches!(greeting, TunnelReplyV1::Data { seq: 0, .. }),
+        "{greeting:?}"
+    );
+    // Seq 1 writes nothing and acknowledges the greeting, so the exit holds no bytes once it
+    // applied it.
+    client.seq = 1;
+    let (mut request, surbs) = client.request(None, Vec::new(), 1);
+    request.ack_offset = GREETING.len() as u64;
+    exit.handler.handle(request, surbs);
+    wait_until("the exit applies seq 1", || {
+        exit.handler.buffered_bytes() == 0
+    })
+    .await;
+    reset.notify_one();
+    let reply = client.reply(&mut exit).await;
+    assert!(
+        matches!(
+            reply,
+            TunnelReplyV1::Rejected {
+                seq: 1,
+                code: TunnelRejectCodeV1::UpstreamClosed,
+                ..
+            }
+        ),
+        "{reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn lifetime_end_after_a_partial_write_ends_the_stream() {
+    let ca = start_upstream(1).await.ca;
+    let port = raw_upstream(b"", false).await;
+    let config = TunnelConfig {
+        session_max_secs: 1,
+        ..tunnel_config(port)
+    };
+    let mut exit = start_exit(config, true);
+    let mut client = Client::new(&ca, HOST);
+    let hello = client.tls_out();
+    let (request, surbs) = client.request(Some(port), hello, 1);
+    exit.handler.handle(request, surbs);
+    client.seq = 1;
+    let (request, surbs) = client.request(None, records(4_000_000), 1);
+    exit.handler.handle(request, surbs);
+    assert_eq!(end_of_stream(&client.reply(&mut exit).await), 1);
+    wait_until("the tunnel closes", || exit.handler.sessions() == 0).await;
+}

@@ -185,6 +185,15 @@ impl<S> Window<S> {
         self.eof = true;
     }
 
+    /// Ends the stream where it stands: unsent bytes beyond what the SURBs held can carry are
+    /// dropped, so the parts still to send end with `Eof`.
+    pub fn truncate(&mut self) {
+        let carried = self.surbs.len().saturating_mul(TUNNEL_PART_MAX_DATA);
+        let keep = (self.cursor - self.base) as usize + self.unsent().min(carried);
+        self.buffer.truncate(keep);
+        self.eof = true;
+    }
+
     fn ready(&self, now: Instant, flush: FlushPolicy) -> bool {
         self.unsent() >= TUNNEL_PART_MAX_DATA
             || self.eof
@@ -417,6 +426,27 @@ mod tests {
         let expired = idle.expire(now + HOLD).expect("hold deadline");
         assert_eq!(data_of(&expired), (0, 0, Some(TunnelFinV1::Expired)));
         assert!(!idle.in_flight());
+    }
+
+    #[test]
+    fn truncate_ends_the_stream_on_the_surbs_held() {
+        let now = Instant::now();
+        let mut window = Window::new(32);
+        window.accept(exchange(0, 0, 0..2), now).ok();
+        window.push_upstream(&vec![3; TUNNEL_PART_MAX_DATA * 3], now);
+        window.truncate();
+        let first = window.next_part(now, FLUSH).expect("part");
+        assert_eq!(data_of(&first), (0, TUNNEL_PART_MAX_DATA, None));
+        let last = window.next_part(now, FLUSH).expect("end of stream");
+        assert_eq!(
+            data_of(&last),
+            (
+                TUNNEL_PART_MAX_DATA as u64,
+                TUNNEL_PART_MAX_DATA,
+                Some(TunnelFinV1::Eof)
+            )
+        );
+        assert!(window.drained() && window.next_part(now, FLUSH).is_none());
     }
 
     #[test]

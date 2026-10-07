@@ -692,6 +692,10 @@ struct SessionState {
     held: usize,
     /// When the upstream connection was seen closed.
     closed_since: Option<Instant>,
+    /// Some byte of the current seq's data reached the upstream.
+    seq_written: bool,
+    /// Parts that end the tunnel's last exchange, sent once the tunnel is gone.
+    closing_parts: Vec<Part<Surb>>,
     /// Rejection sent once the tunnel is gone, so a client that reacts to it finds the slot
     /// free.
     closing_reply: Option<(Option<Surb>, u32, TunnelError)>,
@@ -740,6 +744,8 @@ impl Session {
             last_request: Instant::now(),
             held: 0,
             closed_since: None,
+            seq_written: false,
+            closing_parts: Vec::new(),
             closing_reply: None,
         };
         let reason = match self.on_exchange(first, &mut state, &mut upstream) {
@@ -752,6 +758,9 @@ impl Session {
         debug!(tunnel = %ShortId(&self.id), reason = ?reason, "Tunnel closed");
         self.release(&mut state);
         self.finish(Some(reason));
+        for part in std::mem::take(&mut state.closing_parts) {
+            self.send_part(&mut state, &part);
+        }
         if let Some((surb, seq, error)) = state.closing_reply.take() {
             self.shared.reject(surb.as_ref(), seq, &error);
         }
@@ -867,13 +876,14 @@ impl Session {
                     match written {
                         Ok(n) if n > 0 => {
                             upstream.written += n;
+                            state.seq_written = true;
                             if upstream.written == upstream.pending.len() {
                                 upstream.pending.clear();
                                 upstream.written = 0;
                             }
                         }
                         Ok(_) | Err(_) => {
-                            self.end_with(state, TunnelRejectCodeV1::UpstreamClosed, "upstream stopped accepting data");
+                            self.end_upstream(state, TunnelRejectCodeV1::UpstreamClosed, "upstream stopped accepting data");
                             return CloseReason::Upstream;
                         }
                     }
@@ -897,7 +907,7 @@ impl Session {
                         }
                         Err(e) => {
                             debug!(tunnel = %ShortId(&self.id), error = %e, "Tunnel upstream read failed");
-                            self.end_with(state, TunnelRejectCodeV1::UpstreamClosed, "upstream connection reset");
+                            self.end_upstream(state, TunnelRejectCodeV1::UpstreamClosed, "upstream connection reset");
                             return CloseReason::Upstream;
                         }
                     }
@@ -908,7 +918,7 @@ impl Session {
                     return if state.window.drained() { CloseReason::Eof } else { CloseReason::Idle };
                 }
                 () = sleep_until(lifetime_end) => {
-                    self.end_with(state, TunnelRejectCodeV1::Expired, "tunnel lifetime reached");
+                    self.end_upstream(state, TunnelRejectCodeV1::Expired, "tunnel lifetime reached");
                     return CloseReason::Lifetime;
                 }
             }
@@ -950,6 +960,7 @@ impl Session {
             }
             Ok(Accepted::Write { data, close }) => {
                 self.shared.count_exchange("write");
+                state.seq_written = false;
                 if teardown {
                     return Some(CloseReason::Client);
                 }
@@ -1054,6 +1065,22 @@ impl Session {
         let seq = state.window.seq().unwrap_or_default();
         let surb = state.window.take_surb();
         state.closing_reply = Some((surb, seq, TunnelError::new(code, detail)));
+    }
+
+    /// Ends the tunnel while the upstream connection is gone or closing. A rejection tells the
+    /// client the current seq was never written, so it may send it again elsewhere; once any
+    /// of its bytes reached the upstream, the exchange ends with `Eof` instead.
+    fn end_upstream(&self, state: &mut SessionState, code: TunnelRejectCodeV1, detail: &str) {
+        if !state.seq_written {
+            self.end_with(state, code, detail);
+            return;
+        }
+        state.window.truncate();
+        let now = Instant::now();
+        let flush = self.shared.flush_policy();
+        while let Some(part) = state.window.next_part(now, flush) {
+            state.closing_parts.push(part);
+        }
     }
 
     /// Mirrors this tunnel's held bytes into the exit-wide total.
