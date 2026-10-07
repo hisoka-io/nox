@@ -582,3 +582,208 @@ async fn limits_evict_idle_tunnels_and_release_slots() {
         TunnelRejectCodeV1::Expired
     );
 }
+
+/// Polls `done` until it holds or `REPLY_TIMEOUT` passes.
+async fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + REPLY_TIMEOUT;
+    while !done() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// TLS application-data records of `total` bytes with arbitrary contents.
+fn records(total: usize) -> Vec<u8> {
+    const RECORD: usize = 16 * 1024;
+    let mut out = Vec::with_capacity(total + total / RECORD * 5 + 5);
+    let mut left = total;
+    while left > 0 {
+        let length = left.min(RECORD);
+        out.extend_from_slice(&[23, 3, 3]);
+        out.extend_from_slice(&(length as u16).to_be_bytes());
+        out.extend(std::iter::repeat_n(0x5a, length));
+        left -= length;
+    }
+    out
+}
+
+/// A plain TCP upstream on 127.0.0.1. Each connection gets `greeting`, then is held open without
+/// being read (`hang_up` false) or closed after one read (`hang_up` true).
+async fn raw_upstream(greeting: &'static [u8], hang_up: bool) -> u16 {
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket.set_recv_buffer_size(4_096).expect("receive buffer");
+    socket
+        .bind("127.0.0.1:0".parse().expect("address"))
+        .expect("bind");
+    let port = socket.local_addr().expect("address").port();
+    let listener = socket.listen(16).expect("listen");
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((mut stream, _)) = listener.accept().await {
+            if hang_up {
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let _ = stream.write_all(greeting).await;
+            } else {
+                let _ = stream.write_all(greeting).await;
+                held.push(stream);
+            }
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn tunnels_close_soon_after_the_upstream_closes() {
+    let body_len = 40_000;
+    let upstream = start_upstream(body_len).await;
+    let config = TunnelConfig {
+        closed_linger_ms: 200,
+        ..tunnel_config(upstream.port)
+    };
+    let mut exit = start_exit(config, true);
+    let mut client = Client::new(&upstream.ca, HOST);
+    client.handshake(&mut exit, upstream.port).await;
+    client.send_request(&exit, 4);
+    while client.response_body().is_none() {
+        let reply = client.reply(&mut exit).await;
+        client.absorb(&reply);
+    }
+    assert!(exit.handler.sessions() == 1 && exit.handler.buffered_bytes() > 0);
+    // The client neither acknowledges the response nor tears the tunnel down.
+    wait_until("the tunnel closes and frees its window", || {
+        exit.handler.sessions() == 0 && exit.handler.buffered_bytes() == 0
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_write_waits_for_the_upstream_to_read_the_previous_one() {
+    let ca = start_upstream(1).await.ca;
+    let port = raw_upstream(b"", false).await;
+    let mut exit = start_exit(tunnel_config(port), true);
+    let mut client = Client::new(&ca, HOST);
+    let hello = client.tls_out();
+    let (request, surbs) = client.request(Some(port), hello, 1);
+    exit.handler.handle(request, surbs);
+
+    for (seq, length) in [(1, 4_000_000), (2, 100)] {
+        client.seq = seq;
+        let (request, surbs) = client.request(None, records(length), 1);
+        exit.handler.handle(request, surbs);
+    }
+    let reply = client.reply(&mut exit).await;
+    assert!(
+        matches!(
+            reply,
+            TunnelReplyV1::Rejected {
+                seq: 2,
+                code: TunnelRejectCodeV1::UpstreamClosed,
+                ..
+            }
+        ),
+        "{reply:?}"
+    );
+    wait_until("the tunnel closes", || exit.handler.sessions() == 0).await;
+}
+
+#[tokio::test]
+async fn a_write_after_the_upstream_closed_is_refused_unwritten() {
+    let ca = start_upstream(1).await.ca;
+    let port = raw_upstream(&[22, 3, 3, 0, 4, 2, 0, 0, 0], true).await;
+    let mut exit = start_exit(tunnel_config(port), true);
+    let mut client = Client::new(&ca, HOST);
+    let hello = client.tls_out();
+    let (request, surbs) = client.request(Some(port), hello, 2);
+    exit.handler.handle(request, surbs);
+    loop {
+        if let TunnelReplyV1::Data {
+            fin: Some(TunnelFinV1::Eof),
+            ..
+        } = client.reply(&mut exit).await
+        {
+            break;
+        }
+    }
+    client.seq = 1;
+    let (request, surbs) = client.request(None, records(100), 1);
+    exit.handler.handle(request, surbs);
+    assert_eq!(
+        rejection(&client.reply(&mut exit).await),
+        TunnelRejectCodeV1::UpstreamClosed
+    );
+    wait_until("the tunnel closes", || exit.handler.sessions() == 0).await;
+}
+
+#[tokio::test]
+async fn a_tunnel_whose_upstream_stalls_makes_room_for_an_open() {
+    let upstream = start_upstream(10).await;
+    let config = TunnelConfig {
+        max_sessions: 1,
+        stall_evict_ms: 200,
+        ..tunnel_config(upstream.port)
+    };
+    let mut exit = start_exit(config, true);
+    let mut stalled = Client::new(&upstream.ca, HOST);
+    stalled.handshake(&mut exit, upstream.port).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let mut next = Client::new(&upstream.ca, HOST);
+    next.handshake(&mut exit, upstream.port).await;
+    stalled.seq += 1;
+    let (request, surbs) = stalled.request(None, Vec::new(), 1);
+    exit.handler.handle(request, surbs);
+    assert_eq!(
+        rejection(&stalled.reply(&mut exit).await),
+        TunnelRejectCodeV1::Expired
+    );
+}
+
+#[tokio::test]
+async fn tunnels_that_never_acknowledge_cannot_stall_a_fresh_one() {
+    let body_len = 512 * 1024;
+    let upstream = start_upstream(body_len).await;
+    let max_window = 64 * 1024;
+    let config = TunnelConfig {
+        max_surbs_per_exchange: 2,
+        max_window_bytes: max_window,
+        max_total_buffered_bytes: 2 * max_window,
+        ..tunnel_config(upstream.port)
+    };
+    let mut exit = start_exit(config, true);
+    let mut hoarders = Vec::new();
+    for filled in 1..=2 {
+        let mut hoarder = Client::new(&upstream.ca, HOST);
+        hoarder.handshake(&mut exit, upstream.port).await;
+        hoarder.send_request(&exit, 1);
+        wait_until("a hoarder fills its window", || {
+            exit.handler.buffered_bytes() == filled * max_window
+        })
+        .await;
+        hoarders.push(hoarder);
+    }
+
+    let mut fresh = Client::new(&upstream.ca, HOST);
+    fresh.handshake(&mut exit, upstream.port).await;
+    let request = fresh.send_request(&exit, 2);
+    while fresh.response_body().is_none() {
+        let reply = fresh.reply(&mut exit).await;
+        if let Some(TunnelFinV1::NeedSurbs | TunnelFinV1::Expired) = fresh.absorb(&reply) {
+            fresh.copy(&exit, request.clone(), 2);
+        }
+    }
+    assert_eq!(
+        fresh.response_body(),
+        Some(expected_body(body_len).as_slice())
+    );
+
+    let hoarder = &mut hoarders[0];
+    hoarder.seq += 1;
+    let (request, surbs) = hoarder.request(None, Vec::new(), 1);
+    exit.handler.handle(request, surbs);
+    assert_eq!(
+        rejection(&hoarder.reply(&mut exit).await),
+        TunnelRejectCodeV1::Expired,
+        "the longest-idle hoarder was closed to free the buffer"
+    );
+}

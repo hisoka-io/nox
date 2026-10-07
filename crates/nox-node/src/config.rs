@@ -684,13 +684,14 @@ pub struct TunnelConfig {
     /// Upstream ports a tunnel may connect to.
     pub allowed_ports: Vec<u16>,
     /// Open tunnels across the exit. When full, the longest-idle tunnel with no exchange in
-    /// flight is closed to make room. Each tunnel holds one socket.
+    /// flight is closed to make room, or else the tunnel whose upstream has been silent longest,
+    /// past `stall_evict_ms`. Each tunnel holds one socket.
     pub max_sessions: usize,
     /// Sustained tunnel opens per second across the exit.
     pub opens_per_sec: u32,
     /// Tunnel opens allowed in a burst above the sustained rate.
     pub opens_burst: u32,
-    /// Time to connect to the upstream, shared across its resolved addresses.
+    /// Time for the DNS lookup and the connect together, across all resolved addresses.
     pub connect_timeout_ms: u64,
     /// Lower bound for the client's `hold_ms`.
     pub min_hold_ms: u32,
@@ -702,6 +703,12 @@ pub struct TunnelConfig {
     pub flush_max_ms: u64,
     /// A tunnel with no client request for this long is closed.
     pub session_idle_secs: u64,
+    /// A tunnel whose upstream closed is closed after this long without a client request,
+    /// which leaves time for copies that fetch the last parts or resend lost ones.
+    pub closed_linger_ms: u64,
+    /// When the exit needs room, a tunnel holding SURBs may be closed once its upstream has sent
+    /// nothing for this long.
+    pub stall_evict_ms: u64,
     /// A tunnel is closed this long after it opened. Closed tunnel IDs are refused for
     /// the same time.
     pub session_max_secs: u64,
@@ -709,7 +716,8 @@ pub struct TunnelConfig {
     pub max_session_bytes: u64,
     /// Downstream bytes a tunnel keeps from the client's acknowledged offset on.
     pub max_window_bytes: usize,
-    /// Downstream bytes kept across all tunnels.
+    /// Downstream bytes kept across all tunnels. When reached, idle tunnels holding bytes are
+    /// closed, and each tunnel with an exchange in flight may still hold a fair share.
     pub max_total_buffered_bytes: usize,
     /// Largest `data` in one request.
     pub max_write_bytes: usize,
@@ -733,6 +741,8 @@ impl Default for TunnelConfig {
             flush_idle_ms: 3,
             flush_max_ms: 25,
             session_idle_secs: 60,
+            closed_linger_ms: 15_000,
+            stall_evict_ms: 10_000,
             session_max_secs: 600,
             max_session_bytes: 64 * 1024 * 1024,
             max_window_bytes: 1024 * 1024,
@@ -756,6 +766,8 @@ impl TunnelConfig {
             ("min_hold_ms", u64::from(self.min_hold_ms)),
             ("flush_idle_ms", self.flush_idle_ms),
             ("session_idle_secs", self.session_idle_secs),
+            ("closed_linger_ms", self.closed_linger_ms),
+            ("stall_evict_ms", self.stall_evict_ms),
             ("max_session_bytes", self.max_session_bytes),
             ("max_write_bytes", self.max_write_bytes as u64),
             ("max_surbs_per_exchange", self.max_surbs_per_exchange as u64),

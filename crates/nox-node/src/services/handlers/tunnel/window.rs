@@ -103,6 +103,11 @@ impl<S> Window<S> {
         !self.surbs.is_empty()
     }
 
+    /// The upstream closed its side of the connection.
+    pub fn upstream_closed(&self) -> bool {
+        self.eof
+    }
+
     /// The upstream closed and its last byte went out with `Eof`.
     pub fn drained(&self) -> bool {
         self.eof && self.fin_sent

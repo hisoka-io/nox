@@ -16,14 +16,16 @@ use nox_core::events::NoxEvent;
 use nox_core::models::payloads::encode_payload;
 use nox_core::models::wire_id::{reply_wire_id, PacketOrigin};
 use nox_core::traits::IEventPublisher;
-use nox_core::{TunnelRejectCodeV1, TunnelReplyV1, TunnelRequestV1, TUNNEL_ID_LEN};
+use nox_core::{
+    TunnelRejectCodeV1, TunnelReplyV1, TunnelRequestV1, TUNNEL_ID_LEN, TUNNEL_PART_MAX_DATA,
+};
 use nox_crypto::sphinx::surb::Surb;
 use parking_lot::Mutex;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -111,13 +113,43 @@ impl OpenBucket {
     }
 }
 
+/// What the table reads of a running tunnel.
+struct Status {
+    /// Connecting, or holding SURBs of an exchange. Written only by the tunnel's task.
+    in_flight: AtomicBool,
+    /// Requests routed to the tunnel that its task has not applied yet.
+    queued: AtomicUsize,
+    /// Downstream bytes held.
+    held: AtomicUsize,
+    /// Last upstream read or the connect, in ms since the handler started.
+    progress_ms: AtomicU64,
+}
+
+impl Status {
+    fn new(now_ms: u64) -> Self {
+        Self {
+            in_flight: AtomicBool::new(true),
+            queued: AtomicUsize::new(1),
+            held: AtomicUsize::new(0),
+            progress_ms: AtomicU64::new(now_ms),
+        }
+    }
+
+    fn busy(&self) -> bool {
+        self.in_flight.load(Ordering::Acquire) || self.queued.load(Ordering::Acquire) > 0
+    }
+
+    fn stalled(&self, now_ms: u64, stall_ms: u64) -> bool {
+        now_ms.saturating_sub(self.progress_ms.load(Ordering::Acquire)) >= stall_ms
+    }
+}
+
 struct SessionEntry {
     host: String,
     port: u16,
     sender: mpsc::Sender<Exchange<Surb>>,
     last_request: Instant,
-    /// Connecting, or holding SURBs of an exchange. Such tunnels are never evicted.
-    busy: Arc<AtomicBool>,
+    status: Arc<Status>,
     cancel: CancellationToken,
 }
 
@@ -141,13 +173,29 @@ impl Table {
         }
     }
 
-    /// The longest-idle tunnel with nothing in flight.
-    fn eviction_candidate(&self) -> Option<TunnelId> {
-        self.sessions
-            .iter()
-            .filter(|(_, entry)| !entry.busy.load(Ordering::Acquire))
-            .min_by_key(|(_, entry)| entry.last_request)
-            .map(|(id, _)| *id)
+    /// A tunnel to close for room, other than `keep` and holding at least `min_held` bytes:
+    /// the longest-idle one with nothing in flight, or else the one whose upstream has been
+    /// silent longest, once that is `stall_ms` or more.
+    fn eviction_candidate(
+        &self,
+        keep: &TunnelId,
+        min_held: usize,
+        now_ms: u64,
+        stall_ms: u64,
+    ) -> Option<TunnelId> {
+        let eligible = self.sessions.iter().filter(|(id, entry)| {
+            *id != keep && entry.status.held.load(Ordering::Acquire) >= min_held
+        });
+        let idle = eligible
+            .clone()
+            .filter(|(_, entry)| !entry.status.busy())
+            .min_by_key(|(_, entry)| entry.last_request);
+        idle.or_else(|| {
+            eligible
+                .filter(|(_, entry)| entry.status.stalled(now_ms, stall_ms))
+                .min_by_key(|(_, entry)| entry.status.progress_ms.load(Ordering::Acquire))
+        })
+        .map(|(id, _)| *id)
     }
 }
 
@@ -161,6 +209,9 @@ struct Shared {
     table: Mutex<Table>,
     /// Downstream bytes held across all tunnels.
     buffered: AtomicUsize,
+    /// Open tunnels, mirrored from the table for the fair-share check.
+    open_sessions: AtomicUsize,
+    started: Instant,
     cancel: CancellationToken,
 }
 
@@ -231,7 +282,56 @@ impl Shared {
     }
 
     fn set_sessions_gauge(&self, sessions: usize) {
+        self.open_sessions.store(sessions, Ordering::Release);
         self.metrics.tunnel_sessions_active.set(sessions as i64);
+    }
+
+    fn millis_since_start(&self, now: Instant) -> u64 {
+        u64::try_from(now.saturating_duration_since(self.started).as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Bytes a tunnel with an exchange in flight may hold while the exit-wide budget is full.
+    fn fair_share(&self) -> usize {
+        let sessions = self.open_sessions.load(Ordering::Acquire).max(1);
+        (self.config.max_total_buffered_bytes / sessions).max(TUNNEL_PART_MAX_DATA)
+    }
+
+    /// Closes `id` to make room; its ID is refused until the tunnel's lifetime would have ended.
+    fn evict(&self, table: &mut Table, id: &TunnelId, now: Instant, why: &str) {
+        if let Some(entry) = table.sessions.remove(id) {
+            entry.cancel.cancel();
+            table
+                .tombstones
+                .insert(*id, now + Duration::from_secs(self.config.session_max_secs));
+            self.count_close("evicted");
+            self.set_sessions_gauge(table.sessions.len());
+            debug!(tunnel = %ShortId(id), why, "Tunnel evicted");
+        }
+    }
+
+    /// While the exit-wide buffer is full, closes tunnels holding bytes until the bytes they
+    /// release bring it back under the limit.
+    fn relieve_buffer(&self, table: &mut Table, keep: &TunnelId, now: Instant) {
+        let limit = self.config.max_total_buffered_bytes;
+        let buffered = self.buffered.load(Ordering::Acquire);
+        if buffered < limit {
+            return;
+        }
+        let mut excess = buffered - limit + 1;
+        let now_ms = self.millis_since_start(now);
+        while excess > 0 {
+            let Some(victim) =
+                table.eviction_candidate(keep, 1, now_ms, self.config.stall_evict_ms)
+            else {
+                return;
+            };
+            let held = table
+                .sessions
+                .get(&victim)
+                .map_or(0, |entry| entry.status.held.load(Ordering::Acquire));
+            self.evict(table, &victim, now, "buffer full");
+            excess = excess.saturating_sub(held);
+        }
     }
 
     /// Removes a tunnel and refuses its ID until `tombstone_until`.
@@ -277,6 +377,8 @@ impl TunnelHandler {
                 metrics,
                 table: Mutex::new(table),
                 buffered: AtomicUsize::new(0),
+                open_sessions: AtomicUsize::new(0),
+                started: now,
                 cancel,
             }),
         }
@@ -307,7 +409,8 @@ impl TunnelHandler {
             );
             return;
         }
-        if surbs.is_empty() && !request.close {
+        // Without SURBs only a teardown is meaningful, and seq 0 has nothing to tear down.
+        if surbs.is_empty() && (!request.close || request.seq == 0) {
             shared.count_exchange("dropped");
             return;
         }
@@ -384,6 +487,7 @@ impl TunnelHandler {
         let shared = &self.shared;
         let mut table = shared.table.lock();
         table.prune(now);
+        shared.relieve_buffer(&mut table, &id, now);
         if table.is_tombstoned(&id, now) {
             return Err((
                 TunnelError::new(TunnelRejectCodeV1::Expired, "tunnel is closed"),
@@ -404,10 +508,9 @@ impl TunnelHandler {
                 ));
             }
             entry.last_request = now;
-            if !exchange.surbs.is_empty() {
-                entry.busy.store(true, Ordering::Release);
-            }
+            entry.status.queued.fetch_add(1, Ordering::AcqRel);
             if entry.sender.try_send(exchange).is_err() {
+                entry.status.queued.fetch_sub(1, Ordering::AcqRel);
                 shared.count_exchange("dropped");
             }
             return Ok(());
@@ -424,22 +527,17 @@ impl TunnelHandler {
                 exchange,
             ));
         }
+        let now_ms = shared.millis_since_start(now);
         if table.sessions.len() >= shared.config.max_sessions {
-            let Some(victim) = table.eviction_candidate() else {
+            let Some(victim) =
+                table.eviction_candidate(&id, 0, now_ms, shared.config.stall_evict_ms)
+            else {
                 return Err((
                     TunnelError::new(TunnelRejectCodeV1::SessionLimit, "all tunnels are busy"),
                     exchange,
                 ));
             };
-            if let Some(entry) = table.sessions.remove(&victim) {
-                entry.cancel.cancel();
-                table.tombstones.insert(
-                    victim,
-                    now + Duration::from_secs(shared.config.session_max_secs),
-                );
-                shared.count_close("evicted");
-                debug!(tunnel = %ShortId(&victim), "Idle tunnel evicted for a new open");
-            }
+            shared.evict(&mut table, &victim, now, "session limit");
         }
 
         let (sender, receiver) = mpsc::channel(shared.config.session_queue);
@@ -453,7 +551,7 @@ impl TunnelHandler {
                 exchange,
             ));
         }
-        let busy = Arc::new(AtomicBool::new(true));
+        let status = Arc::new(Status::new(now_ms));
         let cancel = shared.cancel.child_token();
         table.sessions.insert(
             id,
@@ -462,7 +560,7 @@ impl TunnelHandler {
                 port: open.port,
                 sender,
                 last_request: now,
-                busy: busy.clone(),
+                status: status.clone(),
                 cancel: cancel.clone(),
             },
         );
@@ -475,7 +573,7 @@ impl TunnelHandler {
             host: open.host,
             port: open.port,
             opened: now,
-            busy,
+            status,
             cancel,
         };
         tokio::spawn(session.run(receiver));
@@ -503,10 +601,21 @@ fn check_bounds(config: &TunnelConfig, request: &TunnelRequestV1) -> Result<(), 
     Ok(())
 }
 
-/// A DNS name in ASCII (IDNs as punycode), not an IP literal, without a trailing dot.
+/// A DNS name in ASCII (IDNs as punycode), not an IP literal, without a trailing dot. As in
+/// the WHATWG URL host parser, a name whose last label is a number (`134744072`, `8.8.2056`,
+/// `0x08080808`) counts as an IPv4 address, since the system resolver reads it as one.
 fn check_host(host: &str) -> Result<(), TunnelError> {
     let refuse = |detail: &str| TunnelError::new(TunnelRejectCodeV1::HostNotAllowed, detail);
-    if host.parse::<IpAddr>().is_ok() || host.starts_with('[') {
+    let numeric_last_label = host.rsplit('.').next().is_some_and(|label| {
+        let hex = label
+            .strip_prefix("0x")
+            .or_else(|| label.strip_prefix("0X"));
+        match hex {
+            Some(digits) => digits.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            None => !label.is_empty() && label.bytes().all(|byte| byte.is_ascii_digit()),
+        }
+    });
+    if host.parse::<IpAddr>().is_ok() || host.starts_with('[') || numeric_last_label {
         return Err(refuse("tunnels reach hosts by name, not by IP address"));
     }
     if host.is_empty() || host.len() > MAX_HOST_LEN {
@@ -560,7 +669,7 @@ struct Session {
     host: String,
     port: u16,
     opened: Instant,
-    busy: Arc<AtomicBool>,
+    status: Arc<Status>,
     cancel: CancellationToken,
 }
 
@@ -581,6 +690,8 @@ struct SessionState {
     parts: u64,
     last_request: Instant,
     held: usize,
+    /// When the upstream connection was seen closed.
+    closed_since: Option<Instant>,
     /// Rejection sent once the tunnel is gone, so a client that reacts to it finds the slot
     /// free.
     closing_reply: Option<(Option<Surb>, u32, TunnelError)>,
@@ -610,6 +721,7 @@ impl Session {
             }
         };
         self.shared.count_open("opened");
+        self.mark_progress(Instant::now());
         debug!(tunnel = %ShortId(&self.id), host = %self.host, "Tunnel open");
         let (reader, writer) = stream.into_split();
         let mut upstream = Upstream {
@@ -627,6 +739,7 @@ impl Session {
             parts: 0,
             last_request: Instant::now(),
             held: 0,
+            closed_since: None,
             closing_reply: None,
         };
         let reason = match self.on_exchange(first, &mut state, &mut upstream) {
@@ -644,18 +757,28 @@ impl Session {
         }
     }
 
+    /// DNS lookup and connect share one `connect_timeout_ms` deadline. Rejection details stay
+    /// generic so a client learns nothing about the exit's own network; the cause is logged.
     async fn connect(&self) -> Result<TcpStream, TunnelError> {
         let timeout = Duration::from_millis(self.shared.config.connect_timeout_ms);
-        let addresses = tokio::time::timeout(
-            timeout,
+        let deadline = Instant::now() + timeout;
+        let addresses = tokio::time::timeout_at(
+            deadline,
             security::resolve_hostname_all(&self.host, self.port),
         )
         .await
         .map_err(|_| TunnelError::new(TunnelRejectCodeV1::DnsFailed, "DNS lookup timed out"))?
-        .map_err(|e| TunnelError::new(TunnelRejectCodeV1::DnsFailed, e.to_string()))?;
+        .map_err(|e| {
+            debug!(tunnel = %ShortId(&self.id), error = %e, "Tunnel DNS lookup failed");
+            TunnelError::new(TunnelRejectCodeV1::DnsFailed, "host did not resolve")
+        })?;
         for address in &addresses {
             security::is_ip_allowed(*address, self.shared.allow_private_ips).map_err(|e| {
-                TunnelError::new(TunnelRejectCodeV1::DestinationBlocked, e.to_string())
+                debug!(tunnel = %ShortId(&self.id), error = %e, "Tunnel destination refused");
+                TunnelError::new(
+                    TunnelRejectCodeV1::DestinationBlocked,
+                    "destination address is not allowed",
+                )
             })?;
         }
         let port = self.port;
@@ -669,7 +792,7 @@ impl Session {
             }
             Err(last_error.map_or_else(|| "no address".to_string(), |e| e.to_string()))
         };
-        let stream = tokio::time::timeout(timeout, attempt)
+        let stream = tokio::time::timeout_at(deadline, attempt)
             .await
             .map_err(|_| {
                 TunnelError::new(
@@ -695,6 +818,7 @@ impl Session {
         let flush = self.shared.flush_policy();
         let lifetime_end = self.opened + Duration::from_secs(config.session_max_secs);
         let idle = Duration::from_secs(config.session_idle_secs);
+        let linger = Duration::from_millis(config.closed_linger_ms);
         let mut read_buffer = vec![0_u8; READ_CHUNK];
         loop {
             if upstream.shutdown_after_write
@@ -707,43 +831,38 @@ impl Session {
                 }
             }
             let now = Instant::now();
-            self.send_ready(state, now, !receiver.is_empty());
+            self.send_ready(state, now);
             if state.window.finished() {
                 return CloseReason::Eof;
             }
-            let room = state.window.room(config.max_window_bytes).min(READ_CHUNK);
+            let window_room = state.window.room(config.max_window_bytes).min(READ_CHUNK);
             let budget_full =
                 self.shared.buffered.load(Ordering::Acquire) >= config.max_total_buffered_bytes;
-            let can_read = room > 0 && !budget_full;
+            // While the exit-wide budget is full, an exchange in flight keeps reading up to its
+            // fair share, so tunnels holding unacknowledged bytes cannot stall the others.
+            let room = match (budget_full, state.window.in_flight()) {
+                (false, _) => window_room,
+                (true, true) => {
+                    window_room.min(self.shared.fair_share().saturating_sub(state.held))
+                }
+                (true, false) => 0,
+            };
+            let can_read = room > 0;
             let can_write = upstream.written < upstream.pending.len();
             let deadline = state.window.next_deadline(flush);
-            let idle_end = state.last_request + idle;
+            if state.window.upstream_closed() {
+                state.closed_since.get_or_insert(now);
+            }
+            let idle_end = match state.closed_since {
+                Some(closed) => closed.max(state.last_request) + linger,
+                None => state.last_request + idle,
+            };
 
+            // Writes come before new requests, so a write is refused only while the upstream
+            // is not reading.
             tokio::select! {
+                biased;
                 () = self.cancel.cancelled() => return CloseReason::Cancelled,
-                exchange = receiver.recv() => {
-                    let Some(exchange) = exchange else {
-                        return CloseReason::Cancelled;
-                    };
-                    if let Some(reason) = self.on_exchange(exchange, state, upstream) {
-                        return reason;
-                    }
-                }
-                read = upstream.reader.read(&mut read_buffer[..room]), if can_read => {
-                    match read {
-                        Ok(0) => state.window.mark_eof(),
-                        Ok(n) => {
-                            if let Some(reason) = self.on_upstream(&read_buffer[..n], state) {
-                                return reason;
-                            }
-                        }
-                        Err(e) => {
-                            debug!(tunnel = %ShortId(&self.id), error = %e, "Tunnel upstream read failed");
-                            self.end_with(state, TunnelRejectCodeV1::UpstreamClosed, "upstream connection reset");
-                            return CloseReason::Upstream;
-                        }
-                    }
-                }
                 written = upstream.writer.write(&upstream.pending[upstream.written..]), if can_write => {
                     match written {
                         Ok(n) if n > 0 => {
@@ -759,8 +878,32 @@ impl Session {
                         }
                     }
                 }
+                exchange = receiver.recv() => {
+                    let Some(exchange) = exchange else {
+                        return CloseReason::Cancelled;
+                    };
+                    if let Some(reason) = self.on_exchange(exchange, state, upstream) {
+                        return reason;
+                    }
+                }
+                read = upstream.reader.read(&mut read_buffer[..room]), if can_read => {
+                    self.mark_progress(Instant::now());
+                    match read {
+                        Ok(0) => state.window.mark_eof(),
+                        Ok(n) => {
+                            if let Some(reason) = self.on_upstream(&read_buffer[..n], state) {
+                                return reason;
+                            }
+                        }
+                        Err(e) => {
+                            debug!(tunnel = %ShortId(&self.id), error = %e, "Tunnel upstream read failed");
+                            self.end_with(state, TunnelRejectCodeV1::UpstreamClosed, "upstream connection reset");
+                            return CloseReason::Upstream;
+                        }
+                    }
+                }
                 () = sleep_until(deadline.unwrap_or(lifetime_end)), if deadline.is_some() => {}
-                () = sleep_until(now + BUFFER_FULL_RETRY), if room > 0 && budget_full => {}
+                () = sleep_until(now + BUFFER_FULL_RETRY), if window_room > 0 && !can_read => {}
                 () = sleep_until(idle_end) => {
                     return if state.window.drained() { CloseReason::Eof } else { CloseReason::Idle };
                 }
@@ -785,6 +928,10 @@ impl Session {
         let teardown = exchange.close && exchange.surbs.is_empty();
         let first_surb = exchange.surbs.first().cloned();
         let accepted = state.window.accept(exchange, now);
+        self.status
+            .in_flight
+            .store(state.window.in_flight(), Ordering::Release);
+        self.status.queued.fetch_sub(1, Ordering::AcqRel);
         self.sync_buffered(state);
         match accepted {
             Err(code) => {
@@ -805,6 +952,24 @@ impl Session {
                 self.shared.count_exchange("write");
                 if teardown {
                     return Some(CloseReason::Client);
+                }
+                if !data.is_empty() && state.window.upstream_closed() {
+                    self.end_with(
+                        state,
+                        TunnelRejectCodeV1::UpstreamClosed,
+                        "upstream closed the connection",
+                    );
+                    return Some(CloseReason::Eof);
+                }
+                // One write at a time: a client waits for its exchange before sending the next
+                // seq, so unwritten bytes here mean the upstream is not reading.
+                if !data.is_empty() && !upstream.pending.is_empty() {
+                    self.end_with(
+                        state,
+                        TunnelRejectCodeV1::UpstreamClosed,
+                        "upstream stopped accepting data",
+                    );
+                    return Some(CloseReason::Upstream);
                 }
                 if let Err(e) = state.framer.feed(&data) {
                     debug!(tunnel = %ShortId(&self.id), error = %e, "Tunnel data is not TLS");
@@ -861,17 +1026,18 @@ impl Session {
         None
     }
 
-    /// Sends every part that is due. The busy flag is updated first, so a client acting on
-    /// a final part never finds this tunnel still marked busy.
-    fn send_ready(&self, state: &mut SessionState, now: Instant, queued: bool) {
+    /// Sends every part that is due. The in-flight flag is updated first, so a client acting
+    /// on a final part never finds this tunnel still marked busy.
+    fn send_ready(&self, state: &mut SessionState, now: Instant) {
         let flush = self.shared.flush_policy();
         let mut parts = Vec::new();
         while let Some(part) = state.window.next_part(now, flush) {
             parts.push(part);
         }
         parts.extend(state.window.expire(now));
-        self.busy
-            .store(state.window.in_flight() || queued, Ordering::Release);
+        self.status
+            .in_flight
+            .store(state.window.in_flight(), Ordering::Release);
         for part in &parts {
             self.send_part(state, part);
         }
@@ -903,11 +1069,19 @@ impl Session {
                 .fetch_sub(state.held - now_held, Ordering::AcqRel);
         }
         state.held = now_held;
+        self.status.held.store(now_held, Ordering::Release);
     }
 
     fn release(&self, state: &mut SessionState) {
         self.shared.buffered.fetch_sub(state.held, Ordering::AcqRel);
         state.held = 0;
+        self.status.held.store(0, Ordering::Release);
+    }
+
+    fn mark_progress(&self, now: Instant) {
+        self.status
+            .progress_ms
+            .store(self.shared.millis_since_start(now), Ordering::Release);
     }
 
     fn finish(&self, reason: Option<CloseReason>) {
@@ -963,7 +1137,15 @@ mod tests {
 
     #[test]
     fn hosts_must_be_dns_names() {
-        for host in ["rpc.example", "a-b.c0.example", "xn--bcher-kva.example"] {
+        for host in [
+            "rpc.example",
+            "a-b.c0.example",
+            "xn--bcher-kva.example",
+            "1.example",
+            "0x8.example",
+            "rpc.c0",
+            "rpc.0xg1",
+        ] {
             assert!(check_host(host).is_ok(), "{host}");
         }
         let long_label = format!("{}.example", "a".repeat(MAX_LABEL_LEN + 1));
@@ -977,6 +1159,13 @@ mod tests {
             "rpc_example.org",
             "rpc.example:443",
             "bücher.example",
+            "134744072",
+            "0x08080808",
+            "0X8",
+            "8.8.2056",
+            "2130706433",
+            "rpc.example.0x1f",
+            "rpc.123",
             long_label.as_str(),
         ] {
             assert!(check_host(host).is_err(), "{host}");

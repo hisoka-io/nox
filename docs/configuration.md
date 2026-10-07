@@ -199,17 +199,19 @@ exit relays TLS records between it and one upstream host. Destinations follow
 |---|---|---|
 | `enabled` | `false` | Accept tunnels and advertise `tunnel_v1` |
 | `allowed_ports` | `[443]` | Upstream ports a tunnel may reach |
-| `max_sessions` | `4096` | Open tunnels; when full, the longest-idle tunnel with nothing in flight makes room. Each holds one socket |
+| `max_sessions` | `4096` | Open tunnels; when full, the longest-idle tunnel with nothing in flight makes room, or else the one whose upstream has been silent longest past `stall_evict_ms`. Each holds one socket |
 | `opens_per_sec` / `opens_burst` | 50 / 200 | Token bucket for tunnel opens across the exit |
-| `connect_timeout_ms` | `5000` | DNS lookup, and connecting across the resolved addresses |
+| `connect_timeout_ms` | `5000` | DNS lookup and connect together, across the resolved addresses |
 | `min_hold_ms` / `max_hold_ms` | 1000 / 30000 | Clamp for how long the exit holds an exchange's SURBs |
 | `flush_idle_ms` / `flush_max_ms` | 3 / 25 | A part that is not full goes out after this much upstream silence, or this long after its first byte (`flush_max_ms` at most `max_hold_ms`) |
 | `session_idle_secs` | `60` | A tunnel with no client request for this long closes |
+| `closed_linger_ms` | `15000` | Once the upstream closed, a tunnel with no client request for this long closes (time for copies that fetch the last parts or resend lost ones) |
+| `stall_evict_ms` | `10000` | When the exit needs room, a tunnel holding SURBs may close once its upstream has sent nothing for this long |
 | `session_max_secs` | `600` | A tunnel closes this long after it opened; its ID is refused for the same time (at most 86400) |
 | `max_session_bytes` | `67108864` | Bytes per tunnel, both directions (64 MiB) |
 | `max_window_bytes` | `1048576` | Downstream bytes kept per tunnel until acknowledged; at least `max_surbs_per_exchange` × 30656 |
-| `max_total_buffered_bytes` | `134217728` | Downstream bytes kept across all tunnels (128 MiB); at least `max_window_bytes` |
-| `max_write_bytes` | `4259840` | Largest write in one request |
+| `max_total_buffered_bytes` | `134217728` | Downstream bytes kept across all tunnels (128 MiB); at least `max_window_bytes`. When reached, idle tunnels holding bytes close, and each tunnel with an exchange in flight may still hold a fair share |
+| `max_write_bytes` | `4259840` | Largest write in one request. A tunnel takes its next write once the upstream has read the previous one |
 | `max_surbs_per_exchange` | `32` | SURBs used from one request |
 | `session_queue` | `8` | Requests waiting per tunnel |
 
