@@ -11,12 +11,14 @@ use super::{
     admission::{AdmissionGate, PeerAdmission},
     behaviour::{NoxBehaviour, NoxBehaviourEvent, SphinxPacket, SystemMessage},
     connection_filter::ConnectionFilter,
+    outbound_window::{OutboundWindow, Submit},
     rate_limiter::{PeerRateLimiter, RateLimitResult},
     wire_ids::{choose_wire_id, fresh_wire_id},
 };
 
 use dashmap::DashMap;
 use futures::StreamExt;
+use libp2p::request_response::{self, OutboundFailure, OutboundRequestId};
 use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use libp2p::{identity, noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
 use rand::RngCore;
@@ -109,6 +111,7 @@ pub struct P2PService {
     topology_request_timestamps: Arc<DashMap<PeerId, Instant>>,
     liveness_window_secs: u64,
     wire_ids: crate::config::WireIdMode,
+    outbound: OutboundWindow<OutboundRequestId, SystemMessage>,
     cancel_token: Option<CancellationToken>,
 }
 
@@ -198,6 +201,10 @@ impl P2PService {
             topology_request_timestamps: Arc::new(DashMap::new()),
             liveness_window_secs: config.network.topology_liveness_window_secs,
             wire_ids: config.relayer.wire_ids,
+            outbound: OutboundWindow::new(
+                config.network.max_packets_in_flight_per_peer,
+                config.network.max_queued_packets_per_peer,
+            ),
             cancel_token: None,
         };
 
@@ -228,6 +235,51 @@ impl P2PService {
     pub fn rate_limited_count(&self) -> u64 {
         self.rate_limited_count
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Sends a packet to `peer` now if fewer than the in-flight limit are
+    /// open to it, else holds it (or drops it when the peer's queue is full).
+    fn submit_packet(&mut self, peer: PeerId, message: SystemMessage) {
+        match self.outbound.submit(peer, message) {
+            Submit::Send(message) => self.send_packet(peer, message),
+            Submit::Queued => {
+                self.metrics.p2p_outbound_queued_total.inc();
+            }
+            Submit::Full => {
+                warn!(peer = %peer, "Outbound packet queue full, dropping packet");
+                self.count_outbound_drop("queue_full");
+            }
+        }
+        self.metrics
+            .p2p_outbound_queue_depth
+            .set(i64::try_from(self.outbound.queued()).unwrap_or(i64::MAX));
+    }
+
+    fn send_packet(&mut self, peer: PeerId, message: SystemMessage) {
+        let id = self
+            .swarm
+            .behaviour_mut()
+            .direct_message
+            .send_request(&peer, message);
+        self.outbound.sent(id, peer);
+    }
+
+    /// A packet request was answered or failed: its slot goes to the next
+    /// packet held for the same peer.
+    fn complete_packet(&mut self, id: OutboundRequestId) {
+        if let Some((peer, next)) = self.outbound.complete(&id) {
+            self.send_packet(peer, next);
+        }
+        self.metrics
+            .p2p_outbound_queue_depth
+            .set(i64::try_from(self.outbound.queued()).unwrap_or(i64::MAX));
+    }
+
+    fn count_outbound_drop(&self, reason: &str) {
+        self.metrics
+            .p2p_outbound_dropped_total
+            .get_or_create(&vec![("reason".into(), reason.into())])
+            .inc();
     }
 
     pub async fn run(&mut self) {
@@ -376,12 +428,7 @@ impl P2PService {
                         id: choice.wire_id,
                         data,
                     };
-                    let message = SystemMessage::Packet(sphinx_packet);
-
-                    self.swarm
-                        .behaviour_mut()
-                        .direct_message
-                        .send_request(&peer, message);
+                    self.submit_packet(peer, SystemMessage::Packet(sphinx_packet));
                 } else {
                     warn!(next_hop = %next_hop_peer_id, "Could not resolve PeerID for next hop");
                 }
@@ -756,6 +803,27 @@ impl P2PService {
                         }
                     }
                 }
+            }
+            NoxBehaviourEvent::DirectMessage(request_response::Event::Message {
+                message: request_response::Message::Response { request_id, .. },
+                ..
+            }) => self.complete_packet(request_id),
+            NoxBehaviourEvent::DirectMessage(request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            }) => {
+                let reason = match &error {
+                    OutboundFailure::DialFailure => "dial_failure",
+                    OutboundFailure::Timeout => "timeout",
+                    OutboundFailure::ConnectionClosed => "connection_closed",
+                    OutboundFailure::UnsupportedProtocols => "unsupported_protocols",
+                    OutboundFailure::Io(_) => "io",
+                };
+                debug!(peer = %peer, error = %error, "Outbound packet request failed");
+                self.count_outbound_drop(reason);
+                self.complete_packet(request_id);
             }
             NoxBehaviourEvent::Ping(libp2p::ping::Event { peer, result, .. }) => {
                 match result {
