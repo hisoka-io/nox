@@ -832,3 +832,30 @@ fn test_init_ignores_bytes_after_the_chunk() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_shutdown_with_short_length_followed_by_a_chunk() {
+    // SHUTDOWN whose length leaves no room for the cumulative TSN ack, with
+    // another chunk after it.
+    let shutdown: &[u8] = &[0x07, 0x00, 0x00, 0x04];
+    let raw_pkt = packet_with_checksum(&[shutdown, COOKIE_ACK].concat());
+
+    assert!(Packet::unmarshal(&raw_pkt).is_err());
+    assert!(ChunkShutdown::unmarshal(&Bytes::from([shutdown, COOKIE_ACK].concat())).is_err());
+}
+
+#[test]
+fn test_shutdown_followed_by_a_chunk() -> Result<()> {
+    let shutdown: &[u8] = &[0x07, 0x00, 0x00, 0x08, 0x12, 0x34, 0x56, 0x78];
+    let raw_pkt = packet_with_checksum(&[shutdown, COOKIE_ACK].concat());
+
+    let pkt = Packet::unmarshal(&raw_pkt)?;
+    assert_eq!(pkt.chunks.len(), 2);
+    let c = pkt.chunks[0]
+        .as_any()
+        .downcast_ref::<ChunkShutdown>()
+        .expect("first chunk is SHUTDOWN");
+    assert_eq!(c.cumulative_tsn_ack, 0x12345678);
+
+    Ok(())
+}
