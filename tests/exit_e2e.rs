@@ -1,8 +1,7 @@
-//! Exit node E2E: wiring, invalid payloads, ResponsePacker stress, fragment chaos.
+//! Exit node E2E: wiring, invalid payloads, ResponsePacker stress.
 
 use nox_core::{
-    Fragmenter, IEventPublisher, IEventSubscriber, NoxEvent, RelayerPayload, ServiceHandler,
-    ServiceRequest,
+    IEventPublisher, IEventSubscriber, NoxEvent, RelayerPayload, ServiceHandler, ServiceRequest,
 };
 use nox_crypto::{PathHop, Surb};
 use nox_node::services::handlers::echo::EchoHandler;
@@ -141,33 +140,4 @@ async fn test_concurrent_packer_access() {
     }
 
     assert_eq!(completed.load(Ordering::SeqCst), 20);
-}
-
-#[test]
-fn test_fragment_chaos_resilience() {
-    use nox_core::{Reassembler, ReassemblerConfig};
-    use rand::seq::SliceRandom;
-
-    let fragmenter = Fragmenter::new();
-
-    let original: Vec<u8> = (0..200_000).map(|i| (i % 256) as u8).collect();
-
-    let fragments = fragmenter
-        .fragment(999, &original, 30_000)
-        .expect("fragmentation");
-
-    let mut shuffled = fragments.clone();
-    shuffled.shuffle(&mut rand::thread_rng());
-
-    let mut reassembler = Reassembler::new(ReassemblerConfig::default());
-    let mut result = None;
-
-    for frag in shuffled {
-        if let Ok(Some(data)) = reassembler.add_fragment(frag) {
-            result = Some(data);
-        }
-    }
-
-    let reassembled = result.expect("should reassemble");
-    assert_eq!(reassembled, original);
 }

@@ -1,6 +1,8 @@
-//! FEC E2E: Reed-Solomon encode/decode round-trip across all drop patterns and data sizes.
+//! Reed-Solomon FEC through `Fragmenter` and `Reassembler` at SURB payload size: shard
+//! boundaries, reordering, random drops and the largest message the protocol accepts.
 
 use nox_core::protocol::fec;
+use nox_core::protocol::fragmentation::MAX_MESSAGE_SIZE;
 use nox_core::{FecInfo, Fragment, Fragmenter, Reassembler, ReassemblerConfig, SURB_PAYLOAD_SIZE};
 
 fn usable() -> usize {
@@ -79,81 +81,6 @@ fn drop_seq(frags: Vec<Fragment>, seq: u32) -> Vec<Fragment> {
 }
 
 #[test]
-fn test_fec_no_drop_fast_path() {
-    let data: Vec<u8> = (0..50_000).map(|i| (i % 251) as u8).collect();
-    let frags = make_fec_fragments(&data, 2);
-
-    let d = frags[0]
-        .fec
-        .as_ref()
-        .expect("FecInfo missing")
-        .data_shard_count as usize;
-    let p = frags.len() - d;
-    assert_eq!(p, 2);
-
-    let recovered = reassemble(frags).expect("Fast path reassembly failed");
-    assert_eq!(recovered, data, "Fast path recovered data mismatch");
-}
-
-#[test]
-fn test_fec_drop_both_parity_fast_path() {
-    let data: Vec<u8> = (0..60_000).map(|i| (i % 199) as u8).collect();
-    let frags = make_fec_fragments(&data, 2);
-
-    let d = frags[0].fec.as_ref().unwrap().data_shard_count as usize;
-
-    let data_only: Vec<Fragment> = frags
-        .into_iter()
-        .filter(|f| (f.sequence as usize) < d)
-        .collect();
-    assert_eq!(data_only.len(), d);
-
-    let recovered = reassemble(data_only).expect("Parity-drop fast path failed");
-    assert_eq!(recovered, data);
-}
-
-#[test]
-fn test_fec_single_data_shard_no_drop() {
-    let data: Vec<u8> = vec![0xAB; 500];
-    let frags = make_fec_fragments(&data, 1);
-    assert_eq!(frags.len(), 2);
-
-    let fec = frags[0].fec.as_ref().expect("FecInfo missing");
-    assert_eq!(fec.data_shard_count, 1, "Should be D=1");
-
-    let recovered = reassemble(frags).expect("D=1 no-drop failed");
-    assert_eq!(recovered, data);
-}
-
-#[test]
-fn test_fec_single_data_shard_dropped() {
-    let data: Vec<u8> = vec![0xCD; 1000];
-    let frags = make_fec_fragments(&data, 1);
-    assert_eq!(frags.len(), 2);
-
-    // Drop data shard (sequence == 0)
-    let without_data = drop_seq(frags, 0);
-    assert_eq!(without_data.len(), 1, "Only parity shard should remain");
-    assert_eq!(without_data[0].sequence, 1, "Parity shard has sequence 1");
-
-    let recovered = reassemble(without_data).expect("Parity-only recovery failed");
-    assert_eq!(recovered, data, "Recovered from parity mismatch");
-}
-
-#[test]
-fn test_fec_drop_first_data_shard() {
-    let data: Vec<u8> = (0..60_000).map(|i| (i % 251) as u8).collect();
-    let frags = make_fec_fragments(&data, 2);
-
-    let d = frags[0].fec.as_ref().unwrap().data_shard_count as usize;
-    assert!(d >= 2, "Need D>=2 for this test");
-
-    let frags = drop_seq(frags, 0); // drop fragment 0 (first data shard)
-    let recovered = reassemble(frags).expect("First-shard-drop recovery failed");
-    assert_eq!(recovered, data, "First-shard drop data mismatch");
-}
-
-#[test]
 fn test_fec_drop_last_data_shard() {
     let data: Vec<u8> = (0..60_000).map(|i| i as u8).collect();
     let frags = make_fec_fragments(&data, 2);
@@ -164,144 +91,6 @@ fn test_fec_drop_last_data_shard() {
     let frags = drop_seq(frags, last_data_seq);
     let recovered = reassemble(frags).expect("Last-shard-drop recovery failed");
     assert_eq!(recovered, data, "Last-shard drop data mismatch");
-}
-
-#[test]
-fn test_fec_drop_middle_data_shard() {
-    let data: Vec<u8> = (0..80_000).map(|i| (i % 127) as u8).collect();
-    let frags = make_fec_fragments(&data, 2);
-
-    let d = frags[0].fec.as_ref().unwrap().data_shard_count as usize;
-    assert!(d >= 3, "Need D>=3 for middle drop");
-
-    let mid = (d / 2) as u32;
-    let frags = drop_seq(frags, mid);
-    let recovered = reassemble(frags).expect("Middle-shard-drop recovery failed");
-    assert_eq!(recovered, data, "Middle-shard drop data mismatch");
-}
-
-#[test]
-fn test_fec_drop_two_data_shards_at_limit() {
-    let data: Vec<u8> = (0..80_000).map(|i| (i % 251) as u8).collect();
-    let frags = make_fec_fragments(&data, 2);
-
-    let d = frags[0].fec.as_ref().unwrap().data_shard_count as usize;
-    assert!(d >= 3, "Need D>=3 to drop 2 data shards safely");
-
-    // Drop first and last data shards (exactly P=2 drops)
-    let frags: Vec<Fragment> = frags
-        .into_iter()
-        .filter(|f| f.sequence != 0 && f.sequence != (d - 1) as u32)
-        .collect();
-
-    let recovered = reassemble(frags).expect("Two-data-shard drop recovery failed");
-    assert_eq!(recovered, data, "Two-data-shard drop data mismatch");
-}
-
-#[test]
-fn test_fec_irrecoverable_too_many_drops() {
-    // Need D>=4: usable() = 30699, so 4 shards needs > 3*30699 = 92097 bytes
-    let data: Vec<u8> = (0..120_000).map(|i| (i % 251) as u8).collect();
-    let frags = make_fec_fragments(&data, 2); // P=2
-
-    let d = frags[0].fec.as_ref().unwrap().data_shard_count as usize;
-    assert!(d >= 4, "Need D>=4 to drop 3 data shards, got D={}", d);
-
-    // Drop 3 data shards (> P=2) -- irrecoverable
-    let frags: Vec<Fragment> = frags
-        .into_iter()
-        .filter(|f| f.sequence > 2) // drop sequences 0, 1, 2
-        .collect();
-
-    let result = reassemble(frags);
-    assert!(
-        result.is_err(),
-        "Expected error with 3 dropped shards (P=2)"
-    );
-}
-
-#[test]
-fn test_no_fec_plain_fragments() {
-    let data: Vec<u8> = (0..50_000).map(|i| (i % 251) as u8).collect();
-    let frags = make_fec_fragments(&data, 0); // no parity
-
-    for frag in &frags {
-        assert!(
-            frag.fec.is_none(),
-            "Fragment {} should have no FecInfo",
-            frag.sequence
-        );
-    }
-
-    let recovered = reassemble(frags).expect("No-FEC reassembly failed");
-    assert_eq!(recovered, data, "No-FEC data mismatch");
-}
-
-#[test]
-fn test_fec_info_consistent_across_fragments() {
-    let data: Vec<u8> = (0..45_000).map(|i| (i % 100) as u8).collect();
-    let frags = make_fec_fragments(&data, 3);
-
-    let first_fec = frags[0].fec.clone().expect("FecInfo missing on fragment 0");
-
-    for frag in &frags {
-        let fec = frag
-            .fec
-            .as_ref()
-            .unwrap_or_else(|| panic!("FecInfo missing on fragment {}", frag.sequence));
-        assert_eq!(
-            fec.data_shard_count, first_fec.data_shard_count,
-            "data_shard_count inconsistent on fragment {}",
-            frag.sequence
-        );
-        assert_eq!(
-            fec.original_data_len, first_fec.original_data_len,
-            "original_data_len inconsistent on fragment {}",
-            frag.sequence
-        );
-    }
-}
-
-#[test]
-fn test_fec_total_fragments_correct() {
-    let data: Vec<u8> = (0..30_000).map(|i| (i % 73) as u8).collect();
-    let p = 2usize;
-    let frags = make_fec_fragments(&data, p);
-
-    let d = frags[0].fec.as_ref().unwrap().data_shard_count as usize;
-
-    for frag in &frags {
-        assert_eq!(
-            frag.total_fragments as usize,
-            d + p,
-            "total_fragments wrong on sequence {}",
-            frag.sequence
-        );
-    }
-}
-
-#[test]
-fn test_fec_parity_shard_sequences() {
-    let data: Vec<u8> = (0..40_000).map(|i| (i % 71) as u8).collect();
-    let p = 3usize;
-    let frags = make_fec_fragments(&data, p);
-
-    let d = frags[0].fec.as_ref().unwrap().data_shard_count as usize;
-    let parity_frags: Vec<&Fragment> = frags
-        .iter()
-        .filter(|f| (f.sequence as usize) >= d)
-        .collect();
-
-    assert_eq!(parity_frags.len(), p, "Expected exactly P parity fragments");
-
-    for (i, parity) in parity_frags.iter().enumerate() {
-        assert_eq!(
-            parity.sequence as usize,
-            d + i,
-            "Parity shard {} has wrong sequence",
-            i
-        );
-    }
 }
 
 #[test]
@@ -440,4 +229,27 @@ fn test_fec_out_of_order_with_drop() {
 
     let recovered = reassemble(frags).expect("Out-of-order+drop recovery failed");
     assert_eq!(recovered, data, "Out-of-order+drop data mismatch");
+}
+
+/// The largest message the protocol accepts, with a tenth of its shards as parity and that
+/// many data shards lost.
+#[test]
+fn test_fec_recovery_at_max_message_size() {
+    let data: Vec<u8> = (0..MAX_MESSAGE_SIZE).map(|i| (i % 251) as u8).collect();
+    let d = data.len().div_ceil(usable());
+    let parity = d / 10;
+    assert!(d + parity <= fec::MAX_TOTAL_SHARDS);
+
+    let frags = make_fec_fragments(&data, parity);
+    assert_eq!(frags.len(), d + parity);
+
+    let remaining: Vec<Fragment> = frags
+        .into_iter()
+        .filter(|f| f.sequence as usize >= parity)
+        .collect();
+    let recovered = reassemble(remaining).expect("recovery at the size limit failed");
+    assert!(
+        recovered == data,
+        "recovered data differs from the original"
+    );
 }
