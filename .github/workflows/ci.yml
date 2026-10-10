@@ -144,18 +144,9 @@ jobs:
           version: v1.3.2
       - name: Verify Anvil version
         run: 'anvil --version | grep -F "anvil Version: 1.3.2"'
+      # The root crate's tests/ run in the Integration Tests job.
       - name: Test subcrates
-        run: cargo nextest run --workspace --exclude nox-mixnet --exclude nox-sim --exclude nox-test-infra
-      - name: Test HTTP E2E integration
-        run: cargo test --test http_e2e
-      - name: Test FEC E2E integration
-        run: cargo test --test fec_e2e
-      - name: Test transaction plan
-        run: cargo test --test transaction_plan -- --nocapture
-      - name: Test durable transaction outbox
-        run: cargo test --test transaction_outbox -- --nocapture
-      - name: Test chain model exports
-        run: cargo test -p nox-core --test chain_exports
+        run: cargo nextest run --workspace --exclude nox-mixnet --exclude nox-test-infra
       - name: Test vendored webrtc-sctp
         run: scripts/test-vendored-sctp.sh
       # The nox-kps soaks are #[ignore]d in the default run. Here: 200 sequential
@@ -253,10 +244,10 @@ jobs:
           echo "f3e987dc6ecebd4bd350c48edcbc320b46cf9e3109bd3fc3d88f1acaf4c428f7  /tmp/solc-static-linux" | sha256sum --check --strict
           sudo install -m 0755 /tmp/solc-static-linux /usr/local/bin/solc
           solc --version | grep -F "0.8.30+commit.73712a01"
-      # Every tests/*.rs file of the root crate. Slow suites are #[ignore]d and run nightly
-      # from slow-tests.yml.
+      # Every tests/*.rs file of the root crate except payment_trace_safety, which has its
+      # own required job above.
       - name: Test root integration suites
-        run: cargo nextest run -p nox-mixnet --features dev-node --no-fail-fast
+        run: cargo nextest run -p nox-mixnet --features dev-node --no-fail-fast -E 'not binary(payment_trace_safety)'
 
   container:
     name: Container image
