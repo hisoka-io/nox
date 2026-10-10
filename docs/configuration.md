@@ -86,6 +86,9 @@ configured gas buffer, and set quote and aggregate pending-gas ceilings above th
 | `peer_admission_grace_secs` | `120` | Delay after startup before enforcement, and how long a link to a peer that left the registry is kept |
 | `topology_liveness_window_secs` | `60` | A member is reported online in `/topology` if it answered on P2P within this window |
 | `tcp_nodelay` | `true` | Sets `TCP_NODELAY` on P2P connections, so each Sphinx packet is sent at once instead of waiting on Nagle's algorithm and the peer's delayed ACK |
+| `max_concurrent_streams` | `256` | Inbound packet streams served at once per connection. libp2p drops streams above this without telling the sender; nodes before v0.4.0-rc.9 send a whole reply at once, so this absorbs one reply burst from them |
+| `max_packets_in_flight_per_peer` | `48` | Packet requests kept open to one peer. Later packets wait in order until earlier ones are answered, so a many-fragment reply never exceeds the next hop's stream limit (100 on rc.8 and earlier) |
+| `max_queued_packets_per_peer` | `512` | Packets held per peer while the in-flight limit is reached (16 MiB of Sphinx packets); more are dropped and counted in `nox_p2p_outbound_dropped{reason="queue_full"}` |
 
 ### `[network.rate_limit]`
 

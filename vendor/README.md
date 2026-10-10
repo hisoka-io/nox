@@ -9,6 +9,9 @@ commits, so `git log -p vendor/` shows exactly what differs from upstream.
 Only nox-kps (the browser-facing entry sidecar) links these crates. The node
 binaries do not use them.
 
+The webrtc-sctp unit tests, including the regression tests for the nox
+changes, run in CI through `scripts/test-vendored-sctp.sh`.
+
 ## webrtc-sctp 0.13.0
 
 Base: the kps fork at `a73a0a8f9e4f76f3b89ba1155562ec836bcf3f3b`, which is the
@@ -37,6 +40,32 @@ emulated 274 ms path, the 1 s floor gave the best reply times; a 300 ms floor
 The numbers behind each setting come from `scripts/bench/kps-latency`
 (headless Chromium, 274 ms RTT, with and without 1.5% loss and a 20 Mbit/s
 bottleneck with a 32 KiB queue).
+
+Send times of DATA chunks (RTT samples, timed partial reliability) use a
+monotonic clock instead of the wall clock. Upstream, an RTT sample taken after
+the system clock stepped back failed the whole SACK after the acked chunk had
+already left the inflight queue, so every later SACK was rejected and the
+association stalled until the connection's idle timeout. A clock step of a
+few tens of milliseconds while a chunk is in flight is enough; NTP steps, VM
+time sync and WSL hosts all produce them.
+
+When the peer resets a stream (RFC 6525) whose outgoing direction this side
+has already reset, the answer carries no second reset of the same stream.
+Chrome reuses a data channel identifier as soon as its own reset is answered;
+upstream's second reset, or a retransmission of it after a loss, then reached
+Chrome after the reuse and closed the new channel. nox-kps closes its side of
+every stream after the reply, so on a lossy path about one connection in
+eight died this way within 20 calls.
+
+Chunk parsing: `Packet::unmarshal` hands each chunk the rest of the packet, so
+every parser reads only up to its own chunk length.
+
+| Chunk | Change | Where |
+|---|---|---|
+| FORWARD-TSN | stream entries end at the chunk length | `chunk/chunk_forward_tsn.rs` |
+| INIT, INIT ACK | optional parameters end at the chunk length | `chunk/chunk_init.rs` |
+| SHUTDOWN | size checked against the chunk length | `chunk/chunk_shutdown.rs` |
+| ABORT, ERROR | error causes end at the chunk length | `chunk/chunk_abort.rs`, `chunk/chunk_error.rs` |
 
 ## webrtc-ice 0.14.0
 

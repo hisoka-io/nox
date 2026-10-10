@@ -160,6 +160,34 @@ async fn close_association_pair(br: &Arc<Bridge>, client: Association, server: A
     drop(closed_tx);
 }
 
+/// nox: stops the tail loss probe on `a`. The bridge moves packets only when
+/// a test ticks it, one per direction per tick, while the probe runs on the
+/// wall clock at 2 x SRTT (about 45 ms here). In the fast retransmit tests
+/// the third SACK reporting a loss arrives about four 10 ms ticks after the
+/// send, so the probe could resend the lost chunk first; tests that count
+/// DATA chunks or retransmissions of another mechanism turn it off.
+async fn disable_tail_loss_probe(a: &Association) {
+    let mut ai = a.association_internal.lock().await;
+    if let Some(tlp) = ai.tlp.take() {
+        tlp.stop().await;
+    }
+}
+
+/// nox: waits until the bridge holds at least `n` packets written by side
+/// `id`. The write loop runs on its own task, so a fixed sleep before
+/// dropping or reordering queued packets can find the queue still empty on
+/// a busy host.
+async fn wait_for_queued(br: &Arc<Bridge>, id: usize, n: usize) {
+    let wait = async {
+        while br.len(id).await < n {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .expect("packets were never queued on the bridge");
+}
+
 async fn flush_buffers(br: &Arc<Bridge>, client: &Association, server: &Association) {
     loop {
         loop {
@@ -355,7 +383,7 @@ async fn test_assoc_reliable_ordered_reordered() -> Result<()> {
         .await?;
     assert_eq!(n, sbuf.len(), "unexpected length of received data");
 
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    wait_for_queued(&br, 0, 2).await;
     br.reorder(0).await;
     br.process().await;
 
@@ -653,7 +681,7 @@ async fn test_assoc_reliable_retransmission() -> Result<()> {
         .await?;
     assert_eq!(n, MSG2.len(), "unexpected length of received data");
 
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    wait_for_queued(&br, 0, 1).await;
     log::debug!("dropping packet");
     br.drop_offset(0, 0, 1).await; // drop the first packet (second one should be sacked)
 
@@ -1069,7 +1097,7 @@ async fn test_assoc_unreliable_rexmit_unordered_fragment() -> Result<()> {
     assert_eq!(n, sbuf.len(), "unexpected length of received data");
 
     //log::debug!("flush_buffers");
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    wait_for_queued(&br, 0, 4).await;
     br.drop_offset(0, 0, 2).await; // drop the second fragment of the first chunk (second chunk should be sacked)
     flush_buffers(&br, &a0, &a1).await;
 
@@ -1321,6 +1349,7 @@ async fn test_assoc_congestion_control_fast_retransmission() -> Result<()> {
         create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::Normal, 0).await?;
 
     let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+    disable_tail_loss_probe(&a0).await;
 
     br.drop_next_nwrites(0, 1); // drop the first packet (second one should be sacked)
 
@@ -1401,6 +1430,7 @@ async fn test_assoc_congestion_control_burst_loss_drops_the_loss_floor() -> Resu
         create_new_association_pair(&br, Arc::new(ca), Arc::new(cb), AckMode::Normal, 0).await?;
 
     let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+    disable_tail_loss_probe(&a0).await;
 
     let entry_cwnd = a0.association_internal.lock().await.cwnd;
     br.drop_next_nwrites(0, 4); // four packets lost in one window: congestion
@@ -1464,27 +1494,30 @@ async fn test_assoc_tail_loss_probe_resends_before_the_rto() -> Result<()> {
     s0.write_sctp(&MSG, PayloadProtocolIdentifier::Binary)
         .await?;
 
+    // The deadline is well past the 1 s RTO, so a missing probe shows up as
+    // a T3-rtx expiry below rather than as a wall-clock miss on a busy host.
     let started = tokio::time::Instant::now();
     let mut buf = vec![0u8; 32];
-    let mut received = None;
-    while started.elapsed() < Duration::from_millis(800) {
+    let mut delivered = false;
+    while started.elapsed() < Duration::from_secs(5) {
         br.tick().await;
         if let Ok(Ok((n, _))) =
             tokio::time::timeout(Duration::from_millis(5), s1.read_sctp(&mut buf)).await
         {
             assert_eq!(&buf[..n], &MSG[..]);
-            received = Some(started.elapsed());
+            delivered = true;
             break;
         }
     }
-    let received = received.expect("the probe should deliver the lost chunk");
-    assert!(
-        received < Duration::from_millis(600),
-        "delivered after {received:?}, expected the probe at about 300 ms"
-    );
+    assert!(delivered, "the lost chunk was never resent");
     {
         let a = a0.association_internal.lock().await;
-        assert_eq!(a.stats.get_num_t3timeouts(), 0, "no RTO was needed");
+        assert_eq!(
+            a.stats.get_num_t3timeouts(),
+            0,
+            "the probe, not the RTO, should resend the chunk"
+        );
+        assert_eq!(a.stats.get_num_fast_retrans(), 0);
     }
 
     close_association_pair(&br, a0, a1).await;
@@ -1530,6 +1563,9 @@ async fn test_assoc_congestion_control_congestion_avoidance() -> Result<()> {
     .await?;
 
     let (s0, s1) = establish_session_pair(&br, &a0, &mut a1, SI).await?;
+    // Counts every DATA chunk; a probe fired while the loop below is slow to
+    // tick would add a resent chunk.
+    disable_tail_loss_probe(&a0).await;
 
     {
         let a = a0.association_internal.lock().await;

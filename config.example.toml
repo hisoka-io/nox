@@ -161,6 +161,9 @@ peer_admission = "enforce"
 peer_admission_grace_secs = 120   # startup delay, and how long a link to a deregistered peer is kept
 topology_liveness_window_secs = 60  # /topology reports a member online if seen on P2P within this window
 tcp_nodelay = true                # send each Sphinx packet at once (TCP_NODELAY on P2P connections)
+max_concurrent_streams = 256      # inbound packet streams served at once per connection
+max_packets_in_flight_per_peer = 48  # open packet requests per peer; later packets wait in order
+max_queued_packets_per_peer = 512    # packets held per peer beyond those (16 MiB)
 
 # Graduated rate limiting (packets/sec by reputation tier)
 [network.rate_limit]

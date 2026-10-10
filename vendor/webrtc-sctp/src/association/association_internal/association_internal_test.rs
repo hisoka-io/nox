@@ -1,7 +1,9 @@
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Shutdown, SocketAddr};
+use std::time::{Duration, Instant};
 
 use super::*;
+use crate::chunk::chunk_selective_ack::GapAckBlock;
 
 type Result<T> = std::result::Result<T, util::Error>;
 
@@ -170,6 +172,115 @@ fn test_create_forward_tsn_forward_two_abandoned_with_the_same_si() -> Result<()
     }
     assert!(si1ok, "si=1 should be present");
     assert!(si2ok, "si=2 should be present");
+
+    Ok(())
+}
+
+/// nox: a SACK for chunks whose send time is later than now, as after a
+/// step back of the wall clock, still advances the cumulative TSN ack point
+/// and pops every acked chunk. With wall-clock send times the RTT sample
+/// failed after the first chunk had been popped, and each later SACK then
+/// failed on the missing chunk.
+#[tokio::test]
+async fn test_sack_with_send_time_ahead_of_now() -> Result<()> {
+    let mut a = create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        name: "client".to_owned(),
+        local_port: 5000,
+        remote_port: 5000,
+    });
+    a.set_state(AssociationState::Established);
+    a.cumulative_tsn_ack_point = 9;
+    a.min_tsn2measure_rtt = 10;
+    let ahead = Instant::now() + Duration::from_secs(60);
+    for tsn in 10..=13 {
+        a.inflight_queue.push_no_check(ChunkPayloadData {
+            beginning_fragment: true,
+            ending_fragment: true,
+            tsn,
+            stream_identifier: 1,
+            user_data: Bytes::from_static(b"ABC"),
+            nsent: 1,
+            since: ahead,
+            ..Default::default()
+        });
+    }
+
+    // TSN 10 and 11 cumulatively, 13 in a gap block.
+    a.handle_sack(&ChunkSelectiveAck {
+        cumulative_tsn_ack: 11,
+        advertised_receiver_window_credit: 65536,
+        gap_ack_blocks: vec![GapAckBlock { start: 2, end: 2 }],
+        duplicate_tsn: vec![],
+    })
+    .await?;
+    assert_eq!(a.cumulative_tsn_ack_point, 11);
+    assert_eq!(a.inflight_queue.len(), 2);
+
+    a.handle_sack(&ChunkSelectiveAck {
+        cumulative_tsn_ack: 13,
+        advertised_receiver_window_credit: 65536,
+        gap_ack_blocks: vec![],
+        duplicate_tsn: vec![],
+    })
+    .await?;
+    assert_eq!(a.cumulative_tsn_ack_point, 13);
+    assert_eq!(a.inflight_queue.len(), 0);
+
+    Ok(())
+}
+
+/// nox: the peer's reset of a stream is answered with this side's own reset
+/// only when this side has not queued one already.
+#[tokio::test]
+async fn test_peer_reset_answered_with_one_outgoing_reset() -> Result<()> {
+    let mut a = create_association_internal(Config {
+        net_conn: Arc::new(DumbConn {}),
+        max_receive_buffer_size: 0,
+        max_message_size: 0,
+        name: "server".to_owned(),
+        local_port: 5000,
+        remote_port: 5000,
+    });
+    a.set_state(AssociationState::Established);
+    let closed_here = a.create_stream(2, false).expect("stream 2");
+    a.create_stream(4, false).expect("stream 4");
+    closed_here.shutdown(Shutdown::Both).await?;
+
+    let mut reply = vec![];
+    for (rsn, si) in [(100, 2), (101, 4)] {
+        let request = ParamOutgoingResetRequest {
+            reconfig_request_sequence_number: rsn,
+            sender_last_tsn: a.peer_last_tsn,
+            stream_identifiers: vec![si],
+            ..Default::default()
+        };
+        a.reset_streams_if_any(&request, true, &mut reply)?;
+    }
+
+    let mut reset_streams = vec![];
+    for packet in &reply {
+        for chunk in &packet.chunks {
+            let Some(c) = chunk.as_any().downcast_ref::<ChunkReconfig>() else {
+                continue;
+            };
+            if let Some(r) = c
+                .param_a
+                .as_ref()
+                .and_then(|p| p.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+            {
+                reset_streams.extend(r.stream_identifiers.iter().copied());
+            }
+        }
+    }
+    assert_eq!(
+        reset_streams,
+        vec![4],
+        "stream 2 was already reset by this side"
+    );
+    assert!(a.streams.is_empty());
 
     Ok(())
 }

@@ -74,6 +74,8 @@ pub struct Stream {
     pub(crate) read_notifier: Notify,
     pub(crate) read_shutdown: AtomicBool,
     pub(crate) write_shutdown: AtomicBool,
+    /// nox: this side has queued the reset of its outgoing stream.
+    pub(crate) reset_requested: AtomicBool,
     pub(crate) unordered: AtomicBool,
     pub(crate) reliability_type: AtomicU8, //ReliabilityType,
     pub(crate) reliability_value: AtomicU32,
@@ -130,6 +132,7 @@ impl Stream {
             read_notifier: Notify::new(),
             read_shutdown: AtomicBool::new(false),
             write_shutdown: AtomicBool::new(false),
+            reset_requested: AtomicBool::new(false),
             unordered: AtomicBool::new(false),
             reliability_type: AtomicU8::new(0), //ReliabilityType::Reliable,
             reliability_value: AtomicU32::new(0),
@@ -402,6 +405,7 @@ impl Stream {
         {
             // Reset the stream
             // https://tools.ietf.org/html/rfc6525
+            self.reset_requested.store(true, Ordering::SeqCst);
             self.send_reset_request(self.stream_identifier).await?;
         }
 

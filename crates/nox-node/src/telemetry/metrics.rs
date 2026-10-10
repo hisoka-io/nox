@@ -76,6 +76,12 @@ pub struct MetricsService {
     pub ingress_responses_pruned_total: Counter,
     pub p2p_rate_limit_total: Family<Vec<(String, String)>, Counter>,
     pub p2p_rate_limit_disconnects_total: Counter,
+    /// Packets held because the in-flight limit to their next hop was reached.
+    pub p2p_outbound_queued_total: Counter,
+    /// Packets held for next hops right now.
+    pub p2p_outbound_queue_depth: Gauge<i64, AtomicI64>,
+    /// Packets that did not reach the next hop, by `reason`.
+    pub p2p_outbound_dropped_total: Family<Vec<(String, String)>, Counter>,
     pub replay_checks_total: Family<Vec<(String, String)>, Counter>,
     pub replay_bloom_rotations_total: Counter,
     pub event_bus_lag_total: Counter,
@@ -378,6 +384,27 @@ impl MetricsService {
             "nox_p2p_rate_limit_disconnects_total",
             "Peers disconnected due to rate limit abuse",
             p2p_rate_limit_disconnects_total.clone(),
+        );
+
+        let p2p_outbound_queued_total = Counter::default();
+        registry.register(
+            "nox_p2p_outbound_queued",
+            "Packets held because the in-flight limit to their next hop was reached",
+            p2p_outbound_queued_total.clone(),
+        );
+
+        let p2p_outbound_queue_depth = Gauge::<i64, AtomicI64>::default();
+        registry.register(
+            "nox_p2p_outbound_queue_depth",
+            "Packets held for next hops",
+            p2p_outbound_queue_depth.clone(),
+        );
+
+        let p2p_outbound_dropped_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_p2p_outbound_dropped",
+            "Packets that did not reach the next hop, by reason",
+            p2p_outbound_dropped_total.clone(),
         );
 
         let replay_checks_total = Family::<Vec<(String, String)>, Counter>::default();
@@ -930,6 +957,9 @@ impl MetricsService {
             ingress_responses_pruned_total,
             p2p_rate_limit_total,
             p2p_rate_limit_disconnects_total,
+            p2p_outbound_queued_total,
+            p2p_outbound_queue_depth,
+            p2p_outbound_dropped_total,
             replay_checks_total,
             replay_bloom_rotations_total,
             event_bus_lag_total,
