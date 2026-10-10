@@ -57,6 +57,16 @@ Chrome after the reuse and closed the new channel. nox-kps closes its side of
 every stream after the reply, so on a lossy path about one connection in
 eight died this way within 20 calls.
 
+Chunk parsing: `Packet::unmarshal` hands each chunk the rest of the packet, so
+every parser reads only up to its own chunk length.
+
+| Chunk | Change | Where |
+|---|---|---|
+| FORWARD-TSN | stream entries end at the chunk length | `chunk/chunk_forward_tsn.rs` |
+| INIT, INIT ACK | optional parameters end at the chunk length | `chunk/chunk_init.rs` |
+| SHUTDOWN | size checked against the chunk length | `chunk/chunk_shutdown.rs` |
+| ABORT, ERROR | error causes end at the chunk length | `chunk/chunk_abort.rs`, `chunk/chunk_error.rs` |
+
 ## webrtc-ice 0.14.0
 
 Base: crates.io `webrtc-ice` 0.14.0, the version webrtc 0.14 resolves.
