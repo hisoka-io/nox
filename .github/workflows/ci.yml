@@ -144,9 +144,13 @@ jobs:
           version: v1.3.2
       - name: Verify Anvil version
         run: 'anvil --version | grep -F "anvil Version: 1.3.2"'
-      # The root crate's tests/ run in the Integration Tests job.
       - name: Test subcrates
         run: cargo nextest run --workspace --exclude nox-mixnet --exclude nox-test-infra
+      # The root crate's tests/ run in the Integration Tests job, which is not a required
+      # check and builds with dev-node. The two paid-path suites also run here, under this
+      # required check and on the default feature set.
+      - name: Test transaction plan and durable outbox
+        run: cargo nextest run --test transaction_plan --test transaction_outbox
       - name: Test vendored webrtc-sctp
         run: scripts/test-vendored-sctp.sh
       - name: Test vendored webrtc-ice (lite pair selection)
@@ -154,7 +158,7 @@ jobs:
       # The nox-kps soaks are #[ignore]d in the default run. Here: 200 sequential
       # 32 KiB exchanges per transport and direction, and 20 large claim bodies
       # (5 MiB) per transport, with zero stalls allowed. The split-process soak
-      # is a diagnostic and runs nightly from slow-tests.yml.
+      # is a diagnostic and stays manual.
       - name: nox-kps soaks (zero stalls)
         run: >
           cargo test --locked -p nox-kps --profile release-kps --test soak --
