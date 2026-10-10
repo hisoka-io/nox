@@ -1,5 +1,6 @@
 //! Reed-Solomon FEC through `Fragmenter` and `Reassembler` at SURB payload size: shard
-//! boundaries, reordering, random drops and the largest message the protocol accepts.
+//! boundaries, reordering, random drops, the largest request the protocol accepts and a
+//! reply too large for FEC.
 
 use nox_core::protocol::fec;
 use nox_core::protocol::fragmentation::MAX_MESSAGE_SIZE;
@@ -248,6 +249,35 @@ fn test_fec_recovery_at_max_message_size() {
         .filter(|f| f.sequence as usize >= parity)
         .collect();
     let recovered = reassemble(remaining).expect("recovery at the size limit failed");
+    assert!(
+        recovered == data,
+        "recovered data differs from the original"
+    );
+}
+
+/// A reply of more than 255 fragments carries no parity (`ResponsePacker` skips FEC there)
+/// and is not bound by `MAX_MESSAGE_SIZE`; the client still has to reassemble it.
+#[test]
+fn test_reassembly_beyond_fec_shard_limit() {
+    use rand::rngs::StdRng;
+    use rand::seq::SliceRandom;
+    use rand::SeedableRng;
+
+    let fragment_count = 300;
+    let data: Vec<u8> = (0..fragment_count * usable() - 7)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    assert!(data.len() > MAX_MESSAGE_SIZE);
+
+    let mut frags = Fragmenter::with_max_size(data.len())
+        .fragment(7, &data, SURB_PAYLOAD_SIZE)
+        .expect("fragment() failed");
+    assert_eq!(frags.len(), fragment_count);
+    assert!(frags.len() > fec::MAX_TOTAL_SHARDS);
+    assert!(frags.iter().all(|f| f.fec.is_none()));
+
+    frags.shuffle(&mut StdRng::seed_from_u64(7));
+    let recovered = reassemble(frags).expect("reassembly above 255 fragments failed");
     assert!(
         recovered == data,
         "recovered data differs from the original"

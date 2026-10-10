@@ -923,16 +923,16 @@ mod tests {
     #[test]
     fn test_fec_parity_clamped_to_255_limit() {
         let packer = ResponsePacker::new();
-        let data = [0x42u8; 64];
-        assert_eq!(packer.surbs_needed(data.len()), 1);
+        let data = vec![0x42u8; ResponsePacker::usable_per_fragment() + 1];
+        assert_eq!(packer.surbs_needed(data.len()), 2);
 
-        // One SURB more than the 255 shards a block can hold.
-        let surbs = make_test_surbs(256);
+        // Two SURBs more than the 255 shards a block can hold.
+        let surbs = make_test_surbs(257);
         let pack = packer.pack_response(2, &data, surbs).unwrap();
         assert_eq!(
             pack.packets.len(),
             255,
-            "should clamp to 255 total (1 data + 254 parity)"
+            "should clamp to 255 total (2 data + 253 parity)"
         );
     }
 
