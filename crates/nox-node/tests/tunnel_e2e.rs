@@ -1,0 +1,894 @@
+//! End-to-end TLS tunnels through the exit's `TunnelHandler`: a rustls client talks to a
+//! local HTTPS server and the exit relays only TLS records, answering on real SURBs.
+
+use nox_core::models::payloads::decode_payload;
+use nox_core::IEventSubscriber;
+use nox_core::{
+    NoxEvent, RelayerPayload, TunnelFinV1, TunnelOpenV1, TunnelRejectCodeV1, TunnelReplyV1,
+    TunnelRequestV1, TUNNEL_ID_LEN,
+};
+use nox_crypto::{PathHop, Surb, SurbRecovery, HEADER_SIZE};
+use nox_node::config::{HttpConfig, TunnelConfig};
+use nox_node::services::handlers::tunnel::TunnelHandler;
+use nox_node::services::response_packer::ResponsePacker;
+use nox_node::telemetry::metrics::MetricsService;
+use nox_node::TokioEventBus;
+use parking_lot::Mutex;
+use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Write};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::broadcast;
+use tokio_rustls::rustls;
+use tokio_util::sync::CancellationToken;
+
+const HOST: &str = "localhost";
+const CANARY: &str = "0xcanary5f1e2d3c4b5a69788796a5b4c3d2e1f0";
+const HOLD_MS: u32 = 20_000;
+const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
+
+/// HTTPS server on 127.0.0.1 answering every request with `body_len` bytes. It records the
+/// plaintext it reads so tests can count upstream writes.
+struct Upstream {
+    port: u16,
+    ca: rustls::pki_types::CertificateDer<'static>,
+    received: Arc<Mutex<Vec<u8>>>,
+}
+
+async fn start_upstream(body_len: usize) -> Upstream {
+    let ca_key = rcgen::KeyPair::generate().expect("CA key");
+    let mut ca_params = rcgen::CertificateParams::new(Vec::new()).expect("CA params");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).expect("CA certificate");
+    let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
+    let leaf = rcgen::CertificateParams::new(vec![HOST.to_string()])
+        .expect("leaf params")
+        .signed_by(&leaf_key, &ca, &ca_key)
+        .expect("leaf certificate");
+    let mut server_config = rustls::ServerConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![leaf.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+        )
+        .expect("server certificate");
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("address").port();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let log = received.clone();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            let log = log.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(socket).await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while !request_complete(&request) {
+                    match tls.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&buffer[..n]),
+                    }
+                }
+                log.lock().extend_from_slice(&request);
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
+                )
+                .into_bytes();
+                response.extend((0..body_len).map(|i| (i % 251) as u8));
+                if tls.write_all(&response).await.is_ok() {
+                    let _ = tls.shutdown().await;
+                }
+            });
+        }
+    });
+    Upstream {
+        port,
+        ca: ca.der().clone(),
+        received,
+    }
+}
+
+fn request_complete(request: &[u8]) -> bool {
+    let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+    let length = head
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    request.len() >= end + 4 + length
+}
+
+fn http_request() -> Vec<u8> {
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["{CANARY}","latest"]}}"#
+    );
+    format!(
+        "POST /v1/secret-api-key HTTP/1.1\r\nHost: {HOST}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+fn tunnel_config(port: u16) -> TunnelConfig {
+    TunnelConfig {
+        enabled: true,
+        allowed_ports: vec![port],
+        ..TunnelConfig::default()
+    }
+}
+
+struct Exit {
+    handler: TunnelHandler,
+    events: broadcast::Receiver<NoxEvent>,
+}
+
+fn start_exit(config: TunnelConfig, allow_private_ips: bool) -> Exit {
+    let bus = TokioEventBus::new(4_096);
+    let events = bus.subscribe();
+    let http = HttpConfig {
+        allow_private_ips,
+        ..HttpConfig::default()
+    };
+    let handler = TunnelHandler::new(
+        config,
+        &http,
+        Arc::new(ResponsePacker::new()),
+        Arc::new(bus),
+        MetricsService::new(),
+        CancellationToken::new(),
+    );
+    Exit { handler, events }
+}
+
+/// The client side of one tunnel: SURBs, reply decryption, reordering by offset and a
+/// rustls connection fed from the contiguous bytes.
+struct Client {
+    id: [u8; TUNNEL_ID_LEN],
+    seq: u32,
+    tls: rustls::ClientConnection,
+    path: Vec<PathHop>,
+    recoveries: HashMap<[u8; 16], SurbRecovery>,
+    parts: BTreeMap<u64, Vec<u8>>,
+    contiguous: u64,
+    plaintext: Vec<u8>,
+    /// Every byte the client handed to the exit, to check for plaintext.
+    sent: Vec<u8>,
+}
+
+impl Client {
+    fn new(ca: &rustls::pki_types::CertificateDer<'static>, sni: &str) -> Self {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.clone()).expect("root");
+        let mut config = rustls::ClientConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config.resumption = rustls::client::Resumption::disabled();
+        let name = rustls::pki_types::ServerName::try_from(sni.to_string()).expect("name");
+        let secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+        Self {
+            id: rand::random(),
+            seq: 0,
+            tls: rustls::ClientConnection::new(Arc::new(config), name).expect("client"),
+            path: vec![PathHop {
+                public_key: x25519_dalek::PublicKey::from(&secret),
+                address: "/ip4/127.0.0.1/tcp/9000".to_string(),
+            }],
+            recoveries: HashMap::new(),
+            parts: BTreeMap::new(),
+            contiguous: 0,
+            plaintext: Vec::new(),
+            sent: Vec::new(),
+        }
+    }
+
+    fn surbs(&mut self, count: usize) -> Vec<Surb> {
+        (0..count)
+            .map(|_| {
+                let (surb, mut recovery) = Surb::new(&self.path, rand::random(), 0).expect("SURB");
+                recovery.layer_keys.clear();
+                self.recoveries.insert(surb.id, recovery);
+                surb
+            })
+            .collect()
+    }
+
+    fn tls_out(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        while self.tls.wants_write() {
+            self.tls.write_tls(&mut out).expect("write_tls");
+        }
+        self.sent.extend_from_slice(&out);
+        out
+    }
+
+    fn request(
+        &mut self,
+        open_port: Option<u16>,
+        data: Vec<u8>,
+        surbs: usize,
+    ) -> (TunnelRequestV1, Vec<Surb>) {
+        let request = TunnelRequestV1 {
+            tunnel_id: self.id,
+            seq: self.seq,
+            open: open_port.map(|port| TunnelOpenV1 {
+                host: HOST.to_string(),
+                port,
+            }),
+            ack_offset: self.contiguous,
+            data,
+            close: false,
+            hold_ms: HOLD_MS,
+        };
+        (request, self.surbs(surbs))
+    }
+
+    /// Next reply the exit sent on one of this client's SURBs.
+    async fn reply(&mut self, exit: &mut Exit) -> TunnelReplyV1 {
+        loop {
+            let event = tokio::time::timeout(REPLY_TIMEOUT, exit.events.recv())
+                .await
+                .expect("reply in time")
+                .expect("event bus open");
+            let NoxEvent::SendPacket {
+                data, reply_handle, ..
+            } = event
+            else {
+                continue;
+            };
+            let Some(recovery) = reply_handle.and_then(|id| self.recoveries.remove(&id)) else {
+                continue;
+            };
+            let opened = recovery.decrypt(&data[HEADER_SIZE..]).expect("decrypt");
+            let RelayerPayload::ServiceResponse { fragment, .. } =
+                decode_payload(&opened).expect("service response")
+            else {
+                panic!("expected a service response");
+            };
+            return decode_payload(&fragment.data).expect("tunnel reply");
+        }
+    }
+
+    /// Stores a data part, feeds contiguous bytes to TLS, and returns its `fin`.
+    fn absorb(&mut self, reply: &TunnelReplyV1) -> Option<TunnelFinV1> {
+        let TunnelReplyV1::Data {
+            offset, data, fin, ..
+        } = reply
+        else {
+            panic!("unexpected rejection {reply:?}");
+        };
+        self.parts.insert(*offset, data.clone());
+        // Parts resent after a copy may start below the contiguous point.
+        while let Some(tail) = self.parts.iter().find_map(|(offset, data)| {
+            let skip = usize::try_from(self.contiguous.checked_sub(*offset)?).ok()?;
+            data.get(skip..)
+                .filter(|tail| !tail.is_empty())
+                .map(<[u8]>::to_vec)
+        }) {
+            let mut input = tail.as_slice();
+            let mut buffer = [0_u8; 16 * 1024];
+            while !input.is_empty() {
+                self.tls.read_tls(&mut input).expect("read_tls");
+                self.tls.process_new_packets().expect("TLS records verify");
+                while let Ok(n @ 1..) = self.tls.reader().read(&mut buffer) {
+                    self.plaintext.extend_from_slice(&buffer[..n]);
+                }
+            }
+            self.contiguous += tail.len() as u64;
+        }
+        let contiguous = self.contiguous;
+        self.parts
+            .retain(|offset, data| *offset + data.len() as u64 > contiguous);
+        *fin
+    }
+
+    /// Opens the tunnel and completes the TLS handshake.
+    async fn handshake(&mut self, exit: &mut Exit, port: u16) {
+        let hello = self.tls_out();
+        let (request, surbs) = self.request(Some(port), hello, 2);
+        exit.handler.handle(request, surbs);
+        while self.tls.is_handshaking() {
+            let reply = self.reply(exit).await;
+            self.absorb(&reply);
+        }
+    }
+
+    /// Sends the client Finished and the HTTP request as the next seq.
+    fn send_request(&mut self, exit: &Exit, surbs: usize) -> TunnelRequestV1 {
+        self.tls
+            .writer()
+            .write_all(&http_request())
+            .expect("write request");
+        self.seq += 1;
+        let data = self.tls_out();
+        let (request, surbs) = self.request(None, data, surbs);
+        exit.handler.handle(request.clone(), surbs);
+        request
+    }
+
+    fn copy(&mut self, exit: &Exit, mut request: TunnelRequestV1, surbs: usize) {
+        request.ack_offset = self.contiguous;
+        let surbs = self.surbs(surbs);
+        exit.handler.handle(request, surbs);
+    }
+
+    fn response_body(&self) -> Option<&[u8]> {
+        let end = self.plaintext.windows(4).position(|w| w == b"\r\n\r\n")?;
+        let head = String::from_utf8_lossy(&self.plaintext[..end]).to_ascii_lowercase();
+        let length: usize = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))?
+            .trim()
+            .parse()
+            .ok()?;
+        self.plaintext.get(end + 4..end + 4 + length)
+    }
+}
+
+fn expected_body(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+fn rejection(reply: &TunnelReplyV1) -> TunnelRejectCodeV1 {
+    match reply {
+        TunnelReplyV1::Rejected { code, .. } => *code,
+        TunnelReplyV1::Data { .. } => panic!("expected a rejection, got {reply:?}"),
+    }
+}
+
+#[derive(Clone, Default)]
+struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl Write for LogBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn round_trip_writes_once_and_hides_the_request() {
+    let logs = LogBuffer::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    // Global, so callsites first hit on other test threads still reach this writer.
+    tracing::subscriber::set_global_default(subscriber).expect("only this test sets a subscriber");
+
+    let body_len = 4_000;
+    let upstream = start_upstream(body_len).await;
+    let mut exit = start_exit(tunnel_config(upstream.port), true);
+    let mut client = Client::new(&upstream.ca, HOST);
+    client.handshake(&mut exit, upstream.port).await;
+
+    let request = client.send_request(&exit, 4);
+    client.copy(&exit, request, 4);
+    while client.response_body().is_none() {
+        let reply = client.reply(&mut exit).await;
+        client.absorb(&reply);
+    }
+    assert_eq!(
+        client.response_body(),
+        Some(expected_body(body_len).as_slice())
+    );
+    assert_eq!(
+        *upstream.received.lock(),
+        http_request(),
+        "one upstream write"
+    );
+
+    let canary = CANARY.as_bytes();
+    assert!(!client.sent.windows(canary.len()).any(|w| w == canary));
+    let logged = logs.0.lock();
+    assert!(!logged.is_empty(), "debug logs were captured");
+    assert!(!logged.windows(canary.len()).any(|w| w == canary));
+    assert!(!logged.windows(14).any(|w| w == b"secret-api-key"));
+}
+
+#[tokio::test]
+async fn policy_rejects_before_connecting() {
+    let upstream = start_upstream(10).await;
+    let cases: [(&str, u16, &str, bool, TunnelRejectCodeV1); 4] = [
+        (
+            "port",
+            upstream.port + 1,
+            HOST,
+            true,
+            TunnelRejectCodeV1::PortNotAllowed,
+        ),
+        (
+            "IP literal",
+            upstream.port,
+            "127.0.0.1",
+            true,
+            TunnelRejectCodeV1::HostNotAllowed,
+        ),
+        (
+            "SNI mismatch",
+            upstream.port,
+            "other.localhost",
+            true,
+            TunnelRejectCodeV1::HostNotAllowed,
+        ),
+        (
+            "private address",
+            upstream.port,
+            HOST,
+            false,
+            TunnelRejectCodeV1::DestinationBlocked,
+        ),
+    ];
+    for (name, port, host, allow_private_ips, expected) in cases {
+        let mut exit = start_exit(tunnel_config(upstream.port), allow_private_ips);
+        let mut client = Client::new(&upstream.ca, HOST);
+        let hello = client.tls_out();
+        let (mut request, surbs) = client.request(Some(port), hello, 1);
+        request.open = Some(TunnelOpenV1 {
+            host: host.to_string(),
+            port,
+        });
+        exit.handler.handle(request, surbs);
+        assert_eq!(
+            rejection(&client.reply(&mut exit).await),
+            expected,
+            "{name}"
+        );
+        assert_eq!(exit.handler.sessions(), 0, "{name}");
+    }
+    assert!(upstream.received.lock().is_empty());
+}
+
+#[tokio::test]
+async fn flow_control_bounds_the_window_and_resumes_with_copies() {
+    let body_len = 2 * 1024 * 1024;
+    let upstream = start_upstream(body_len).await;
+    let config = tunnel_config(upstream.port);
+    let max_window = config.max_window_bytes;
+    let mut exit = start_exit(config, true);
+    let mut client = Client::new(&upstream.ca, HOST);
+    client.handshake(&mut exit, upstream.port).await;
+
+    let request = client.send_request(&exit, 4);
+    let mut need_surbs = 0;
+    while client.response_body().is_none() {
+        let reply = client.reply(&mut exit).await;
+        assert!(exit.handler.buffered_bytes() <= max_window);
+        match client.absorb(&reply) {
+            Some(TunnelFinV1::NeedSurbs) => {
+                need_surbs += 1;
+                client.copy(&exit, request.clone(), 32);
+            }
+            Some(TunnelFinV1::Expired) => panic!("exchange expired"),
+            _ => {}
+        }
+    }
+    assert!(
+        need_surbs >= 2,
+        "the first exchange and each full window ask for SURBs"
+    );
+    assert_eq!(
+        client.response_body(),
+        Some(expected_body(body_len).as_slice())
+    );
+}
+
+#[tokio::test]
+async fn limits_evict_idle_tunnels_and_release_slots() {
+    let upstream = start_upstream(256 * 1024).await;
+    let config = TunnelConfig {
+        max_sessions: 1,
+        min_hold_ms: 50,
+        session_idle_secs: 1,
+        max_session_bytes: 64 * 1024,
+        ..tunnel_config(upstream.port)
+    };
+
+    // An idle tunnel is evicted for a new open; while that one is busy, opens are refused.
+    let mut exit = start_exit(config.clone(), true);
+    let mut idle = Client::new(&upstream.ca, HOST);
+    let hello = idle.tls_out();
+    let (mut request, surbs) = idle.request(Some(upstream.port), hello, 2);
+    request.hold_ms = 50;
+    exit.handler.handle(request, surbs);
+    loop {
+        let reply = idle.reply(&mut exit).await;
+        if idle.absorb(&reply) == Some(TunnelFinV1::Expired) {
+            break;
+        }
+    }
+    let mut busy = Client::new(&upstream.ca, HOST);
+    busy.handshake(&mut exit, upstream.port).await;
+    let mut refused = Client::new(&upstream.ca, HOST);
+    let hello = refused.tls_out();
+    let (request, surbs) = refused.request(Some(upstream.port), hello, 1);
+    exit.handler.handle(request, surbs);
+    assert_eq!(
+        rejection(&refused.reply(&mut exit).await),
+        TunnelRejectCodeV1::SessionLimit
+    );
+    idle.seq += 1;
+    let (request, surbs) = idle.request(None, Vec::new(), 1);
+    exit.handler.handle(request, surbs);
+    assert_eq!(
+        rejection(&idle.reply(&mut exit).await),
+        TunnelRejectCodeV1::Expired
+    );
+
+    // The byte limit closes the busy tunnel.
+    busy.send_request(&exit, 8);
+    let code = loop {
+        match busy.reply(&mut exit).await {
+            TunnelReplyV1::Rejected { code, .. } => break code,
+            reply => {
+                busy.absorb(&reply);
+            }
+        }
+    };
+    assert_eq!(code, TunnelRejectCodeV1::ByteLimit);
+
+    // A failed connect releases its slot.
+    let closed_port = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        listener.local_addr().expect("address").port()
+    };
+    let mut exit = start_exit(
+        TunnelConfig {
+            allowed_ports: vec![upstream.port, closed_port],
+            ..config
+        },
+        true,
+    );
+    let mut failed = Client::new(&upstream.ca, HOST);
+    let hello = failed.tls_out();
+    let (request, surbs) = failed.request(Some(closed_port), hello, 1);
+    exit.handler.handle(request, surbs);
+    assert_eq!(
+        rejection(&failed.reply(&mut exit).await),
+        TunnelRejectCodeV1::ConnectFailed
+    );
+    let mut next = Client::new(&upstream.ca, HOST);
+    next.handshake(&mut exit, upstream.port).await;
+
+    // An idle tunnel expires.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let request = next.send_request(&exit, 1);
+    assert_eq!(request.seq, 1);
+    assert_eq!(
+        rejection(&next.reply(&mut exit).await),
+        TunnelRejectCodeV1::Expired
+    );
+}
+
+/// Polls `done` until it holds or `REPLY_TIMEOUT` passes.
+async fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + REPLY_TIMEOUT;
+    while !done() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// TLS application-data records of `total` bytes with arbitrary contents.
+fn records(total: usize) -> Vec<u8> {
+    const RECORD: usize = 16 * 1024;
+    let mut out = Vec::with_capacity(total + total / RECORD * 5 + 5);
+    let mut left = total;
+    while left > 0 {
+        let length = left.min(RECORD);
+        out.extend_from_slice(&[23, 3, 3]);
+        out.extend_from_slice(&(length as u16).to_be_bytes());
+        out.extend(std::iter::repeat_n(0x5a, length));
+        left -= length;
+    }
+    out
+}
+
+/// A plain TCP upstream on 127.0.0.1. Each connection gets `greeting`, then is held open without
+/// being read (`hang_up` false) or closed after one read (`hang_up` true).
+async fn raw_upstream(greeting: &'static [u8], hang_up: bool) -> u16 {
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket.set_recv_buffer_size(4_096).expect("receive buffer");
+    socket
+        .bind("127.0.0.1:0".parse().expect("address"))
+        .expect("bind");
+    let port = socket.local_addr().expect("address").port();
+    let listener = socket.listen(16).expect("listen");
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((mut stream, _)) = listener.accept().await {
+            if hang_up {
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let _ = stream.write_all(greeting).await;
+            } else {
+                let _ = stream.write_all(greeting).await;
+                held.push(stream);
+            }
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn tunnels_close_soon_after_the_upstream_closes() {
+    let body_len = 40_000;
+    let upstream = start_upstream(body_len).await;
+    let config = TunnelConfig {
+        closed_linger_ms: 200,
+        ..tunnel_config(upstream.port)
+    };
+    let mut exit = start_exit(config, true);
+    let mut client = Client::new(&upstream.ca, HOST);
+    client.handshake(&mut exit, upstream.port).await;
+    client.send_request(&exit, 4);
+    while client.response_body().is_none() {
+        let reply = client.reply(&mut exit).await;
+        client.absorb(&reply);
+    }
+    assert!(exit.handler.sessions() == 1 && exit.handler.buffered_bytes() > 0);
+    // The client neither acknowledges the response nor tears the tunnel down.
+    wait_until("the tunnel closes and frees its window", || {
+        exit.handler.sessions() == 0 && exit.handler.buffered_bytes() == 0
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_write_waits_for_the_upstream_to_read_the_previous_one() {
+    let ca = start_upstream(1).await.ca;
+    let port = raw_upstream(b"", false).await;
+    let mut exit = start_exit(tunnel_config(port), true);
+    let mut client = Client::new(&ca, HOST);
+    let hello = client.tls_out();
+    let (request, surbs) = client.request(Some(port), hello, 1);
+    exit.handler.handle(request, surbs);
+
+    for (seq, length) in [(1, 4_000_000), (2, 100)] {
+        client.seq = seq;
+        let (request, surbs) = client.request(None, records(length), 1);
+        exit.handler.handle(request, surbs);
+    }
+    let reply = client.reply(&mut exit).await;
+    assert!(
+        matches!(
+            reply,
+            TunnelReplyV1::Rejected {
+                seq: 2,
+                code: TunnelRejectCodeV1::UpstreamClosed,
+                ..
+            }
+        ),
+        "{reply:?}"
+    );
+    wait_until("the tunnel closes", || exit.handler.sessions() == 0).await;
+}
+
+#[tokio::test]
+async fn a_write_after_the_upstream_closed_is_refused_unwritten() {
+    let ca = start_upstream(1).await.ca;
+    let port = raw_upstream(&[22, 3, 3, 0, 4, 2, 0, 0, 0], true).await;
+    let mut exit = start_exit(tunnel_config(port), true);
+    let mut client = Client::new(&ca, HOST);
+    let hello = client.tls_out();
+    let (request, surbs) = client.request(Some(port), hello, 2);
+    exit.handler.handle(request, surbs);
+    loop {
+        if let TunnelReplyV1::Data {
+            fin: Some(TunnelFinV1::Eof),
+            ..
+        } = client.reply(&mut exit).await
+        {
+            break;
+        }
+    }
+    client.seq = 1;
+    let (request, surbs) = client.request(None, records(100), 1);
+    exit.handler.handle(request, surbs);
+    assert_eq!(
+        rejection(&client.reply(&mut exit).await),
+        TunnelRejectCodeV1::UpstreamClosed
+    );
+    wait_until("the tunnel closes", || exit.handler.sessions() == 0).await;
+}
+
+#[tokio::test]
+async fn a_tunnel_whose_upstream_stalls_makes_room_for_an_open() {
+    let upstream = start_upstream(10).await;
+    let config = TunnelConfig {
+        max_sessions: 1,
+        stall_evict_ms: 200,
+        ..tunnel_config(upstream.port)
+    };
+    let mut exit = start_exit(config, true);
+    let mut stalled = Client::new(&upstream.ca, HOST);
+    stalled.handshake(&mut exit, upstream.port).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let mut next = Client::new(&upstream.ca, HOST);
+    next.handshake(&mut exit, upstream.port).await;
+    stalled.seq += 1;
+    let (request, surbs) = stalled.request(None, Vec::new(), 1);
+    exit.handler.handle(request, surbs);
+    assert_eq!(
+        rejection(&stalled.reply(&mut exit).await),
+        TunnelRejectCodeV1::Expired
+    );
+}
+
+#[tokio::test]
+async fn tunnels_that_never_acknowledge_cannot_stall_a_fresh_one() {
+    let body_len = 512 * 1024;
+    let upstream = start_upstream(body_len).await;
+    let max_window = 64 * 1024;
+    let config = TunnelConfig {
+        max_surbs_per_exchange: 2,
+        max_window_bytes: max_window,
+        max_total_buffered_bytes: 2 * max_window,
+        ..tunnel_config(upstream.port)
+    };
+    let mut exit = start_exit(config, true);
+    let mut hoarders = Vec::new();
+    for filled in 1..=2 {
+        let mut hoarder = Client::new(&upstream.ca, HOST);
+        hoarder.handshake(&mut exit, upstream.port).await;
+        hoarder.send_request(&exit, 1);
+        wait_until("a hoarder fills its window", || {
+            exit.handler.buffered_bytes() == filled * max_window
+        })
+        .await;
+        hoarders.push(hoarder);
+    }
+
+    let mut fresh = Client::new(&upstream.ca, HOST);
+    fresh.handshake(&mut exit, upstream.port).await;
+    let request = fresh.send_request(&exit, 2);
+    while fresh.response_body().is_none() {
+        let reply = fresh.reply(&mut exit).await;
+        if let Some(TunnelFinV1::NeedSurbs | TunnelFinV1::Expired) = fresh.absorb(&reply) {
+            fresh.copy(&exit, request.clone(), 2);
+        }
+    }
+    assert_eq!(
+        fresh.response_body(),
+        Some(expected_body(body_len).as_slice())
+    );
+
+    let hoarder = &mut hoarders[0];
+    hoarder.seq += 1;
+    let (request, surbs) = hoarder.request(None, Vec::new(), 1);
+    exit.handler.handle(request, surbs);
+    assert_eq!(
+        rejection(&hoarder.reply(&mut exit).await),
+        TunnelRejectCodeV1::Expired,
+        "the longest-idle hoarder was closed to free the buffer"
+    );
+}
+
+/// A plain TCP upstream on 127.0.0.1 that reads the ClientHello, sends `greeting`, then resets
+/// the connection once `reset` is notified.
+async fn resetting_upstream(greeting: &'static [u8], reset: Arc<tokio::sync::Notify>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("address").port();
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buffer = [0_u8; 4096];
+        let _ = stream.read(&mut buffer).await;
+        let _ = stream.write_all(greeting).await;
+        reset.notified().await;
+        let _ = stream.set_linger(Some(Duration::ZERO));
+    });
+    port
+}
+
+fn end_of_stream(reply: &TunnelReplyV1) -> u32 {
+    match reply {
+        TunnelReplyV1::Data {
+            seq,
+            fin: Some(TunnelFinV1::Eof),
+            ..
+        } => *seq,
+        _ => panic!("expected the end of the stream, got {reply:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_reset_after_the_write_was_read_ends_the_stream() {
+    let ca = start_upstream(1).await.ca;
+    let reset = Arc::new(tokio::sync::Notify::new());
+    reset.notify_one();
+    let port = resetting_upstream(b"", reset).await;
+    let mut exit = start_exit(tunnel_config(port), true);
+    let mut client = Client::new(&ca, HOST);
+    let hello = client.tls_out();
+    let (request, surbs) = client.request(Some(port), hello, 1);
+    exit.handler.handle(request, surbs);
+    assert_eq!(end_of_stream(&client.reply(&mut exit).await), 0);
+    wait_until("the tunnel closes", || exit.handler.sessions() == 0).await;
+}
+
+#[tokio::test]
+async fn a_reset_before_the_seq_was_written_is_refused_unwritten() {
+    let ca = start_upstream(1).await.ca;
+    let reset = Arc::new(tokio::sync::Notify::new());
+    const GREETING: &[u8] = &[22, 3, 3, 0, 4, 2, 0, 0, 0];
+    let port = resetting_upstream(GREETING, reset.clone()).await;
+    let mut exit = start_exit(tunnel_config(port), true);
+    let mut client = Client::new(&ca, HOST);
+    let hello = client.tls_out();
+    let (request, surbs) = client.request(Some(port), hello, 2);
+    exit.handler.handle(request, surbs);
+    let greeting = client.reply(&mut exit).await;
+    assert!(
+        matches!(greeting, TunnelReplyV1::Data { seq: 0, .. }),
+        "{greeting:?}"
+    );
+    // Seq 1 writes nothing and acknowledges the greeting, so the exit holds no bytes once it
+    // applied it.
+    client.seq = 1;
+    let (mut request, surbs) = client.request(None, Vec::new(), 1);
+    request.ack_offset = GREETING.len() as u64;
+    exit.handler.handle(request, surbs);
+    wait_until("the exit applies seq 1", || {
+        exit.handler.buffered_bytes() == 0
+    })
+    .await;
+    reset.notify_one();
+    let reply = client.reply(&mut exit).await;
+    assert!(
+        matches!(
+            reply,
+            TunnelReplyV1::Rejected {
+                seq: 1,
+                code: TunnelRejectCodeV1::UpstreamClosed,
+                ..
+            }
+        ),
+        "{reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn lifetime_end_after_a_partial_write_ends_the_stream() {
+    let ca = start_upstream(1).await.ca;
+    let port = raw_upstream(b"", false).await;
+    let config = TunnelConfig {
+        session_max_secs: 1,
+        ..tunnel_config(port)
+    };
+    let mut exit = start_exit(config, true);
+    let mut client = Client::new(&ca, HOST);
+    let hello = client.tls_out();
+    let (request, surbs) = client.request(Some(port), hello, 1);
+    exit.handler.handle(request, surbs);
+    client.seq = 1;
+    let (request, surbs) = client.request(None, records(4_000_000), 1);
+    exit.handler.handle(request, surbs);
+    assert_eq!(end_of_stream(&client.reply(&mut exit).await), 1);
+    wait_until("the tunnel closes", || exit.handler.sessions() == 0).await;
+}

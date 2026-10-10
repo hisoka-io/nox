@@ -260,6 +260,7 @@ paid_concurrency = 4
 quote_concurrency = 8
 proxy_concurrency = 32
 control_concurrency = 16
+tunnel_concurrency = 64
 queue_capacity = 256
 
 # Partial responses waiting for more SURBs at an exit. Filled by anonymous
@@ -270,6 +271,31 @@ max_pending_bytes = 134217728
 max_surb_requests = 100
 max_surbs_per_request = 512
 entry_ttl_secs = 300
+
+# End-to-end TLS tunnels (exit node). Clients run TLS themselves; the exit relays
+# TLS records to the named host and never sees the plaintext. Destinations follow
+# [http] allowed_domains and allow_private_ips. See docs/tunnel.md.
+[tunnel]
+enabled = false
+allowed_ports = [443]
+max_sessions = 4096                  # one socket each; keep below the fd limit
+opens_per_sec = 50
+opens_burst = 200
+connect_timeout_ms = 5000
+min_hold_ms = 1000
+max_hold_ms = 30000
+flush_idle_ms = 3
+flush_max_ms = 25
+session_idle_secs = 60
+closed_linger_ms = 15000             # once the upstream closed, without client requests
+stall_evict_ms = 10000               # busy tunnels with a silent upstream may make room
+session_max_secs = 600
+max_session_bytes = 67108864         # 64 MiB, both directions
+max_window_bytes = 1048576           # 1 MiB per tunnel
+max_total_buffered_bytes = 134217728 # 128 MiB across tunnels
+max_write_bytes = 4259840
+max_surbs_per_exchange = 32
+session_queue = 8
 
 # Database maintenance: mined/failed transactions and finished quotes are
 # slimmed, then deleted after their retention. Records the node may still act

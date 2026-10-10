@@ -302,6 +302,7 @@ fn run_check_config(config_path: &str) -> anyhow::Result<()> {
         );
         println!("payment_adapters: {}", config.payment_adapters.len());
         println!("tokens: {}", config.tokens.len());
+        println!("tunnel: {:?}", config.tunnel);
     }
     println!("configuration OK");
     Ok(())

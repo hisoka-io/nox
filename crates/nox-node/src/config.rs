@@ -533,6 +533,8 @@ pub struct ExitWorkerConfig {
     pub proxy_concurrency: usize,
     /// Echo, cover and other cheap payloads handled at once.
     pub control_concurrency: usize,
+    /// Tunnel requests checked and handed to their tunnel at once.
+    pub tunnel_concurrency: usize,
     /// Payloads that may wait per lane; further payloads are dropped and counted.
     pub queue_capacity: usize,
 }
@@ -544,6 +546,7 @@ impl Default for ExitWorkerConfig {
             quote_concurrency: 8,
             proxy_concurrency: 32,
             control_concurrency: 16,
+            tunnel_concurrency: 64,
             queue_capacity: 256,
         }
     }
@@ -690,6 +693,178 @@ impl ReplenishmentConfig {
     }
 }
 
+/// Upper bound for `tunnel.session_max_secs` (one day).
+pub const MAX_TUNNEL_SESSION_SECS: u64 = 86_400;
+
+/// End-to-end TLS tunnels (`ServiceRequest::TunnelV1`). The exit relays TLS records between
+/// a client and one upstream host and never sees the plaintext. Destinations follow
+/// `http.allowed_domains` and `http.allow_private_ips`.
+#[derive(Debug, Deserialize, Clone, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TunnelConfig {
+    /// Accept tunnels and advertise the `tunnel_v1` capability (exit-capable roles only).
+    pub enabled: bool,
+    /// Upstream ports a tunnel may connect to.
+    pub allowed_ports: Vec<u16>,
+    /// Open tunnels across the exit. When full, the longest-idle tunnel with no exchange in
+    /// flight is closed to make room, or else the tunnel whose upstream has been silent longest,
+    /// past `stall_evict_ms`. Each tunnel holds one socket.
+    pub max_sessions: usize,
+    /// Sustained tunnel opens per second across the exit.
+    pub opens_per_sec: u32,
+    /// Tunnel opens allowed in a burst above the sustained rate.
+    pub opens_burst: u32,
+    /// Time for the DNS lookup and the connect together, across all resolved addresses.
+    pub connect_timeout_ms: u64,
+    /// Lower bound for the client's `hold_ms`.
+    pub min_hold_ms: u32,
+    /// Upper bound for the client's `hold_ms`.
+    pub max_hold_ms: u32,
+    /// A part that is not full is sent after this much upstream silence.
+    pub flush_idle_ms: u64,
+    /// A part that is not full is sent at most this long after its first byte.
+    pub flush_max_ms: u64,
+    /// A tunnel with no client request for this long is closed.
+    pub session_idle_secs: u64,
+    /// A tunnel whose upstream closed is closed after this long without a client request,
+    /// which leaves time for copies that fetch the last parts or resend lost ones.
+    pub closed_linger_ms: u64,
+    /// When the exit needs room, a tunnel holding SURBs may be closed once its upstream has sent
+    /// nothing for this long.
+    pub stall_evict_ms: u64,
+    /// A tunnel is closed this long after it opened. Closed tunnel IDs are refused for
+    /// the same time.
+    pub session_max_secs: u64,
+    /// Bytes a tunnel may carry in both directions together.
+    pub max_session_bytes: u64,
+    /// Downstream bytes a tunnel keeps from the client's acknowledged offset on.
+    pub max_window_bytes: usize,
+    /// Downstream bytes kept across all tunnels. When reached, idle tunnels holding bytes are
+    /// closed, and each tunnel with an exchange in flight may still hold a fair share.
+    pub max_total_buffered_bytes: usize,
+    /// Largest `data` in one request.
+    pub max_write_bytes: usize,
+    /// SURBs used from one request; extra SURBs are ignored.
+    pub max_surbs_per_exchange: usize,
+    /// Requests waiting per tunnel; further requests are dropped.
+    pub session_queue: usize,
+}
+
+impl Default for TunnelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_ports: vec![443],
+            max_sessions: 4_096,
+            opens_per_sec: 50,
+            opens_burst: 200,
+            connect_timeout_ms: 5_000,
+            min_hold_ms: 1_000,
+            max_hold_ms: 30_000,
+            flush_idle_ms: 3,
+            flush_max_ms: 25,
+            session_idle_secs: 60,
+            closed_linger_ms: 15_000,
+            stall_evict_ms: 10_000,
+            session_max_secs: 600,
+            max_session_bytes: 64 * 1024 * 1024,
+            max_window_bytes: 1024 * 1024,
+            max_total_buffered_bytes: 128 * 1024 * 1024,
+            max_write_bytes: 4 * 1024 * 1024 + 64 * 1024,
+            max_surbs_per_exchange: 32,
+            session_queue: 8,
+        }
+    }
+}
+
+impl TunnelConfig {
+    #[must_use]
+    pub fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for (name, value) in [
+            ("max_sessions", self.max_sessions as u64),
+            ("opens_per_sec", u64::from(self.opens_per_sec)),
+            ("opens_burst", u64::from(self.opens_burst)),
+            ("connect_timeout_ms", self.connect_timeout_ms),
+            ("min_hold_ms", u64::from(self.min_hold_ms)),
+            ("flush_idle_ms", self.flush_idle_ms),
+            ("session_idle_secs", self.session_idle_secs),
+            ("closed_linger_ms", self.closed_linger_ms),
+            ("stall_evict_ms", self.stall_evict_ms),
+            ("max_session_bytes", self.max_session_bytes),
+            ("max_write_bytes", self.max_write_bytes as u64),
+            ("max_surbs_per_exchange", self.max_surbs_per_exchange as u64),
+            ("session_queue", self.session_queue as u64),
+        ] {
+            if value == 0 {
+                errors.push(format!("tunnel.{name} is 0"));
+            }
+        }
+        for (min_name, min, max_name, max) in [
+            (
+                "min_hold_ms",
+                u64::from(self.min_hold_ms),
+                "max_hold_ms",
+                u64::from(self.max_hold_ms),
+            ),
+            (
+                "flush_idle_ms",
+                self.flush_idle_ms,
+                "flush_max_ms",
+                self.flush_max_ms,
+            ),
+            (
+                "session_idle_secs",
+                self.session_idle_secs,
+                "session_max_secs",
+                self.session_max_secs,
+            ),
+        ] {
+            if min > max {
+                errors.push(format!(
+                    "tunnel.{min_name} ({min}) is above tunnel.{max_name} ({max})"
+                ));
+            }
+        }
+        let window_floor = self
+            .max_surbs_per_exchange
+            .saturating_mul(nox_core::TUNNEL_PART_MAX_DATA);
+        if self.max_window_bytes < window_floor {
+            errors.push(format!(
+                "tunnel.max_window_bytes ({}) is below tunnel.max_surbs_per_exchange x {} ({window_floor}); \
+                 an exchange could not fill its SURBs",
+                self.max_window_bytes,
+                nox_core::TUNNEL_PART_MAX_DATA
+            ));
+        }
+        if self.max_total_buffered_bytes < self.max_window_bytes {
+            errors.push(format!(
+                "tunnel.max_total_buffered_bytes ({}) is below tunnel.max_window_bytes ({})",
+                self.max_total_buffered_bytes, self.max_window_bytes
+            ));
+        }
+        if self.session_max_secs > MAX_TUNNEL_SESSION_SECS {
+            errors.push(format!(
+                "tunnel.session_max_secs ({}) is above {MAX_TUNNEL_SESSION_SECS}",
+                self.session_max_secs
+            ));
+        }
+        if self.flush_max_ms > u64::from(self.max_hold_ms) {
+            errors.push(format!(
+                "tunnel.flush_max_ms ({}) is above tunnel.max_hold_ms ({})",
+                self.flush_max_ms, self.max_hold_ms
+            ));
+        }
+        if self.allowed_ports.is_empty() {
+            errors.push("tunnel.allowed_ports is empty".into());
+        }
+        if self.allowed_ports.contains(&0) {
+            errors.push("tunnel.allowed_ports contains port 0".into());
+        }
+        errors
+    }
+}
+
 #[derive(Deserialize, Clone, Serialize)]
 pub struct NoxConfig {
     pub eth_rpc_url: String,
@@ -734,6 +909,8 @@ pub struct NoxConfig {
     /// Caps on partial responses waiting for more SURBs at an exit.
     #[serde(default)]
     pub exit_replenishment: ReplenishmentConfig,
+    #[serde(default)]
+    pub tunnel: TunnelConfig,
     /// Retention and maintenance of the node database.
     #[serde(default)]
     pub storage: StorageConfig,
@@ -828,6 +1005,7 @@ impl std::fmt::Debug for NoxConfig {
             .field("http", &self.http)
             .field("exit_workers", &self.exit_workers)
             .field("exit_replenishment", &self.exit_replenishment)
+            .field("tunnel", &self.tunnel)
             .field("storage", &self.storage)
             .field("block_poll_interval_secs", &self.block_poll_interval_secs)
             .field(
@@ -914,6 +1092,7 @@ impl Default for NoxConfig {
             http: HttpConfig::default(),
             exit_workers: ExitWorkerConfig::default(),
             exit_replenishment: ReplenishmentConfig::default(),
+            tunnel: TunnelConfig::default(),
             storage: StorageConfig::default(),
 
             block_poll_interval_secs: 12,
@@ -1010,6 +1189,7 @@ impl NoxConfig {
         errors.extend(self.ingress.validation_errors());
         errors.extend(self.storage.validation_errors());
         errors.extend(self.exit_replenishment.validation_errors());
+        errors.extend(self.tunnel.validation_errors());
 
         if self.chain_id == 0 && !self.benchmark_mode {
             errors.push("chain_id is 0 (must be set for production)".into());
@@ -1200,6 +1380,10 @@ impl NoxConfig {
             (
                 "exit_workers.control_concurrency",
                 self.exit_workers.control_concurrency,
+            ),
+            (
+                "exit_workers.tunnel_concurrency",
+                self.exit_workers.tunnel_concurrency,
             ),
             (
                 "exit_workers.queue_capacity",
@@ -1690,5 +1874,93 @@ mod tests {
             parsed.maintenance_interval_secs,
             DEFAULT_STORAGE_MAINTENANCE_INTERVAL_SECS
         );
+    }
+
+    #[test]
+    fn tunnel_config_validation() {
+        assert!(TunnelConfig::default().validation_errors().is_empty());
+        let cases: [(TunnelConfig, &str); 9] = [
+            (
+                TunnelConfig {
+                    session_max_secs: MAX_TUNNEL_SESSION_SECS + 1,
+                    ..TunnelConfig::default()
+                },
+                "tunnel.session_max_secs (86401) is above 86400",
+            ),
+            (
+                TunnelConfig {
+                    flush_max_ms: 40_000,
+                    ..TunnelConfig::default()
+                },
+                "tunnel.flush_max_ms (40000) is above tunnel.max_hold_ms",
+            ),
+            (
+                TunnelConfig {
+                    max_sessions: 0,
+                    ..TunnelConfig::default()
+                },
+                "tunnel.max_sessions is 0",
+            ),
+            (
+                TunnelConfig {
+                    min_hold_ms: 40_000,
+                    ..TunnelConfig::default()
+                },
+                "tunnel.min_hold_ms (40000) is above tunnel.max_hold_ms",
+            ),
+            (
+                TunnelConfig {
+                    flush_idle_ms: 30,
+                    ..TunnelConfig::default()
+                },
+                "tunnel.flush_idle_ms (30) is above tunnel.flush_max_ms",
+            ),
+            (
+                TunnelConfig {
+                    max_window_bytes: 256 * 1024,
+                    ..TunnelConfig::default()
+                },
+                "tunnel.max_window_bytes (262144) is below",
+            ),
+            (
+                TunnelConfig {
+                    max_total_buffered_bytes: 1024,
+                    ..TunnelConfig::default()
+                },
+                "tunnel.max_total_buffered_bytes (1024) is below",
+            ),
+            (
+                TunnelConfig {
+                    allowed_ports: Vec::new(),
+                    ..TunnelConfig::default()
+                },
+                "tunnel.allowed_ports is empty",
+            ),
+            (
+                TunnelConfig {
+                    allowed_ports: vec![443, 0],
+                    ..TunnelConfig::default()
+                },
+                "tunnel.allowed_ports contains port 0",
+            ),
+        ];
+        for (tunnel, expected) in cases {
+            let errors = tunnel.validation_errors();
+            assert!(
+                errors.iter().any(|error| error.starts_with(expected)),
+                "{expected}: {errors:?}"
+            );
+        }
+
+        let mut config = NoxConfig::default();
+        config.exit_workers.tunnel_concurrency = 0;
+        config.tunnel.session_queue = 0;
+        let errors = config.validate().unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("exit_workers.tunnel_concurrency")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("tunnel.session_queue")));
     }
 }

@@ -5,6 +5,30 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- Tunnels are off by default. rc.6-rc.8 nodes and current clients interoperate unchanged; clients send
+  `TunnelV1` only to exits that list `tunnel_v1`.
+
+### Added
+
+- End-to-end TLS tunnels for exits (`ServiceRequest::TunnelV1`, bincode tag 8): the client runs TLS and
+  the exit relays TLS records to the named host on an allowed port, with a `ClientHello` check (server
+  name equals the host, ALPN `http/1.1` only, no early data, pre-shared key or session ticket), TLS record
+  framing checks, per-tunnel flow control with acknowledgements, one unread write per tunnel, and
+  exit-wide session, open-rate and buffer limits with fair shares and eviction of idle or stalled tunnels.
+  Configured in `[tunnel]`, advertised as `tunnel_v1`, run on a fifth exit lane
+  (`exit_workers.tunnel_concurrency`, 64). See [docs/tunnel.md](docs/tunnel.md).
+- `nox_tunnel_*` metrics; `/metrics/json` gains `tunnelSessionsActive`, `tunnelOpened`,
+  `tunnelOpenRejected` and `tunnelClosed`.
+
+### Changed
+
+- The exit SSRF check also blocks 0.0.0.0/8, 224.0.0.0/4, 240.0.0.0/4, 192.0.0.0/24, 198.18.0.0/15,
+  ::/96, 2001::/32, 2001:db8::/32, 100::/64 and the local-use NAT64 prefix 64:ff9b:1::/48, and checks
+  the IPv4 address inside well-known NAT64 (64:ff9b::/96) and 6to4 (2002::/16) addresses, on the HTTP,
+  RPC and broadcast proxy paths and for tunnels.
+
 ### Fixed
 
 - Large replies arrive whole at the next hop (NOX-180). A node keeps at most

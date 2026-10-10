@@ -8,9 +8,20 @@ use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 
 /// Exit dispatch lanes, used as the `lane` label.
-pub const EXIT_LANES: [&str; 4] = ["paid", "quote", "proxy", "control"];
+pub const EXIT_LANES: [&str; 5] = ["paid", "quote", "proxy", "control", "tunnel"];
 /// Reasons an exit payload is dropped before dispatch, used as the `reason` label.
 pub const EXIT_DROP_REASONS: [&str; 2] = ["queue_full", "lane_closed"];
+/// Why a tunnel closed, used as the `reason` label of `nox_tunnel_closes_total`.
+pub const TUNNEL_CLOSE_REASONS: [&str; 8] = [
+    "eof",
+    "client",
+    "idle",
+    "lifetime",
+    "evicted",
+    "byte_limit",
+    "not_tls",
+    "upstream",
+];
 
 /// Prometheus metrics for all NOX subsystems.
 #[derive(Clone)]
@@ -132,6 +143,12 @@ pub struct MetricsService {
     pub exit_reassembly_total: Family<Vec<(String, String)>, Counter>,
     pub reassembly_conflict_total: Counter,
     pub exit_reassembler_pending: Gauge<i64, AtomicI64>,
+    pub tunnel_sessions_active: Gauge<i64, AtomicI64>,
+    pub tunnel_opens_total: Family<Vec<(String, String)>, Counter>,
+    pub tunnel_exchanges_total: Family<Vec<(String, String)>, Counter>,
+    pub tunnel_parts_total: Counter,
+    pub tunnel_bytes_total: Family<Vec<(String, String)>, Counter>,
+    pub tunnel_closes_total: Family<Vec<(String, String)>, Counter>,
     pub topology_nodes: Family<Vec<(String, String)>, Gauge<i64, AtomicI64>>,
     pub topology_bootstrap_total: Family<Vec<(String, String)>, Counter>,
 
@@ -862,6 +879,43 @@ impl MetricsService {
             health_status.clone(),
         );
 
+        let tunnel_sessions_active = Gauge::<i64, AtomicI64>::default();
+        registry.register(
+            "nox_tunnel_sessions_active",
+            "Open TLS tunnels",
+            tunnel_sessions_active.clone(),
+        );
+        let tunnel_opens_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_tunnel_opens",
+            "TLS tunnel opens, by result (opened or the reject code)",
+            tunnel_opens_total.clone(),
+        );
+        let tunnel_exchanges_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_tunnel_exchanges",
+            "TLS tunnel requests, by kind (write, copy, rejected, dropped)",
+            tunnel_exchanges_total.clone(),
+        );
+        let tunnel_parts_total = Counter::default();
+        registry.register(
+            "nox_tunnel_parts",
+            "TLS tunnel data parts sent to clients",
+            tunnel_parts_total.clone(),
+        );
+        let tunnel_bytes_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_tunnel_bytes",
+            "TLS tunnel bytes relayed, by direction (up, down)",
+            tunnel_bytes_total.clone(),
+        );
+        let tunnel_closes_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_tunnel_closes",
+            "TLS tunnels closed, by reason",
+            tunnel_closes_total.clone(),
+        );
+
         let uptime_seconds = Gauge::<i64, AtomicI64>::default();
         registry.register(
             "nox_uptime_seconds",
@@ -964,6 +1018,12 @@ impl MetricsService {
             exit_reassembly_total,
             reassembly_conflict_total,
             exit_reassembler_pending,
+            tunnel_sessions_active,
+            tunnel_opens_total,
+            tunnel_exchanges_total,
+            tunnel_parts_total,
+            tunnel_bytes_total,
+            tunnel_closes_total,
             topology_nodes,
             topology_bootstrap_total,
             process_resident_memory_bytes,
@@ -1266,6 +1326,31 @@ impl MetricsService {
         );
 
         m.insert(
+            "tunnelSessionsActive".into(),
+            self.tunnel_sessions_active.get().into(),
+        );
+        m.insert(
+            "tunnelOpened".into(),
+            fc(&self.tunnel_opens_total, &[("result", "opened")]).into(),
+        );
+        m.insert(
+            "tunnelOpenRejected".into(),
+            nox_core::TunnelRejectCodeV1::ALL
+                .iter()
+                .map(|code| fc(&self.tunnel_opens_total, &[("result", code.as_str())]))
+                .sum::<u64>()
+                .into(),
+        );
+        m.insert(
+            "tunnelClosed".into(),
+            TUNNEL_CLOSE_REASONS
+                .iter()
+                .map(|reason| fc(&self.tunnel_closes_total, &[("reason", reason)]))
+                .sum::<u64>()
+                .into(),
+        );
+
+        m.insert(
             "httpProxySuccess".into(),
             fc(&self.http_proxy_requests_total, &[("result", "success")]).into(),
         );
@@ -1546,5 +1631,37 @@ mod tests {
             metrics.to_json()["capabilities"],
             serde_json::json!(["paid_v2", "surb_v2"])
         );
+    }
+
+    #[test]
+    fn public_json_carries_tunnel_counts_but_not_volumes() {
+        let metrics = MetricsService::new();
+        let inc = |family: &Family<Vec<(String, String)>, Counter>, label: &str, value: &str| {
+            family
+                .get_or_create(&vec![(label.into(), value.into())])
+                .inc();
+        };
+        inc(&metrics.tunnel_opens_total, "result", "opened");
+        inc(&metrics.tunnel_opens_total, "result", "rate_limited");
+        inc(&metrics.tunnel_opens_total, "result", "not_tls");
+        inc(&metrics.tunnel_closes_total, "reason", "eof");
+        inc(&metrics.tunnel_closes_total, "reason", "evicted");
+        inc(&metrics.tunnel_bytes_total, "direction", "down");
+        metrics.tunnel_parts_total.inc();
+        metrics.tunnel_sessions_active.set(3);
+
+        let projection = metrics.to_json();
+        assert_eq!(projection["tunnelSessionsActive"], 3);
+        assert_eq!(projection["tunnelOpened"], 1);
+        assert_eq!(projection["tunnelOpenRejected"], 2);
+        assert_eq!(projection["tunnelClosed"], 2);
+        let keys = projection
+            .as_object()
+            .map(|object| object.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert!(keys
+            .iter()
+            .filter(|key| key.starts_with("tunnel"))
+            .all(|key| !key.contains("Bytes") && !key.contains("Parts")));
     }
 }

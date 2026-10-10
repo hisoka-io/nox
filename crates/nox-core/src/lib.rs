@@ -17,7 +17,8 @@ pub use models::handshake::{
 pub use models::payloads::{
     ExecutionQuoteV1, PaidQuoteOutcomeV2, PaidQuoteRequestV2, PaidTransactionOutcomeV2,
     PaidTransactionRejectionCodeV2, PaidTransactionRequestV2, RelayerPayload, RpcResponse,
-    ServiceRequest,
+    ServiceRequest, TunnelFinV1, TunnelOpenV1, TunnelRejectCodeV1, TunnelReplyV1, TunnelRequestV1,
+    TUNNEL_ID_LEN, TUNNEL_PART_MAX_DATA, TUNNEL_REJECT_DETAIL_MAX, TUNNEL_V1_CAPABILITY,
 };
 pub use models::topology::{
     primary_layer_for_role, RelayerNode, TopologyLiveness, TopologyLivenessStatus, TopologySnapshot,

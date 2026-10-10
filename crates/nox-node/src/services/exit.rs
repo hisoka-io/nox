@@ -6,6 +6,7 @@ use crate::services::handlers::ethereum::EthereumHandler;
 use crate::services::handlers::http::HttpHandler;
 use crate::services::handlers::rpc::RpcHandler;
 use crate::services::handlers::traffic::TrafficHandler;
+use crate::services::handlers::tunnel::TunnelHandler;
 use crate::services::replenishment::{PendingResponses, ReplenishmentLimits, SurbStash};
 use crate::services::response_packer::ResponsePacker;
 use crate::telemetry::metrics::MetricsService;
@@ -70,10 +71,18 @@ pub enum ExitLane {
     Proxy,
     /// Echo and cover traffic.
     Control,
+    /// End-to-end TLS tunnel requests.
+    Tunnel,
 }
 
 impl ExitLane {
-    pub const ALL: [Self; 4] = [Self::Paid, Self::Quote, Self::Proxy, Self::Control];
+    pub const ALL: [Self; 5] = [
+        Self::Paid,
+        Self::Quote,
+        Self::Proxy,
+        Self::Control,
+        Self::Tunnel,
+    ];
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -82,6 +91,7 @@ impl ExitLane {
             Self::Quote => "quote",
             Self::Proxy => "proxy",
             Self::Control => "control",
+            Self::Tunnel => "tunnel",
         }
     }
 
@@ -91,6 +101,7 @@ impl ExitLane {
             Self::Quote => 1,
             Self::Proxy => 2,
             Self::Control => 3,
+            Self::Tunnel => 4,
         }
     }
 
@@ -100,6 +111,7 @@ impl ExitLane {
             Self::Quote => config.quote_concurrency,
             Self::Proxy => config.proxy_concurrency,
             Self::Control => config.control_concurrency,
+            Self::Tunnel => config.tunnel_concurrency,
         }
     }
 }
@@ -124,6 +136,7 @@ const SERVICE_REQUEST_BROADCAST: u32 = 4;
 const SERVICE_REQUEST_REPLENISH_SURBS: u32 = 5;
 const SERVICE_REQUEST_PAID_TRANSACTION_V2: u32 = 6;
 const SERVICE_REQUEST_PAID_QUOTE_V2: u32 = 7;
+const SERVICE_REQUEST_TUNNEL_V1: u32 = 8;
 
 /// Picks the dispatch lane from the payload variant without decoding the request body.
 #[must_use]
@@ -154,6 +167,7 @@ pub fn classify_payload(command: &RelayerPayload) -> ExitDispatch {
                     ExitDispatch::Lane(ExitLane::Paid)
                 }
                 SERVICE_REQUEST_PAID_QUOTE_V2 => ExitDispatch::Lane(ExitLane::Quote),
+                SERVICE_REQUEST_TUNNEL_V1 => ExitDispatch::Lane(ExitLane::Tunnel),
                 // ReplenishSurbs stays in order with the bus; unknown tags are logged inline.
                 _ => ExitDispatch::Inline,
             }
@@ -171,6 +185,7 @@ pub struct ExitService {
     http_handler: Option<Arc<HttpHandler>>,
     echo_handler: Option<Arc<EchoHandler>>,
     rpc_handler: Option<Arc<RpcHandler>>,
+    tunnel_handler: Option<Arc<TunnelHandler>>,
     reassembler: Arc<Mutex<Reassembler>>,
     prune_interval: Duration,
     stale_timeout: Duration,
@@ -268,6 +283,7 @@ impl ExitService {
             http_handler: Some(http_handler),
             echo_handler: Some(echo_handler),
             rpc_handler: None,
+            tunnel_handler: None,
             reassembler: Arc::new(Mutex::new(Reassembler::new(reassembler_config))),
             prune_interval: Duration::from_secs(frag_config.prune_interval_seconds),
             stale_timeout: Duration::from_secs(frag_config.timeout_seconds),
@@ -304,6 +320,7 @@ impl ExitService {
             http_handler: Some(http_handler),
             echo_handler: Some(echo_handler),
             rpc_handler: Some(rpc_handler),
+            tunnel_handler: None,
             reassembler: Arc::new(Mutex::new(Reassembler::new(reassembler_config))),
             prune_interval: Duration::from_secs(frag_config.prune_interval_seconds),
             stale_timeout: Duration::from_secs(frag_config.timeout_seconds),
@@ -339,6 +356,7 @@ impl ExitService {
             http_handler,
             echo_handler,
             rpc_handler: None,
+            tunnel_handler: None,
             reassembler: Arc::new(Mutex::new(Reassembler::new(reassembler_config))),
             prune_interval: Duration::from_secs(frag_config.prune_interval_seconds),
             stale_timeout: Duration::from_secs(frag_config.timeout_seconds),
@@ -376,6 +394,7 @@ impl ExitService {
             http_handler,
             echo_handler,
             rpc_handler,
+            tunnel_handler: None,
             reassembler: Arc::new(Mutex::new(Reassembler::new(reassembler_config))),
             prune_interval: Duration::from_secs(frag_config.prune_interval_seconds),
             stale_timeout: Duration::from_secs(frag_config.timeout_seconds),
@@ -392,6 +411,12 @@ impl ExitService {
     #[must_use]
     pub fn with_worker_config(mut self, workers: ExitWorkerConfig) -> Self {
         self.workers = workers;
+        self
+    }
+
+    #[must_use]
+    pub fn with_tunnel_handler(mut self, handler: Arc<TunnelHandler>) -> Self {
+        self.tunnel_handler = Some(handler);
         self
     }
 
@@ -467,6 +492,7 @@ impl ExitService {
             quote = self.workers.quote_concurrency,
             proxy = self.workers.proxy_concurrency,
             control = self.workers.control_concurrency,
+            tunnel = self.workers.tunnel_concurrency,
             queue = self.workers.queue_capacity,
             "Exit Service active."
         );
@@ -515,7 +541,7 @@ impl ExitService {
     }
 
     /// Starts one bounded queue and worker per lane. Workers stop with the cancel token.
-    fn start_lanes(&self) -> [mpsc::Sender<LaneJob>; 4] {
+    fn start_lanes(&self) -> [mpsc::Sender<LaneJob>; 5] {
         let service = Arc::new(self.clone());
         let queue_capacity = self.workers.queue_capacity.max(1);
         ExitLane::ALL.map(|lane| {
@@ -575,7 +601,7 @@ impl ExitService {
 
     async fn route(
         &self,
-        lanes: &[mpsc::Sender<LaneJob>; 4],
+        lanes: &[mpsc::Sender<LaneJob>; 5],
         packet_id: String,
         command: RelayerPayload,
     ) {
@@ -1095,6 +1121,20 @@ impl ExitService {
                             );
                         }
                     }
+                    Ok(ServiceRequest::TunnelV1(request)) => {
+                        self.metrics
+                            .exit_payloads_dispatched_total
+                            .get_or_create(&vec![("handler".to_string(), "tunnel".to_string())])
+                            .inc();
+                        if let Some(ref handler) = self.tunnel_handler {
+                            handler.handle(request, reply_surbs);
+                        } else {
+                            debug!(
+                                packet_id = %packet_id,
+                                "Tunnel request received but no tunnel handler configured"
+                            );
+                        }
+                    }
                     Ok(ServiceRequest::ReplenishSurbs { request_id, surbs }) => {
                         // Lock order everywhere: accumulator, then pending. Neither lock is
                         // held while packing.
@@ -1285,6 +1325,18 @@ mod tests {
         }
     }
 
+    fn tunnel_request() -> nox_core::TunnelRequestV1 {
+        nox_core::TunnelRequestV1 {
+            tunnel_id: [1; nox_core::TUNNEL_ID_LEN],
+            seq: 1,
+            open: None,
+            ack_offset: 0,
+            data: Vec::new(),
+            close: false,
+            hold_ms: 1_000,
+        }
+    }
+
     #[test]
     fn service_requests_map_to_their_lanes() {
         let cases = [
@@ -1346,6 +1398,10 @@ mod tests {
                 ServiceRequest::PaidQuoteRequestV2(quote_request()),
                 ExitDispatch::Lane(ExitLane::Quote),
             ),
+            (
+                ServiceRequest::TunnelV1(tunnel_request()),
+                ExitDispatch::Lane(ExitLane::Tunnel),
+            ),
         ];
         for (request, expected) in cases {
             assert_eq!(
@@ -1372,6 +1428,10 @@ mod tests {
         assert_eq!(
             tag(&ServiceRequest::PaidQuoteRequestV2(quote_request())),
             SERVICE_REQUEST_PAID_QUOTE_V2
+        );
+        assert_eq!(
+            tag(&ServiceRequest::TunnelV1(tunnel_request())),
+            SERVICE_REQUEST_TUNNEL_V1
         );
     }
 
