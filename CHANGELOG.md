@@ -5,8 +5,14 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+## [0.4.0-rc.9] - 2026-10-10
+
 ### Upgrade notes
 
+- Upgrade one node at a time; rc.6 to rc.9 nodes, nox-kps relays and all published clients interoperate.
+  The Sphinx wire, fragment, FEC and SURB formats are unchanged.
+- Exits that turn tunnels on set `max_sessions` within the container's open-files limit
+  ([docs/tunnel.md](docs/tunnel.md)).
 - Tunnels are off by default. rc.6-rc.8 nodes and current clients interoperate unchanged; clients send
   `TunnelV1` only to exits that list `tunnel_v1`.
 
