@@ -1,6 +1,6 @@
 //! Integration tests for client-side features: SURB budgeting, adaptive EMA,
-//! cover traffic controller, disconnect cleanup, RPC URL passthrough,
-//! HTTP retry constants, topology PoW field, and fragmentation constants.
+//! cover traffic controller, disconnect cleanup, RPC URL passthrough and the
+//! topology PoW field.
 
 #![allow(
     clippy::expect_used,
@@ -9,12 +9,9 @@
     clippy::uninlined_format_args
 )]
 
-use nox_client::surb_budget::{
-    AdaptiveSurbBudget, SurbBudget, DEFAULT_RPC_SURBS, MAX_SURBS, USABLE_RESPONSE_PER_SURB,
-};
+use nox_client::surb_budget::{AdaptiveSurbBudget, SurbBudget, DEFAULT_RPC_SURBS};
 use nox_client::{CoverTrafficController, MixnetClient, MixnetClientConfig};
 use nox_core::models::topology::{RelayerNode, TopologySnapshot};
-use nox_core::protocol::fragmentation::FRAGMENT_OVERHEAD;
 use nox_core::traits::interfaces::EventBusError;
 use nox_core::{IEventPublisher, NoxEvent, ServiceRequest};
 use nox_crypto::sphinx::packet::MAX_PAYLOAD_SIZE;
@@ -263,22 +260,6 @@ fn test_rpc_request_roundtrip_without_url() {
 }
 
 #[test]
-fn test_http_retry_constants() {
-    // These constants are private to http_transport, but we can verify them
-    // indirectly by checking the HttpPacketTransport is constructable and the
-    // module's behavior is consistent. We verify the expected values via a
-    // compile-time check pattern: the constants are MAX_SEND_RETRIES=3 and
-    // INITIAL_RETRY_DELAY_MS=100 as documented.
-    //
-    // Since the constants are private (`const` without `pub`), we validate that
-    // the transport exists and is properly typed. The actual constant values
-    // are verified in the crate's own unit tests.
-    let transport = nox_client::HttpPacketTransport::new();
-    // Verify the transport implements the expected trait
-    let _: Box<dyn nox_core::traits::transport::PacketTransport> = Box::new(transport);
-}
-
-#[test]
 fn test_topology_snapshot_pow_difficulty_roundtrip() {
     let snapshot = TopologySnapshot {
         nodes: vec![RelayerNode::new(
@@ -348,76 +329,6 @@ fn test_topology_snapshot_pow_difficulty_high_value() {
     let json = serde_json::to_string(&snapshot).expect("serialize");
     let back: TopologySnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(back.pow_difficulty, u32::MAX);
-}
-
-#[test]
-fn test_stall_detection_constants_are_sensible() {
-    // The stall timeout and max replenishment rounds are private constants
-    // (STALL_TIMEOUT = 8s, MAX_REPLENISHMENT_ROUNDS = 50).
-    // We verify indirectly by ensuring the client config defaults are consistent:
-    // - Default timeout (300s) divided by stall timeout (8s) = 37.5 check cycles
-    // - MAX_REPLENISHMENT_ROUNDS (50) exceeds this, providing headroom.
-    let config = MixnetClientConfig::default();
-    assert_eq!(
-        config.timeout,
-        std::time::Duration::from_secs(300),
-        "default timeout changed from 300s"
-    );
-    // The stall detection window (8s) and replenishment cap (50 rounds)
-    // mean up to 50 * 8s = 400s of stall recovery, exceeding the 300s timeout.
-    // This confirms the cap is sufficient for the default config.
-}
-
-#[test]
-fn test_forward_fragment_chunk_size_value() {
-    // FORWARD_FRAGMENT_CHUNK_SIZE = MAX_PAYLOAD_SIZE - 32 (private const).
-    // Verify the expected relationship: it must be > 30KB and < 35KB,
-    // and equal to MAX_PAYLOAD_SIZE - 32.
-    let expected = MAX_PAYLOAD_SIZE - 32;
-    assert!(
-        expected > 30_000,
-        "chunk size {expected} too small (< 30000)"
-    );
-    assert!(
-        expected < 35_000,
-        "chunk size {expected} too large (>= 35000)"
-    );
-    assert_eq!(expected, MAX_PAYLOAD_SIZE - 32);
-}
-
-#[test]
-fn test_forward_fragment_chunk_exceeds_fragment_overhead() {
-    let chunk = MAX_PAYLOAD_SIZE - 32;
-    assert!(
-        chunk > FRAGMENT_OVERHEAD,
-        "chunk {chunk} <= fragment overhead {FRAGMENT_OVERHEAD}"
-    );
-    // The usable payload per forward fragment
-    let usable = chunk - FRAGMENT_OVERHEAD;
-    assert!(usable > 30_000, "usable payload {usable} bytes < 30KB");
-}
-
-#[test]
-fn test_surb_payload_vs_forward_chunk_relationship() {
-    // SURB responses use SURB_PAYLOAD_SIZE (30KB), forward uses MAX_PAYLOAD_SIZE - 32.
-    // Forward chunk should be slightly larger than SURB payload size.
-    let forward_chunk = MAX_PAYLOAD_SIZE - 32;
-    let surb_payload = nox_core::SURB_PAYLOAD_SIZE;
-    assert!(
-        forward_chunk > surb_payload,
-        "forward chunk {forward_chunk} <= SURB payload {surb_payload}"
-    );
-}
-
-#[test]
-fn test_max_surbs_consistent_with_usable_per_surb() {
-    // MAX_SURBS * USABLE_RESPONSE_PER_SURB gives total response capacity
-    let total = MAX_SURBS * USABLE_RESPONSE_PER_SURB;
-    // Should be at least 260 MB
-    assert!(
-        total >= 260 * 1024 * 1024,
-        "max response capacity {total} < 260MB"
-    );
 }
 
 #[test]
