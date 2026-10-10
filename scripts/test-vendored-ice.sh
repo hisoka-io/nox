@@ -15,7 +15,14 @@ cp "$root/Cargo.lock" "$work/webrtc-ice/Cargo.lock"
 
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/target/vendor-ice}"
 cd "$work/webrtc-ice"
-if [ $# -eq 0 ]; then
-    set -- test_lite_selects_pair_on_first_authenticated_check
+if [ $# -gt 0 ]; then
+    cargo test --lib -- "$@"
+    exit
 fi
-cargo test --lib -- "$@"
+# libtest exits 0 when a filter matches nothing, so require the test to have run.
+regression=agent::agent_test::test_lite_selects_pair_on_first_authenticated_check
+cargo test --lib -- --exact "$regression" | tee "$work/output"
+grep -q '^test result: ok\. 1 passed' "$work/output" || {
+    echo "$regression did not run" >&2
+    exit 1
+}
