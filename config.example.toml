@@ -278,7 +278,7 @@ entry_ttl_secs = 300
 [tunnel]
 enabled = false
 allowed_ports = [443]
-max_sessions = 4096                  # one socket each; keep below the fd limit
+max_sessions = 4096                  # one socket each; keep below the fd limit (512 under Docker's default 1024)
 opens_per_sec = 50
 opens_burst = 200
 connect_timeout_ms = 5000
