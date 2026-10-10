@@ -149,6 +149,8 @@ jobs:
         run: cargo nextest run --workspace --exclude nox-mixnet --exclude nox-test-infra
       - name: Test vendored webrtc-sctp
         run: scripts/test-vendored-sctp.sh
+      - name: Test vendored webrtc-ice (lite pair selection)
+        run: scripts/test-vendored-ice.sh
       # The nox-kps soaks are #[ignore]d in the default run. Here: 200 sequential
       # 32 KiB exchanges per transport and direction, and 20 large claim bodies
       # (5 MiB) per transport, with zero stalls allowed. The split-process soak

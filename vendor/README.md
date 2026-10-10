@@ -82,3 +82,6 @@ peer (`agent_selector.rs`, controlled `handle_binding_request`). The check is
 authenticated with the ICE password, which kps derives from the server
 certhash, so only a client that knows the published address gets this far. A
 later `USE-CANDIDATE` for another pair still switches to that pair.
+
+`scripts/test-vendored-ice.sh` runs the regression test for this change
+(`test_lite_selects_pair_on_first_authenticated_check`) in CI.

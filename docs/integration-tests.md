@@ -28,7 +28,7 @@ interpret an application protocol.
 
 On every push and pull request, `.github/workflows/ci.yml` runs:
 
-- **Test**: `cargo nextest run` over the subcrates, the vendored webrtc-sctp tests, the nox-kps
+- **Test**: `cargo nextest run` over the subcrates, the vendored webrtc-sctp and webrtc-ice tests, the nox-kps
   soaks and the nox-kps interop test;
 - **Integration Tests**: `cargo nextest run -p nox-mixnet --features dev-node`, which compiles and runs every
   `tests/*.rs` file except `payment_trace_safety`, with Anvil 1.3.2 and solc 0.8.30 installed;
