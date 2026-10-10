@@ -57,7 +57,7 @@ Integration tests:
 cargo test --test payment_trace_safety --features dev-node -- --nocapture
 cargo test --test transaction_outbox -- --nocapture
 cargo test --test http_e2e -- --nocapture
-cargo test --test fec_e2e
+cargo test -p nox-core --test fec
 ```
 
 ## Crate map

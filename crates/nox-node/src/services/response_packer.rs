@@ -922,21 +922,17 @@ mod tests {
 
     #[test]
     fn test_fec_parity_clamped_to_255_limit() {
-        use nox_core::protocol::fragmentation::Fragmenter;
         let packer = ResponsePacker::new();
-        let usable = Fragmenter::usable_payload_size(SURB_PAYLOAD_SIZE);
-        let data: Vec<u8> = vec![0x42; usable * 200];
-        let d = packer.surbs_needed(data.len());
-        assert_eq!(d, 200);
+        let data = vec![0x42u8; ResponsePacker::usable_per_fragment() + 1];
+        assert_eq!(packer.surbs_needed(data.len()), 2);
 
-        let surbs = make_test_surbs(300);
-        let result = packer.pack_response(2, &data, surbs);
-        assert!(result.is_ok());
-        let pack = result.unwrap();
+        // Two SURBs more than the 255 shards a block can hold.
+        let surbs = make_test_surbs(257);
+        let pack = packer.pack_response(2, &data, surbs).unwrap();
         assert_eq!(
             pack.packets.len(),
             255,
-            "should clamp to 255 total (200 data + 55 parity)"
+            "should clamp to 255 total (2 data + 253 parity)"
         );
     }
 

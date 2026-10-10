@@ -421,6 +421,50 @@ mod tests {
         (path, secret_keys)
     }
 
+    /// Size of the small bodies below. `decrypt` treats every body size alike.
+    const SAMPLE_BODY_LEN: usize = 64;
+    const SAMPLE_BODIES: u32 = 5_100;
+    /// Bodies of the sample that may decrypt to valid padding: the expected
+    /// 5,100 / 255 = 20, give or take four standard deviations (4.5 each).
+    const ACCEPTED_SAMPLE_BOUNDS: std::ops::RangeInclusive<usize> = 3..=37;
+
+    /// Recovery data with fixed keys, so a body decrypts to the same bytes on
+    /// every run.
+    fn fixed_recovery(version: u8) -> SurbRecovery {
+        let keys = |seed: u8| LionessKeys {
+            k1: [seed; 32],
+            k2: [seed + 1; 32],
+            k3: [seed + 2; 32],
+            k4: [seed + 3; 32],
+        };
+        SurbRecovery {
+            id: [0; 16],
+            layer_keys: vec![keys(0x10), keys(0x20)],
+            payload_keys: keys(0x30),
+            version,
+        }
+    }
+
+    /// The body that `recovery.decrypt` turns back into `plaintext`.
+    fn body_decrypting_to(recovery: &SurbRecovery, plaintext: &[u8]) -> Vec<u8> {
+        let mut body = plaintext.to_vec();
+        lioness_encrypt(&recovery.payload_keys, &mut body);
+        for keys in recovery.layer_keys.iter().rev() {
+            lioness_decrypt(keys, &mut body);
+        }
+        body
+    }
+
+    /// Body `index` of a fixed pseudo-random sequence.
+    fn sample_body(index: u32) -> [u8; SAMPLE_BODY_LEN] {
+        let mut body = [0u8; SAMPLE_BODY_LEN];
+        blake3::Hasher::new()
+            .update(&index.to_le_bytes())
+            .finalize_xof()
+            .fill(&mut body);
+        body
+    }
+
     #[test]
     fn test_surb_construction() {
         let (path, _) = generate_test_path(3);
@@ -527,31 +571,58 @@ mod tests {
         assert_eq!(deserialized.payload_keys.k2, surb.payload_keys.k2);
     }
 
-    /// Random data should fail ISO 7816-4 padding validation (cover traffic defense).
+    /// A format 1 reply has no tag, so `decrypt` accepts a body exactly when it
+    /// decrypts to valid ISO 7816-4 padding. For a random body that is the case
+    /// when its last non-zero byte is 0x80: one body in 255.
     #[test]
     fn test_decrypt_rejects_random_data() {
-        let (path, _) = generate_test_path(3);
-        let id: [u8; 16] = rand::random();
+        let recovery = fixed_recovery(1);
 
-        let (_, recovery) = Surb::new(&path, id, 0).expect("SURB construction failed");
-
-        let mut rng = rand::thread_rng();
-
-        let random_body: Vec<u8> = (0..32296).map(|_| rand::Rng::gen::<u8>(&mut rng)).collect();
-        let result = recovery.decrypt(&random_body);
-        let mut failures = 0;
-        for _ in 0..100 {
-            let random_data: Vec<u8> = (0..32296).map(|_| rand::Rng::gen::<u8>(&mut rng)).collect();
-            if recovery.decrypt(&random_data).is_err() {
-                failures += 1;
-            }
-        }
-        assert!(
-            failures >= 90,
-            "only {failures}/100 random inputs were rejected -- padding check too permissive",
+        let mut padded = vec![0x42u8; SAMPLE_BODY_LEN];
+        padded[40] = 0x80;
+        padded[41..].fill(0);
+        assert_eq!(
+            recovery
+                .decrypt(&body_decrypting_to(&recovery, &padded))
+                .expect("valid padding"),
+            vec![0x42u8; 40]
         );
 
-        assert!(result.is_err());
+        let no_marker = vec![0x42u8; SAMPLE_BODY_LEN];
+        let mut data_after_marker = padded.clone();
+        data_after_marker[SAMPLE_BODY_LEN - 1] = 0x01;
+        let all_zero = vec![0u8; SAMPLE_BODY_LEN];
+        for invalid in [no_marker, data_after_marker, all_zero] {
+            assert!(matches!(
+                recovery.decrypt(&body_decrypting_to(&recovery, &invalid)),
+                Err(SurbError::InvalidPadding)
+            ));
+        }
+
+        let accepted = (0..SAMPLE_BODIES)
+            .filter(|&index| recovery.decrypt(&sample_body(index)).is_ok())
+            .count();
+        assert!(
+            ACCEPTED_SAMPLE_BOUNDS.contains(&accepted),
+            "{accepted} of {SAMPLE_BODIES} random bodies accepted, expected about {}",
+            SAMPLE_BODIES / 255
+        );
+    }
+
+    /// Format 2 adds the tag, so no random body is accepted: the ones with
+    /// valid padding fail on the tag.
+    #[test]
+    fn v2_decrypt_rejects_every_random_body() {
+        let recovery = fixed_recovery(2);
+        let mut valid_padding = 0;
+        for index in 0..SAMPLE_BODIES {
+            match recovery.decrypt(&sample_body(index)) {
+                Err(SurbError::InvalidPadding) => {}
+                Err(SurbError::TagMismatch) => valid_padding += 1,
+                other => panic!("random body {index}: {other:?}"),
+            }
+        }
+        assert!(ACCEPTED_SAMPLE_BOUNDS.contains(&valid_padding));
     }
 
     #[test]
@@ -656,17 +727,18 @@ mod tests {
         use super::super::packet::PACKET_SIZE;
 
         let (path, _secret_keys) = generate_test_path(3);
-        let id: [u8; 16] = rand::random();
 
-        let (surb, recovery) = Surb::new(&path, id, 0).expect("SURB construction failed");
+        // Format 2: the tag rejects the body at the wrong offset. A format 1
+        // body would pass the padding check there one time in 255.
+        let (surb, recovery) = Surb::new_v2(&path, 0).expect("SURB construction failed");
         let message = b"offset regression test";
-        let packet = surb.encapsulate(message).expect("Encapsulation failed");
+        let packet = surb.encapsulate_v2(message).expect("Encapsulation failed");
 
         let recovery_no_layers = SurbRecovery {
             id: recovery.id,
             layer_keys: vec![],
             payload_keys: recovery.payload_keys.clone(),
-            version: 1,
+            version: 2,
         };
 
         let packet_bytes = packet.as_bytes();
@@ -898,18 +970,55 @@ mod tests {
         assert_ne!(delivery_id_from_shared_secret(&ss)[..], tag[..16]);
     }
 
+    /// Flips every bit of a small reply, in the plaintext (message, tag,
+    /// padding marker, padding) and in the encrypted body, then bits spread
+    /// over a full-size reply that went down a return path.
     #[test]
     fn v2_reply_rejects_any_flipped_bit() {
+        let recovery = fixed_recovery(2);
+        let message = b"tamper check";
+        let tag_end = message.len() + SURB_TAG_LEN;
+        let mut plain = vec![0u8; SAMPLE_BODY_LEN];
+        plain[..message.len()].copy_from_slice(message);
+        plain[message.len()..tag_end].copy_from_slice(&reply_tag(&recovery.payload_keys, message));
+        plain[tag_end] = 0x80;
+        let body = body_decrypting_to(&recovery, &plain);
+        assert_eq!(recovery.decrypt(&body).expect("untampered"), message);
+
+        for bit in 0..SAMPLE_BODY_LEN * 8 {
+            let flipped = |bytes: &[u8]| {
+                let mut bytes = bytes.to_vec();
+                bytes[bit / 8] ^= 1 << (bit % 8);
+                bytes
+            };
+            let result = recovery.decrypt(&body_decrypting_to(&recovery, &flipped(&plain)));
+            if bit / 8 < tag_end {
+                assert!(
+                    matches!(result, Err(SurbError::TagMismatch)),
+                    "message or tag bit {bit}: {result:?}"
+                );
+            } else {
+                assert!(result.is_err(), "padding bit {bit} accepted");
+            }
+            assert!(
+                recovery.decrypt(&flipped(&body)).is_err(),
+                "body bit {bit} accepted"
+            );
+        }
+
         let (path, sks) = generate_test_path(2);
         let (surb, recovery) = Surb::new_v2(&path, 0).expect("v2 SURB");
-        let packet = surb.encapsulate_v2(b"tamper check").expect("seal");
+        let packet = surb.encapsulate_v2(message).expect("seal");
         let (_, _, payload) = walk_return_path(&packet, &sks);
-        let mut rng = rand::thread_rng();
-        for _ in 0..2_000 {
+        let last = payload.len() - 1;
+        // First and last byte, both sides of the Lioness split, 28 interior bytes.
+        let positions = [0, 31, 32, last]
+            .into_iter()
+            .chain((1..=28).map(|step| step * last / 29));
+        for (index, byte) in positions.enumerate() {
             let mut body = payload.clone();
-            let bit = rng.gen_range(0..body.len() * 8);
-            body[bit / 8] ^= 1 << (bit % 8);
-            assert!(recovery.decrypt(&body).is_err(), "bit {bit} accepted");
+            body[byte] ^= 1 << (index % 8);
+            assert!(recovery.decrypt(&body).is_err(), "byte {byte} accepted");
         }
     }
 
