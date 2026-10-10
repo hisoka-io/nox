@@ -97,7 +97,9 @@ Rejections carry a `TunnelRejectCodeV1`: `Malformed`, `Disabled`, `PortNotAllowe
 
 - Turn tunnels on with `[tunnel] enabled = true` ([configuration.md](configuration.md#tunnel-exit-node)).
 - Each open tunnel holds one TCP socket. Keep `max_sessions` well below the process file-descriptor
-  limit, with headroom for P2P and HTTP connections.
+  limit, with headroom for P2P and HTTP connections. A container started with Docker's usual soft limit of
+  1,024 open files suits `max_sessions = 512`; for the default 4,096, raise the limit first (compose
+  `ulimits: nofile`).
 - Downstream data waiting for acknowledgement is kept within `max_total_buffered_bytes` across all
   tunnels (128 MiB by default). When that is reached, the longest-idle tunnels holding bytes close to
   make room, and each tunnel with an exchange in flight keeps reading up to its fair share (the limit
