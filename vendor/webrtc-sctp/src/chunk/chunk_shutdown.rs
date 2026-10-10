@@ -45,7 +45,9 @@ impl Chunk for ChunkShutdown {
             return Err(Error::ErrChunkTypeNotShutdown);
         }
 
-        if raw.len() != CHUNK_HEADER_SIZE + CUMULATIVE_TSN_ACK_LENGTH {
+        // `raw` may run past this chunk (other chunks after it in the same
+        // packet), so the size check is on the chunk's own length.
+        if header.value_length() != CUMULATIVE_TSN_ACK_LENGTH {
             return Err(Error::ErrInvalidChunkSize);
         }
 

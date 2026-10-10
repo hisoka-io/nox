@@ -166,7 +166,10 @@ impl Chunk for ChunkInit {
             return Err(Error::ErrChunkTypeInitFlagZero);
         }
 
-        let reader = &mut raw.slice(CHUNK_HEADER_SIZE..CHUNK_HEADER_SIZE + header.value_length());
+        // `raw` may run past this chunk (padding, other chunks after it in the
+        // same packet), so every bound below is the chunk's own length.
+        let end = CHUNK_HEADER_SIZE + header.value_length();
+        let reader = &mut raw.slice(CHUNK_HEADER_SIZE..end);
 
         let initiate_tag = reader.get_u32();
         let advertised_receiver_window_credit = reader.get_u32();
@@ -174,16 +177,16 @@ impl Chunk for ChunkInit {
         let num_inbound_streams = reader.get_u16();
         let initial_tsn = reader.get_u32();
 
+        // The last parameter's padding is outside the chunk length, so
+        // `offset` can step past `end`; the loop then stops.
         let mut params = vec![];
         let mut offset = CHUNK_HEADER_SIZE + INIT_CHUNK_MIN_LENGTH;
-        let mut remaining = raw.len() as isize - offset as isize;
-        while remaining >= INIT_OPTIONAL_VAR_HEADER_LENGTH as isize {
-            let p = build_param(&raw.slice(offset..CHUNK_HEADER_SIZE + header.value_length()))?;
+        while offset + INIT_OPTIONAL_VAR_HEADER_LENGTH <= end {
+            let p = build_param(&raw.slice(offset..end))?;
             let p_len = PARAM_HEADER_LENGTH + p.value_length();
             let len_plus_padding = p_len + get_padding_size(p_len);
             params.push(p);
             offset += len_plus_padding;
-            remaining -= len_plus_padding as isize;
         }
 
         Ok(ChunkInit {
