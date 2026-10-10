@@ -179,8 +179,21 @@ pub struct NetworkConfig {
     pub gossip_heartbeat_secs: u64,
     pub idle_connection_timeout_secs: u64,
     pub session_ttl_secs: u64,
-    /// Raise to ~5,000+ for burst SURB-response traffic in benchmarks.
+    /// Inbound packet streams served at once per connection; streams above
+    /// this are dropped by libp2p without telling the sender. Senders before
+    /// v0.4.0-rc.9 do not limit their open requests, so this has to absorb a
+    /// whole reply burst from them.
     pub max_concurrent_streams: usize,
+    /// Packet requests this node keeps open to one peer; later packets wait
+    /// in order until earlier ones are answered. Kept below the receive
+    /// limit of older peers (100 streams per connection, shared with their
+    /// own requests to this node).
+    #[serde(default = "default_max_packets_in_flight_per_peer")]
+    pub max_packets_in_flight_per_peer: usize,
+    /// Packets held per peer while the in-flight limit is reached; more are
+    /// dropped. 512 Sphinx packets are 16 MiB, an 8 MiB reply with FEC parity.
+    #[serde(default = "default_max_queued_packets_per_peer")]
+    pub max_queued_packets_per_peer: usize,
     pub rate_limit: RateLimitConfig,
     pub connection_filter: ConnectionFilterConfig,
     #[serde(default)]
@@ -203,6 +216,14 @@ fn default_tcp_nodelay() -> bool {
     true
 }
 
+const fn default_max_packets_in_flight_per_peer() -> usize {
+    48
+}
+
+const fn default_max_queued_packets_per_peer() -> usize {
+    512
+}
+
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
@@ -213,13 +234,15 @@ impl Default for NetworkConfig {
             gossip_heartbeat_secs: 1,
             idle_connection_timeout_secs: 3600,
             session_ttl_secs: 86400,
-            max_concurrent_streams: 100,
+            max_concurrent_streams: 256,
             rate_limit: RateLimitConfig::default(),
             connection_filter: ConnectionFilterConfig::default(),
             peer_admission: PeerAdmissionMode::default(),
             peer_admission_grace_secs: default_peer_admission_grace_secs(),
             topology_liveness_window_secs: default_topology_liveness_window_secs(),
             tcp_nodelay: default_tcp_nodelay(),
+            max_packets_in_flight_per_peer: default_max_packets_in_flight_per_peer(),
+            max_queued_packets_per_peer: default_max_queued_packets_per_peer(),
         }
     }
 }
@@ -1149,6 +1172,11 @@ impl NoxConfig {
 
         if self.network.max_connections == 0 {
             errors.push("network.max_connections is 0".into());
+        }
+        if self.network.max_packets_in_flight_per_peer == 0 {
+            errors.push(
+                "network.max_packets_in_flight_per_peer is 0 (no packet could be sent)".into(),
+            );
         }
         if self.relayer.queue_size == 0 {
             errors.push("relayer.queue_size is 0".into());
