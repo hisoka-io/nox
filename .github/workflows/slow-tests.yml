@@ -6,11 +6,12 @@ on:
       suite:
         description: "Test suite to run"
         required: true
-        default: "anvil"
+        default: "all"
         type: choice
         options:
-          - anvil
-          - large-payload
+          - exit-storage
+          - kps-soak
+          - compat-mesh
           - all
   schedule:
     # Nightly at 02:00 UTC
@@ -20,20 +21,25 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   # .cargo/config.toml builds for the local CPU. Runners differ, so cached artifacts built with
   # target-cpu=native can hit SIGILL on another runner. Pin a baseline every runner supports.
   RUSTFLAGS: "-C target-cpu=x86-64-v2"
 
 jobs:
-  anvil-tests:
-    name: Anvil Tests
+  # The long horizons of crates/nox-node/tests/exit_storage_bounds.rs. Pull requests run the
+  # short ones.
+  exit-storage:
+    name: Exit Storage Bounds
     if: >
       github.event_name == 'schedule' ||
-      inputs.suite == 'anvil' ||
+      inputs.suite == 'exit-storage' ||
       inputs.suite == 'all'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -43,38 +49,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
         with:
           toolchain: 1.95.0
-      - name: Verify Rust version
-        run: rustc --version | grep -F "rustc 1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           prefix-key: v1-rust
-      - name: Install Foundry (anvil)
-        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
-        with:
-          version: v1.3.2
-      - name: Verify Anvil version
-        run: 'anvil --version | grep -F "anvil Version: 1.3.2"'
-      - name: Install Solidity 0.8.30
-        run: |
-          curl --fail --location --silent --show-error \
-            https://github.com/ethereum/solidity/releases/download/v0.8.30/solc-static-linux \
-            --output /tmp/solc-static-linux
-          echo "f3e987dc6ecebd4bd350c48edcbc320b46cf9e3109bd3fc3d88f1acaf4c428f7  /tmp/solc-static-linux" | sha256sum --check --strict
-          sudo install -m 0755 /tmp/solc-static-linux /usr/local/bin/solc
-      - name: Run transaction plan
-        run: cargo test --test transaction_plan -- --nocapture
-      - name: Run durable transaction outbox
-        run: cargo test --test transaction_outbox -- --nocapture
-      - name: Run committed payment evidence
-        run: cargo test --test payment_trace_safety --features dev-node -- --nocapture
-      - name: Run anvil_trace_debug
-        run: cargo test --test anvil_trace_debug -- --ignored --nocapture
+      - name: Run the long storage horizons
+        run: cargo test --locked -p nox-node --test exit_storage_bounds -- --ignored --nocapture
 
-  large-payload-tests:
-    name: Large Payload Tests
+  # WebRTC large-claim soak with nox-kps as its own process. It prints one mark per exchange
+  # and the server's stream counters; the logs of both ends are shown when it fails.
+  kps-soak:
+    name: KPS Split-Process Soak
     if: >
       github.event_name == 'schedule' ||
-      inputs.suite == 'large-payload' ||
+      inputs.suite == 'kps-soak' ||
       inputs.suite == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -82,13 +69,69 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
       - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
         with:
           toolchain: 1.95.0
-      - name: Verify Rust version
-        run: rustc --version | grep -F "rustc 1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           prefix-key: v1-rust
-      - name: Run large-payload suite
-        run: cargo test --test large_payload -- --ignored --nocapture
+      - name: Run the split-process soak
+        run: >
+          cargo test --locked -p nox-kps --profile release-kps --test soak --
+          --ignored --exact soak_large_split_process --nocapture
+        env:
+          SOAK_LOG_DIR: ${{ runner.temp }}/soak-split
+      - name: Show soak logs
+        if: failure()
+        run: tail -n 200 "$RUNNER_TEMP"/soak-split/*.log
+
+  # A published client release against a local mesh in which every other node runs the
+  # latest tagged release and the rest run this commit.
+  compat-mesh:
+    name: Mixed-Version Mesh
+    if: >
+      github.event_name == 'schedule' ||
+      inputs.suite == 'compat-mesh' ||
+      inputs.suite == 'all'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: 1.95.0
+      - name: Install Foundry 1.3.2
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: v1.3.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Build the latest tagged release
+        run: |
+          tag="$(git for-each-ref --sort=-creatordate --count=1 --format='%(refname:short)' 'refs/tags/v[0-9]*')"
+          [ -n "$tag" ] || { echo "no release tag found" >&2; exit 1; }
+          echo "previous build: $tag"
+          git worktree add --detach "$RUNNER_TEMP/previous" "$tag"
+          cargo build --locked --release --bin nox \
+            --manifest-path "$RUNNER_TEMP/previous/Cargo.toml" --target-dir target
+          cp target/release/nox "$RUNNER_TEMP/nox-previous"
+      - name: Build this commit
+        run: |
+          cargo build --locked --release --bin nox
+          cargo build --locked --release -p nox-sim --features dev-node --bin nox_mesh_server
+      - name: Run the mixed mesh
+        run: scripts/compat-mesh/run.sh mixed
+        env:
+          LEGACY_BIN: ${{ runner.temp }}/nox-previous
+          WORK: ${{ runner.temp }}/compat-mesh
+      - name: Show mesh logs
+        if: failure()
+        run: tail -n 100 "$RUNNER_TEMP"/compat-mesh/mixed/*.log

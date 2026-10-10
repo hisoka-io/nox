@@ -152,7 +152,7 @@ jobs:
       # The nox-kps soaks are #[ignore]d in the default run. Here: 200 sequential
       # 32 KiB exchanges per transport and direction, and 20 large claim bodies
       # (5 MiB) per transport, with zero stalls allowed. The split-process soak
-      # is a diagnostic and stays manual.
+      # is a diagnostic and runs nightly from slow-tests.yml.
       - name: nox-kps soaks (zero stalls)
         run: >
           cargo test --locked -p nox-kps --profile release-kps --test soak --
