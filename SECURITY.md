@@ -37,7 +37,7 @@ We will credit reporters in the advisory unless they prefer to remain anonymous.
 ### Out of Scope
 
 - Third-party dependencies (report upstream to the respective maintainer)
-- The Ethereum smart contracts (separate repository: `hisoka-io/darkpool-v2`)
+- The Ethereum smart contracts (separate repository: `hisoka-io/darkpool`)
 - Infrastructure and deployment issues
 - Social engineering attacks
 
