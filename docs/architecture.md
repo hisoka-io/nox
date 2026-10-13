@@ -28,7 +28,7 @@ There is no outer encryption layer: the Sphinx header and body fill the packet. 
 1. X25519 ECDH with relay's static key
 2. Derive keys via 4x SHA-256: routing key, MAC key, body key, blinding scalar
 3. Verify MAC (constant-time)
-4. Decrypt routing info and body (ChaCha20)
+4. Decrypt routing info (ChaCha20) and body (Lioness wide-block cipher)
 5. Blind ephemeral key for next hop (Curve25519 scalar mul)
 
 ECDH + key blinding account for ~95% of per-hop cost. Symmetric ops are negligible.
@@ -216,7 +216,7 @@ The HTTP ingress applies a per-client-IP token bucket and an optional CORS origi
 
 [SECURITY.md](../SECURITY.md) has the reporting policy, the scope and the dependency exception table. In summary:
 
-**Protected against**: IP identification, content analysis, replay, packet flooding, sender-receiver linkability, key compromise (current packets), header tagging, body tagging (Lioness wide-block cipher on the packet body), MEV/front-running, relay payment linkability.
+**Protected against**: IP identification, content analysis, replay, packet flooding, sender-receiver linkability, key compromise (current packets), header tagging, MEV/front-running, relay payment linkability.
 
 **Partial**: Inter-node traffic analysis (server cover only), timing correlation (depends on traffic volume), Sybil attacks (staking; P2P peers must be registered).
 

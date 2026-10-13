@@ -41,7 +41,7 @@ Sphinx packets go in, opaque actions come out. Paid execution is protocol-neutra
 - Fixed-point paid execution with durable transaction recovery
 - Proof of work anti-spam to rate limit without identity
 - End-to-end TLS tunnels (`tunnel_v1`): the client runs TLS with its RPC provider and the exit relays the encrypted records
-- KPS entry (`nox-kps`) so browsers reach a node directly over WebRTC and QUIC
+- KPS entry (`nox-kps`): browsers reach a node directly over WebRTC, native clients over QUIC
 
 ## Quick start
 
