@@ -5,6 +5,18 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+## [0.4.0-rc.10] - 2026-10-13
+
+### Upgrade notes
+
+- Upgrade one node at a time; rc.6 to rc.10 nodes, nox-kps relays and all published clients interoperate. Wire
+  formats and configuration are unchanged from rc.9.
+
+### Changed
+
+- nox-kps builds with `quinn-proto` 0.11.19, which carries the upstream fixes for RUSTSEC-2026-0338, 0339, 0340
+  and 0341 in the QUIC listener.
+
 ## [0.4.0-rc.9] - 2026-10-10
 
 ### Upgrade notes
