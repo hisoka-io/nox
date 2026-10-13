@@ -28,7 +28,7 @@ There is no outer encryption layer: the Sphinx header and body fill the packet. 
 1. X25519 ECDH with relay's static key
 2. Derive keys via 4x SHA-256: routing key, MAC key, body key, blinding scalar
 3. Verify MAC (constant-time)
-4. Decrypt routing info and body (ChaCha20)
+4. Decrypt routing info (ChaCha20) and body (Lioness wide-block cipher)
 5. Blind ephemeral key for next hop (Curve25519 scalar mul)
 
 ECDH + key blinding account for ~95% of per-hop cost. Symmetric ops are negligible.
@@ -115,7 +115,8 @@ Node behaviour with `relayer.surb_formats = "both"` (default):
 - Delivery-keyed replies live in their own store: at most 1,000 entries and 64 MiB, and no single previous-hop
   peer may hold more than 25% of either. They never push handle-keyed replies out.
 - Claim, WebSocket and SSE return each reply as `reply-0-{the ID it was claimed with}`.
-- The node lists `surb_v2` in `capabilities` in `/metrics/json` (and `paid_v2` on exits with paid execution).
+- The node lists `surb_v2` in `capabilities` in `/metrics/json` (and, on exits, `paid_v2` with paid execution and
+  `tunnel_v1` with `[tunnel] enabled = true`).
 
 `relayer.surb_formats = "v1"` turns format 2 off: flags are ignored and a format 2 SURB is answered like any
 other SURB.
@@ -139,7 +140,7 @@ Loopix cover traffic via two Poisson streams:
 - **Loop**: Self-routed packets through all 3 layers. Health monitoring + traffic pattern cover.
 - **Drop**: Random-path packets, silently discarded at exit. Volume hiding.
 
-**Gap**: Client-side cover traffic is not implemented. Server-side cover protects inter-node links, but client activity is observable. See [SECURITY.md](../SECURITY.md).
+Node cover traffic protects the links between nodes. The Rust client crate ships a Poisson cover sender (`nox_client::CoverTrafficController`) that an application starts itself; client cover on by default is the next milestone for hiding when a client is active.
 
 ---
 
@@ -205,7 +206,7 @@ Price oracle (`nox-oracle`) aggregates from Binance and CoinGecko.
 
 ## Observability
 
-61 Prometheus metrics at `/metrics` (JSON summary at `/metrics/json`). Additional endpoints: `/topology` (JSON), `/events` (SSE stream of node, peer and topology events), `/admin/config` (redacted). `/events` carries no per-packet events: packet counts and latency are published only as aggregates.
+Prometheus metrics at `/metrics` (JSON summary at `/metrics/json`). Additional endpoints: `/topology` (JSON), `/events` (SSE stream of node, peer and topology events), `/admin/config` (redacted). `/events` carries no per-packet events: packet counts and latency are published only as aggregates.
 
 The HTTP ingress applies a per-client-IP token bucket and an optional CORS origin allowlist (`[ingress]` in `config.example.toml`).
 
@@ -213,10 +214,10 @@ The HTTP ingress applies a per-client-IP token bucket and an optional CORS origi
 
 ## Threat model
 
-See [SECURITY.md](../SECURITY.md) for the full threat model including five P0 gaps. In summary:
+[SECURITY.md](../SECURITY.md) has the reporting policy, the scope and the dependency exception table. In summary:
 
 **Protected against**: IP identification, content analysis, replay, packet flooding, sender-receiver linkability, key compromise (current packets), header tagging, MEV/front-running, relay payment linkability.
 
 **Partial**: Inter-node traffic analysis (server cover only), timing correlation (depends on traffic volume), Sybil attacks (staking; P2P peers must be registered).
 
-**Not protected**: Client activity observation (no client cover), past traffic decryption (no key rotation), body tagging (no SPRP cipher).
+**Next milestones**: client cover traffic on by default, which hides when a client is active (the Rust client ships an opt-in cover sender); scheduled routing-key rotation, which keeps recorded traffic sealed after a later key compromise (nodes already follow key rotations published in the registry).

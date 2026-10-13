@@ -59,6 +59,17 @@ request_timeout_secs = 10
 max_response_bytes = 1048576  # 1 MB
 allow_private_ips = false
 
+# End-to-end TLS tunnels: the client runs TLS itself and the exit relays TLS
+# records to the named host. With enabled = true the exit lists tunnel_v1 in
+# its /metrics/json capabilities. Each open tunnel holds one socket, so keep
+# max_sessions inside the open-files limit (512 suits Docker's default 1024).
+# See docs/tunnel.md. To turn tunnels on, uncomment:
+#
+# [tunnel]
+# enabled = true
+# allowed_ports = [443]
+# max_sessions = 512
+
 [network]
 max_connections = 1000
 max_connections_per_peer = 2
