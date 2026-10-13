@@ -232,3 +232,131 @@ async fn test_topology_hydrate_from_snapshot() {
 
     cancel.cancel();
 }
+
+#[tokio::test]
+async fn test_hydrate_places_nodes_by_role() {
+    let (db, _dir) = make_storage();
+    let sub: Arc<dyn IEventSubscriber> = make_bus();
+    let tm = TopologyManager::new(db, sub, None);
+
+    // Create a snapshot with nodes across all layers
+    let nodes = vec![
+        RelayerNode {
+            address: "0x1111111111111111111111111111111111111111".to_string(),
+            sphinx_key: "aa".repeat(32),
+            url: "/ip4/127.0.0.1/tcp/9001".to_string(),
+            stake: "1000".to_string(),
+            last_seen: 0,
+            is_privileged: false,
+            layer: 0,
+            role: 1, // Relay
+            ingress_url: None,
+            metadata_url: None,
+        },
+        RelayerNode {
+            address: "0x2222222222222222222222222222222222222222".to_string(),
+            sphinx_key: "bb".repeat(32),
+            url: "/ip4/127.0.0.1/tcp/9002".to_string(),
+            stake: "1000".to_string(),
+            last_seen: 0,
+            is_privileged: false,
+            layer: 1,
+            role: 1, // Relay
+            ingress_url: None,
+            metadata_url: None,
+        },
+        RelayerNode {
+            address: "0x3333333333333333333333333333333333333333".to_string(),
+            sphinx_key: "cc".repeat(32),
+            url: "/ip4/127.0.0.1/tcp/9003".to_string(),
+            stake: "1000".to_string(),
+            last_seen: 0,
+            is_privileged: false,
+            layer: 2,
+            role: 2, // Exit
+            ingress_url: None,
+            metadata_url: None,
+        },
+    ];
+
+    // Hydrate
+    tm.hydrate_from_snapshot(nodes.clone()).await;
+
+    let l0 = tm.get_nodes_in_layer(0);
+    let l1 = tm.get_nodes_in_layer(1);
+    let l2 = tm.get_nodes_in_layer(2);
+    assert_eq!(l0.len(), 3);
+    assert_eq!(l1.len(), 3);
+    assert_eq!(l2.len(), 1);
+    assert_eq!(l2[0].role, 2);
+
+    let fp = tm.get_current_fingerprint();
+    let addresses: Vec<String> = nodes.iter().map(|n| n.address.clone()).collect();
+    let expected_fp = TopologyManager::compute_topology_fingerprint(&addresses);
+    assert_eq!(fp, expected_fp);
+
+    let all = tm.get_all_nodes();
+    assert_eq!(all.len(), 3);
+}
+
+#[tokio::test]
+async fn test_hydrate_overwrites_previous() {
+    let (db, _dir) = make_storage();
+    let sub: Arc<dyn IEventSubscriber> = make_bus();
+    let tm = TopologyManager::new(db, sub, None);
+
+    // First hydration: 2 nodes
+    let nodes_v1 = vec![
+        RelayerNode {
+            address: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            sphinx_key: "11".repeat(32),
+            url: "/ip4/10.0.0.1/tcp/9001".to_string(),
+            stake: "500".to_string(),
+            last_seen: 0,
+            is_privileged: false,
+            layer: 0,
+            role: 1,
+            ingress_url: None,
+            metadata_url: None,
+        },
+        RelayerNode {
+            address: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            sphinx_key: "22".repeat(32),
+            url: "/ip4/10.0.0.2/tcp/9002".to_string(),
+            stake: "500".to_string(),
+            last_seen: 0,
+            is_privileged: false,
+            layer: 2,
+            role: 2,
+            ingress_url: None,
+            metadata_url: None,
+        },
+    ];
+    tm.hydrate_from_snapshot(nodes_v1).await;
+    assert_eq!(tm.get_all_nodes().len(), 2);
+
+    let fp_v1 = tm.get_current_fingerprint();
+
+    // Second hydration: 1 different node -- should completely replace
+    let nodes_v2 = vec![RelayerNode {
+        address: "0xcccccccccccccccccccccccccccccccccccccccc".to_string(),
+        sphinx_key: "33".repeat(32),
+        url: "/ip4/10.0.0.3/tcp/9003".to_string(),
+        stake: "1000".to_string(),
+        last_seen: 0,
+        is_privileged: false,
+        layer: 1,
+        role: 3,
+        ingress_url: None,
+        metadata_url: None,
+    }];
+    tm.hydrate_from_snapshot(nodes_v2).await;
+
+    assert_eq!(tm.get_all_nodes().len(), 1);
+    assert_eq!(tm.get_nodes_in_layer(0).len(), 1);
+    assert_eq!(tm.get_nodes_in_layer(1).len(), 1);
+    assert_eq!(tm.get_nodes_in_layer(2).len(), 1);
+
+    let fp_v2 = tm.get_current_fingerprint();
+    assert_ne!(fp_v1, fp_v2);
+}

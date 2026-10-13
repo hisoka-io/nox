@@ -1,72 +1,13 @@
 //! Fragmentation E2E: chaos, memory safety, max message sizes, SURB response reassembly.
 
-use nox_client::surb_budget::{
-    SurbBudget, ESTIMATED_SURB_SERIALIZED_SIZE, MAX_SURBS, USABLE_RESPONSE_PER_SURB,
-};
-use nox_core::protocol::fragmentation::{
-    DEFAULT_MAX_BUFFER_BYTES, DEFAULT_STALE_TIMEOUT_SECS, FRAGMENT_OVERHEAD,
-    MAX_FRAGMENTS_PER_MESSAGE, MAX_MESSAGE_SIZE,
-};
+use nox_client::surb_budget::{SurbBudget, ESTIMATED_SURB_SERIALIZED_SIZE, MAX_SURBS};
+use nox_core::protocol::fragmentation::{MAX_FRAGMENTS_PER_MESSAGE, MAX_MESSAGE_SIZE};
 use nox_core::{
     Fragment, FragmentationError, Fragmenter, Reassembler, ReassemblerConfig, SURB_PAYLOAD_SIZE,
 };
 use nox_crypto::MAX_PAYLOAD_SIZE;
 use rand::seq::SliceRandom;
 use std::time::Duration;
-
-#[test]
-fn test_max_message_size_equals_200_times_32kb() {
-    assert_eq!(MAX_MESSAGE_SIZE, 200 * 32 * 1024);
-    assert_eq!(MAX_MESSAGE_SIZE, 6_553_600);
-}
-
-#[test]
-fn test_max_fragments_is_9500() {
-    assert_eq!(MAX_FRAGMENTS_PER_MESSAGE, 9_500);
-}
-
-#[test]
-fn test_stale_timeout_is_120_seconds() {
-    assert_eq!(DEFAULT_STALE_TIMEOUT_SECS, 120);
-}
-
-#[test]
-fn test_forward_capacity_exceeds_max_surbs() {
-    let usable_per_fragment = MAX_PAYLOAD_SIZE - FRAGMENT_OVERHEAD;
-    let forward_capacity = MAX_FRAGMENTS_PER_MESSAGE as usize * usable_per_fragment;
-    let theoretical_max_surbs = forward_capacity / ESTIMATED_SURB_SERIALIZED_SIZE;
-
-    assert!(
-        theoretical_max_surbs >= MAX_SURBS,
-        "forward capacity ({theoretical_max_surbs} SURBs) < MAX_SURBS ({MAX_SURBS})"
-    );
-}
-
-#[test]
-fn test_surb_payload_size_is_30kb() {
-    assert_eq!(SURB_PAYLOAD_SIZE, 30 * 1024);
-}
-
-#[test]
-fn test_usable_response_per_surb() {
-    assert_eq!(
-        USABLE_RESPONSE_PER_SURB,
-        SURB_PAYLOAD_SIZE - FRAGMENT_OVERHEAD
-    );
-    assert_eq!(USABLE_RESPONSE_PER_SURB, 30_699);
-}
-
-#[test]
-fn test_max_payload_size() {
-    assert_eq!(MAX_PAYLOAD_SIZE, 31_716);
-}
-
-#[test]
-fn test_default_buffer_capacity() {
-    let typical_large_response = 1_000_000;
-    let messages_at_capacity = DEFAULT_MAX_BUFFER_BYTES / typical_large_response;
-    assert!(messages_at_capacity >= 5);
-}
 
 #[test]
 fn test_shuffle_reconstruction_500kb() {

@@ -2201,3 +2201,75 @@ async fn test_lite_lifecycle() -> Result<()> {
 
     Ok(())
 }
+
+// nox: a lite agent starts using a pair on the first authenticated check,
+// without waiting for USE-CANDIDATE. A full agent keeps waiting.
+#[tokio::test]
+async fn test_lite_selects_pair_on_first_authenticated_check() -> Result<()> {
+    let remote = SocketAddr::from_str("172.17.0.3:999")?;
+    let local: Arc<dyn Candidate + Send + Sync> = Arc::new(
+        CandidateHostConfig {
+            base_config: CandidateBaseConfig {
+                network: "udp".to_owned(),
+                address: "192.168.0.2".to_owned(),
+                port: 777,
+                component: 1,
+                conn: Some(Arc::new(MockPacketConn {})),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .new_candidate_host()?,
+    );
+
+    for lite in [true, false] {
+        let a = Agent::new(AgentConfig {
+            lite,
+            candidate_types: vec![CandidateType::Host],
+            ..Default::default()
+        })
+        .await?;
+        let (username, local_pwd) = {
+            let ufrag_pwd = a.internal.ufrag_pwd.lock().await;
+            (
+                format!("{}:{}", ufrag_pwd.local_ufrag, ufrag_pwd.remote_ufrag),
+                ufrag_pwd.local_pwd.clone(),
+            )
+        };
+
+        a.internal
+            .handle_inbound(
+                &mut build_msg(CLASS_REQUEST, username.clone(), "Invalid".to_owned())?,
+                &local,
+                remote,
+            )
+            .await;
+        assert!(
+            a.internal.agent_conn.get_selected_pair().is_none(),
+            "a check with a wrong password selected a pair"
+        );
+
+        a.internal
+            .handle_inbound(
+                &mut build_msg(CLASS_REQUEST, username, local_pwd)?,
+                &local,
+                remote,
+            )
+            .await;
+        let selected = a.internal.agent_conn.get_selected_pair();
+        if lite {
+            let pair = selected.expect("lite agent selects the checked pair");
+            assert_eq!(pair.remote.addr(), remote);
+            assert_eq!(
+                pair.state.load(Ordering::SeqCst),
+                CandidatePairState::Succeeded as u8
+            );
+        } else {
+            assert!(selected.is_none(), "full agent selected without nomination");
+        }
+
+        a.close().await?;
+    }
+
+    Ok(())
+}

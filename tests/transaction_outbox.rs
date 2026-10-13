@@ -564,6 +564,29 @@ async fn corrupt_v2_record_aborts_manager_startup() {
     .is_err());
 }
 
+/// The interval `TransactionManager::run_monitor` sleeps between passes.
+const MONITOR_INTERVAL: Duration = Duration::from_secs(12);
+
+/// Runs the next monitor pass now instead of an interval later: moves the
+/// clock past the interval, then waits for the pass to end. The monitor sets
+/// the quote gauges as the last step of a pass, which is the signal used here.
+async fn run_monitor_pass(metrics: &MetricsService) {
+    const PASS_RUNNING: i64 = -1;
+    metrics.quote_outstanding.set(PASS_RUNNING);
+    // The monitor task has to be waiting on its interval before the clock moves.
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+    tokio::time::advance(MONITOR_INTERVAL).await;
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while metrics.quote_outstanding.get() == PASS_RUNNING {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the monitor pass did not finish");
+}
+
 async fn replacement_case(maximum_fee_per_gas: U256) -> PendingTransactionV2 {
     let anvil = Anvil::new().arg("--no-mining").spawn();
     let mut config = NoxConfig::default();
@@ -607,11 +630,12 @@ async fn replacement_case(maximum_fee_per_gas: U256) -> PendingTransactionV2 {
     drop(manager);
 
     let cancellation = CancellationToken::new();
+    let metrics = MetricsService::new();
     let manager = Arc::new(
         TransactionManager::new(
             executor,
             repository.clone(),
-            MetricsService::new(),
+            metrics.clone(),
             nox_node::config::DEFAULT_REPLACEMENT_STEP_BPS,
         )
         .await
@@ -622,7 +646,7 @@ async fn replacement_case(maximum_fee_per_gas: U256) -> PendingTransactionV2 {
         let manager = manager.clone();
         async move { manager.run_monitor().await }
     });
-    tokio::time::sleep(Duration::from_secs(13)).await;
+    run_monitor_pass(&metrics).await;
     cancellation.cancel();
     monitor.await.unwrap();
     let records = nox_core::IStorageRepository::scan(repository.as_ref(), b"tx:")
@@ -637,10 +661,8 @@ async fn replacement_case(maximum_fee_per_gas: U256) -> PendingTransactionV2 {
 
 #[tokio::test]
 async fn replacement_policy_applies_exact_step_and_never_exceeds_ceiling() {
-    let (capped, stepped) = tokio::join!(
-        replacement_case(U256::from(2_000_000_000_u64)),
-        replacement_case(U256::from(3_000_000_000_u64)),
-    );
+    let capped = replacement_case(U256::from(2_000_000_000_u64)).await;
+    let stepped = replacement_case(U256::from(3_000_000_000_u64)).await;
     assert_eq!(capped.replacement_attempts, 0);
     assert_eq!(capped.gas_price, "2000000000");
     assert!(capped.prior_transaction_hashes.is_empty());
@@ -689,11 +711,12 @@ async fn capped_mined_transaction_reconciles_before_replacement() {
     drop(manager);
 
     let cancellation = CancellationToken::new();
+    let metrics = MetricsService::new();
     let manager = Arc::new(
         TransactionManager::new(
             executor,
             repository.clone(),
-            MetricsService::new(),
+            metrics.clone(),
             nox_node::config::DEFAULT_REPLACEMENT_STEP_BPS,
         )
         .await
@@ -704,7 +727,7 @@ async fn capped_mined_transaction_reconciles_before_replacement() {
         let manager = manager.clone();
         async move { manager.run_monitor().await }
     });
-    tokio::time::sleep(Duration::from_secs(13)).await;
+    run_monitor_pass(&metrics).await;
     cancellation.cancel();
     monitor.await.unwrap();
     let records = nox_core::IStorageRepository::scan(repository.as_ref(), b"tx:")
@@ -840,11 +863,12 @@ async fn live_monitor_rebroadcasts_ambiguous_prepared_bytes_without_restart() {
         .await
         .unwrap();
     let cancellation = CancellationToken::new();
+    let metrics = MetricsService::new();
     let manager = Arc::new(
         TransactionManager::new(
             executor,
             repository.clone(),
-            MetricsService::new(),
+            metrics.clone(),
             nox_node::config::DEFAULT_REPLACEMENT_STEP_BPS,
         )
         .await
@@ -880,7 +904,7 @@ async fn live_monitor_rebroadcasts_ambiguous_prepared_bytes_without_restart() {
         let manager = manager.clone();
         async move { manager.run_monitor().await }
     });
-    tokio::time::sleep(Duration::from_secs(13)).await;
+    run_monitor_pass(&metrics).await;
     cancellation.cancel();
     monitor.await.unwrap();
     let after = nox_core::IStorageRepository::scan(repository.as_ref(), b"tx:")
@@ -985,11 +1009,12 @@ async fn live_monitor_rebroadcasts_ambiguous_replacement_bytes_without_restart()
     drop(manager);
 
     let cancellation = CancellationToken::new();
+    let metrics = MetricsService::new();
     let manager = Arc::new(
         TransactionManager::new(
             executor,
             repository.clone(),
-            MetricsService::new(),
+            metrics.clone(),
             nox_node::config::DEFAULT_REPLACEMENT_STEP_BPS,
         )
         .await
@@ -1000,7 +1025,8 @@ async fn live_monitor_rebroadcasts_ambiguous_replacement_bytes_without_restart()
         let manager = manager.clone();
         async move { manager.run_monitor().await }
     });
-    tokio::time::sleep(Duration::from_secs(25)).await;
+    run_monitor_pass(&metrics).await;
+    run_monitor_pass(&metrics).await;
     cancellation.cancel();
     monitor.await.unwrap();
     let records = nox_core::IStorageRepository::scan(repository.as_ref(), b"tx:")
@@ -1094,7 +1120,7 @@ async fn legacy_pending_receipt_becomes_terminal_without_raw_broadcast() {
         let manager = manager.clone();
         async move { manager.run_monitor().await }
     });
-    tokio::time::sleep(Duration::from_secs(13)).await;
+    run_monitor_pass(&metrics).await;
     cancellation.cancel();
     monitor.await.unwrap();
 

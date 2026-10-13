@@ -800,6 +800,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_duplicate_before_ensure_capacity() {
+        let config = ReassemblerConfig {
+            max_buffer_bytes: 100_000,
+            max_concurrent_messages: 2,
+            stale_timeout: Duration::from_mins(1),
+        };
+        let mut reassembler = Reassembler::new(config);
+
+        let frag_a = Fragment::new(100, 10, 0, vec![0xAA; 500]).unwrap();
+        let frag_b = Fragment::new(200, 10, 0, vec![0xBB; 500]).unwrap();
+        reassembler.add_fragment(frag_a).unwrap();
+        reassembler.add_fragment(frag_b.clone()).unwrap();
+        assert_eq!(reassembler.pending_count(), 2);
+
+        // Both slots are taken. A capacity check before the duplicate check
+        // would evict message 100, the older one.
+        reassembler.add_fragment(frag_b).unwrap();
+        assert_eq!(reassembler.pending_count(), 2);
+        assert!(
+            reassembler.has_message(100),
+            "Message 100 should survive duplicate"
+        );
+        assert!(
+            reassembler.has_message(200),
+            "Message 200 should survive duplicate"
+        );
+    }
+
+    #[test]
+    fn test_full_reassembly_with_duplicate_fragment() {
+        let fragmenter = Fragmenter::new();
+        let mut reassembler = Reassembler::new(ReassemblerConfig::default());
+
+        let original: Vec<u8> = (0..5_000).map(|i| (i % 256) as u8).collect();
+        let fragments = fragmenter.fragment(1, &original, 1_000).unwrap();
+
+        let dup = fragments[2].clone();
+        reassembler.add_fragment(dup).unwrap();
+
+        let mut result = None;
+        for frag in fragments {
+            if let Some(data) = reassembler.add_fragment(frag).unwrap() {
+                result = Some(data);
+            }
+        }
+
+        assert_eq!(
+            result.unwrap(),
+            original,
+            "Data should reconstruct correctly despite duplicate"
+        );
+    }
+
     use super::super::fec::{encode_parity_shards, pad_to_uniform, FecInfo};
 
     fn make_fec_fragments(
