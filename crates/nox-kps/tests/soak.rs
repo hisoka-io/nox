@@ -407,6 +407,8 @@ async fn soak_large_claim_bodies() {
 ///
 /// Writes `server.log` (nox-kps stdout) and `client.log` (this process) to
 /// `SOAK_LOG_DIR`, plus one `client.log` marker line per exchange.
+/// With `SOAK_MAX_STALL_RATE` set, exchanges without a complete response count
+/// against it; the nightly run does that at 5 MiB.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "diagnostic soak; run explicitly with --ignored"]
 async fn soak_large_split_process() {
@@ -511,4 +513,9 @@ async fn soak_large_split_process() {
     let _ = child.kill();
     let _ = child.wait();
     println!("logs in {}", log_dir.display());
+    assert_stall_rate(
+        &format!("split process {size} B ({sequence})"),
+        sequence.chars().filter(|&mark| mark != '.').count(),
+        count,
+    );
 }

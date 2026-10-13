@@ -10,6 +10,7 @@ on:
         type: choice
         options:
           - exit-storage
+          - kps-soak
           - compat-mesh
           - all
   schedule:
@@ -51,11 +52,55 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           prefix-key: v1-rust
+      # libtest exits 0 when --ignored selects nothing, so require a test to have run.
       - name: Run the long storage horizons
-        run: cargo test --locked -p nox-node --test exit_storage_bounds -- --ignored --nocapture
+        shell: bash
+        run: |
+          cargo test --locked -p nox-node --test exit_storage_bounds -- --ignored --nocapture \
+            | tee "$RUNNER_TEMP/horizons.log"
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/horizons.log"
+
+  # The WebRTC large-claim soak of the Test job with nox-kps as its own process, zero stalls
+  # allowed. At the test's default 16 MiB the link still stalls, so that size stays a manual
+  # diagnostic.
+  kps-soak:
+    name: KPS Split-Process Soak
+    if: >
+      github.event_name == 'schedule' ||
+      inputs.suite == 'kps-soak' ||
+      inputs.suite == 'all'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          prefix-key: v1-rust
+      - name: Run the split-process soak
+        shell: bash
+        run: |
+          cargo test --locked -p nox-kps --profile release-kps --test soak -- \
+            --ignored --exact soak_large_split_process --nocapture | tee "$RUNNER_TEMP/soak-split.log"
+          grep -q '^test result: ok\. 1 passed' "$RUNNER_TEMP/soak-split.log"
+        env:
+          SOAK_LARGE_BYTES: "5242880"
+          SOAK_LARGE_REQUESTS: "20"
+          SOAK_STALL_MS: "5000"
+          SOAK_MAX_STALL_RATE: "0"
+          SOAK_LOG_DIR: ${{ runner.temp }}/soak-split
+      - name: Show soak logs
+        if: failure()
+        run: tail -n 200 "$RUNNER_TEMP"/soak-split/*.log
 
   # A published client release against a local mesh in which every other node runs the
-  # latest tagged release and the rest run this commit.
+  # previous release and the rest run this commit.
   compat-mesh:
     name: Mixed-Version Mesh
     if: >
@@ -84,27 +129,30 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
-      # The release is built into a target dir of its own. In a shared one cargo takes the
-      # release's artifacts as fresh for this commit (same package paths and version, older
-      # source mtimes) and the mesh runs the release against itself.
-      - name: Build the latest tagged release
-        run: |
-          tag="$(git for-each-ref --sort=-creatordate --count=1 --format='%(refname:short)' 'refs/tags/v[0-9]*')"
-          [ -n "$tag" ] || { echo "no release tag found" >&2; exit 1; }
-          echo "previous build: $tag ($(git rev-parse "$tag^{commit}"))"
-          git worktree add --detach "$RUNNER_TEMP/previous" "$tag"
-          cargo build --locked --release --bin nox \
-            --manifest-path "$RUNNER_TEMP/previous/Cargo.toml" \
-            --target-dir "$RUNNER_TEMP/previous-target"
-          cp "$RUNNER_TEMP/previous-target/release/nox" "$RUNNER_TEMP/nox-previous"
       - name: Build this commit
         run: |
           cargo build --locked --release --bin nox
           cargo build --locked --release -p nox-sim --features dev-node --bin nox_mesh_server
-          sha256sum "$RUNNER_TEMP/nox-previous" target/release/nox
-          if cmp -s "$RUNNER_TEMP/nox-previous" target/release/nox; then
-            echo "::notice::this commit builds the same nox binary as the latest release; the mesh runs one version"
-          fi
+      # The newest release whose nox binary differs from this commit's, built in a target
+      # dir of its own. A commit that changes no shipped code builds the latest release's
+      # binary, and a mesh of that would run one version.
+      - name: Build the previous release
+        run: |
+          for tag in $(git for-each-ref --sort=-creatordate --count=2 --format='%(refname:short)' 'refs/tags/v[0-9]*'); do
+            git worktree add --detach "$RUNNER_TEMP/src-$tag" "$tag"
+            cargo build --locked --release --bin nox \
+              --manifest-path "$RUNNER_TEMP/src-$tag/Cargo.toml" \
+              --target-dir "$RUNNER_TEMP/previous-target"
+            if ! cmp -s "$RUNNER_TEMP/previous-target/release/nox" target/release/nox; then
+              echo "previous build: $tag ($(git rev-parse "$tag^{commit}"))"
+              cp "$RUNNER_TEMP/previous-target/release/nox" "$RUNNER_TEMP/nox-previous"
+              sha256sum "$RUNNER_TEMP/nox-previous" target/release/nox
+              exit 0
+            fi
+            echo "$tag builds the same nox binary as this commit"
+          done
+          echo "no release with a nox binary different from this commit's" >&2
+          exit 1
       - name: Run the mixed mesh
         run: scripts/compat-mesh/run.sh mixed
         env:
