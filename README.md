@@ -12,7 +12,7 @@
 
 Sphinx mix network for private DeFi on Ethereum. Transactions are onion-encrypted through a 3-layer relay network with Poisson mixing delays. Responses return anonymously via SURBs. No one, not even relay operators, can link a transaction to its sender.
 
-**[Live Mixnet Map](https://map.hisoka.io)** · **[Nox Explorer](https://shield.hisoka.io)**
+**[Live Mixnet Map](https://map.hisoka.io)** · **[Nox Explorer](https://demo.nox.hisoka.io)** · **[anon-rpc demo](https://demo.nox.hisoka.io/anon-rpc)**
 
 ## Why
 
@@ -40,6 +40,8 @@ Sphinx packets go in, opaque actions come out. Paid execution is protocol-neutra
 - Error correction on responses so lost packets don't require retransmission
 - Fixed-point paid execution with durable transaction recovery
 - Proof of work anti-spam to rate limit without identity
+- End-to-end TLS tunnels (`tunnel_v1`): the client runs TLS with its RPC provider and the exit relays the encrypted records
+- KPS entry (`nox-kps`) so browsers reach a node directly over WebRTC and QUIC
 
 ## Quick start
 
@@ -63,6 +65,14 @@ Full setup guide, prerequisites, environment variables, and testing in [docs/qui
 - [Contributing](CONTRIBUTING.md)
 - [Security](SECURITY.md)
 - [Changelog](CHANGELOG.md)
+
+## Ecosystem
+
+- [run-nox](https://github.com/hisoka-io/run-nox): operator kit for running a relay or exit on the public testnet
+- [`@hisoka-io/nox-client`](https://www.npmjs.com/package/@hisoka-io/nox-client): TypeScript client SDK ([source](https://github.com/hisoka-io/nox-sdk))
+- [`@hisoka-io/anon-rpc-worker`](https://www.npmjs.com/package/@hisoka-io/anon-rpc-worker): Nox transport for [anon-rpc](https://github.com/ethereum/anon-rpc) wallets, with end-to-end TLS to the RPC provider
+- Worker specifier on Ethereum Sepolia: [`0x35133267A8F7EC35046a83DCA0f4Ca8A6e1b7A9A`](https://sepolia.etherscan.io/address/0x35133267A8F7EC35046a83DCA0f4Ca8A6e1b7A9A), one stable address that follows the current worker release
+- [Live mixnet map](https://map.hisoka.io) and [demo](https://demo.nox.hisoka.io) ([anon-rpc demo](https://demo.nox.hisoka.io/anon-rpc))
 
 ## Resources
 - [The Loopix Anonymity System](https://www.usenix.org/conference/usenixsecurity17/technical-sessions/presentation/piotrowska) (USENIX Security 2017)
