@@ -108,6 +108,11 @@ the `kps:` resolver strings. The running service picks it up within
 `limits.bundle_rescan_secs`. `bundle list` shows what is served and
 `bundle verify` re-hashes every file.
 
+The bundle is published as
+[`@hisoka-io/anon-rpc-worker`](https://www.npmjs.com/package/@hisoka-io/anon-rpc-worker).
+The Nox WorkerSpecifier on Ethereum Sepolia, `0x35133267A8F7EC35046a83DCA0f4Ca8A6e1b7A9A`,
+lists the bundle hash and its resolvers for the current release.
+
 ## Configuration
 
 TOML at `/etc/nox-kps/config.toml`, with `NOX_KPS__<KEY>` environment overrides
