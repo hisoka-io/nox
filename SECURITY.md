@@ -59,6 +59,7 @@ documented reachability, and an enforced control.
 | `RUSTSEC-2025-0057` | `sled 0.34 -> fxhash` in the node's local store | sled hashes only its internal page ids, log offsets and tree names with it, never stored keys | storage | 2026-12-31 |
 | `RUSTSEC-2024-0384` | libp2p runtime timing (`instant`) | Protocol expiry and money arithmetic use explicit chain or standard monotonic time, not this crate | networking | 2026-12-31 |
 | `RUSTSEC-2024-0436` | `libp2p -> netlink-packet-utils -> paste` proc macro | Build-time expansion only; no runtime input reaches the macro | networking | 2026-12-31 |
+| `RUSTSEC-2026-0387` | `k256 0.13 -> elliptic-curve 0.13 -> crypto-bigint 0.5.5` through Alloy's signer: secp256k1 scalar addition, subtraction and reduction when the node signs chain transactions and its handshake identity proof | Signing runs only inside the node process with deterministic RFC 6979 nonces; the advisory's leak needs a co-resident observer with cycle-level timing of that process; the fix ships with `k256 0.14` / `crypto-bigint >=0.7.6`, adopted as soon as the Ethereum signer stack moves to it | chain-signing | 2026-12-31 |
 | Yanked `keccak 0.1.5` | `sha3` worker-bundle hashing in nox-kps | Cargo lock checksum is pinned; nox-kps tests bundle names against known Keccak-256 digests | nox-kps | 2026-12-31 |
 | Yanked `spin 0.9.8` | `reed-solomon-erasure 6` synchronization | Fragment/shard counts and memory are bounded; FEC property, corruption, and recovery suites cover the path | protocol-wire | 2026-12-31 |
 

@@ -801,7 +801,7 @@ async fn resetting_upstream(greeting: &'static [u8], reset: Arc<tokio::sync::Not
         let _ = stream.read(&mut buffer).await;
         let _ = stream.write_all(greeting).await;
         reset.notified().await;
-        let _ = stream.set_linger(Some(Duration::ZERO));
+        let _ = stream.set_zero_linger();
     });
     port
 }
