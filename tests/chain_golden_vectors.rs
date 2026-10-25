@@ -886,3 +886,75 @@ async fn executor_upstream_requests() {
 
     check_golden("executor_upstream_requests", &Value::Array(steps));
 }
+
+/// Records the exit's transaction outbox writes for one planned submission:
+/// every stored key and value, with the wall-clock fields removed.
+#[tokio::test]
+async fn stored_outbox_records() {
+    use nox_core::IStorageRepository;
+    use nox_node::blockchain::transaction_plan::TransactionPlan;
+    use nox_node::blockchain::tx_manager::TransactionManager;
+    use nox_node::telemetry::metrics::MetricsService;
+    use nox_node::SledRepository;
+
+    let (server, _rpc) = recording_server(true).await;
+    let mut config = NoxConfig::default();
+    config.eth_rpc_url = server.uri();
+    config.chain_id = 421_614;
+    config.eth_wallet_private_key = KEYS[1].to_string();
+    let executor = Arc::new(ChainExecutor::new(&config).await.expect("executor"));
+    let directory = tempfile::tempdir().expect("tempdir");
+    let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+    let manager = TransactionManager::new(
+        executor,
+        storage.clone(),
+        MetricsService::new(),
+        nox_node::config::DEFAULT_REPLACEMENT_STEP_BPS,
+    )
+    .await
+    .expect("transaction manager");
+    let submitted = manager
+        .submit_planned(
+            [0x5c; 32],
+            eth::address(hex_array("ad911ca217c6dc779fce6a6538bdda3071c38e7e")),
+            eth::bytes(&hex::decode("c0ffee00112233").expect("hex")),
+            TransactionPlan {
+                gas_limit: eth::u256(144_000),
+                initial_fee_per_gas: eth::u256(115_000_000),
+                maximum_fee_per_gas: eth::u256(138_000_000),
+                chain_data_fee_native: eth::u256(0),
+            },
+        )
+        .await
+        .expect("submit");
+
+    let mut records = Vec::new();
+    for prefix in [&b"tx:"[..], b"nonce:", b"outbox:", b"execution:"] {
+        for (key, value) in storage.scan(prefix).await.expect("scan") {
+            let value = match serde_json::from_slice::<Value>(&value) {
+                Ok(mut json) => {
+                    for field in ["first_sent_at", "last_update_at"] {
+                        if let Some(object) = json.as_object_mut() {
+                            object.remove(field);
+                        }
+                        if let Some(object) =
+                            json.get_mut("transaction").and_then(Value::as_object_mut)
+                        {
+                            object.remove(field);
+                        }
+                    }
+                    json
+                }
+                Err(_) => json!(hex::encode(&value)),
+            };
+            records.push(json!({"key": String::from_utf8_lossy(&key), "value": value}));
+        }
+    }
+    check_golden(
+        "stored_outbox_records",
+        &json!({
+            "transaction_hash": eth::b256_hex(&submitted.transaction_hash),
+            "records": records,
+        }),
+    );
+}
