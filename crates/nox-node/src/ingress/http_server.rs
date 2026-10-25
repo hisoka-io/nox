@@ -1361,7 +1361,7 @@ mod tests {
     #[tokio::test]
     async fn test_claim_binary_by_body_field_and_by_accept() {
         let state = test_state(false);
-        let reply = vec![0xabu8; 31_716];
+        let reply = vec![0xabu8; nox_crypto::BODY_SIZE];
         state
             .response_buffer
             .store_response(&format!("reply-0-{SURB_A}"), reply.clone());
@@ -1381,7 +1381,7 @@ mod tests {
         let items = decode_batch(&body);
         assert_eq!(items, vec![(0, format!("reply-0-{SURB_A}"), reply)]);
         assert!(
-            body.len() < 31_716 + 64,
+            body.len() < nox_crypto::BODY_SIZE + 64,
             "binary is about the payload size, JSON would be ~3.6x"
         );
 

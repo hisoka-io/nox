@@ -4,7 +4,9 @@
 use crate::telemetry::metrics::MetricsService;
 use nox_core::models::payloads::{encode_payload, RelayerPayload};
 use nox_core::protocol::fec::{self, FecError, FecInfo};
-use nox_core::protocol::fragmentation::{Fragment, FragmentationError, FRAGMENT_OVERHEAD};
+use nox_core::protocol::fragmentation::{
+    Fragment, FragmentationError, RESPONSE_FRAGMENT_DATA_SIZE,
+};
 use nox_crypto::sphinx::surb::{Surb, SurbError};
 use thiserror::Error;
 use tracing::debug;
@@ -131,7 +133,7 @@ impl ResponsePacker {
     }
 
     fn usable_per_fragment() -> usize {
-        SURB_PAYLOAD_SIZE.saturating_sub(FRAGMENT_OVERHEAD)
+        RESPONSE_FRAGMENT_DATA_SIZE
     }
 
     /// Extra SURBs beyond data needs become FEC parity shards.
@@ -666,9 +668,8 @@ mod tests {
 
     #[test]
     fn test_surbs_needed_calculation() {
-        use nox_core::protocol::fragmentation::Fragmenter;
         let packer = ResponsePacker::new();
-        let usable = Fragmenter::usable_payload_size(SURB_PAYLOAD_SIZE);
+        let usable = RESPONSE_FRAGMENT_DATA_SIZE;
 
         assert_eq!(packer.surbs_needed(0), 0);
         assert_eq!(packer.surbs_needed(100), 1);

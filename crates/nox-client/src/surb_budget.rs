@@ -2,7 +2,7 @@
 //! Each SURB carries ~30 KB; adaptive budgeting via EMA tracks per-operation sizes.
 
 use nox_core::protocol::fragmentation::{
-    FRAGMENT_OVERHEAD, MAX_FRAGMENTS_PER_MESSAGE, SURB_PAYLOAD_SIZE,
+    FRAGMENT_OVERHEAD, MAX_FRAGMENTS_PER_MESSAGE, RESPONSE_FRAGMENT_DATA_SIZE,
 };
 use nox_crypto::sphinx::packet::MAX_PAYLOAD_SIZE;
 use parking_lot::Mutex;
@@ -12,7 +12,7 @@ use std::sync::Arc;
 /// Estimated bincode-serialized SURB size. Rounded to 700.
 pub const ESTIMATED_SURB_SERIALIZED_SIZE: usize = 700;
 
-pub const USABLE_RESPONSE_PER_SURB: usize = SURB_PAYLOAD_SIZE - FRAGMENT_OVERHEAD;
+pub const USABLE_RESPONSE_PER_SURB: usize = RESPONSE_FRAGMENT_DATA_SIZE;
 
 /// Capped at 9,000 (post-Lioness SPRP SURB size increase).
 pub const MAX_SURBS: usize = 9_000;
@@ -338,10 +338,7 @@ mod tests {
 
     #[test]
     fn test_usable_response_per_surb() {
-        assert_eq!(
-            USABLE_RESPONSE_PER_SURB,
-            SURB_PAYLOAD_SIZE - FRAGMENT_OVERHEAD
-        );
+        assert_eq!(USABLE_RESPONSE_PER_SURB, RESPONSE_FRAGMENT_DATA_SIZE);
         assert_eq!(USABLE_RESPONSE_PER_SURB, 30_699);
     }
 

@@ -80,9 +80,10 @@ relay cap) and `504` (no answer in time). Other node statuses pass through.
 
 Claim sizing. The node removes every reply it returns from its buffer, and
 writes each reply's bytes as a JSON array of decimal numbers: one full reply
-(31,716 bytes) is at most 126,928 bytes of JSON. nox-kps refuses to start
-unless `claimMaxSurbIds` full replies fit in `claimResponseMaxBytes`
-(128 × 126,928 + 2 = 16,246,786 ≤ 16,777,216 with the defaults), so every
+(one Sphinx body, 32,296 bytes) is at most 129,248 bytes of JSON. nox-kps
+refuses to start unless `claimMaxSurbIds` full replies fit in
+`claimResponseMaxBytes` (128 × 129,248 + 2 = 16,543,746 ≤ 16,777,216 with the
+defaults), so every
 claim it accepts can be relayed whole. Clients split larger claims into
 chunks of at most `claimMaxSurbIds` IDs.
 

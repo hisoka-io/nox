@@ -2,7 +2,7 @@
 //! SSRF protection, DNS rebinding mitigation, optional domain whitelist.
 
 use crate::config::HttpConfig;
-use crate::services::response_packer::{PackResult, ResponsePacker, SURB_PAYLOAD_SIZE};
+use crate::services::response_packer::{PackResult, ResponsePacker};
 use crate::services::security;
 use crate::telemetry::metrics::MetricsService;
 use async_trait::async_trait;
@@ -380,9 +380,7 @@ impl HttpHandler {
         body_len: usize,
         mut surbs: Vec<Surb>,
     ) -> Result<PackResult, HandlerError> {
-        use nox_core::protocol::fragmentation::FRAGMENT_OVERHEAD;
-
-        let usable = SURB_PAYLOAD_SIZE.saturating_sub(FRAGMENT_OVERHEAD);
+        let usable = nox_core::protocol::fragmentation::RESPONSE_FRAGMENT_DATA_SIZE;
 
         let header_response = SerializableHttpResponse {
             status,

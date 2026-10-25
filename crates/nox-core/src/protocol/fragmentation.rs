@@ -19,10 +19,21 @@ pub const DEFAULT_MAX_CONCURRENT_MESSAGES: usize = 50;
 pub const DEFAULT_STALE_TIMEOUT_SECS: u64 = 120;
 /// Single fragment: 32KB + overhead.
 pub const MAX_FRAGMENT_DESERIALIZE_SIZE: u64 = 33 * 1024;
-/// Bincode overhead per Fragment (~21 bytes without FEC, ~33 with FEC).
-pub const FRAGMENT_OVERHEAD: usize = 21;
-/// Sphinx body (~31KB) minus `ServiceResponse` wrapper overhead (~50 bytes).
+/// Bytes a bincode-encoded `Fragment` adds around its data without FEC: `message_id` (8),
+/// `total_fragments` (4), `sequence` (4), the data length (8) and the `None` FEC tag (1).
+pub const FRAGMENT_OVERHEAD: usize = 25;
+/// Bytes a bincode-encoded `Fragment` adds around its data with FEC: [`FRAGMENT_OVERHEAD`]
+/// plus `FecInfo` (`data_shard_count` 4, `original_data_len` 8).
+pub const FEC_FRAGMENT_OVERHEAD: usize = FRAGMENT_OVERHEAD + 12;
+/// Nominal reply budget per SURB (30 KiB), well inside the 32,296-byte Sphinx body.
 pub const SURB_PAYLOAD_SIZE: usize = 30 * 1024;
+/// Response data carried by one reply fragment (30,699 bytes, set as `SURB_PAYLOAD_SIZE`
+/// minus an earlier 21-byte framing estimate). Exits chunk responses by it, and clients
+/// size their SURB requests by it (the TypeScript SDK exports it as
+/// `USABLE_RESPONSE_PER_SURB`), so it is part of the wire contract and stays fixed. With
+/// the `ServiceResponse` wrapper, FEC metadata and the reply tag it still fits one SURB
+/// body (see the `largest_reply_fragment_fits_one_surb_body` test).
+pub const RESPONSE_FRAGMENT_DATA_SIZE: usize = 30_699;
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum FragmentationError {
@@ -183,8 +194,12 @@ impl Fragment {
 
     #[must_use]
     pub fn size(&self) -> usize {
-        let fec_overhead = if self.fec.is_some() { 13 } else { 1 };
-        FRAGMENT_OVERHEAD + self.data.len() + fec_overhead
+        let overhead = if self.fec.is_some() {
+            FEC_FRAGMENT_OVERHEAD
+        } else {
+            FRAGMENT_OVERHEAD
+        };
+        overhead + self.data.len()
     }
 }
 
@@ -570,6 +585,55 @@ mod tests {
         let bytes = frag.to_bytes().unwrap();
         let recovered = Fragment::from_bytes(&bytes).unwrap();
         assert_eq!(frag, recovered);
+    }
+
+    #[test]
+    fn fragment_overhead_matches_the_bincode_encoding() {
+        for len in [0usize, 1, 1_000, RESPONSE_FRAGMENT_DATA_SIZE] {
+            let plain = Fragment::new(7, 3, 1, vec![0xAB; len]).unwrap();
+            let encoded = bincode::serialize(&plain).unwrap();
+            assert_eq!(encoded.len(), FRAGMENT_OVERHEAD + len);
+            assert_eq!(plain.size(), encoded.len());
+
+            let fec = Fragment::new_with_fec(
+                7,
+                3,
+                1,
+                vec![0xAB; len],
+                super::super::fec::FecInfo {
+                    data_shard_count: 2,
+                    original_data_len: 9,
+                },
+            )
+            .unwrap();
+            let encoded = bincode::serialize(&fec).unwrap();
+            assert_eq!(encoded.len(), FEC_FRAGMENT_OVERHEAD + len);
+            assert_eq!(fec.size(), encoded.len());
+        }
+        assert_eq!(FRAGMENT_OVERHEAD, 25);
+        assert_eq!(FEC_FRAGMENT_OVERHEAD, 37);
+    }
+
+    #[test]
+    fn fragmenter_chunks_fit_the_requested_size() {
+        let data = vec![0x5A; 10_000];
+        for max_chunk in [100usize, 1_000, 4_096] {
+            let fragments = Fragmenter::new().fragment(1, &data, max_chunk).unwrap();
+            for fragment in &fragments {
+                assert!(bincode::serialize(fragment).unwrap().len() <= max_chunk);
+            }
+            assert_eq!(
+                bincode::serialize(&fragments[0]).unwrap().len(),
+                max_chunk,
+                "full fragments use the whole chunk"
+            );
+        }
+    }
+
+    #[test]
+    fn response_fragment_budget_is_fixed() {
+        assert_eq!(RESPONSE_FRAGMENT_DATA_SIZE, 30_699);
+        assert_eq!(RESPONSE_FRAGMENT_DATA_SIZE, SURB_PAYLOAD_SIZE - 21);
     }
 
     #[test]

@@ -339,7 +339,7 @@ async fn test_http_e2e_claim_v2_long_poll_binary_retain_ack() {
     let http = reqwest::Client::new();
     let url = format!("{}/api/v1/responses/claim", harness.entry_url);
     let id = surb_hex(77);
-    let payload = vec![0x5A_u8; 31_716];
+    let payload = vec![0x5A_u8; nox_crypto::BODY_SIZE];
 
     let publisher = harness.publisher.clone();
     let reply = payload.clone();

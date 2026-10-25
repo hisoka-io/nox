@@ -1,21 +1,27 @@
 //! Fixed-size (32KB) Sphinx packet container.
 //!
 //! Packet encryption is done by the Sphinx layer (`sphinx` for forward packets,
-//! `surb` for replies); this type only enforces the fixed size.
-//! The size constants below still budget a 12-byte nonce and a 16-byte tag per
-//! packet; `MAX_PAYLOAD_SIZE` is part of the wire format and must not change.
+//! `surb` for replies); this type only enforces the fixed size. A packet is the
+//! 472-byte Sphinx header followed by the 32,296-byte onion-encrypted body.
 
 use thiserror::Error;
 
 pub const PACKET_SIZE: usize = 32_768;
 
-/// Reserved for Sphinx header (1KB). Accommodates ephemeral key + routing info + MAC + nonce + extensions.
-pub const HEADER_SIZE: usize = 1024;
+/// Sphinx header: ephemeral key, routing info, MAC and proof-of-work nonce
+/// (the same value as [`crate::sphinx::HEADER_SIZE`], 472 bytes).
+pub const HEADER_SIZE: usize = super::HEADER_SIZE;
 
-pub const POLY1305_TAG_SIZE: usize = 16;
-pub const NONCE_SIZE: usize = 12;
-pub const PAYLOAD_OVERHEAD: usize = POLY1305_TAG_SIZE + NONCE_SIZE;
-pub const MAX_PAYLOAD_SIZE: usize = PACKET_SIZE - HEADER_SIZE - PAYLOAD_OVERHEAD;
+/// Onion-encrypted body that follows the header (32,296 bytes). Forward bodies
+/// are zero-padded to this size before Lioness encryption, and a SURB reply is
+/// buffered at the entry as this many bytes of ciphertext.
+pub const BODY_SIZE: usize = PACKET_SIZE - HEADER_SIZE;
+
+/// Forward payload budget: the largest encoded payload a client puts in one
+/// forward packet (31,716 bytes), 580 bytes below [`BODY_SIZE`]. Clients size
+/// single packets and forward fragments by it (the TypeScript SDK mirrors it in
+/// `client.ts`), so it is part of the wire contract and stays fixed.
+pub const MAX_PAYLOAD_SIZE: usize = 31_716;
 
 #[derive(Debug, Error)]
 pub enum PacketError {
@@ -23,7 +29,7 @@ pub enum PacketError {
     InvalidSize { expected: usize, actual: usize },
 }
 
-/// Fixed-size (32KB) packet buffer: `[Header: 1024][Body]`.
+/// Fixed-size (32KB) packet buffer: `[Header: 472][Body: 32,296]`.
 #[derive(Debug, Clone)]
 pub struct SphinxPacket(Vec<u8>);
 
@@ -88,15 +94,24 @@ mod tests {
     #[test]
     fn test_constants() {
         assert_eq!(PACKET_SIZE, 32_768);
-        assert_eq!(HEADER_SIZE, 1024);
-        assert_eq!(POLY1305_TAG_SIZE, 16);
-        assert_eq!(NONCE_SIZE, 12);
-        assert_eq!(PAYLOAD_OVERHEAD, 28);
+        assert_eq!(HEADER_SIZE, 472);
+        assert_eq!(BODY_SIZE, 32_296);
+        assert_eq!(HEADER_SIZE + BODY_SIZE, PACKET_SIZE);
         assert_eq!(MAX_PAYLOAD_SIZE, 31_716);
+        assert_eq!(BODY_SIZE - MAX_PAYLOAD_SIZE, 580);
+    }
 
-        assert_eq!(
-            HEADER_SIZE + NONCE_SIZE + MAX_PAYLOAD_SIZE + POLY1305_TAG_SIZE,
-            PACKET_SIZE
-        );
+    #[test]
+    fn header_is_the_sphinx_header() {
+        let header = crate::sphinx::SphinxHeader {
+            ephemeral_key: x25519_dalek::PublicKey::from([9u8; 32]),
+            routing_info: [0u8; crate::sphinx::ROUTING_INFO_SIZE],
+            mac: [0u8; crate::sphinx::MAC_SIZE],
+            nonce: 0,
+        };
+        let bytes = header.to_bytes(&vec![0u8; BODY_SIZE]);
+        assert_eq!(bytes.len(), PACKET_SIZE);
+        let packet = SphinxPacket::from_bytes(bytes).expect("exact size");
+        assert_eq!(packet.header().len(), HEADER_SIZE);
     }
 }
