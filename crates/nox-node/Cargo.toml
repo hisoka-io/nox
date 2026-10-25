@@ -55,6 +55,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 url = "2.5"
 http = "1"
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["process"] }
+
 [dev-dependencies]
 alloy-node-bindings = { workspace = true }
 tower = { version = "0.5", features = ["util"] }

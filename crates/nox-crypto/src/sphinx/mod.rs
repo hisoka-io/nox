@@ -602,7 +602,7 @@ pub fn build_multi_hop_packet(
     // Body must be padded to full capacity BEFORE Lioness encryption.
     // Lioness output depends on the full block size -- a size mismatch between
     // sender and relay produces garbage.
-    let body_capacity = packet::PACKET_SIZE - HEADER_SIZE;
+    let body_capacity = packet::BODY_SIZE;
     let mut current_body = vec![0u8; body_capacity];
     let copy_len = payload.len().min(body_capacity);
     current_body[..copy_len].copy_from_slice(&payload[..copy_len]);

@@ -48,6 +48,16 @@ struct TopologyApiState {
 }
 use tracing::{error, info, warn};
 
+/// How long shutdown waits for service tasks before aborting them.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The metrics service and the two tasks behind it.
+struct MetricsTasks {
+    service: MetricsService,
+    adapter: MetricsAdapter,
+    server: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+}
+
 pub struct NoxNode;
 
 impl NoxNode {
@@ -71,6 +81,9 @@ impl NoxNode {
             eprintln!("PANIC at {location}: {payload}");
             default_hook(info);
         }));
+
+        crate::infra::fd_limit::ensure_fd_budget(&config)
+            .map_err(|e| anyhow::anyhow!("Open-file limit check failed: {e}"))?;
 
         let shutdown_token = CancellationToken::new();
         let mut join_set = JoinSet::new();
@@ -124,12 +137,16 @@ impl NoxNode {
         let observed_chain = Arc::new(ObservedChain::default());
 
         let node_id = format!("nox:{}", config.metrics_port);
-        let bench_publisher = if config.benchmark_mode {
+        let bench_publisher = if config.benchmark_mode_active() {
             Some(bus_publisher.clone())
         } else {
             None
         };
-        let metrics_service = Self::spawn_metrics_with_admin(
+        let MetricsTasks {
+            service: metrics_service,
+            adapter: metrics_adapter,
+            server: metrics_server,
+        } = Self::build_metrics(
             config.metrics_port,
             bus_subscriber.clone(),
             topology_manager.clone(),
@@ -139,7 +156,10 @@ impl NoxNode {
             Some(observed_chain.clone()),
             &config.ingress.cors_allowed_origins,
             config.network.topology_liveness_window_secs,
+            &shutdown_token,
         );
+        join_set.spawn(async move { metrics_adapter.run().await });
+        join_set.spawn(metrics_server);
         if config.relayer.surb_formats.v2_enabled() {
             metrics_service.add_capability("surb_v2");
         }
@@ -209,7 +229,7 @@ impl NoxNode {
                 config.response_prune_interval_secs,
                 metrics_service.clone(),
             )
-            .with_buffer_all_payloads(config.benchmark_mode)
+            .with_buffer_all_payloads(config.benchmark_mode_active())
             .with_cancel_token(shutdown_token.clone());
             join_set.spawn(async move {
                 router.run().await;
@@ -384,11 +404,23 @@ impl NoxNode {
             metrics_service.clone(),
         )
         .with_cancel_token(shutdown_token.clone());
-        join_set.spawn(async move {
-            if let Err(e) = relayer_service.run().await {
-                error!("Relayer failed to start: {}", e);
-            }
-        });
+        // Each stage stops once the stage before it has stopped (ingest on the token),
+        // so the drain below waits for packets already in the pipeline.
+        let relayer_stages = relayer_service
+            .run()
+            .await
+            .map_err(|e| anyhow::anyhow!("Relayer failed to start: {e}"))?;
+        let mut detached_aborts = Vec::with_capacity(relayer_stages.len());
+        for stage in relayer_stages {
+            detached_aborts.push(stage.abort_handle());
+            join_set.spawn(async move {
+                if let Err(e) = stage.await {
+                    if e.is_panic() {
+                        std::panic::resume_unwind(e.into_panic());
+                    }
+                }
+            });
+        }
 
         let config_chain = config.clone();
         let publisher_chain = bus_publisher.clone();
@@ -748,9 +780,13 @@ impl NoxNode {
         }
 
         shutdown_token.cancel();
-        info!("Draining {} service tasks (30s timeout)...", join_set.len());
+        info!(
+            "Draining {} service tasks ({}s timeout)...",
+            join_set.len(),
+            SHUTDOWN_DRAIN_TIMEOUT.as_secs()
+        );
 
-        let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let drain_deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
         let mut completed = 0u32;
         let mut panicked = 0u32;
 
@@ -775,10 +811,14 @@ impl NoxNode {
                 () = tokio::time::sleep_until(drain_deadline) => {
                     let remaining = join_set.len();
                     warn!(
-                        "Shutdown timeout: {} tasks did not finish within 30s. Aborting them.",
-                        remaining
+                        "Shutdown timeout: {} tasks did not finish within {}s. Aborting them.",
+                        remaining,
+                        SHUTDOWN_DRAIN_TIMEOUT.as_secs()
                     );
                     join_set.abort_all();
+                    for stage in &detached_aborts {
+                        stage.abort();
+                    }
                     while let Some(result) = join_set.join_next().await {
                         match result {
                             Err(e) if e.is_panic() => {
@@ -943,6 +983,8 @@ impl NoxNode {
     }
 
     /// Pass `Some(publisher)` to enable benchmark-only admin topology registration.
+    /// The adapter and HTTP server run detached until the process exits; `NoxNode::run`
+    /// instead ties both to its shutdown token.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_metrics_with_admin(
         port: u16,
@@ -955,15 +997,49 @@ impl NoxNode {
         cors_allowed_origins: &[String],
         liveness_window_secs: u64,
     ) -> MetricsService {
+        let MetricsTasks {
+            service,
+            adapter,
+            server,
+        } = Self::build_metrics(
+            port,
+            bus_subscriber,
+            topology_manager,
+            node_id,
+            bench_publisher,
+            pow_difficulty,
+            observed_chain,
+            cors_allowed_origins,
+            liveness_window_secs,
+            &CancellationToken::new(),
+        );
+        tokio::spawn(async move { adapter.run().await });
+        tokio::spawn(server);
+        service
+    }
+
+    /// Builds the metrics service with its event-bus adapter and HTTP server, both of
+    /// which stop when `shutdown` is cancelled. The caller spawns the two tasks.
+    #[allow(clippy::too_many_arguments)]
+    fn build_metrics(
+        port: u16,
+        bus_subscriber: Arc<dyn IEventSubscriber>,
+        topology_manager: Arc<TopologyManager>,
+        node_id: String,
+        bench_publisher: Option<Arc<dyn IEventPublisher>>,
+        pow_difficulty: u32,
+        observed_chain: Option<Arc<ObservedChain>>,
+        cors_allowed_origins: &[String],
+        liveness_window_secs: u64,
+        shutdown: &CancellationToken,
+    ) -> MetricsTasks {
         info!("Initializing Observability...");
         let metrics_service = MetricsService::new();
         let metrics_registry = metrics_service.get_registry();
 
         let sse_bus = bus_subscriber.clone();
-        let metrics_adapter = MetricsAdapter::new(metrics_service.clone(), bus_subscriber);
-        tokio::spawn(async move {
-            metrics_adapter.run().await;
-        });
+        let metrics_adapter = MetricsAdapter::new(metrics_service.clone(), bus_subscriber)
+            .with_cancel_token(shutdown.clone());
 
         let metrics_addr = SocketAddr::from(([0, 0, 0, 0], port));
         let json_metrics = metrics_service.clone();
@@ -994,6 +1070,9 @@ impl NoxNode {
             .route("/events", get(crate::telemetry::sse::handle_sse_events))
             .layer(axum::extract::Extension(node_id))
             .layer(axum::extract::Extension(sse_bus))
+            .layer(axum::extract::Extension(
+                crate::telemetry::sse::SseShutdown(shutdown.clone()),
+            ))
             .layer(crate::ingress::policy::cors_layer(cors_allowed_origins))
             .layer(middleware::from_fn(
                 crate::telemetry::version::version_header,
@@ -1017,21 +1096,29 @@ impl NoxNode {
             info!("Benchmark admin endpoint enabled: POST http://{metrics_addr}/admin/topology/register");
         }
 
-        tokio::spawn(async move {
+        let server_shutdown = shutdown.clone();
+        let server = Box::pin(async move {
             info!(
                 "API Endpoints: http://{}/metrics, http://{}/topology, http://{}/events",
                 metrics_addr, metrics_addr, metrics_addr
             );
             match tokio::net::TcpListener::bind(metrics_addr).await {
                 Ok(listener) => {
-                    if let Err(e) = axum::serve(listener, metrics_app).await {
+                    if let Err(e) = axum::serve(listener, metrics_app)
+                        .with_graceful_shutdown(server_shutdown.cancelled_owned())
+                        .await
+                    {
                         error!("HTTP server error: {}", e);
                     }
                 }
                 Err(e) => error!("Failed to bind HTTP port {}: {}", port, e),
             }
         });
-        metrics_service
+        MetricsTasks {
+            service: metrics_service,
+            adapter: metrics_adapter,
+            server,
+        }
     }
 }
 

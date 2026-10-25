@@ -5013,6 +5013,7 @@ dependencies = [
  "rayon",
  "rcgen 0.13.2",
  "reqwest 0.12.28",
+ "rustix",
  "serde",
  "serde_json",
  "sled",

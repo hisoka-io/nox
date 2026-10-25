@@ -36,7 +36,7 @@ cargo run --release -- --config config.toml
 | `quote_max_pending_sponsored_gas` | `u64` | `0` | Aggregate sponsored-gas reservation limit |
 | `quote_rolling_loss_limit_native` | `String` | `"0"` | Rolling unreimbursed gas-loss ceiling |
 | `quote_rolling_loss_window_secs` | `u64` | `0` | Rolling loss window |
-| `benchmark_mode` | `bool` | `false` | Skip production validations |
+| `benchmark_mode` | `bool` | `false` | Simulation and benchmark harnesses: skips production validations and enables the benchmark admin endpoint. Accepted by builds with the `dev-node` feature; production builds require `false` |
 | `bootstrap_topology_urls` | `Vec<String>` | `[]` | Seed node URLs |
 
 ### Contract addresses

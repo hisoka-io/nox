@@ -7,11 +7,32 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ### Upgrade notes
 
+- Configurations that set `benchmark_mode = true` now load only in builds with the
+  `dev-node` feature; production nodes keep the default `false`.
+  The process mesh (`nox_mesh_server`, the multi-process benchmarks and the compat-mesh job) runs its nodes in
+  `benchmark_mode`, so it needs a `nox` binary built with `--features dev-node`.
+- Exits with tunnels enabled check `max_sessions` against the open-file limit at startup
+  ([docs/tunnel.md](docs/tunnel.md#operating-an-exit)); the fleet setting (`max_sessions = 512`) fits.
 - Wire formats, configuration keys and stored records are unchanged; nodes on this build and rc.6 to rc.10 nodes
   interoperate.
 
 ### Changed
 
+- Graceful shutdown now drains the metrics server and its event adapter, every relayer pipeline stage and the
+  exit lanes (requests already running finish); open `/events` streams end on shutdown. A relayer that cannot
+  start (for example an unreadable routing key) stops node startup with the error.
+- `benchmark_mode` is honoured only by `dev-node` builds and is refused at config validation otherwise, with the
+  setting to change in the error.
+- At startup the node raises its open-file soft limit to the hard limit and refuses to start when
+  `tunnel.max_sessions` plus a 256-descriptor reserve does not fit; a P2P connection budget above the limit is
+  logged as a warning.
+- Size constants describe the real wire format: `nox_crypto` `packet::HEADER_SIZE` is the 472-byte Sphinx header,
+  the new `BODY_SIZE` is the 32,296-byte body, and `MAX_PAYLOAD_SIZE` stays 31,716 as the documented forward
+  payload budget. `FRAGMENT_OVERHEAD` is the measured 25 bytes (new `FEC_FRAGMENT_OVERHEAD`: 37), and reply
+  fragments keep their 30,699-byte data size through the new `RESPONSE_FRAGMENT_DATA_SIZE`.
+- `decode_payload_limited` rejects bytes after the encoded value, like `decode_payload`; payloads read from a
+  padded Sphinx body keep using `decode_padded_relayer_payload_limited`.
+- nox-kps sizes claim responses for full 32,296-byte replies (`128 x 129,248 + 2` bytes with the defaults).
 - Chain access (registry observer and reconciler, exit executor and transaction outbox, paid quotes, the RPC proxy
   and client topology verification) runs on Alloy 2.5. EIP-712 quote digests and exit signatures, signed
   transactions, peer identity signatures, profitability decisions and stored records are byte-identical to rc.10,
@@ -29,6 +50,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ### Removed
 
+- `nox_crypto` `POLY1305_TAG_SIZE`, `PAYLOAD_OVERHEAD` and `PACKET_NONCE_SIZE`, superseded by the real header and
+  body sizes above.
 - `ChainExecutor::submit_transaction` and `ChainExecutor::send_raw`, which had no callers; exits broadcast through
   the transaction outbox.
 

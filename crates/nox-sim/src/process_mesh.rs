@@ -139,7 +139,8 @@ pub fn find_nox_binary(explicit: Option<&str>) -> Result<PathBuf> {
         .map(|p| p.display().to_string())
         .collect();
     bail!(
-        "nox binary not found. Build it first: cargo build --release --bin nox\n\
+        "nox binary not found. Mesh nodes run benchmark_mode, so build it with the dev-node \
+         feature first: cargo build --release --features dev-node --bin nox\n\
          Searched:\n  {}",
         searched.join("\n  ")
     );
@@ -648,7 +649,18 @@ mod tests {
         assert_eq!(config.registry_contract_address, registry.address);
         assert_eq!(config.chain_id, 31_337);
         assert_eq!(config.block_poll_interval_secs, 1);
-        assert!(config.validate().is_ok());
+        // Mesh nodes run benchmark_mode, which only dev-node builds accept.
+        let errors = config.validate().err().unwrap_or_default();
+        if cfg!(feature = "dev-node") {
+            assert!(errors.is_empty(), "{errors:?}");
+        } else {
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e == nox_node::config::BENCHMARK_MODE_REQUIRES_DEV_NODE),
+                "{errors:?}"
+            );
+        }
         Ok(())
     }
 }

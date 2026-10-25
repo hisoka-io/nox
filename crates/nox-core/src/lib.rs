@@ -27,7 +27,8 @@ pub use models::topology::{
 };
 pub use protocol::fec::{FecError, FecInfo};
 pub use protocol::fragmentation::{
-    Fragment, FragmentationError, Fragmenter, Reassembler, ReassemblerConfig, SURB_PAYLOAD_SIZE,
+    Fragment, FragmentationError, Fragmenter, Reassembler, ReassemblerConfig,
+    RESPONSE_FRAGMENT_DATA_SIZE, SURB_PAYLOAD_SIZE,
 };
 pub use traits::interfaces::*;
 pub use traits::service::{ServiceError, ServiceHandler};

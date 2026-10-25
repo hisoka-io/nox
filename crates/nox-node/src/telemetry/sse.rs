@@ -5,13 +5,19 @@
 
 use axum::extract::Extension;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use futures::stream::{self, Stream};
+use futures::stream::{self, Stream, StreamExt};
 use nox_core::events::NoxEvent;
 use nox_core::traits::IEventSubscriber;
 use serde::Serialize;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+/// Ends open `/events` streams when the node shuts down, so the metrics server's
+/// graceful shutdown does not wait on long-lived subscribers.
+#[derive(Clone, Debug, Default)]
+pub struct SseShutdown(pub CancellationToken);
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -126,9 +132,11 @@ fn make_sse_stream(
 pub async fn handle_sse_events(
     Extension(bus): Extension<Arc<dyn IEventSubscriber>>,
     Extension(node_id): Extension<String>,
+    Extension(SseShutdown(shutdown)): Extension<SseShutdown>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = bus.subscribe();
-    Sse::new(make_sse_stream(rx, node_id)).keep_alive(
+    let stream = make_sse_stream(rx, node_id).take_until(shutdown.cancelled_owned());
+    Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(30))
             .text("ping"),
@@ -155,6 +163,23 @@ mod tests {
             prev_peer: None,
         };
         assert!(to_sse(&received, "node").is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_ends_on_shutdown() {
+        let (tx, rx) = tokio::sync::broadcast::channel(4);
+        let shutdown = CancellationToken::new();
+        let mut stream = Box::pin(
+            make_sse_stream(rx, "node".to_string()).take_until(shutdown.clone().cancelled_owned()),
+        );
+        tx.send(NoxEvent::NodeStarted { timestamp: 1 }).unwrap();
+        assert!(stream.next().await.is_some());
+        shutdown.cancel();
+        let ended = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("stream ends within 2s of shutdown");
+        assert!(ended.is_none());
+        drop(tx);
     }
 
     #[test]

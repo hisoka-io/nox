@@ -900,6 +900,9 @@ pub struct NoxConfig {
 
     pub network: NetworkConfig,
     pub relayer: RelayerConfig,
+    /// Simulation and benchmark harnesses only: relaxes production validation and enables
+    /// the benchmark admin endpoint. Honoured only by builds with the `dev-node` feature;
+    /// production builds refuse a config that sets it.
     pub benchmark_mode: bool,
 
     pub node_role: NodeRole,
@@ -1125,6 +1128,12 @@ impl Default for NoxConfig {
     }
 }
 
+/// Validation error for `benchmark_mode = true` in a build without the `dev-node` feature.
+pub const BENCHMARK_MODE_REQUIRES_DEV_NODE: &str = "benchmark_mode = true is honoured only by \
+builds with the dev-node feature (simulation and benchmark harnesses), and this binary is a \
+production build: set benchmark_mode = false (or unset NOX__BENCHMARK_MODE), or build with \
+`cargo build --features dev-node` for a local benchmark node";
+
 impl NoxConfig {
     pub fn load(config_path: &str) -> Result<Self, ConfigError> {
         info!("Loading configuration from: {}", config_path);
@@ -1139,12 +1148,17 @@ impl NoxConfig {
 
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+        let bench = self.benchmark_mode_active();
 
-        if self.relayer.wire_ids == WireIdMode::Passthrough && !self.benchmark_mode {
+        if self.benchmark_mode && !bench {
+            errors.push(BENCHMARK_MODE_REQUIRES_DEV_NODE.into());
+        }
+
+        if self.relayer.wire_ids == WireIdMode::Passthrough && !bench {
             errors.push("relayer.wire_ids = \"passthrough\" requires benchmark_mode = true".into());
         }
 
-        if !self.benchmark_mode {
+        if !bench {
             if self.routing_private_key.is_empty() {
                 errors.push("routing_private_key is empty (required in production)".into());
             }
@@ -1166,7 +1180,7 @@ impl NoxConfig {
                 ));
             }
         }
-        if !self.benchmark_mode {
+        if !bench {
             if self.registry_contract_address == zero_addr {
                 errors.push("registry_contract_address is zero address".into());
             }
@@ -1191,7 +1205,7 @@ impl NoxConfig {
         errors.extend(self.exit_replenishment.validation_errors());
         errors.extend(self.tunnel.validation_errors());
 
-        if self.chain_id == 0 && !self.benchmark_mode {
+        if self.chain_id == 0 && !bench {
             errors.push("chain_id is 0 (must be set for production)".into());
         }
 
@@ -1199,11 +1213,11 @@ impl NoxConfig {
             errors.push("eth_rpc_url is empty".into());
         }
 
-        if self.oracle_url.is_empty() && self.node_role.is_exit_capable() && !self.benchmark_mode {
+        if self.oracle_url.is_empty() && self.node_role.is_exit_capable() && !bench {
             errors.push("oracle_url is empty (required for exit/full role)".into());
         }
 
-        if self.node_role.is_exit_capable() && !self.benchmark_mode {
+        if self.node_role.is_exit_capable() && !bench {
             if self.oracle_max_observation_age_secs == 0
                 || self.oracle_max_observation_age_secs > MAX_ORACLE_OBSERVATION_AGE_SECS
             {
@@ -1393,7 +1407,7 @@ impl NoxConfig {
             }
         }
 
-        if self.block_poll_interval_secs == 0 && !self.benchmark_mode {
+        if self.block_poll_interval_secs == 0 && !bench {
             errors.push("block_poll_interval_secs is 0 (would cause 100% CPU spin)".into());
         }
 
@@ -1402,6 +1416,13 @@ impl NoxConfig {
         } else {
             Err(errors)
         }
+    }
+
+    /// Whether benchmark behaviour is on: `benchmark_mode = true` in a build with the
+    /// `dev-node` feature. Production builds never honour it, and `validate` rejects it there.
+    #[must_use]
+    pub fn benchmark_mode_active(&self) -> bool {
+        cfg!(feature = "dev-node") && self.benchmark_mode
     }
 
     pub fn min_profit_margin_bps(&self) -> Result<u128, String> {
@@ -1580,8 +1601,34 @@ mod tests {
     fn test_config_validate_accepts_valid_addresses() {
         let mut config = NoxConfig::default();
         config.benchmark_mode = true;
-        let result = config.validate();
-        assert!(result.is_ok());
+        let errors = config.validate().err().unwrap_or_default();
+        assert!(!errors
+            .iter()
+            .any(|e| e.contains("not a valid Ethereum address")));
+        if cfg!(feature = "dev-node") {
+            assert!(errors.is_empty(), "{errors:?}");
+        }
+    }
+
+    #[test]
+    fn benchmark_mode_is_honoured_only_with_dev_node() {
+        let mut config = NoxConfig::default();
+        assert!(!config.benchmark_mode_active());
+        config.benchmark_mode = true;
+        let errors = config.validate().err().unwrap_or_default();
+        let refused = errors.iter().any(|e| e == BENCHMARK_MODE_REQUIRES_DEV_NODE);
+        if cfg!(feature = "dev-node") {
+            assert!(config.benchmark_mode_active());
+            assert!(!refused, "{errors:?}");
+        } else {
+            assert!(!config.benchmark_mode_active());
+            assert!(refused, "{errors:?}");
+            // Production checks still run, so the operator sees every problem at once.
+            assert!(errors.iter().any(|e| e.contains("routing_private_key")));
+            assert!(errors.iter().any(|e| e.contains("chain_id")));
+        }
+        assert!(BENCHMARK_MODE_REQUIRES_DEV_NODE.contains("benchmark_mode = false"));
+        assert!(BENCHMARK_MODE_REQUIRES_DEV_NODE.contains("--features dev-node"));
     }
 
     #[test]
@@ -1636,7 +1683,11 @@ mod tests {
 
         config.benchmark_mode = true;
         let errors = config.validate().err().unwrap_or_default();
-        assert!(!errors.iter().any(|e| e.contains("wire_ids")));
+        assert_eq!(
+            errors.iter().any(|e| e.contains("wire_ids")),
+            !cfg!(feature = "dev-node"),
+            "passthrough needs benchmark_mode in a dev-node build: {errors:?}"
+        );
     }
 
     #[test]
