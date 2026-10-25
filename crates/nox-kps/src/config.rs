@@ -32,9 +32,9 @@ pub const SPHINX_PACKET_BYTES: usize = 32_768;
 /// Hex length of one SURB ID (`nox-node` `SURB_ID_HEX_LEN`).
 pub const SURB_ID_HEX_LEN: usize = 32;
 
-/// Largest reply payload the node buffers for one SURB or delivery ID
-/// (`nox-crypto` `MAX_PAYLOAD_SIZE`: one Sphinx payload).
-pub const MAX_REPLY_PAYLOAD_BYTES: usize = 31_716;
+/// Largest reply payload the node buffers for one SURB or delivery ID: the
+/// reply's whole Sphinx body ciphertext (`nox-crypto` `BODY_SIZE`).
+pub const MAX_REPLY_PAYLOAD_BYTES: usize = 32_296;
 /// Bytes one claimed reply adds to the node's claim JSON besides its data:
 /// `{"data":[` `],"id":"reply-0-<32 hex>"}` (59 bytes) and the `,` between
 /// items, rounded up.
@@ -1355,12 +1355,12 @@ mod tests {
             &raw,
             "limits.claim_response_max_bytes (16777216) must hold a full claim of limits.claim_max_surb_ids (1024) replies",
         );
-        assert_error(&raw, "lower claim_max_surb_ids to at most 132");
+        assert_error(&raw, "lower claim_max_surb_ids to at most 129");
 
-        raw.limits.claim_max_surb_ids = 132;
+        raw.limits.claim_max_surb_ids = 129;
         assert!(errors_of(&raw).is_empty(), "{:?}", errors_of(&raw));
-        raw.limits.claim_max_surb_ids = 133;
-        assert_error(&raw, "at most 132");
+        raw.limits.claim_max_surb_ids = 130;
+        assert_error(&raw, "at most 129");
 
         raw.limits.claim_max_surb_ids = 1024;
         raw.limits.claim_response_max_bytes = max_claim_response_bytes(1024);

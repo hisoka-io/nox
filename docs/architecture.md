@@ -11,7 +11,7 @@ All packets are fixed-size **32 KB**.
 |<- Sphinx header: 472B ->|<- Onion-encrypted body: 32,296B ->|
 ```
 
-There is no outer encryption layer: the Sphinx header and body fill the packet. Application payloads are capped at `MAX_PAYLOAD_SIZE` (31,716 bytes), a budget that is part of the wire format.
+There is no outer encryption layer: the Sphinx header and body fill the packet. Clients cap one forward packet's encoded payload at `MAX_PAYLOAD_SIZE` (31,716 bytes), a budget that is part of the wire format; the body is zero-padded to its full 32,296 bytes before encryption. A SURB reply is buffered at the entry as its full 32,296-byte body ciphertext.
 
 ### Header (472 bytes)
 
@@ -127,9 +127,9 @@ other SURB.
 
 Reed-Solomon FEC on SURB responses handles packet loss without retransmission round-trips. In a mixnet, each ARQ retry adds a full round-trip through Poisson delays. FEC trades bandwidth for latency.
 
-**Encoding**: Fragment response into D data shards (30 KB each), generate P parity shards (P = ceil(D * fec_ratio), default 0.3). Any D-of-(D+P) shards suffice for recovery.
+**Encoding**: Fragment response into D data shards of 30,699 bytes (`RESPONSE_FRAGMENT_DATA_SIZE`, which clients mirror as `USABLE_RESPONSE_PER_SURB`), generate P parity shards (P = ceil(D * fec_ratio), default 0.3). Any D-of-(D+P) shards suffice for recovery. A fragment adds 25 bytes of framing (37 with FEC metadata), and the largest reply fragment with its `ServiceResponse` wrapper and reply tag fits one SURB body.
 
-**Limits**: 255 max shards (GF(2^8)), 200 max fragments, ~6.4 MB max message.
+**Limits**: 255 shards per FEC group (GF(2^8)), 9,500 fragments per message. Forward messages are at most 6,553,600 bytes; larger responses arrive over several SURB rounds.
 
 ---
 
@@ -148,7 +148,9 @@ Node cover traffic protects the links between nodes. The Rust client crate ships
 
 Dispatches decrypted payloads by type: Ethereum TX execution, HTTP proxy (SSRF-protected), anonymous RPC, echo, or fragmented message reassembly. Anonymous requests include SURBs for response delivery.
 
-Reassembly is bounded: 10 MB buffer, 50 concurrent messages, 200 fragments max, 120s stale timeout.
+Reassembly is bounded by `[relayer.fragmentation]`: 300 MiB of pending fragments, 50 concurrent messages and a 300 s timeout by default, with at most 9,500 fragments per message. FEC metadata is accepted on reply fragments only.
+
+Requests run in five lanes (paid, quote, proxy, control, tunnel), each with its own bounded queue and concurrency (`[exit_workers]`), so quotes and control messages keep moving while slow upstream calls run.
 
 ---
 
@@ -200,15 +202,29 @@ bundles itself. It ships in the node image and runs as its own process and conta
 
 Clients submit application-opaque EntryPoint calldata bound to a selected exit and execution ID. Exit nodes validate the request before simulation, accept only the EntryPoint settlement event for their own address, value only the exit fee, authorize the maximum transaction plan with fixed-point prices, persist signed bytes, and then submit.
 
-Price oracle (`nox-oracle`) aggregates from Binance and CoinGecko.
+Price oracle (`nox-oracle`, served by `price_server`) queries Kraken, CoinGecko and Binance, plus CryptoCompare when `PRICE_CRYPTOCOMPARE_API_KEY` is set. It publishes the median per asset after dropping quotes more than 50% from it, and only when at least `PRICE_MIN_SOURCES` providers (default 2) price the asset.
 
 ---
 
 ## Observability
 
-Prometheus metrics at `/metrics` (JSON summary at `/metrics/json`). Additional endpoints: `/topology` (JSON), `/events` (SSE stream of node, peer and topology events), `/admin/config` (redacted). `/events` carries no per-packet events: packet counts and latency are published only as aggregates.
+Prometheus metrics at `/metrics` (JSON summary at `/metrics/json`). Additional endpoints: `/topology` (JSON) and `/events` (SSE stream of node, peer and topology events). `/events` carries no per-packet events: packet counts and latency are published only as aggregates. Benchmark builds (`dev-node` feature with `benchmark_mode = true`) add `POST /admin/topology/register` for harnesses; production builds run with `benchmark_mode = false`.
 
 The HTTP ingress applies a per-client-IP token bucket and an optional CORS origin allowlist (`[ingress]` in `config.example.toml`).
+
+---
+
+## Shutdown
+
+On SIGTERM or SIGINT the node cancels one shutdown token and waits up to 30 s for its services: the metrics
+server (open `/events` streams end) and its event adapter, the ingress and topology servers, the relayer pipeline
+(ingest stops, then workers, the mix queue and egress finish the packets already inside), and the exit lanes, which
+finish the requests already running. The replay filter and chain cursor are written on the way out. Tasks still
+running at the deadline are aborted.
+
+At startup the node raises its open-file soft limit to the hard limit and checks that `[tunnel] max_sessions` plus
+a 256-descriptor reserve fits; when it does not, the node stops with the largest setting that fits and the limit to set
+([tunnel.md](tunnel.md#operating-an-exit)).
 
 ---
 

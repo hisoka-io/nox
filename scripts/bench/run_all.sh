@@ -160,7 +160,7 @@ if ! $CHARTS_ONLY && ! $SKIP_BUILD; then
         (cd "$NOX_ROOT" && cargo build $CARGO_PROFILE -p nox-sim --bin nox_multiprocess_bench --features dev-node 2>&1 | tail -5) >&2
 
         log "Building nox binary (for multi-process)..."
-        (cd "$NOX_ROOT" && cargo build --release --bin nox 2>&1 | tail -5) >&2
+        (cd "$NOX_ROOT" && cargo build --release --features dev-node --bin nox 2>&1 | tail -5) >&2
     fi
 
     log "Build complete."
@@ -309,7 +309,7 @@ json.dump(data, sys.stdout, indent=2)
              --duration 15 --warmup-secs 3 \
              > \"$DATA_DIR/concurrency_sweep.json\""
     else
-        skip_bench "Multi-process benchmarks (nox binary not found at $NOX_BIN -- build with cargo build --release --bin nox)"
+        skip_bench "Multi-process benchmarks (nox binary not found at $NOX_BIN -- build with cargo build --release --features dev-node --bin nox)"
     fi
 fi
 
@@ -325,7 +325,7 @@ if $RUN_TIER3 && ! $CHARTS_ONLY; then
         (cd "$NOX_ROOT" && cargo build $CARGO_PROFILE -p nox-sim --bin nox_realworld_bench --features dev-node 2>&1 | tail -5) >&2
 
         log "Building nox binary (release, for multi-process mesh)..."
-        (cd "$NOX_ROOT" && cargo build --release --bin nox 2>&1 | tail -5) >&2
+        (cd "$NOX_ROOT" && cargo build --release --features dev-node --bin nox 2>&1 | tail -5) >&2
     fi
 
     RW_BENCH="$NOX_ROOT/target/$PROFILE_NAME/nox_realworld_bench"

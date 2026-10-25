@@ -56,6 +56,9 @@ reqwest-legacy = { package = "reqwest", version = "0.11.27", default-features = 
 url = "2.5"
 http = "1"
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["process"] }
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = "0.24"

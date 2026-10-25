@@ -15,45 +15,46 @@ pub fn encode_payload<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Decode a versioned wire payload back into `T`.
-pub fn decode_payload<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, String> {
-    use bincode::Options;
+/// The bincode body of a versioned wire payload.
+fn versioned_body(bytes: &[u8]) -> Result<&[u8], String> {
     match bytes.split_first() {
         None => Err("empty payload bytes".into()),
-        Some((&ver, body)) => {
-            if ver != PAYLOAD_VERSION {
-                return Err(format!("unsupported payload version {ver}"));
-            }
-            bincode::DefaultOptions::new()
-                .with_fixint_encoding()
-                .reject_trailing_bytes()
-                .deserialize(body)
-                .map_err(|e| e.to_string())
-        }
+        Some((&PAYLOAD_VERSION, body)) => Ok(body),
+        Some((&ver, _)) => Err(format!("unsupported payload version {ver}")),
     }
 }
 
+/// Decode a versioned wire payload back into `T`. Bytes after the encoded value are
+/// rejected.
+pub fn decode_payload<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, String> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .deserialize(versioned_body(bytes)?)
+        .map_err(|e| e.to_string())
+}
+
 /// Like `decode_payload` but with a bincode size limit to prevent OOM from malicious packets.
+/// Bytes after the encoded value are rejected, as in `decode_payload`. It decodes exact
+/// encodings: reassembled fragment data and `AnonymousRequest.inner`. A payload read
+/// straight from a Sphinx body carries zero padding up to the body size and goes through
+/// [`decode_padded_relayer_payload_limited`] instead.
 pub fn decode_payload_limited<T: for<'de> Deserialize<'de>>(
     bytes: &[u8],
     max_bytes: u64,
 ) -> Result<T, String> {
     use bincode::Options;
-    match bytes.split_first() {
-        None => Err("empty payload bytes".into()),
-        Some((&ver, body)) => {
-            if ver != PAYLOAD_VERSION {
-                return Err(format!("unsupported payload version {ver}"));
-            }
-            bincode::DefaultOptions::new()
-                .with_limit(max_bytes)
-                .with_fixint_encoding()
-                .deserialize(body)
-                .map_err(|e| e.to_string())
-        }
-    }
+    bincode::DefaultOptions::new()
+        .with_limit(max_bytes)
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .deserialize(versioned_body(bytes)?)
+        .map_err(|e| e.to_string())
 }
 
+/// Decodes a `RelayerPayload` read from a Sphinx body: the encoded value followed by zero
+/// padding. Nonzero bytes after the value are rejected.
 pub fn decode_padded_relayer_payload_limited(
     bytes: &[u8],
     max_bytes: u64,
@@ -424,6 +425,68 @@ pub struct RpcResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limited_decoding_rejects_trailing_bytes_like_unlimited_decoding() {
+        let inner = encode_payload(&ServiceRequest::Echo {
+            data: vec![1, 2, 3],
+        })
+        .unwrap();
+        assert!(decode_payload_limited::<ServiceRequest>(&inner, 1_024).is_ok());
+
+        for tail in [&[0u8][..], &[0xff], &[0; 64]] {
+            let mut padded = inner.clone();
+            padded.extend_from_slice(tail);
+            assert!(decode_payload::<ServiceRequest>(&padded).is_err());
+            assert!(decode_payload_limited::<ServiceRequest>(&padded, 1_024).is_err());
+        }
+
+        // A payload taken from a Sphinx body keeps its zero padding and decodes with the
+        // padded decoder.
+        let outer = encode_payload(&RelayerPayload::AnonymousRequest {
+            inner,
+            reply_surbs: vec![],
+        })
+        .unwrap();
+        let mut body = outer.clone();
+        body.resize(4_096, 0);
+        assert!(decode_payload_limited::<RelayerPayload>(&body, 65_536).is_err());
+        assert!(decode_padded_relayer_payload_limited(&body, 65_536).is_ok());
+        assert!(decode_payload_limited::<RelayerPayload>(&outer, 65_536).is_ok());
+    }
+
+    #[test]
+    fn largest_reply_fragment_fits_one_surb_body() {
+        use crate::protocol::fec::FecInfo;
+        use crate::protocol::fragmentation::{FEC_FRAGMENT_OVERHEAD, RESPONSE_FRAGMENT_DATA_SIZE};
+        use nox_crypto::sphinx::packet::BODY_SIZE;
+        use nox_crypto::SURB_TAG_LEN;
+
+        let fragment = Fragment::new_with_fec(
+            u64::MAX,
+            2,
+            1,
+            vec![0xFF; RESPONSE_FRAGMENT_DATA_SIZE],
+            FecInfo {
+                data_shard_count: 1,
+                original_data_len: RESPONSE_FRAGMENT_DATA_SIZE as u64,
+            },
+        )
+        .unwrap();
+        let reply = encode_payload(&RelayerPayload::ServiceResponse {
+            request_id: u64::MAX,
+            fragment,
+        })
+        .unwrap();
+        // Version byte, enum tag, request_id, then the fragment.
+        assert_eq!(
+            reply.len(),
+            1 + 4 + 8 + FEC_FRAGMENT_OVERHEAD + RESPONSE_FRAGMENT_DATA_SIZE
+        );
+        // A format 2 SURB reply carries the message, the reply tag and at least one
+        // padding byte inside the Sphinx body.
+        assert!(reply.len() + SURB_TAG_LEN < BODY_SIZE);
+    }
 
     #[test]
     fn test_broadcast_signed_transaction_roundtrip() {

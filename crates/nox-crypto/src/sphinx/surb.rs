@@ -300,10 +300,7 @@ impl Surb {
     }
 
     fn seal(&self, message: &[u8], tagged: bool) -> Result<SphinxPacket, SurbError> {
-        use super::packet::PACKET_SIZE;
-        use super::HEADER_SIZE as SPHINX_HEADER_SIZE;
-
-        let body_size = PACKET_SIZE - SPHINX_HEADER_SIZE;
+        let body_size = super::packet::BODY_SIZE;
         let tag_len = if tagged { SURB_TAG_LEN } else { 0 };
 
         if message.len() + tag_len >= body_size {
@@ -324,9 +321,9 @@ impl Surb {
 
         let packet_bytes = self.header.to_bytes(&body);
 
-        if packet_bytes.len() != PACKET_SIZE {
-            let mut final_packet = vec![0u8; PACKET_SIZE];
-            let copy_len = packet_bytes.len().min(PACKET_SIZE);
+        if packet_bytes.len() != super::packet::PACKET_SIZE {
+            let mut final_packet = vec![0u8; super::packet::PACKET_SIZE];
+            let copy_len = packet_bytes.len().min(super::packet::PACKET_SIZE);
             final_packet[..copy_len].copy_from_slice(&packet_bytes[..copy_len]);
             return SphinxPacket::from_bytes(final_packet).map_err(SurbError::Packet);
         }
@@ -742,7 +739,8 @@ mod tests {
         };
 
         let packet_bytes = packet.as_bytes();
-        let wrong_offset = super::super::packet::HEADER_SIZE + super::super::packet::NONCE_SIZE;
+        // The body offset of the former 1,024-byte header budget plus a 12-byte nonce.
+        let wrong_offset = 1024 + 12;
         let correct_offset = super::super::HEADER_SIZE;
 
         assert_eq!(wrong_offset, 1036);

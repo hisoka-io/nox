@@ -32,8 +32,9 @@ use tracing::{debug, info, warn};
 
 /// Max size for deserializing a single Sphinx packet payload (64 KB).
 ///
-/// A single Sphinx packet body is `MAX_PAYLOAD_SIZE` = 31,716 bytes. We use 64 KB here to
-/// give bincode deserialization headroom for the wrapper envelope.
+/// A single Sphinx packet body is `BODY_SIZE` = 32,296 bytes, of which clients fill at most
+/// `MAX_PAYLOAD_SIZE` = 31,716. We use 64 KB here to give bincode deserialization headroom
+/// for the wrapper envelope.
 const MAX_SINGLE_PAYLOAD_SIZE: u64 = 64 * 1024;
 
 /// Max size for deserializing a reassembled (multi-fragment) payload.
@@ -499,7 +500,7 @@ impl ExitService {
 
         let mut rx = self.bus_subscriber.subscribe();
         let mut prune_timer = tokio::time::interval(self.prune_interval);
-        let lanes = self.start_lanes();
+        let (lanes, lane_tasks) = self.start_lanes();
 
         loop {
             tokio::select! {
@@ -538,64 +539,64 @@ impl ExitService {
                 }
             }
         }
+
+        drop(lanes);
+        for task in lane_tasks {
+            if let Err(e) = task.await {
+                warn!(error = %e, "Exit lane task ended abnormally during shutdown");
+            }
+        }
+        info!("Exit Service stopped; lane jobs in flight have finished.");
     }
 
-    /// Starts one bounded queue and worker per lane. Workers stop with the cancel token.
-    fn start_lanes(&self) -> [mpsc::Sender<LaneJob>; 5] {
+    /// Starts one bounded queue and worker per lane. Workers stop with the cancel token
+    /// and finish once their jobs in flight have finished.
+    fn start_lanes(&self) -> ([mpsc::Sender<LaneJob>; 5], Vec<tokio::task::JoinHandle<()>>) {
         let service = Arc::new(self.clone());
         let queue_capacity = self.workers.queue_capacity.max(1);
-        ExitLane::ALL.map(|lane| {
+        let mut tasks = Vec::with_capacity(ExitLane::ALL.len());
+        let senders = ExitLane::ALL.map(|lane| {
             let (sender, receiver) = mpsc::channel(queue_capacity);
             let concurrency = lane.concurrency(&self.workers).max(1);
-            tokio::spawn(Self::run_lane(
+            tasks.push(tokio::spawn(Self::run_lane(
                 service.clone(),
                 lane,
                 receiver,
                 concurrency,
                 self.cancel_token.clone(),
-            ));
+            )));
             sender
-        })
+        });
+        (senders, tasks)
     }
 
-    /// Takes a permit first, then a job, so waiting jobs stay in the bounded queue.
     async fn run_lane(
         service: Arc<Self>,
         lane: ExitLane,
-        mut receiver: mpsc::Receiver<LaneJob>,
+        receiver: mpsc::Receiver<LaneJob>,
         concurrency: usize,
         cancel: CancellationToken,
     ) {
-        let semaphore = Arc::new(Semaphore::new(concurrency));
         let inflight = service
             .metrics
             .exit_lane_inflight
             .get_or_create(&vec![("lane".to_string(), lane.as_str().to_string())])
             .clone();
-        loop {
-            let permit = tokio::select! {
-                permit = semaphore.clone().acquire_owned() => match permit {
-                    Ok(permit) => permit,
-                    Err(_) => break,
-                },
-                () = cancel.cancelled() => break,
-            };
-            let job = tokio::select! {
-                job = receiver.recv() => job,
-                () = cancel.cancelled() => break,
-            };
-            let Some((packet_id, command)) = job else {
-                break;
-            };
-            let service = service.clone();
-            let inflight = inflight.clone();
-            inflight.inc();
-            tokio::spawn(async move {
-                service.dispatch_payload(&packet_id, command).await;
-                inflight.dec();
-                drop(permit);
-            });
-        }
+        drive_lane(
+            receiver,
+            concurrency,
+            cancel,
+            move |(packet_id, command)| {
+                let service = service.clone();
+                let inflight = inflight.clone();
+                inflight.inc();
+                async move {
+                    service.dispatch_payload(&packet_id, command).await;
+                    inflight.dec();
+                }
+            },
+        )
+        .await;
         debug!(lane = lane.as_str(), "Exit lane stopped");
     }
 
@@ -1274,6 +1275,48 @@ fn continue_or_stash(
     }
 }
 
+/// Runs jobs from `receiver`, at most `concurrency` at once, until `cancel` fires or the
+/// queue closes, then waits for the jobs already started. A permit is taken before a job,
+/// so waiting jobs stay in the bounded queue; jobs still queued at shutdown are dropped.
+async fn drive_lane<J, F, Fut>(
+    mut receiver: mpsc::Receiver<J>,
+    concurrency: usize,
+    cancel: CancellationToken,
+    mut start: F,
+) where
+    F: FnMut(J) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    loop {
+        let permit = tokio::select! {
+            permit = semaphore.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
+            () = cancel.cancelled() => break,
+        };
+        let job = tokio::select! {
+            job = receiver.recv() => job,
+            () = cancel.cancelled() => break,
+        };
+        let Some(job) = job else {
+            break;
+        };
+        let work = start(job);
+        tokio::spawn(async move {
+            work.await;
+            drop(permit);
+        });
+    }
+    // Every permit back means every started job has finished.
+    if let Ok(all) = u32::try_from(concurrency) {
+        if semaphore.acquire_many(all).await.is_err() {
+            debug!("Exit lane semaphore closed while waiting for jobs in flight");
+        }
+    }
+}
+
 /// Drops expired entries from both replenishment maps. Size caps are
 /// enforced on every insert. The two locks are never held together.
 fn prune_replenishment_maps(pending: &PendingReplenishments, accumulator: &SurbAccumulator) {
@@ -1335,6 +1378,59 @@ mod tests {
             close: false,
             hold_ms: 1_000,
         }
+    }
+
+    #[tokio::test]
+    async fn lane_shutdown_waits_for_jobs_in_flight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (sender, receiver) = mpsc::channel::<u32>(8);
+        let cancel = CancellationToken::new();
+        let started = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let (s, f) = (started.clone(), finished.clone());
+        let lane = tokio::spawn(drive_lane(receiver, 2, cancel.clone(), move |_job| {
+            let (s, f) = (s.clone(), f.clone());
+            async move {
+                s.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                f.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        for job in 0..2 {
+            sender.send(job).await.unwrap();
+        }
+        while started.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        sender.send(99).await.unwrap();
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), lane)
+            .await
+            .expect("lane stops within 2s")
+            .expect("lane does not panic");
+        assert_eq!(finished.load(Ordering::SeqCst), 2, "started jobs finished");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "queued job was not started"
+        );
+    }
+
+    #[tokio::test]
+    async fn lane_stops_when_its_queue_closes() {
+        let (sender, receiver) = mpsc::channel::<u32>(1);
+        let lane = tokio::spawn(drive_lane(
+            receiver,
+            1,
+            CancellationToken::new(),
+            |_job| async {},
+        ));
+        sender.send(1).await.unwrap();
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(2), lane)
+            .await
+            .expect("lane stops within 2s")
+            .expect("lane does not panic");
     }
 
     #[test]

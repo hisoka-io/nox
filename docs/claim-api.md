@@ -106,7 +106,7 @@ then N items:
         2     id length L
         L     id (ASCII, e.g. "reply-0-<32 hex>")
         4     data length D
-        D     data (one encrypted reply, at most 31,716 bytes)
+        D     data (one encrypted reply, at most 32,296 bytes)
 ```
 
 The body ends after the last item. A reader should reject a version byte it

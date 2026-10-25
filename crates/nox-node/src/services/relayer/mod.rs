@@ -114,3 +114,51 @@ impl RelayerService {
         Ok(handles)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infra::event_bus::TokioEventBus;
+    use crate::infra::persistence::rotational_bloom::RotationalBloomFilter;
+    use crate::services::mixing::NoMixStrategy;
+    use crate::telemetry::metrics::MetricsService;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn every_stage_stops_after_cancellation() {
+        let bus = TokioEventBus::new(64);
+        let mut config = NoxConfig::default();
+        config.routing_private_key = "11".repeat(32);
+        config.relayer.worker_count = 3;
+        let token = CancellationToken::new();
+        let stages = RelayerService::new(
+            config,
+            Arc::new(bus.clone()),
+            Arc::new(bus.clone()),
+            Arc::new(RotationalBloomFilter::new(
+                1_000,
+                0.001,
+                Duration::from_mins(1),
+            )),
+            Arc::new(NoMixStrategy),
+            MetricsService::new(),
+        )
+        .with_cancel_token(token.clone())
+        .run()
+        .await
+        .expect("pipeline starts");
+        // Ingest, three workers, mix, egress.
+        assert_eq!(stages.len(), 6);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(stages.iter().all(|stage| !stage.is_finished()));
+
+        token.cancel();
+        for stage in stages {
+            tokio::time::timeout(Duration::from_secs(2), stage)
+                .await
+                .expect("stage stops within 2s of cancellation")
+                .expect("stage does not panic");
+        }
+        drop(bus);
+    }
+}
