@@ -34,23 +34,22 @@ pub fn sign_peer_id(
     peer_id_bytes: &[u8],
     eth_private_key_hex: &str,
 ) -> Result<String, InfrastructureError> {
-    use ethers::core::k256::ecdsa::SigningKey;
-    use ethers::signers::LocalWallet;
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::signers::SignerSync;
 
     let key_bytes = hex::decode(eth_private_key_hex.trim_start_matches("0x"))
         .map_err(|e| InfrastructureError::Network(format!("Invalid ETH private key hex: {e}")))?;
-    let signing_key = SigningKey::from_bytes(key_bytes.as_slice().into())
+    let wallet = PrivateKeySigner::from_slice(&key_bytes)
         .map_err(|e| InfrastructureError::Network(format!("Invalid secp256k1 key: {e}")))?;
-    let wallet = LocalWallet::from(signing_key);
 
-    let message_hash = ethers::core::utils::keccak256(peer_id_bytes);
+    let message_hash = alloy::primitives::keccak256(peer_id_bytes);
 
     // Sign the raw hash (not EIP-191 personal_sign -- we want plain ecrecover)
     let signature = wallet
-        .sign_hash(ethers::core::types::H256::from(message_hash))
+        .sign_hash_sync(&message_hash)
         .map_err(|e| InfrastructureError::Network(format!("Signing failed: {e}")))?;
 
-    Ok(hex::encode(signature.to_vec()))
+    Ok(hex::encode(signature.as_bytes()))
 }
 
 #[derive(Debug, Clone)]
@@ -919,22 +918,22 @@ impl P2PService {
         };
 
         let peer_id_bytes = peer_id.to_bytes();
-        let message_hash = ethers::core::utils::keccak256(&peer_id_bytes);
-        let signature = match ethers::core::types::Signature::try_from(sig_bytes.as_slice()) {
+        let message_hash = alloy::primitives::keccak256(&peer_id_bytes);
+        let signature = match alloy::primitives::Signature::try_from(sig_bytes.as_slice()) {
             Ok(s) => s,
             Err(e) => {
                 return (false, Some(format!("Invalid secp256k1 signature: {e}")));
             }
         };
 
-        let recovered_address = match signature.recover(message_hash) {
+        let recovered_address = match signature.recover_address_from_prehash(&message_hash) {
             Ok(a) => a,
             Err(e) => {
                 return (false, Some(format!("ecrecover failed: {e}")));
             }
         };
 
-        let claimed_address = match addr.parse::<ethers::core::types::Address>() {
+        let claimed_address = match nox_core::eth::parse_address(addr) {
             Ok(a) => a,
             Err(e) => {
                 return (false, Some(format!("Invalid eth_address format: {e}")));

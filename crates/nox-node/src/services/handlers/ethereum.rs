@@ -1,8 +1,6 @@
 //! Ethereum TX handler: simulate, profitability-check, and submit on-chain.
 
-use crate::blockchain::executor::{
-    build_pinned_ethers_http1_provider, public_rpc_error, ChainExecutor,
-};
+use crate::blockchain::executor::{build_pinned_http1_provider, public_rpc_error, ChainExecutor};
 use crate::blockchain::tx_manager::{SubmitError, TransactionManager};
 use crate::infra::storage::QuoteStoreError;
 use crate::price::client::FixedPriceSource;
@@ -11,13 +9,13 @@ use crate::services::quotes::{execution_quote_digest, u256_word, QuotePolicy};
 use crate::services::security;
 use crate::services::token_registry::TokenRegistry;
 use crate::telemetry::metrics::MetricsService;
+use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy::providers::Provider;
+use alloy::rpc::types::Log;
 use async_trait::async_trait;
-use ethers::prelude::*;
-use ethers::utils::keccak256;
 use nox_core::models::payloads::RelayerPayload;
 use nox_core::traits::service::{ServiceError, ServiceHandler};
 use std::fmt;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -37,7 +35,7 @@ const PAID_EXECUTION_SETTLED_SIGNATURE: &[u8] = b"PaidExecutionSettled(bytes32,b
 pub enum PaidOutcome {
     Submitted {
         execution_id: nox_core::ExecutionId,
-        transaction_hash: H256,
+        transaction_hash: B256,
     },
 }
 
@@ -98,7 +96,7 @@ pub enum PaidRejection {
     #[error("execution {execution_id:?} conflicts with transaction {transaction_hash:?}")]
     Duplicate {
         execution_id: nox_core::ExecutionId,
-        transaction_hash: H256,
+        transaction_hash: B256,
     },
     #[error("submission failed: {detail}")]
     Submission { detail: BoundedDetail },
@@ -174,7 +172,7 @@ impl EthereumHandler {
             max_broadcast_tx_size,
             gas_limit_buffer_bps: crate::config::DEFAULT_GAS_LIMIT_BUFFER_BPS,
             initial_fee_buffer_bps: crate::config::DEFAULT_INITIAL_FEE_BUFFER_BPS,
-            nox_entry_point_address: Address::zero(),
+            nox_entry_point_address: Address::ZERO,
             quote_policy: None,
             last_quote_prune_unix: AtomicU64::new(0),
         }
@@ -348,7 +346,7 @@ impl EthereumHandler {
             quote_version: 1,
             chain_id: u256_word(U256::from(request.chain_id)),
             entry_point: request.entry_point,
-            exit_address: self.chain_executor.address().0,
+            exit_address: self.chain_executor.address().into_array(),
             client_intent_id: request.client_intent_id,
             payment_adapter: request.payment_adapter,
             payment_id: request.payment_id,
@@ -549,7 +547,7 @@ impl EthereumHandler {
                             .finalize_quote_durably(
                                 request.execution_id,
                                 nox_core::QuoteStatusV2::Expired,
-                                U256::zero(),
+                                U256::ZERO,
                                 wall_timestamp,
                             )
                             .await
@@ -596,7 +594,7 @@ impl EthereumHandler {
                     .finalize_quote_durably(
                         request.execution_id,
                         nox_core::QuoteStatusV2::Expired,
-                        U256::zero(),
+                        U256::ZERO,
                         wall_timestamp,
                     )
                     .await
@@ -685,7 +683,7 @@ impl EthereumHandler {
                 }
             };
         if settlement.fee_asset != Address::from(stored_quote.quote.fee_asset)
-            || settlement.exit_fee != U256::from_big_endian(&stored_quote.quote.exit_fee)
+            || settlement.exit_fee != U256::from_be_bytes(stored_quote.quote.exit_fee)
         {
             return paid_v2_rejection(
                 Some(request.execution_id),
@@ -714,8 +712,8 @@ impl EthereumHandler {
                 );
             }
         };
-        let quoted_gas = U256::from_big_endian(&stored_quote.quote.maximum_transaction_gas);
-        let quoted_fee_per_gas = U256::from_big_endian(&stored_quote.quote.maximum_fee_per_gas);
+        let quoted_gas = U256::from_be_bytes(stored_quote.quote.maximum_transaction_gas);
+        let quoted_fee_per_gas = U256::from_be_bytes(stored_quote.quote.maximum_fee_per_gas);
         if let Err(violation) =
             validate_initial_plan_caps(&candidate, quoted_gas, quoted_fee_per_gas)
         {
@@ -775,7 +773,7 @@ impl EthereumHandler {
                         .finalize_quote_durably(
                             request.execution_id,
                             nox_core::QuoteStatusV2::Expired,
-                            U256::zero(),
+                            U256::ZERO,
                             wall_timestamp,
                         )
                         .await;
@@ -844,7 +842,7 @@ impl EthereumHandler {
                     .finalize_quote_durably(
                         request.execution_id,
                         nox_core::QuoteStatusV2::Rejected,
-                        U256::zero(),
+                        U256::ZERO,
                         wall_timestamp,
                     )
                     .await;
@@ -862,7 +860,7 @@ impl EthereumHandler {
                     .finalize_quote_durably(
                         request.execution_id,
                         nox_core::QuoteStatusV2::Rejected,
-                        U256::zero(),
+                        U256::ZERO,
                         wall_timestamp,
                     )
                     .await;
@@ -882,7 +880,9 @@ impl EthereumHandler {
                 {
                     Ok(Some(outbox)) => crate::blockchain::tx_manager::SubmittedTransaction {
                         execution_id: request.execution_id,
-                        transaction_hash: match H256::from_str(&outbox.tx_hash) {
+                        transaction_hash: match nox_core::eth::parse_fixed_hex::<32>(
+                            &outbox.tx_hash,
+                        ) {
                             Ok(hash) => hash,
                             Err(_) => {
                                 return paid_v2_rejection(
@@ -901,7 +901,7 @@ impl EthereumHandler {
                             .finalize_quote_durably(
                                 request.execution_id,
                                 nox_core::QuoteStatusV2::Rejected,
-                                U256::zero(),
+                                U256::ZERO,
                                 wall_timestamp,
                             )
                             .await;
@@ -1036,8 +1036,8 @@ impl EthereumHandler {
 
             // Pinned to the validated address with redirects disabled, so neither
             // DNS rebinding nor an upstream redirect can reach another host.
-            let user_provider = build_pinned_ethers_http1_provider(&validated_url, resolved_ip)
-                .map_err(|e| {
+            let user_provider =
+                build_pinned_http1_provider(&validated_url, resolved_ip).map_err(|e| {
                     ServiceError::ProcessingFailed(format!(
                         "Failed to create provider for user-supplied RPC URL: {e}"
                     ))
@@ -1054,7 +1054,8 @@ impl EthereumHandler {
             let hex_tx = format!("0x{}", hex::encode(&signed_tx));
             let rpc_result = tokio::time::timeout(
                 BROADCAST_RPC_TIMEOUT,
-                user_provider.request::<_, serde_json::Value>(method, [hex_tx]),
+                user_provider
+                    .raw_request::<_, serde_json::Value>(method.to_string().into(), [hex_tx]),
             )
             .await;
 
@@ -1119,9 +1120,9 @@ impl EthereumHandler {
                     debug!(
                         packet_id,
                         %tx_hash,
-                        status = ?receipt.status,
-                        gas_used = ?receipt.gas_used,
-                        logs = receipt.logs.len(),
+                        status = receipt.status(),
+                        gas_used = receipt.gas_used,
+                        logs = receipt.inner.logs().len(),
                         block = ?receipt.block_number,
                         "Broadcast TX receipt"
                     );
@@ -1138,7 +1139,7 @@ impl EthereumHandler {
                 }
             }
 
-            tx_hash.as_bytes().to_vec()
+            tx_hash.to_vec()
         };
 
         debug!(
@@ -1179,14 +1180,14 @@ impl EthereumHandler {
         initial_fee_buffer_bps: u32,
         nox_entry_point_address_str: &str,
     ) -> Result<Self, ServiceError> {
-        let nox_reward_pool_address =
-            Address::from_str(nox_reward_pool_address_str).map_err(|_| {
+        let nox_reward_pool_address = nox_core::eth::parse_address(nox_reward_pool_address_str)
+            .map_err(|_| {
                 ServiceError::ProcessingFailed(format!(
                     "Invalid nox_reward_pool_address in config: {nox_reward_pool_address_str}"
                 ))
             })?;
-        let nox_entry_point_address =
-            Address::from_str(nox_entry_point_address_str).map_err(|_| {
+        let nox_entry_point_address = nox_core::eth::parse_address(nox_entry_point_address_str)
+            .map_err(|_| {
                 ServiceError::ProcessingFailed(format!(
                     "Invalid nox_entry_point_address in config: {nox_entry_point_address_str}"
                 ))
@@ -1256,28 +1257,29 @@ fn parse_paid_v2_settlement(
     expected_exit: Address,
     logs: &[Log],
 ) -> Result<PaidV2Settlement, nox_core::PaidTransactionRejectionCodeV2> {
-    let event_topic = H256::from(keccak256(PAID_EXECUTION_SETTLED_SIGNATURE));
+    let event_topic = keccak256(PAID_EXECUTION_SETTLED_SIGNATURE);
     let matching: Vec<&Log> = logs
         .iter()
         .filter(|log| {
-            log.address == Address::from(request.entry_point)
-                && log.topics.first() == Some(&event_topic)
+            log.address() == Address::from(request.entry_point)
+                && log.topics().first() == Some(&event_topic)
         })
         .collect();
     let [log] = matching.as_slice() else {
         return Err(nox_core::PaidTransactionRejectionCodeV2::PaymentMissing);
     };
-    if log.topics.len() != 4 || log.data.len() != 224 {
+    let topics = log.topics();
+    if topics.len() != 4 || log.data().data.len() != 224 {
         return Err(nox_core::PaidTransactionRejectionCodeV2::MalformedRequest);
     }
-    if log.topics[1] != H256::from(request.execution_id) || log.topics[2] == H256::zero() {
+    if topics[1] != B256::from(request.execution_id) || topics[2] == B256::ZERO {
         return Err(nox_core::PaidTransactionRejectionCodeV2::PaymentMissing);
     }
-    let exit_topic = log.topics[3].as_bytes();
+    let exit_topic = topics[3].as_slice();
     if exit_topic[..12] != [0_u8; 12] || Address::from_slice(&exit_topic[12..]) != expected_exit {
         return Err(nox_core::PaidTransactionRejectionCodeV2::PaymentMissing);
     }
-    let words = log.data.as_ref();
+    let words = log.data().data.as_ref();
     if words[..12] != [0_u8; 12]
         || words[96..108] != [0_u8; 12]
         || words[128..159] != [0_u8; 31]
@@ -1285,7 +1287,7 @@ fn parse_paid_v2_settlement(
     {
         return Err(nox_core::PaidTransactionRejectionCodeV2::MalformedRequest);
     }
-    let exit_fee = U256::from_big_endian(&words[32..64]);
+    let exit_fee = U256::from_be_slice(&words[32..64]);
     if exit_fee.is_zero() {
         return Err(nox_core::PaidTransactionRejectionCodeV2::PaymentMissing);
     }
@@ -1416,9 +1418,9 @@ fn legacy_execution_id(
     preimage.extend_from_slice(&chain_id.to_be_bytes());
     preimage.extend_from_slice(&packet_len.to_be_bytes());
     preimage.extend_from_slice(packet_id.as_bytes());
-    preimage.extend_from_slice(target.as_bytes());
-    preimage.extend_from_slice(&keccak256(data));
-    Ok(keccak256(preimage))
+    preimage.extend_from_slice(target.as_slice());
+    preimage.extend_from_slice(keccak256(data).as_slice());
+    Ok(keccak256(preimage).0)
 }
 
 fn map_profit_error(error: ProfitabilityError) -> PaidRejection {
@@ -1462,7 +1464,7 @@ fn record_accepted_economics(
         if scaled > U256::from(u64::MAX) {
             u64::MAX
         } else {
-            scaled.as_u64()
+            scaled.to::<u64>()
         }
     };
 
@@ -1610,6 +1612,7 @@ impl ServiceHandler for EthereumHandler {
 #[cfg(test)]
 mod paid_control_flow_tests {
     use super::*;
+    use crate::blockchain::executor::unmined_log;
     use crate::blockchain::executor::{SimulationEvidence, SimulationSource};
     use crate::blockchain::transaction_plan::TransactionPlan;
     use crate::services::profitability::ProfitAuthorization;
@@ -1618,13 +1621,11 @@ mod paid_control_flow_tests {
     fn flat_payment_log_maps_to_payment_missing() {
         let evidence = SimulationEvidence {
             gas_used: 1,
-            logs: vec![Log {
-                address: Address::from_low_u64_be(1),
-                topics: vec![H256::from(keccak256(
-                    b"RewardsDeposited(address,address,uint256)",
-                ))],
-                ..Default::default()
-            }],
+            logs: vec![unmined_log(
+                Address::with_last_byte(1),
+                vec![keccak256(b"RewardsDeposited(address,address,uint256)")],
+                Bytes::new(),
+            )],
             source: SimulationSource::FlatSimulation,
         };
         assert!(evidence.legacy_payment_logs().is_none());
@@ -1649,7 +1650,7 @@ mod paid_control_flow_tests {
     #[test]
     fn ambiguous_durable_outcome_returns_original_submitted_identity() {
         let execution_id = [3; 32];
-        let transaction_hash = H256::from_low_u64_be(4);
+        let transaction_hash = B256::with_last_byte(4);
         let submitted = resolve_submission(
             execution_id,
             Err(SubmitError::AmbiguousBroadcast {
@@ -1670,7 +1671,7 @@ mod paid_control_flow_tests {
                 gas_limit: U256::from(21_000),
                 initial_fee_per_gas: U256::from(10),
                 maximum_fee_per_gas: U256::from(12),
-                chain_data_fee_native: U256::zero(),
+                chain_data_fee_native: U256::ZERO,
             },
             revenue_value_e8: U256::from(250_000_000_u64),
             planned_initial_cost_value_e8: U256::from(100_000_000_u64),
@@ -1728,7 +1729,7 @@ mod paid_control_flow_tests {
         let candidate = crate::blockchain::transaction_plan::CostCandidate {
             gas_limit: U256::from(100),
             initial_fee_per_gas: U256::from(10),
-            chain_data_fee_native: U256::zero(),
+            chain_data_fee_native: U256::ZERO,
         };
         assert!(validate_initial_plan_caps(&candidate, U256::from(100), U256::from(10)).is_ok());
         assert_eq!(
@@ -1750,29 +1751,24 @@ mod paid_control_flow_tests {
     #[test]
     fn entry_point_settlement_binds_execution_exit_and_exit_fee() {
         let request = paid_v2_request();
-        let exit = Address::from_low_u64_be(9);
-        let fee_asset = Address::from_low_u64_be(10);
-        let mut fee_asset_word = [0_u8; 32];
-        fee_asset_word[12..].copy_from_slice(fee_asset.as_bytes());
-        let mut exit_topic = [0_u8; 32];
-        exit_topic[12..].copy_from_slice(exit.as_bytes());
+        let exit = Address::with_last_byte(9);
+        let fee_asset = Address::with_last_byte(10);
         let mut data = vec![0_u8; 224];
-        data[..32].copy_from_slice(&fee_asset_word);
-        U256::from(77).to_big_endian(&mut data[32..64]);
-        U256::from(23).to_big_endian(&mut data[64..96]);
+        data[..32].copy_from_slice(fee_asset.into_word().as_slice());
+        data[32..64].copy_from_slice(&U256::from(77).to_be_bytes::<32>());
+        data[64..96].copy_from_slice(&U256::from(23).to_be_bytes::<32>());
         data[127] = 1;
         data[159] = 1;
-        let log = Log {
-            address: Address::from_slice(&request.entry_point),
-            topics: vec![
-                H256::from(keccak256(PAID_EXECUTION_SETTLED_SIGNATURE)),
-                H256::from(request.execution_id),
-                H256::from_low_u64_be(1),
-                H256::from(exit_topic),
+        let log = unmined_log(
+            Address::from_slice(&request.entry_point),
+            vec![
+                keccak256(PAID_EXECUTION_SETTLED_SIGNATURE),
+                B256::from(request.execution_id),
+                B256::with_last_byte(1),
+                exit.into_word(),
             ],
-            data: Bytes::from(data),
-            ..Default::default()
-        };
+            Bytes::from(data),
+        );
 
         let settlement = parse_paid_v2_settlement(&request, exit, &[log]).unwrap();
         assert_eq!(settlement.fee_asset, fee_asset);

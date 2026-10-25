@@ -1,13 +1,18 @@
-use ethers::prelude::*;
-#[cfg(feature = "dev-node")]
-use ethers::providers::MiddlewareError;
-use ethers::providers::{ProviderError, RpcError};
-use ethers::types::transaction::eip2718::TypedTransaction;
-use ethers::types::{
-    BlockId, BlockNumber, CallConfig, CallFrame, CallLogFrame, GethDebugBuiltInTracerConfig,
-    GethDebugBuiltInTracerType, GethDebugTracerConfig, GethDebugTracerType,
-    GethDebugTracingCallOptions, GethDebugTracingOptions, GethTrace, GethTraceFrame,
+use alloy::consensus::{SignableTransaction, TxEnvelope, TxLegacy};
+use alloy::eips::eip2718::Encodable2718;
+use alloy::network::TxSignerSync;
+use alloy::primitives::{keccak256, Address, Bytes, LogData, TxKind, B256, U256, U64};
+use alloy::providers::Provider;
+use alloy::rpc::json_rpc::ErrorPayload;
+use alloy::rpc::types::trace::geth::{
+    CallConfig, CallFrame, CallLogFrame, GethDebugTracingCallOptions, GethDebugTracingOptions,
 };
+use alloy::rpc::types::{Log, TransactionReceipt};
+use alloy::signers::local::PrivateKeySigner;
+use alloy::signers::SignerSync;
+use alloy::transports::{RpcError, TransportError};
+use nox_core::chain_rpc::{self, ChainProvider};
+use std::borrow::Cow;
 use std::str::FromStr;
 #[cfg(feature = "dev-node")]
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,45 +22,63 @@ use zeroize::Zeroizing;
 use crate::config::NoxConfig;
 use nox_core::traits::InfrastructureError;
 
-pub fn build_ethers_http1_provider(rpc_url: &str) -> Result<Provider<Http>, InfrastructureError> {
-    let url = rpc_url.parse::<url::Url>().map_err(|error| {
-        InfrastructureError::Blockchain(format!("invalid Ethers RPC URL: {error}"))
-    })?;
-    let client = reqwest_legacy::Client::builder()
-        .http1_only()
-        .build()
-        .map_err(|error| {
-            InfrastructureError::Blockchain(format!(
-                "Ethers HTTP/1 client initialization failed: {error}"
-            ))
-        })?;
-    Ok(Provider::new(Http::new_with_client(url, client)))
+/// Provider for an operator-configured RPC URL (HTTP/1 only).
+pub fn build_http1_provider(rpc_url: &str) -> Result<ChainProvider, InfrastructureError> {
+    chain_rpc::http1_provider(rpc_url)
+        .map_err(|error| InfrastructureError::Blockchain(error.to_string()))
 }
 
 /// Builds an HTTP/1 provider for a user-supplied RPC URL that already passed
 /// the SSRF check. The client connects only to `pinned_ip` (the address that
 /// was validated), never follows redirects and ignores proxy environment
 /// variables, so a request cannot reach an address that was not validated.
-pub fn build_pinned_ethers_http1_provider(
+pub fn build_pinned_http1_provider(
     url: &url::Url,
     pinned_ip: std::net::IpAddr,
-) -> Result<Provider<Http>, InfrastructureError> {
-    let port = url.port_or_known_default().ok_or_else(|| {
-        InfrastructureError::Blockchain("RPC URL has no port and no known default".to_string())
-    })?;
-    let mut builder = reqwest_legacy::Client::builder()
-        .http1_only()
-        .redirect(reqwest_legacy::redirect::Policy::none())
-        .no_proxy();
-    if let Some(url::Host::Domain(domain)) = url.host() {
-        builder = builder.resolve(domain, std::net::SocketAddr::new(pinned_ip, port));
+) -> Result<ChainProvider, InfrastructureError> {
+    chain_rpc::pinned_http1_provider(url, pinned_ip)
+        .map_err(|error| InfrastructureError::Blockchain(error.to_string()))
+}
+
+/// Call object for `eth_call`, `eth_estimateGas` and `debug_traceCall`: a
+/// legacy-typed request with the calldata under `data`, the field set the node
+/// has always sent upstream.
+#[must_use]
+pub fn legacy_call_object(
+    from: Option<Address>,
+    to: Option<Address>,
+    data: Option<&[u8]>,
+    value: Option<U256>,
+) -> serde_json::Value {
+    let mut call = serde_json::Map::new();
+    call.insert("type".into(), "0x00".into());
+    if let Some(from) = from {
+        call.insert("from".into(), format!("{from:?}").into());
     }
-    let client = builder.build().map_err(|error| {
-        InfrastructureError::Blockchain(format!(
-            "pinned Ethers HTTP/1 client initialization failed: {error}"
-        ))
-    })?;
-    Ok(Provider::new(Http::new_with_client(url.clone(), client)))
+    if let Some(to) = to {
+        call.insert("to".into(), format!("{to:?}").into());
+    }
+    if let Some(value) = value {
+        call.insert("value".into(), format!("0x{value:x}").into());
+    }
+    if let Some(data) = data {
+        call.insert("data".into(), format!("0x{}", hex::encode(data)).into());
+    }
+    serde_json::Value::Object(call)
+}
+
+/// Text of a JSON-RPC error object as clients receive it:
+/// `(code: <code>, message: <message>, data: <data>)`.
+#[must_use]
+pub fn json_rpc_error_text(payload: &ErrorPayload) -> String {
+    let data: Option<serde_json::Value> = payload
+        .data
+        .as_ref()
+        .and_then(|raw| serde_json::from_str(raw.get()).ok());
+    format!(
+        "(code: {}, message: {}, data: {:?})",
+        payload.code, payload.message, data
+    )
 }
 
 /// Text of a provider error that is safe to return to an anonymous client.
@@ -64,9 +87,9 @@ pub fn build_pinned_ethers_http1_provider(
 /// is passed through. Transport and decoding errors are replaced by a fixed
 /// message: their text can carry the upstream URL or raw response bodies.
 #[must_use]
-pub fn public_rpc_error(error: &ProviderError) -> String {
-    match RpcError::as_error_response(error) {
-        Some(response) => response.to_string(),
+pub fn public_rpc_error(error: &TransportError) -> String {
+    match error.as_error_resp() {
+        Some(response) => json_rpc_error_text(response),
         None => "upstream RPC request failed".to_string(),
     }
 }
@@ -156,22 +179,25 @@ impl SimulationBackendError {
     }
 }
 
-fn classify_provider_error(error: &ProviderError, backend: &'static str) -> SimulationBackendError {
-    if matches!(
-        error,
-        ProviderError::UnsupportedRPC | ProviderError::UnsupportedNodeClient
-    ) || RpcError::as_error_response(error).is_some_and(|response| response.code == -32601)
+fn classify_provider_error(
+    error: &TransportError,
+    backend: &'static str,
+) -> SimulationBackendError {
+    if matches!(error, RpcError::UnsupportedFeature(_))
+        || error
+            .as_error_resp()
+            .is_some_and(|response| response.code == -32601)
     {
         return SimulationBackendError::Unsupported { backend };
     }
-    if RpcError::as_error_response(error).is_some() {
+    if error.as_error_resp().is_some() {
         return SimulationBackendError::ExecutionRejected { backend };
     }
-    if RpcError::is_serde_error(error) {
+    if error.is_deser_error() || error.is_ser_error() {
         return SimulationBackendError::ResponseDecode { backend };
     }
-    if let ProviderError::HTTPError(http_error) = error {
-        return classify_http_failure(backend, http_error.is_timeout());
+    if error.is_transport_error() {
+        return classify_http_failure(backend, chain_rpc::is_timeout(error));
     }
     SimulationBackendError::Transport { backend }
 }
@@ -182,18 +208,6 @@ const fn classify_http_failure(backend: &'static str, timed_out: bool) -> Simula
     } else {
         SimulationBackendError::Transport { backend }
     }
-}
-
-#[cfg(feature = "dev-node")]
-fn classify_middleware_error<E: MiddlewareError<Inner = ProviderError>>(
-    error: &E,
-    backend: &'static str,
-) -> SimulationBackendError {
-    error
-        .as_inner()
-        .map_or(SimulationBackendError::Transport { backend }, |provider| {
-            classify_provider_error(provider, backend)
-        })
 }
 
 /// Backend provenance for simulated execution evidence.
@@ -215,7 +229,7 @@ pub struct SimulationEvidence {
 /// Identity expected from a mined simulation transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpectedTransactionIdentity {
-    pub transaction_hash: H256,
+    pub transaction_hash: B256,
     pub from: Address,
     pub to: Address,
 }
@@ -234,7 +248,7 @@ impl SimulationEvidence {
         receipt: TransactionReceipt,
         expected: ExpectedTransactionIdentity,
     ) -> Result<Self, SimulationBackendError> {
-        if receipt.status != Some(U64::one()) {
+        if !receipt.status() {
             return Err(SimulationBackendError::ExecutionRejected {
                 backend: "committed-receipt",
             });
@@ -270,15 +284,16 @@ impl SimulationEvidence {
                     backend: "committed-receipt",
                     field: "block_number",
                 })?;
-        let gas_used = receipt
-            .gas_used
-            .ok_or(SimulationBackendError::EvidenceMalformed {
-                backend: "committed-receipt",
-                field: "gas_used",
-            })?;
+        let transaction_index =
+            receipt
+                .transaction_index
+                .ok_or(SimulationBackendError::EvidenceMalformed {
+                    backend: "committed-receipt",
+                    field: "transaction_index",
+                })?;
 
-        for log in &receipt.logs {
-            if log.removed != Some(false) {
+        for log in receipt.inner.logs() {
+            if log.removed {
                 return Err(SimulationBackendError::EvidenceMalformed {
                     backend: "committed-receipt",
                     field: "log.removed",
@@ -292,7 +307,7 @@ impl SimulationEvidence {
             )?;
             require_log_identity(
                 log.transaction_index,
-                Some(receipt.transaction_index),
+                Some(transaction_index),
                 "log.transaction_index",
             )?;
             require_log_identity(log.block_hash, Some(block_hash), "log.block_hash")?;
@@ -300,8 +315,8 @@ impl SimulationEvidence {
         }
 
         Ok(Self {
-            gas_used: gas_used.as_u64(),
-            logs: receipt.logs,
+            gas_used: receipt.gas_used,
+            logs: receipt.inner.logs().to_vec(),
             source: SimulationSource::CommittedReceipt,
         })
     }
@@ -362,19 +377,19 @@ fn convert_trace_log(log: &CallLogFrame) -> Result<Log, SimulationBackendError> 
             field: "log.data",
         })?;
 
-    Ok(Log {
-        address,
-        topics,
-        data,
-        block_hash: None,
-        block_number: None,
-        transaction_hash: None,
-        transaction_index: None,
-        log_index: None,
-        transaction_log_index: None,
-        log_type: None,
-        removed: None,
-    })
+    Ok(unmined_log(address, topics, data))
+}
+
+/// Log with no block or transaction context (simulation output).
+#[must_use]
+pub fn unmined_log(address: Address, topics: Vec<B256>, data: Bytes) -> Log {
+    Log {
+        inner: alloy::primitives::Log {
+            address,
+            data: LogData::new_unchecked(topics, data),
+        },
+        ..Log::default()
+    }
 }
 
 fn collect_committed_logs(frame: &CallFrame) -> Result<Vec<Log>, SimulationBackendError> {
@@ -384,18 +399,20 @@ fn collect_committed_logs(frame: &CallFrame) -> Result<Vec<Log>, SimulationBacke
     while let Some((current, ancestors_succeeded)) = pending.pop() {
         let frame_succeeded = ancestors_succeeded && current.error.is_none();
 
-        if let Some(frame_logs) = &current.logs {
-            for trace_log in frame_logs {
-                let converted = convert_trace_log(trace_log)?;
-                if frame_succeeded {
-                    committed.push(converted);
-                }
+        for trace_log in &current.logs {
+            let converted = convert_trace_log(trace_log)?;
+            if frame_succeeded {
+                committed.push(converted);
             }
         }
 
-        if let Some(calls) = &current.calls {
-            pending.extend(calls.iter().rev().map(|child| (child, frame_succeeded)));
-        }
+        pending.extend(
+            current
+                .calls
+                .iter()
+                .rev()
+                .map(|child| (child, frame_succeeded)),
+        );
     }
 
     Ok(committed)
@@ -421,7 +438,7 @@ fn validate_trace_identity(
             field: "from",
         });
     }
-    if frame.to != Some(NameOrAddress::Address(expected_to)) {
+    if frame.to != Some(expected_to) {
         return Err(SimulationBackendError::IdentityMismatch {
             backend: BACKEND,
             field: "to",
@@ -433,7 +450,7 @@ fn validate_trace_identity(
             field: "input",
         });
     }
-    if frame.value != Some(U256::zero()) {
+    if frame.value != Some(U256::ZERO) {
         return Err(SimulationBackendError::IdentityMismatch {
             backend: BACKEND,
             field: "value",
@@ -444,8 +461,8 @@ fn validate_trace_identity(
 }
 
 pub struct ChainExecutor {
-    provider: Provider<Http>,
-    wallet: LocalWallet,
+    provider: ChainProvider,
+    wallet: PrivateKeySigner,
     chain_id: u64,
     min_gas_balance: U256,
     /// Mock mode: skip all real blockchain operations (return dummy values).
@@ -454,9 +471,15 @@ pub struct ChainExecutor {
     is_mock: bool,
 }
 
+/// The one field read from `eth_getBlockByNumber`.
+#[derive(Debug, serde::Deserialize)]
+struct BlockTimestamp {
+    timestamp: U256,
+}
+
 impl ChainExecutor {
     pub async fn new(config: &NoxConfig) -> Result<Self, InfrastructureError> {
-        let provider = build_ethers_http1_provider(&config.eth_rpc_url)?;
+        let provider = build_http1_provider(&config.eth_rpc_url)?;
 
         // Determine mock mode -- only available with dev-node feature
         #[cfg(feature = "dev-node")]
@@ -468,13 +491,13 @@ impl ChainExecutor {
             // Mock Mode: Skip RPC
             config.chain_id
         } else if config.chain_id == 0 {
-            provider
-                .get_chainid()
+            let chain_id: U64 = provider
+                .raw_request(Cow::Borrowed("eth_chainId"), ())
                 .await
                 .map_err(|e| {
                     InfrastructureError::Blockchain(format!("Failed to fetch ChainID: {e}"))
-                })?
-                .as_u64()
+                })?;
+            chain_id.to::<u64>()
         } else {
             config.chain_id
         };
@@ -487,8 +510,7 @@ impl ChainExecutor {
                     warn!(
                         "No ETH wallet key provided. Generating ephemeral wallet (benchmark mode)."
                     );
-                    let w = LocalWallet::new(&mut rand::rngs::OsRng);
-                    hex::encode(w.signer().to_bytes())
+                    hex::encode(PrivateKeySigner::random().to_bytes())
                 } else {
                     return Err(InfrastructureError::Blockchain(
                         "eth_wallet_private_key is empty. Required for chain execution.".into(),
@@ -505,11 +527,10 @@ impl ChainExecutor {
             config.eth_wallet_private_key.clone()
         });
 
-        let wallet = LocalWallet::from_str(&wallet_str)
-            .map_err(|e| InfrastructureError::Blockchain(format!("Invalid Private Key: {e}")))?
-            .with_chain_id(chain_id);
+        let wallet = PrivateKeySigner::from_str(&wallet_str)
+            .map_err(|e| InfrastructureError::Blockchain(format!("Invalid Private Key: {e}")))?;
 
-        let min_gas_balance = U256::from_dec_str(&config.min_gas_balance)
+        let min_gas_balance = nox_core::eth::parse_decimal_u256(&config.min_gas_balance)
             .unwrap_or_else(|_| U256::from(100_000_000_000_000_000u64)); // 0.1 ETH default
 
         if is_mock {
@@ -545,26 +566,23 @@ impl ChainExecutor {
                 });
         }
 
-        let block = self
+        let block: Option<BlockTimestamp> = self
             .provider
-            .get_block(BlockNumber::Latest)
+            .raw_request(Cow::Borrowed("eth_getBlockByNumber"), ("latest", false))
             .await
             .map_err(|error| {
                 InfrastructureError::Blockchain(format!(
                     "latest block timestamp lookup failed: {error}"
                 ))
-            })?
-            .ok_or_else(|| {
-                InfrastructureError::Blockchain(
-                    "latest block timestamp lookup returned no block".to_string(),
-                )
             })?;
-        if block.timestamp > U256::from(u64::MAX) {
-            return Err(InfrastructureError::Blockchain(
-                "latest block timestamp exceeds u64".to_string(),
-            ));
-        }
-        Ok(block.timestamp.as_u64())
+        let block = block.ok_or_else(|| {
+            InfrastructureError::Blockchain(
+                "latest block timestamp lookup returned no block".to_string(),
+            )
+        })?;
+        u64::try_from(block.timestamp).map_err(|_| {
+            InfrastructureError::Blockchain("latest block timestamp exceeds u64".to_string())
+        })
     }
 
     /// Returns true if running in mock/benchmark mode.
@@ -590,7 +608,8 @@ impl ChainExecutor {
 
         let balance = self
             .provider
-            .get_balance(self.wallet.address(), None)
+            .get_balance(self.wallet.address())
+            .latest()
             .await
             .map_err(|e| InfrastructureError::Blockchain(format!("Failed to get balance: {e}")))?;
 
@@ -604,6 +623,7 @@ impl ChainExecutor {
         Ok((balance, low))
     }
 
+    #[must_use]
     pub fn address(&self) -> Address {
         self.wallet.address()
     }
@@ -760,7 +780,7 @@ impl ChainExecutor {
 
         let result: serde_json::Value = self
             .provider
-            .request("eth_simulateV1", params)
+            .raw_request(Cow::Borrowed("eth_simulateV1"), params)
             .await
             .map_err(|error| classify_provider_error(&error, "eth_simulateV1"))?;
 
@@ -814,7 +834,7 @@ impl ChainExecutor {
             }
         })?;
 
-        // Extract logs -> convert to ethers::types::Log
+        // Extract logs
         let logs = Self::parse_simulate_logs(call_result)?;
 
         debug!(
@@ -831,7 +851,7 @@ impl ChainExecutor {
         })
     }
 
-    /// Parse event logs from an `eth_simulateV1` call result into `ethers::types::Log`.
+    /// Parse event logs from an `eth_simulateV1` call result.
     fn parse_simulate_logs(
         call_result: &serde_json::Value,
     ) -> Result<Vec<Log>, SimulationBackendError> {
@@ -855,7 +875,7 @@ impl ChainExecutor {
                         backend: "eth_simulateV1",
                         field: "log.address",
                     })?;
-                let address = Address::from_str(address_str).map_err(|_| {
+                let address = nox_core::eth::parse_address(address_str).map_err(|_| {
                     SimulationBackendError::EvidenceMalformed {
                         backend: "eth_simulateV1",
                         field: "log.address",
@@ -869,7 +889,7 @@ impl ChainExecutor {
                         backend: "eth_simulateV1",
                         field: "log.topics",
                     })?;
-                let topics: Vec<H256> = topics_json
+                let topics: Vec<B256> = topics_json
                     .iter()
                     .map(|topic| {
                         let encoded =
@@ -879,7 +899,7 @@ impl ChainExecutor {
                                     backend: "eth_simulateV1",
                                     field: "log.topics",
                                 })?;
-                        H256::from_str(encoded).map_err(|_| {
+                        nox_core::eth::parse_fixed_hex::<32>(encoded).map_err(|_| {
                             SimulationBackendError::EvidenceMalformed {
                                 backend: "eth_simulateV1",
                                 field: "log.topics",
@@ -908,19 +928,7 @@ impl ChainExecutor {
                     }
                 })?;
 
-                Ok(Log {
-                    address,
-                    topics,
-                    data: Bytes::from(data_bytes),
-                    block_hash: None,
-                    block_number: None,
-                    transaction_hash: None,
-                    transaction_index: None,
-                    log_index: None,
-                    transaction_log_index: None,
-                    log_type: None,
-                    removed: None,
-                })
+                Ok(unmined_log(address, topics, Bytes::from(data_bytes)))
             })
             .collect()
     }
@@ -941,23 +949,48 @@ impl ChainExecutor {
     ) -> Result<SimulationEvidence, SimulationBackendError> {
         let snapshot_id: U256 = self
             .provider
-            .request("evm_snapshot", ())
+            .raw_request(Cow::Borrowed("evm_snapshot"), ())
             .await
             .map_err(|error| classify_provider_error(&error, "evm_snapshot"))?;
 
         // Anvil auto-mines by default
-        let client = SignerMiddleware::new(self.provider.clone(), self.wallet.clone());
-        let tx = TransactionRequest::new()
-            .from(self.wallet.address())
-            .to(to)
-            .data(data.clone());
-
+        let from = self.wallet.address();
         let result = async {
-            let pending = client
-                .send_transaction(tx, None)
+            let nonce: U256 = self
+                .provider
+                .raw_request(
+                    Cow::Borrowed("eth_getTransactionCount"),
+                    (format!("{from:?}"), "latest"),
+                )
                 .await
-                .map_err(|error| classify_middleware_error(&error, "committed-receipt send"))?;
-            let tx_hash = pending.tx_hash();
+                .map_err(|error| classify_provider_error(&error, "committed-receipt send"))?;
+            let gas_price: U256 = self
+                .provider
+                .raw_request(Cow::Borrowed("eth_gasPrice"), ())
+                .await
+                .map_err(|error| classify_provider_error(&error, "committed-receipt send"))?;
+            let gas: U256 = self
+                .provider
+                .raw_request(
+                    Cow::Borrowed("eth_estimateGas"),
+                    (legacy_call_object(Some(from), Some(to), Some(&data), None),),
+                )
+                .await
+                .map_err(|error| classify_provider_error(&error, "committed-receipt send"))?;
+            let raw = self
+                .sign_legacy_transaction(to, data.clone(), nonce, gas, gas_price)
+                .await
+                .map_err(|_| SimulationBackendError::ExecutionRejected {
+                    backend: "committed-receipt send",
+                })?;
+            let tx_hash: B256 = self
+                .provider
+                .raw_request(
+                    Cow::Borrowed("eth_sendRawTransaction"),
+                    (format!("0x{}", hex::encode(&raw)),),
+                )
+                .await
+                .map_err(|error| classify_provider_error(&error, "committed-receipt send"))?;
 
             let receipt = self
                 .provider
@@ -973,7 +1006,7 @@ impl ChainExecutor {
                 receipt,
                 ExpectedTransactionIdentity {
                     transaction_hash: tx_hash,
-                    from: self.wallet.address(),
+                    from,
                     to,
                 },
             )
@@ -981,9 +1014,9 @@ impl ChainExecutor {
         .await
         .map_err(SimulationBackendError::after_side_effect);
 
-        let reverted = self
+        let reverted: bool = self
             .provider
-            .request::<_, bool>("evm_revert", [snapshot_id])
+            .raw_request(Cow::Borrowed("evm_revert"), [snapshot_id])
             .await
             .map_err(|_| SimulationBackendError::StateRestoration)?;
         if !reverted {
@@ -1003,72 +1036,39 @@ impl ChainExecutor {
         to: Address,
         data: Bytes,
     ) -> Result<SimulationEvidence, SimulationBackendError> {
-        let tx = TransactionRequest::new()
-            .from(self.wallet.address())
-            .to(to)
-            .data(data.clone());
+        let from = self.wallet.address();
+        let call = legacy_call_object(Some(from), Some(to), Some(&data), None);
+        let options = GethDebugTracingCallOptions::new(GethDebugTracingOptions::call_tracer(
+            CallConfig::default().with_log(),
+        ));
 
-        let tracing_options = GethDebugTracingOptions {
-            tracer: Some(GethDebugTracerType::BuiltInTracer(
-                GethDebugBuiltInTracerType::CallTracer,
-            )),
-            tracer_config: Some(GethDebugTracerConfig::BuiltInTracer(
-                GethDebugBuiltInTracerConfig::CallTracer(CallConfig {
-                    only_top_call: None,
-                    with_log: Some(true),
-                }),
-            )),
-            ..Default::default()
-        };
-
-        let options = GethDebugTracingCallOptions {
-            tracing_options,
-            state_overrides: None,
-            block_overrides: None,
-        };
-
-        let typed_tx = TypedTransaction::Legacy(tx.clone());
-
-        let trace = self
+        let trace: serde_json::Value = self
             .provider
-            .debug_trace_call(
-                typed_tx,
-                Some(BlockId::Number(BlockNumber::Latest)),
-                options,
+            .raw_request(
+                Cow::Borrowed("debug_traceCall"),
+                (call.clone(), "latest", options),
             )
             .await
             .map_err(|error| classify_provider_error(&error, "debug_traceCall"))?;
 
-        let logs = match trace {
-            GethTrace::Known(GethTraceFrame::CallTracer(frame)) => {
-                validate_trace_identity(&frame, self.wallet.address(), to, &data)?;
-                if frame.error.is_some() {
-                    return Err(SimulationBackendError::ExecutionRejected {
-                        backend: "debug_traceCall",
-                    });
-                }
-                collect_committed_logs(&frame)?
+        let frame: CallFrame = serde_json::from_value(trace).map_err(|_| {
+            SimulationBackendError::EvidenceMalformed {
+                backend: "debug_traceCall",
+                field: "trace.variant",
             }
-            GethTrace::Known(
-                GethTraceFrame::Default(_)
-                | GethTraceFrame::NoopTracer(_)
-                | GethTraceFrame::FourByteTracer(_)
-                | GethTraceFrame::PreStateTracer(_),
-            )
-            | GethTrace::Unknown(_) => {
-                return Err(SimulationBackendError::EvidenceMalformed {
-                    backend: "debug_traceCall",
-                    field: "trace.variant",
-                });
-            }
-        };
+        })?;
+        validate_trace_identity(&frame, from, to, &data)?;
+        if frame.error.is_some() {
+            return Err(SimulationBackendError::ExecutionRejected {
+                backend: "debug_traceCall",
+            });
+        }
+        let logs = collect_committed_logs(&frame)?;
 
         let gas_used = self
-            .provider
-            .estimate_gas(&TypedTransaction::Legacy(tx), None)
+            .estimate_gas_raw(call)
             .await
-            .map_err(|error| classify_provider_error(&error, "eth_estimateGas"))?
-            .as_u64();
+            .map_err(|error| classify_provider_error(&error, "eth_estimateGas"))?;
 
         debug!(
             "debug_traceCall succeeded: gas_used={}, logs={}",
@@ -1093,17 +1093,9 @@ impl ChainExecutor {
             return Ok(100_000); // Dummy gas estimate
         }
 
-        let tx = TransactionRequest::new()
-            .from(self.wallet.address())
-            .to(to)
-            .data(data);
-
-        match self
-            .provider
-            .estimate_gas(&TypedTransaction::Legacy(tx), None)
-            .await
-        {
-            Ok(gas) => Ok(gas.as_u64()),
+        let call = legacy_call_object(Some(self.wallet.address()), Some(to), Some(&data), None);
+        match self.estimate_gas_raw(call).await {
+            Ok(gas) => Ok(gas),
             Err(e) => {
                 // Log the raw error so we can see the revert reason (e.g. "execution reverted: ...")
                 warn!("[ChainExecutor] Gas estimation failed: {:?}", e);
@@ -1114,62 +1106,16 @@ impl ChainExecutor {
         }
     }
 
-    /// Execution: Signs and Broadcasts.
-    pub async fn submit_transaction(
-        &self,
-        to: Address,
-        data: Bytes,
-        gas_limit: U256,
-    ) -> Result<H256, InfrastructureError> {
-        if self.is_mock() {
-            let tx_hash = H256::random();
-            info!("[MOCK] Transaction Broadcasted: {:?}", tx_hash);
-            return Ok(tx_hash);
-        }
-
-        let client = SignerMiddleware::new(self.provider.clone(), self.wallet.clone());
-
-        let gas_price = self
-            .provider
-            .get_gas_price()
-            .await
-            .map_err(|e| InfrastructureError::Blockchain(format!("Gas price failed: {e}")))?;
-
-        // Add 3% tip for speed
-        let adjusted_gas_price = gas_price * (100 + 3) / 100;
-
-        let tx = TransactionRequest::new()
-            .to(to)
-            .value(0)
-            .data(data)
-            .gas(gas_limit)
-            .gas_price(adjusted_gas_price);
-
-        let pending_tx = client
-            .send_transaction(tx, None)
-            .await
-            .map_err(|e| InfrastructureError::Blockchain(format!("Broadcast failed: {e}")))?;
-
-        let tx_hash = pending_tx.tx_hash();
-        info!(
-            "Transaction Broadcasted: {:?} (Price: {} gwei)",
-            tx_hash,
-            adjusted_gas_price / 1_000_000_000
-        );
-
-        Ok(tx_hash)
-    }
-
     // For Read-Only Queries
     pub async fn query_state(
         &self,
         to: Address,
         data: Bytes,
     ) -> Result<Bytes, InfrastructureError> {
-        let tx = TransactionRequest::new().to(to).data(data);
-        let result = self
+        let call = legacy_call_object(None, Some(to), Some(&data), None);
+        let result: Bytes = self
             .provider
-            .call(&TypedTransaction::Legacy(tx), None)
+            .raw_request(Cow::Borrowed("eth_call"), (call, "latest"))
             .await
             .map_err(|e| InfrastructureError::Blockchain(format!("Query failed: {e}")))?;
         Ok(result)
@@ -1182,35 +1128,34 @@ impl ChainExecutor {
         self.provider
             .get_gas_price()
             .await
+            .map(U256::from)
             .map_err(|e| InfrastructureError::Blockchain(format!("Failed to get gas price: {e}")))
     }
 
     pub async fn get_nonce(&self) -> Result<U256, InfrastructureError> {
         if self.is_mock() {
-            return Ok(U256::zero());
+            return Ok(U256::ZERO);
         }
 
         self.provider
-            .get_transaction_count(
-                self.wallet.address(),
-                Some(BlockId::Number(BlockNumber::Pending)),
-            )
+            .get_transaction_count(self.wallet.address())
+            .pending()
             .await
+            .map(U256::from)
             .map_err(|e| InfrastructureError::Blockchain(format!("Get nonce failed: {e}")))
     }
 
     /// Nonce of the next transaction in the latest block, ignoring the mempool.
     pub async fn get_confirmed_nonce(&self) -> Result<U256, InfrastructureError> {
         if self.is_mock() {
-            return Ok(U256::zero());
+            return Ok(U256::ZERO);
         }
 
         self.provider
-            .get_transaction_count(
-                self.wallet.address(),
-                Some(BlockId::Number(BlockNumber::Latest)),
-            )
+            .get_transaction_count(self.wallet.address())
+            .latest()
             .await
+            .map(U256::from)
             .map_err(|e| {
                 InfrastructureError::Blockchain(format!("Get confirmed nonce failed: {e}"))
             })
@@ -1219,7 +1164,7 @@ impl ChainExecutor {
     /// Fetch the transaction receipt for a given tx hash.
     pub async fn get_transaction_receipt(
         &self,
-        tx_hash: H256,
+        tx_hash: B256,
     ) -> Result<Option<TransactionReceipt>, InfrastructureError> {
         self.provider
             .get_transaction_receipt(tx_hash)
@@ -1238,13 +1183,9 @@ impl ChainExecutor {
             return Ok(100_000);
         }
 
-        let from = self.wallet.address();
-        let tx = TransactionRequest::new().from(from).to(to).data(data);
-
-        self.provider
-            .estimate_gas(&TypedTransaction::Legacy(tx), None)
+        let call = legacy_call_object(Some(self.wallet.address()), Some(to), Some(&data), None);
+        self.estimate_gas_raw(call)
             .await
-            .map(|g| g.as_u64())
             .map_err(|e| InfrastructureError::Blockchain(format!("Gas estimation failed: {e}")))
     }
 
@@ -1270,25 +1211,21 @@ impl ChainExecutor {
         Ok(CostCandidate {
             gas_limit,
             initial_fee_per_gas,
-            chain_data_fee_native: U256::zero(),
+            chain_data_fee_native: U256::ZERO,
         })
     }
 
-    pub async fn send_raw(&self, tx: TransactionRequest) -> Result<H256, InfrastructureError> {
-        if self.is_mock() {
-            return Ok(H256::random());
-        }
-
-        let client = SignerMiddleware::new(self.provider.clone(), self.wallet.clone());
-
-        let pending = client
-            .send_transaction(tx, None)
-            .await
-            .map_err(|e| InfrastructureError::Blockchain(format!("Send raw failed: {e}")))?;
-
-        Ok(pending.tx_hash())
+    /// `eth_estimateGas` for `call` with no block parameter (the node's default).
+    async fn estimate_gas_raw(&self, call: serde_json::Value) -> Result<u64, TransportError> {
+        let gas: U256 = self
+            .provider
+            .raw_request(Cow::Borrowed("eth_estimateGas"), (call,))
+            .await?;
+        u64::try_from(gas)
+            .map_err(|_| TransportError::local_usage_str("eth_estimateGas result exceeds u64"))
     }
 
+    /// Signs a legacy (EIP-155) transaction offline and returns its raw bytes.
     pub async fn sign_legacy_transaction(
         &self,
         to: Address,
@@ -1297,29 +1234,33 @@ impl ChainExecutor {
         gas_limit: U256,
         gas_price: U256,
     ) -> Result<Bytes, InfrastructureError> {
-        let transaction = TransactionRequest::new()
-            .from(self.wallet.address())
-            .to(to)
-            .data(data)
-            .nonce(nonce)
-            .gas(gas_limit)
-            .gas_price(gas_price)
-            .chain_id(self.chain_id);
-        let typed = TypedTransaction::Legacy(transaction);
+        let field = |name: &str| {
+            InfrastructureError::Blockchain(format!("offline signing failed: {name} out of range"))
+        };
+        let mut transaction = TxLegacy {
+            chain_id: Some(self.chain_id),
+            nonce: u64::try_from(nonce).map_err(|_| field("nonce"))?,
+            gas_price: u128::try_from(gas_price).map_err(|_| field("gas price"))?,
+            gas_limit: u64::try_from(gas_limit).map_err(|_| field("gas limit"))?,
+            to: TxKind::Call(to),
+            value: U256::ZERO,
+            input: data,
+        };
         let signature = self
             .wallet
-            .sign_transaction(&typed)
-            .await
+            .sign_transaction_sync(&mut transaction)
             .map_err(|error| {
                 InfrastructureError::Blockchain(format!("offline signing failed: {error}"))
             })?;
-        Ok(typed.rlp_signed(&signature))
+        let envelope = TxEnvelope::Legacy(transaction.into_signed(signature));
+        Ok(Bytes::from(envelope.encoded_2718()))
     }
 
-    pub fn sign_execution_digest(&self, digest: H256) -> Result<Vec<u8>, InfrastructureError> {
+    /// 65-byte `r || s || v` signature (v = 27 or 28) over an execution digest.
+    pub fn sign_execution_digest(&self, digest: B256) -> Result<Vec<u8>, InfrastructureError> {
         self.wallet
-            .sign_hash(digest)
-            .map(|signature| signature.to_vec())
+            .sign_hash_sync(&digest)
+            .map(|signature| signature.as_bytes().to_vec())
             .map_err(|error| {
                 InfrastructureError::Blockchain(format!("execution quote signing failed: {error}"))
             })
@@ -1327,13 +1268,12 @@ impl ChainExecutor {
 
     /// Broadcast a pre-signed raw transaction via `eth_sendRawTransaction`.
     ///
-    /// Unlike [`send_raw`](Self::send_raw) which signs via `SignerMiddleware`,
-    /// this forwards already-signed bytes directly to the RPC node.
-    /// The signer encoded in the raw bytes pays gas.
+    /// Forwards already-signed bytes directly to the RPC node. The signer
+    /// encoded in the raw bytes pays gas.
     pub async fn broadcast_raw_signed_tx(
         &self,
         raw_tx: &[u8],
-    ) -> Result<H256, InfrastructureError> {
+    ) -> Result<B256, InfrastructureError> {
         self.broadcast_outbox_raw_signed_tx(raw_tx)
             .await
             .map_err(|error| InfrastructureError::Blockchain(error.to_string()))
@@ -1342,19 +1282,21 @@ impl ChainExecutor {
     pub(crate) async fn broadcast_outbox_raw_signed_tx(
         &self,
         raw_tx: &[u8],
-    ) -> Result<H256, OutboxBroadcastError> {
-        let expected_hash = H256::from(ethers::utils::keccak256(raw_tx));
+    ) -> Result<B256, OutboxBroadcastError> {
+        let expected_hash = keccak256(raw_tx);
         if self.is_mock() {
             return Ok(expected_hash);
         }
 
-        let pending = self
+        let rpc_hash: B256 = self
             .provider
-            .send_raw_transaction(Bytes::from(raw_tx.to_vec()))
+            .raw_request(
+                Cow::Borrowed("eth_sendRawTransaction"),
+                (format!("0x{}", hex::encode(raw_tx)),),
+            )
             .await
             .map_err(classify_broadcast_provider_error)?;
 
-        let rpc_hash = pending.tx_hash();
         if rpc_hash != expected_hash {
             return Err(OutboxBroadcastError::Uncertain {
                 detail: "RPC returned a mismatched transaction hash",
@@ -1364,8 +1306,8 @@ impl ChainExecutor {
     }
 }
 
-fn classify_broadcast_provider_error(error: ProviderError) -> OutboxBroadcastError {
-    let Some(response) = RpcError::as_error_response(&error) else {
+fn classify_broadcast_provider_error(error: TransportError) -> OutboxBroadcastError {
+    let Some(response) = error.as_error_resp() else {
         return OutboxBroadcastError::Uncertain {
             detail: "transport, server, or response failure",
         };
@@ -1403,7 +1345,7 @@ fn classify_broadcast_provider_error(error: ProviderError) -> OutboxBroadcastErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ethers::types::CallLogFrame;
+    use alloy::transports::TransportErrorKind;
 
     const TRACE_BACKEND: &str = "debug_traceCall";
 
@@ -1411,7 +1353,7 @@ mod tests {
     fn connection_reset_and_http_5xx_are_uncertain_broadcasts() {
         for detail in ["connection reset by peer", "HTTP status 503"] {
             assert_eq!(
-                classify_broadcast_provider_error(ProviderError::CustomError(detail.to_string())),
+                classify_broadcast_provider_error(TransportErrorKind::custom_str(detail)),
                 OutboxBroadcastError::Uncertain {
                     detail: "transport, server, or response failure"
                 }
@@ -1420,13 +1362,13 @@ mod tests {
     }
 
     async fn executor_with_rpc_url(rpc_url: &str) -> ChainExecutor {
-        let provider = Provider::<Http>::try_from(rpc_url).expect("test provider URL");
-        let wallet = LocalWallet::new(&mut rand::rngs::OsRng).with_chain_id(31_337_u64);
+        let provider = build_http1_provider(rpc_url).expect("test provider URL");
+        let wallet = PrivateKeySigner::random();
         ChainExecutor {
             provider,
             wallet,
             chain_id: 31_337,
-            min_gas_balance: U256::zero(),
+            min_gas_balance: U256::ZERO,
             #[cfg(feature = "dev-node")]
             is_mock: false,
         }
@@ -1456,13 +1398,11 @@ mod tests {
     #[test]
     fn nonce_conflicts_are_classified() {
         let rpc_error = |message: &str| {
-            ProviderError::JsonRpcClientError(Box::new(
-                ethers::providers::HttpClientError::JsonRpcError(ethers::providers::JsonRpcError {
-                    code: -32000,
-                    message: message.to_string(),
-                    data: None,
-                }),
-            ))
+            TransportError::ErrorResp(ErrorPayload {
+                code: -32000,
+                message: message.to_string().into(),
+                data: None,
+            })
         };
         assert_eq!(
             classify_broadcast_provider_error(rpc_error(
@@ -1497,45 +1437,37 @@ mod tests {
     }
 
     fn reward_trace_log() -> CallLogFrame {
-        let asset = Address::from_low_u64_be(2);
-        let payer = Address::from_low_u64_be(3);
-        let mut asset_topic = [0_u8; 32];
-        asset_topic[12..].copy_from_slice(asset.as_bytes());
-        let mut payer_topic = [0_u8; 32];
-        payer_topic[12..].copy_from_slice(payer.as_bytes());
-        let mut amount = [0_u8; 32];
-        U256::from(4).to_big_endian(&mut amount);
+        let asset = Address::with_last_byte(2);
+        let payer = Address::with_last_byte(3);
         CallLogFrame {
-            address: Some(Address::from_low_u64_be(1)),
+            address: Some(Address::with_last_byte(1)),
             topics: Some(vec![
-                H256::from(ethers::utils::keccak256(
-                    "RewardsDeposited(address,address,uint256)",
-                )),
-                H256::from(asset_topic),
-                H256::from(payer_topic),
+                keccak256("RewardsDeposited(address,address,uint256)"),
+                asset.into_word(),
+                payer.into_word(),
             ]),
-            data: Some(Bytes::from(amount.to_vec())),
-        }
-    }
-
-    fn reward_log() -> Log {
-        Log {
-            address: Address::from_low_u64_be(1),
-            topics: vec![H256::from_low_u64_be(2)],
-            data: Bytes::from(vec![3]),
+            data: Some(Bytes::from(U256::from(4).to_be_bytes::<32>().to_vec())),
             ..Default::default()
         }
     }
 
+    fn reward_log() -> Log {
+        unmined_log(
+            Address::with_last_byte(1),
+            vec![B256::with_last_byte(2)],
+            Bytes::from(vec![3]),
+        )
+    }
+
     fn valid_trace() -> (CallFrame, Address, Address, Bytes) {
-        let from = Address::from_low_u64_be(11);
-        let to = Address::from_low_u64_be(12);
+        let from = Address::with_last_byte(11);
+        let to = Address::with_last_byte(12);
         let input = Bytes::from(vec![0xaa, 0xbb]);
         let frame = CallFrame {
             typ: "CALL".into(),
             from,
-            to: Some(NameOrAddress::Address(to)),
-            value: Some(U256::zero()),
+            to: Some(to),
+            value: Some(U256::ZERO),
             input: input.clone(),
             ..Default::default()
         };
@@ -1557,16 +1489,14 @@ mod tests {
         let mut collected = Vec::new();
         let mut pending = vec![frame];
         while let Some(current) = pending.pop() {
-            if let Some(logs) = &current.logs {
-                collected.extend(
-                    logs.iter()
-                        .map(convert_trace_log)
-                        .collect::<Result<Vec<_>, _>>()?,
-                );
-            }
-            if let Some(calls) = &current.calls {
-                pending.extend(calls.iter().rev());
-            }
+            collected.extend(
+                current
+                    .logs
+                    .iter()
+                    .map(convert_trace_log)
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            pending.extend(current.calls.iter().rev());
         }
         Ok(collected)
     }
@@ -1575,11 +1505,11 @@ mod tests {
     fn caught_reverted_child_log_is_excluded() {
         let child = CallFrame {
             error: Some("execution reverted".into()),
-            logs: Some(vec![reward_trace_log()]),
+            logs: vec![reward_trace_log()],
             ..Default::default()
         };
         let parent = CallFrame {
-            calls: Some(vec![child]),
+            calls: vec![child],
             ..Default::default()
         };
 
@@ -1591,11 +1521,11 @@ mod tests {
     #[test]
     fn successful_nested_log_remains_eligible() {
         let child = CallFrame {
-            logs: Some(vec![reward_trace_log()]),
+            logs: vec![reward_trace_log()],
             ..Default::default()
         };
         let parent = CallFrame {
-            calls: Some(vec![child]),
+            calls: vec![child],
             ..Default::default()
         };
 
@@ -1608,12 +1538,12 @@ mod tests {
     #[test]
     fn failed_ancestor_discards_successful_descendant_logs() {
         let descendant = CallFrame {
-            logs: Some(vec![reward_trace_log()]),
+            logs: vec![reward_trace_log()],
             ..Default::default()
         };
         let parent = CallFrame {
             error: Some("execution reverted".into()),
-            calls: Some(vec![descendant]),
+            calls: vec![descendant],
             ..Default::default()
         };
 
@@ -1639,7 +1569,7 @@ mod tests {
             },
         ] {
             let frame = CallFrame {
-                logs: Some(vec![malformed_log]),
+                logs: vec![malformed_log],
                 ..Default::default()
             };
 
@@ -1651,14 +1581,14 @@ mod tests {
     fn malformed_log_in_failed_subtree_rejects_complete_evidence() {
         let child = CallFrame {
             error: Some("execution reverted".into()),
-            logs: Some(vec![CallLogFrame {
+            logs: vec![CallLogFrame {
                 data: None,
                 ..reward_trace_log()
-            }]),
+            }],
             ..Default::default()
         };
         let parent = CallFrame {
-            calls: Some(vec![child]),
+            calls: vec![child],
             ..Default::default()
         };
 
@@ -1704,14 +1634,14 @@ mod tests {
     #[test]
     fn trace_identity_rejects_wrong_sender() {
         let (mut frame, _, _, _) = valid_trace();
-        frame.from = Address::from_low_u64_be(13);
+        frame.from = Address::with_last_byte(13);
         assert_trace_identity_field(&frame, "from");
     }
 
     #[test]
     fn trace_identity_rejects_wrong_or_missing_target() {
         let (mut frame, _, _, _) = valid_trace();
-        frame.to = Some(NameOrAddress::Address(Address::from_low_u64_be(13)));
+        frame.to = Some(Address::with_last_byte(13));
         assert_trace_identity_field(&frame, "to");
 
         frame.to = None;
@@ -1728,7 +1658,7 @@ mod tests {
     #[test]
     fn trace_identity_rejects_nonzero_or_missing_value() {
         let (mut frame, _, _, _) = valid_trace();
-        frame.value = Some(U256::one());
+        frame.value = Some(U256::from(1));
         assert_trace_identity_field(&frame, "value");
 
         frame.value = None;
@@ -1739,11 +1669,11 @@ mod tests {
     fn old_collector_accepts_failed_subtree_log_that_production_rejects() {
         let child = CallFrame {
             error: Some("execution reverted".into()),
-            logs: Some(vec![reward_trace_log()]),
+            logs: vec![reward_trace_log()],
             ..Default::default()
         };
         let parent = CallFrame {
-            calls: Some(vec![child]),
+            calls: vec![child],
             ..Default::default()
         };
 
@@ -1796,8 +1726,12 @@ mod tests {
     #[test]
     fn provider_unsupported_variants_allow_fallback() {
         for provider_error in [
-            ProviderError::UnsupportedRPC,
-            ProviderError::UnsupportedNodeClient,
+            TransportError::UnsupportedFeature("eth_simulateV1"),
+            TransportError::ErrorResp(ErrorPayload {
+                code: -32601,
+                message: "the method eth_simulateV1 does not exist".into(),
+                data: None,
+            }),
         ] {
             assert_eq!(
                 classify_provider_error(&provider_error, "eth_simulateV1"),
@@ -1860,13 +1794,11 @@ mod user_rpc_provider_tests {
         let hits = Arc::new(AtomicUsize::new(0));
         let target = counting_rpc_server(hits.clone()).await;
 
-        let provider = build_pinned_ethers_http1_provider(
-            &user_url(target.port()),
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-        )
-        .expect("provider");
+        let provider =
+            build_pinned_http1_provider(&user_url(target.port()), IpAddr::V4(Ipv4Addr::LOCALHOST))
+                .expect("provider");
         let result: serde_json::Value = provider
-            .request("eth_blockNumber", ())
+            .raw_request(Cow::Borrowed("eth_blockNumber"), ())
             .await
             .expect("pinned request reaches the validated address");
 
@@ -1894,13 +1826,13 @@ mod user_rpc_provider_tests {
         ))
         .await;
 
-        let provider = build_pinned_ethers_http1_provider(
+        let provider = build_pinned_http1_provider(
             &user_url(redirector.port()),
             IpAddr::V4(Ipv4Addr::LOCALHOST),
         )
         .expect("provider");
         let error = provider
-            .request::<_, serde_json::Value>("eth_blockNumber", ())
+            .raw_request::<_, serde_json::Value>(Cow::Borrowed("eth_blockNumber"), ())
             .await
             .expect_err("a redirect must not be followed");
 
@@ -1921,13 +1853,13 @@ mod user_rpc_provider_tests {
             }),
         ))
         .await;
-        let provider = build_pinned_ethers_http1_provider(
+        let provider = build_pinned_http1_provider(
             &user_url(reverting.port()),
             IpAddr::V4(Ipv4Addr::LOCALHOST),
         )
         .expect("provider");
         let error = provider
-            .request::<_, serde_json::Value>("eth_call", ())
+            .raw_request::<_, serde_json::Value>(Cow::Borrowed("eth_call"), ())
             .await
             .expect_err("upstream returns a JSON-RPC error");
         assert!(public_rpc_error(&error).contains("execution reverted"));
@@ -1935,13 +1867,11 @@ mod user_rpc_provider_tests {
         let html =
             serve(Router::new().route("/", post(|| async { "<html>internal admin page</html>" })))
                 .await;
-        let provider = build_pinned_ethers_http1_provider(
-            &user_url(html.port()),
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-        )
-        .expect("provider");
+        let provider =
+            build_pinned_http1_provider(&user_url(html.port()), IpAddr::V4(Ipv4Addr::LOCALHOST))
+                .expect("provider");
         let error = provider
-            .request::<_, serde_json::Value>("eth_call", ())
+            .raw_request::<_, serde_json::Value>(Cow::Borrowed("eth_call"), ())
             .await
             .expect_err("a non JSON-RPC body is an error");
         let public = public_rpc_error(&error);

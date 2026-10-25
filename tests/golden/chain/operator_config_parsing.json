@@ -1,0 +1,243 @@
+{
+  "quote_policy_rolling_loss": [
+    {
+      "input": "",
+      "quote_policy": "0"
+    },
+    {
+      "input": "0",
+      "quote_policy": "0"
+    },
+    {
+      "input": "1",
+      "quote_policy": "1"
+    },
+    {
+      "input": "00012",
+      "quote_policy": "12"
+    },
+    {
+      "input": "1_0",
+      "quote_policy": null
+    },
+    {
+      "input": "0x10",
+      "quote_policy": null
+    },
+    {
+      "input": " 1",
+      "quote_policy": null
+    },
+    {
+      "input": "1 ",
+      "quote_policy": null
+    },
+    {
+      "input": "-1",
+      "quote_policy": null
+    },
+    {
+      "input": "abc",
+      "quote_policy": null
+    },
+    {
+      "input": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+      "quote_policy": "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+    },
+    {
+      "input": "115792089237316195423570985008687907853269984665640564039457584007913129639936",
+      "quote_policy": null
+    }
+  ],
+  "quote_policy_adapter_address": [
+    {
+      "input": "0x74486dc1ac551e5cd3f4eef80727cc9d50d3abe9",
+      "quote_policy": "0x74486dc1ac551e5cd3f4eef80727cc9d50d3abe9"
+    },
+    {
+      "input": "0x74486DC1AC551E5CD3F4EEF80727CC9D50D3ABE9",
+      "quote_policy": "0x74486dc1ac551e5cd3f4eef80727cc9d50d3abe9"
+    },
+    {
+      "input": "0X74486dc1ac551e5cd3f4eef80727cc9d50d3abe9",
+      "quote_policy": null
+    },
+    {
+      "input": "74486dc1ac551e5cd3f4eef80727cc9d50d3abe9",
+      "quote_policy": "0x74486dc1ac551e5cd3f4eef80727cc9d50d3abe9"
+    },
+    {
+      "input": "0x74486Dc1ac551E5cd3F4EeF80727cC9d50d3aBe9",
+      "quote_policy": "0x74486dc1ac551e5cd3f4eef80727cc9d50d3abe9"
+    },
+    {
+      "input": "0x74486dc1ac551e5cd3f4eef80727cc9d50d3abe",
+      "quote_policy": null
+    },
+    {
+      "input": "0x74486dc1ac551e5cd3f4eef80727cc9d50d3abe9aa",
+      "quote_policy": null
+    },
+    {
+      "input": "0x",
+      "quote_policy": null
+    },
+    {
+      "input": "",
+      "quote_policy": null
+    }
+  ],
+  "validate_base": [],
+  "validate_rolling_loss": [
+    {
+      "input": "",
+      "errors": [
+        "quote_rolling_loss_limit_native must be a positive integer"
+      ]
+    },
+    {
+      "input": "0",
+      "errors": [
+        "quote_rolling_loss_limit_native must be a positive integer"
+      ]
+    },
+    {
+      "input": "1",
+      "errors": []
+    },
+    {
+      "input": "00012",
+      "errors": []
+    },
+    {
+      "input": "1_0",
+      "errors": [
+        "quote_rolling_loss_limit_native must be a positive integer"
+      ]
+    },
+    {
+      "input": "0x10",
+      "errors": []
+    },
+    {
+      "input": " 1",
+      "errors": [
+        "quote_rolling_loss_limit_native must be a positive integer"
+      ]
+    },
+    {
+      "input": "1 ",
+      "errors": [
+        "quote_rolling_loss_limit_native must be a positive integer"
+      ]
+    },
+    {
+      "input": "-1",
+      "errors": [
+        "quote_rolling_loss_limit_native must be a positive integer"
+      ]
+    },
+    {
+      "input": "abc",
+      "errors": []
+    },
+    {
+      "input": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+      "errors": [
+        "quote_rolling_loss_limit_native must be a positive integer"
+      ]
+    },
+    {
+      "input": "115792089237316195423570985008687907853269984665640564039457584007913129639936",
+      "errors": [
+        "quote_rolling_loss_limit_native must be a positive integer"
+      ]
+    },
+    {
+      "input": "10",
+      "errors": []
+    },
+    {
+      "input": "a",
+      "errors": []
+    },
+    {
+      "input": "ff",
+      "errors": []
+    },
+    {
+      "input": "0x0",
+      "errors": [
+        "quote_rolling_loss_limit_native must be a positive integer"
+      ]
+    }
+  ],
+  "validate_token_address": [
+    {
+      "input": "0x74486dc1ac551e5cd3f4eef80727cc9d50d3abe9",
+      "errors": [
+        "payment adapter fee asset 0x0f69cf1c9f4ff72471701036dd789c934458e630 is missing token metadata"
+      ]
+    },
+    {
+      "input": "0x74486DC1AC551E5CD3F4EEF80727CC9D50D3ABE9",
+      "errors": [
+        "payment adapter fee asset 0x0f69cf1c9f4ff72471701036dd789c934458e630 is missing token metadata"
+      ]
+    },
+    {
+      "input": "0X74486dc1ac551e5cd3f4eef80727cc9d50d3abe9",
+      "errors": [
+        "token address is invalid",
+        "payment adapter fee asset 0x0f69cf1c9f4ff72471701036dd789c934458e630 is missing token metadata"
+      ]
+    },
+    {
+      "input": "74486dc1ac551e5cd3f4eef80727cc9d50d3abe9",
+      "errors": [
+        "payment adapter fee asset 0x0f69cf1c9f4ff72471701036dd789c934458e630 is missing token metadata"
+      ]
+    },
+    {
+      "input": "0x74486Dc1ac551E5cd3F4EeF80727cC9d50d3aBe9",
+      "errors": [
+        "payment adapter fee asset 0x0f69cf1c9f4ff72471701036dd789c934458e630 is missing token metadata"
+      ]
+    },
+    {
+      "input": "0x74486dc1ac551e5cd3f4eef80727cc9d50d3abe",
+      "errors": [
+        "token address is invalid",
+        "payment adapter fee asset 0x0f69cf1c9f4ff72471701036dd789c934458e630 is missing token metadata"
+      ]
+    },
+    {
+      "input": "0x74486dc1ac551e5cd3f4eef80727cc9d50d3abe9aa",
+      "errors": [
+        "token address is invalid",
+        "payment adapter fee asset 0x0f69cf1c9f4ff72471701036dd789c934458e630 is missing token metadata"
+      ]
+    },
+    {
+      "input": "0x",
+      "errors": [
+        "token address is invalid",
+        "payment adapter fee asset 0x0f69cf1c9f4ff72471701036dd789c934458e630 is missing token metadata"
+      ]
+    },
+    {
+      "input": "",
+      "errors": [
+        "token address is invalid",
+        "payment adapter fee asset 0x0f69cf1c9f4ff72471701036dd789c934458e630 is missing token metadata"
+      ]
+    },
+    {
+      "input": "0x0000000000000000000000000000000000000000",
+      "errors": [
+        "token address is invalid",
+        "payment adapter fee asset 0x0f69cf1c9f4ff72471701036dd789c934458e630 is missing token metadata"
+      ]
+    }
+  ]
+}

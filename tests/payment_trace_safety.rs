@@ -1,9 +1,12 @@
 #![cfg(feature = "dev-node")]
 
-use ethers::abi::{Abi, Detokenize, Tokenize};
-use ethers::prelude::*;
-use ethers::utils::Anvil;
-use ethers_solc::Solc;
+use alloy::network::{EthereumWallet, TransactionBuilder};
+use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy::providers::{DynProvider, Provider, ProviderBuilder};
+use alloy::rpc::types::{Log, TransactionReceipt, TransactionRequest};
+use alloy::signers::local::PrivateKeySigner;
+use alloy::sol_types::{SolCall, SolValue};
+use alloy_node_bindings::Anvil;
 use nox_node::blockchain::executor::{
     ChainExecutor, ExpectedTransactionIdentity, SimulationEvidence, SimulationSource,
 };
@@ -11,14 +14,23 @@ use nox_node::NoxConfig;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::process::Command;
 use wiremock::matchers::method;
 use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
-const EXPECTED_SOLC: (u64, u64, u64) = (0, 8, 30);
+const EXPECTED_SOLC: &str = "0.8.30";
 const CHAIN_ID: u64 = 31_337;
 
-type TestClient = SignerMiddleware<Provider<Http>, LocalWallet>;
+alloy::sol! {
+    function mint(address to, uint256 amount) external;
+    function balanceOf(address account) external view returns (uint256);
+    function setAssetStatus(address asset, bool status) external;
+    function totalCollected(address asset) external view returns (uint256);
+    function depositThenRevert(address pool, address asset, uint256 amount) external;
+    function depositSuccessfully(address pool, address asset, uint256 amount) external;
+    function catchPayment(address child, bytes callData) external returns (bool);
+    function forwardPayment(address child, bytes callData) external returns (bool);
+}
 
 #[derive(Debug)]
 struct JsonRpcMethod(&'static str);
@@ -60,103 +72,135 @@ fn rpc_unavailable() -> ResponseTemplate {
     rpc_error(-32601, "method unavailable")
 }
 
-fn load_artifact(name: &str) -> anyhow::Result<(Abi, Bytes)> {
+/// Creation bytecode of a Hardhat artifact in `abi/`.
+fn load_artifact(name: &str) -> anyhow::Result<Bytes> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("abi")
         .join(format!("{name}.json"));
     let artifact: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-    let abi = serde_json::from_value(
-        artifact
-            .get("abi")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("artifact {} has no ABI", path.display()))?,
-    )?;
     let bytecode = artifact
         .get("bytecode")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("artifact {} has no bytecode", path.display()))?;
-    let bytecode = hex::decode(bytecode.trim_start_matches("0x"))?;
-    Ok((abi, Bytes::from(bytecode)))
+    Ok(Bytes::from(hex::decode(bytecode.trim_start_matches("0x"))?))
 }
 
-fn compile_fixture() -> anyhow::Result<((Abi, Bytes), (Abi, Bytes))> {
-    let solc = Solc::new("solc");
-    let version = solc.version()?;
+/// Compiles the fixture with `solc --standard-json` (optimizer off, Shanghai)
+/// and returns the creation bytecode of the child and the parent contract.
+fn compile_fixture() -> anyhow::Result<(Bytes, Bytes)> {
+    let version = Command::new("solc").arg("--version").output()?;
+    let version = String::from_utf8_lossy(&version.stdout).into_owned();
     anyhow::ensure!(
-        (version.major, version.minor, version.patch) == EXPECTED_SOLC,
-        "PaymentTraceHarness requires solc 0.8.30, observed {version}"
+        version.contains(&format!("Version: {EXPECTED_SOLC}+")),
+        "PaymentTraceHarness requires solc {EXPECTED_SOLC}, observed {version}"
     );
 
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
         .join("PaymentTraceHarness.sol");
-    let output = solc.compile_source(&fixture)?;
+    let input = json!({
+        "language": "Solidity",
+        "sources": {
+            "PaymentTraceHarness.sol": { "content": std::fs::read_to_string(&fixture)? }
+        },
+        "settings": {
+            "optimizer": { "enabled": false, "runs": 200 },
+            "evmVersion": "shanghai",
+            "outputSelection": { "*": { "*": ["evm.bytecode.object"] } }
+        }
+    });
+    let mut child = Command::new("solc")
+        .arg("--standard-json")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("solc stdin unavailable"))?
+            .write_all(serde_json::to_string(&input)?.as_bytes())?;
+    }
+    let output: Value = serde_json::from_slice(&child.wait_with_output()?.stdout)?;
+    let errors: Vec<&Value> = output["errors"]
+        .as_array()
+        .map(|errors| {
+            errors
+                .iter()
+                .filter(|error| error["severity"] == "error")
+                .collect()
+        })
+        .unwrap_or_default();
     anyhow::ensure!(
-        !output.has_error(),
-        "PaymentTraceHarness compilation failed: {:?}",
-        output.errors
+        errors.is_empty(),
+        "PaymentTraceHarness compilation failed: {errors:?}"
     );
-
-    let child = output
-        .find("RevertingPaymentChild")
-        .ok_or_else(|| anyhow::anyhow!("compiled fixture has no RevertingPaymentChild"))?
-        .into_parts();
-    let parent = output
-        .find("CatchingPaymentParent")
-        .ok_or_else(|| anyhow::anyhow!("compiled fixture has no CatchingPaymentParent"))?
-        .into_parts();
-
+    let bytecode = |name: &str| -> anyhow::Result<Bytes> {
+        let object = output["contracts"]["PaymentTraceHarness.sol"][name]["evm"]["bytecode"]
+            ["object"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("compiled fixture has no {name}"))?;
+        Ok(Bytes::from(hex::decode(object)?))
+    };
     Ok((
-        (
-            child
-                .0
-                .ok_or_else(|| anyhow::anyhow!("RevertingPaymentChild has no ABI"))?,
-            child
-                .1
-                .ok_or_else(|| anyhow::anyhow!("RevertingPaymentChild has no bytecode"))?,
-        ),
-        (
-            parent
-                .0
-                .ok_or_else(|| anyhow::anyhow!("CatchingPaymentParent has no ABI"))?,
-            parent
-                .1
-                .ok_or_else(|| anyhow::anyhow!("CatchingPaymentParent has no bytecode"))?,
-        ),
+        bytecode("RevertingPaymentChild")?,
+        bytecode("CatchingPaymentParent")?,
     ))
 }
 
-async fn deploy_contract<T: Tokenize>(
-    client: Arc<TestClient>,
-    abi: Abi,
+async fn deploy_contract(
+    client: &DynProvider,
     bytecode: Bytes,
-    constructor: T,
-) -> anyhow::Result<Contract<TestClient>> {
-    Ok(ContractFactory::new(abi, bytecode, client)
-        .deploy(constructor)?
-        .send()
-        .await?)
+    constructor: Vec<u8>,
+) -> anyhow::Result<Address> {
+    let mut code = bytecode.to_vec();
+    code.extend(constructor);
+    let receipt = client
+        .send_transaction(TransactionRequest::default().with_deploy_code(code))
+        .await?
+        .get_receipt()
+        .await?;
+    receipt
+        .contract_address
+        .ok_or_else(|| anyhow::anyhow!("deployment produced no contract address"))
 }
 
-async fn send_call<D: Detokenize>(
-    call: ContractCall<TestClient, D>,
-) -> anyhow::Result<TransactionReceipt> {
-    let pending = call.send().await?;
-    pending
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("transaction produced no receipt"))
-}
-
-async fn send_identified_call<D: Detokenize>(
-    call: ContractCall<TestClient, D>,
-) -> anyhow::Result<(H256, TransactionReceipt)> {
-    let pending = call.send().await?;
-    let transaction_hash = pending.tx_hash();
-    let receipt = pending
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("transaction produced no receipt"))?;
+async fn send_identified_call<C: SolCall>(
+    client: &DynProvider,
+    to: Address,
+    call: C,
+) -> anyhow::Result<(B256, TransactionReceipt)> {
+    let pending = client
+        .send_transaction(
+            TransactionRequest::default()
+                .with_to(to)
+                .with_input(call.abi_encode()),
+        )
+        .await?;
+    let transaction_hash = *pending.tx_hash();
+    let receipt = pending.get_receipt().await?;
     Ok((transaction_hash, receipt))
+}
+
+async fn send_call<C: SolCall>(
+    client: &DynProvider,
+    to: Address,
+    call: C,
+) -> anyhow::Result<TransactionReceipt> {
+    Ok(send_identified_call(client, to, call).await?.1)
+}
+
+async fn view<C: SolCall>(client: &DynProvider, to: Address, call: C) -> anyhow::Result<C::Return> {
+    let output = client
+        .call(
+            TransactionRequest::default()
+                .with_to(to)
+                .with_input(call.abi_encode()),
+        )
+        .await?;
+    Ok(C::abi_decode_returns(&output)?)
 }
 
 fn assert_receipt_error(
@@ -170,92 +214,60 @@ fn assert_receipt_error(
     assert_eq!(error, format!("Blockchain error: {category}"));
 }
 
-fn set_log_removed(log: &mut Log) {
-    log.removed = Some(true);
+/// Applies `mutate` to the receipt's JSON form and reads it back.
+fn mutated_receipt(
+    receipt: &TransactionReceipt,
+    mutate: impl FnOnce(&mut Value),
+) -> TransactionReceipt {
+    let mut value = serde_json::to_value(receipt).expect("receipt json");
+    mutate(&mut value);
+    serde_json::from_value(value).expect("mutated receipt json")
 }
 
-fn clear_log_removed(log: &mut Log) {
-    log.removed = None;
+fn hex_word(byte: u8) -> Value {
+    json!(format!("{:#x}", B256::with_last_byte(byte)))
 }
 
-fn clear_log_index(log: &mut Log) {
-    log.log_index = None;
+fn hex_address(byte: u8) -> Value {
+    json!(format!("{:#x}", Address::with_last_byte(byte)))
 }
 
-fn replace_log_transaction_hash(log: &mut Log) {
-    log.transaction_hash = Some(H256::from_low_u64_be(93));
+async fn token_balance(
+    client: &DynProvider,
+    token: Address,
+    account: Address,
+) -> anyhow::Result<U256> {
+    view(client, token, balanceOfCall { account }).await
 }
 
-fn clear_log_transaction_hash(log: &mut Log) {
-    log.transaction_hash = None;
-}
-
-fn replace_log_transaction_index(log: &mut Log) {
-    log.transaction_index = Some(U64::from(94));
-}
-
-fn clear_log_transaction_index(log: &mut Log) {
-    log.transaction_index = None;
-}
-
-fn replace_log_block_hash(log: &mut Log) {
-    log.block_hash = Some(H256::from_low_u64_be(95));
-}
-
-fn clear_log_block_hash(log: &mut Log) {
-    log.block_hash = None;
-}
-
-fn replace_log_block_number(log: &mut Log) {
-    log.block_number = Some(U64::from(96));
-}
-
-fn clear_log_block_number(log: &mut Log) {
-    log.block_number = None;
-}
-
-async fn token_balance(token: &Contract<TestClient>, account: Address) -> anyhow::Result<U256> {
-    Ok(token
-        .method::<_, U256>("balanceOf", account)?
-        .call()
-        .await?)
-}
-
-async fn total_collected(pool: &Contract<TestClient>, asset: Address) -> anyhow::Result<U256> {
-    Ok(pool
-        .method::<_, U256>("totalCollected", asset)?
-        .call()
-        .await?)
+async fn total_collected(
+    client: &DynProvider,
+    pool: Address,
+    asset: Address,
+) -> anyhow::Result<U256> {
+    view(client, pool, totalCollectedCall { asset }).await
 }
 
 fn reward_event_count(logs: &[Log], pool: Address) -> usize {
-    let topic = H256::from(ethers::utils::keccak256(
-        "RewardsDeposited(address,address,uint256)",
-    ));
+    let topic = keccak256("RewardsDeposited(address,address,uint256)");
     logs.iter()
-        .filter(|log| log.address == pool && log.topics.first() == Some(&topic))
+        .filter(|log| log.address() == pool && log.topics().first() == Some(&topic))
         .count()
 }
 
-fn address_topic(address: Address) -> H256 {
-    let mut topic = [0_u8; 32];
-    topic[12..].copy_from_slice(address.as_bytes());
-    H256::from(topic)
+fn address_topic(address: Address) -> B256 {
+    address.into_word()
 }
 
 fn amount_data(amount: U256) -> String {
-    let mut encoded = [0_u8; 32];
-    amount.to_big_endian(&mut encoded);
-    format!("0x{}", hex::encode(encoded))
+    format!("0x{}", hex::encode(amount.to_be_bytes::<32>()))
 }
 
 fn rpc_log(reward_pool: Address, asset: Address, payer: Address, amount: U256) -> Value {
     json!({
         "address": format!("{reward_pool:#x}"),
         "topics": [
-            format!("{:#x}", H256::from(ethers::utils::keccak256(
-                "RewardsDeposited(address,address,uint256)",
-            ))),
+            format!("{:#x}", keccak256("RewardsDeposited(address,address,uint256)")),
             format!("{:#x}", address_topic(asset)),
             format!("{:#x}", address_topic(payer)),
         ],
@@ -264,10 +276,10 @@ fn rpc_log(reward_pool: Address, asset: Address, payer: Address, amount: U256) -
 }
 
 async fn rpc_executor_at(rpc_url: String) -> anyhow::Result<ChainExecutor> {
-    let wallet = LocalWallet::new(&mut rand::rngs::OsRng);
+    let wallet = PrivateKeySigner::random();
     let mut config = NoxConfig::default();
     config.eth_rpc_url = rpc_url;
-    config.eth_wallet_private_key = hex::encode(wallet.signer().to_bytes());
+    config.eth_wallet_private_key = hex::encode(wallet.to_bytes());
     config.chain_id = CHAIN_ID;
     config.min_gas_balance = "0".into();
     config.benchmark_mode = false;
@@ -311,11 +323,11 @@ async fn mount_snapshot(server: &MockServer) {
         .await;
 }
 
-fn receipt_json(transaction_hash: H256, from: Address, to: Address, status: U64) -> Value {
+fn receipt_json(transaction_hash: B256, from: Address, to: Address, status: u64) -> Value {
     json!({
         "transactionHash": format!("{transaction_hash:#x}"),
         "transactionIndex": "0x0",
-        "blockHash": format!("{:#x}", H256::from_low_u64_be(61)),
+        "blockHash": format!("{:#x}", B256::with_last_byte(61)),
         "blockNumber": "0x1",
         "from": format!("{from:#x}"),
         "to": format!("{to:#x}"),
@@ -330,7 +342,7 @@ fn receipt_json(transaction_hash: H256, from: Address, to: Address, status: U64)
     })
 }
 
-async fn mount_receipt_transaction(server: &MockServer, transaction_hash: H256, receipt: Value) {
+async fn mount_receipt_transaction(server: &MockServer, transaction_hash: B256, receipt: Value) {
     for (rpc_method, response) in [
         ("eth_getTransactionCount", json!("0x0")),
         ("eth_gasPrice", json!("0x1")),
@@ -422,50 +434,81 @@ fn assert_static_error<T: std::fmt::Debug>(
 
 #[tokio::test]
 async fn caught_revert_receipt_has_no_committed_payment() -> anyhow::Result<()> {
-    let ((child_abi, child_bytecode), (parent_abi, parent_bytecode)) = compile_fixture()?;
-    let (token_abi, token_bytecode) = load_artifact("MockERC20")?;
-    let (pool_abi, pool_bytecode) = load_artifact("NoxRewardPool")?;
+    let (child_bytecode, parent_bytecode) = compile_fixture()?;
+    let token_bytecode = load_artifact("MockERC20")?;
+    let pool_bytecode = load_artifact("NoxRewardPool")?;
 
     let anvil = Anvil::new().spawn();
-    let provider = Provider::<Http>::try_from(anvil.endpoint())?;
-    let deployer = LocalWallet::from(anvil.keys()[0].clone()).with_chain_id(anvil.chain_id());
-    let client = Arc::new(SignerMiddleware::new(provider, deployer.clone()));
+    let deployer = PrivateKeySigner::from_slice(&anvil.keys()[0].to_bytes())?;
+    let deployer_address = deployer.address();
+    let client = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(deployer))
+        .connect_client(nox_core::chain_rpc::http1_rpc_client(&anvil.endpoint())?)
+        .erased();
 
     let token = deploy_contract(
-        client.clone(),
-        token_abi,
+        &client,
         token_bytecode,
-        ("Fee Token".to_owned(), "FEE".to_owned(), 18_u8),
+        // `uint8 decimals` is ABI-encoded as one 32-byte word, like a uint256.
+        ("Fee Token".to_owned(), "FEE".to_owned(), U256::from(18)).abi_encode_params(),
     )
     .await?;
-    let pool = deploy_contract(client.clone(), pool_abi, pool_bytecode, deployer.address()).await?;
-    let child = deploy_contract(client.clone(), child_abi, child_bytecode, ()).await?;
-    let parent = deploy_contract(client.clone(), parent_abi, parent_bytecode, ()).await?;
+    let pool = deploy_contract(
+        &client,
+        pool_bytecode,
+        (deployer_address,).abi_encode_params(),
+    )
+    .await?;
+    let child = deploy_contract(&client, child_bytecode, Vec::new()).await?;
+    let parent = deploy_contract(&client, parent_bytecode, Vec::new()).await?;
 
-    send_call(pool.method::<_, ()>("setAssetStatus", (token.address(), true))?).await?;
+    send_call(
+        &client,
+        pool,
+        setAssetStatusCall {
+            asset: token,
+            status: true,
+        },
+    )
+    .await?;
 
-    let payment = U256::exp10(18);
-    send_call(token.method::<_, ()>("mint", (child.address(), payment))?).await?;
+    let payment = U256::from(10).pow(U256::from(18));
+    send_call(
+        &client,
+        token,
+        mintCall {
+            to: child,
+            amount: payment,
+        },
+    )
+    .await?;
 
-    let caught_calldata = child.encode(
-        "depositThenRevert",
-        (pool.address(), token.address(), payment),
-    )?;
+    let caught_calldata = depositThenRevertCall {
+        pool,
+        asset: token,
+        amount: payment,
+    }
+    .abi_encode();
     let (caught_transaction_hash, caught_receipt) = send_identified_call(
-        parent.method::<_, bool>("catchPayment", (child.address(), caught_calldata))?,
+        &client,
+        parent,
+        catchPaymentCall {
+            child,
+            callData: caught_calldata.into(),
+        },
     )
     .await?;
 
-    assert_eq!(caught_receipt.status, Some(U64::one()));
-    assert_eq!(reward_event_count(&caught_receipt.logs, pool.address()), 0);
-    assert_eq!(token_balance(&token, pool.address()).await?, U256::zero());
-    assert_eq!(total_collected(&pool, token.address()).await?, U256::zero());
-    assert_eq!(token_balance(&token, child.address()).await?, payment);
+    assert!(caught_receipt.status());
+    assert_eq!(reward_event_count(caught_receipt.inner.logs(), pool), 0);
+    assert_eq!(token_balance(&client, token, pool).await?, U256::ZERO);
+    assert_eq!(total_collected(&client, pool, token).await?, U256::ZERO);
+    assert_eq!(token_balance(&client, token, child).await?, payment);
 
     let caught_expected = ExpectedTransactionIdentity {
         transaction_hash: caught_transaction_hash,
-        from: deployer.address(),
-        to: parent.address(),
+        from: deployer_address,
+        to: parent,
     };
     let caught_evidence =
         SimulationEvidence::from_committed_receipt(caught_receipt, caught_expected)?;
@@ -475,159 +518,141 @@ async fn caught_revert_receipt_has_no_committed_payment() -> anyhow::Result<()> 
         .expect("committed receipt is eligible")
         .is_empty());
 
-    let successful_calldata = child.encode(
-        "depositSuccessfully",
-        (pool.address(), token.address(), payment),
-    )?;
+    let successful_calldata = depositSuccessfullyCall {
+        pool,
+        asset: token,
+        amount: payment,
+    }
+    .abi_encode();
     let (successful_transaction_hash, successful_receipt) = send_identified_call(
-        parent.method::<_, bool>("forwardPayment", (child.address(), successful_calldata))?,
+        &client,
+        parent,
+        forwardPaymentCall {
+            child,
+            callData: successful_calldata.into(),
+        },
     )
     .await?;
 
-    assert_eq!(successful_receipt.status, Some(U64::one()));
-    assert_eq!(
-        reward_event_count(&successful_receipt.logs, pool.address()),
-        1
-    );
-    assert_eq!(token_balance(&token, pool.address()).await?, payment);
-    assert_eq!(total_collected(&pool, token.address()).await?, payment);
-    assert_eq!(token_balance(&token, child.address()).await?, U256::zero());
+    assert!(successful_receipt.status());
+    assert_eq!(reward_event_count(successful_receipt.inner.logs(), pool), 1);
+    assert_eq!(token_balance(&client, token, pool).await?, payment);
+    assert_eq!(total_collected(&client, pool, token).await?, payment);
+    assert_eq!(token_balance(&client, token, child).await?, U256::ZERO);
 
     let successful_expected = ExpectedTransactionIdentity {
         transaction_hash: successful_transaction_hash,
-        from: deployer.address(),
-        to: parent.address(),
+        from: deployer_address,
+        to: parent,
     };
 
-    let mut mutated = successful_receipt.clone();
-    mutated.status = None;
-    assert_receipt_error(
-        mutated,
-        successful_expected,
-        "committed-receipt execution rejected",
-    );
-    let mut mutated = successful_receipt.clone();
-    mutated.status = Some(U64::zero());
-    assert_receipt_error(
-        mutated,
-        successful_expected,
-        "committed-receipt execution rejected",
-    );
-    let mut mutated = successful_receipt.clone();
-    mutated.transaction_hash = H256::from_low_u64_be(91);
-    assert_receipt_error(
-        mutated,
-        successful_expected,
-        "committed-receipt identity mismatch: transaction_hash",
-    );
-    let mut mutated = successful_receipt.clone();
-    mutated.from = Address::from_low_u64_be(92);
-    assert_receipt_error(
-        mutated,
-        successful_expected,
-        "committed-receipt identity mismatch: from",
-    );
-    let mut mutated = successful_receipt.clone();
-    mutated.to = None;
-    assert_receipt_error(
-        mutated,
-        successful_expected,
-        "committed-receipt identity mismatch: to",
-    );
-    let mut mutated = successful_receipt.clone();
-    mutated.to = Some(Address::from_low_u64_be(97));
-    assert_receipt_error(
-        mutated,
-        successful_expected,
-        "committed-receipt identity mismatch: to",
-    );
-    let mut mutated = successful_receipt.clone();
-    mutated.block_hash = None;
-    assert_receipt_error(
-        mutated,
-        successful_expected,
-        "committed-receipt evidence malformed: block_hash",
-    );
-    let mut mutated = successful_receipt.clone();
-    mutated.block_number = None;
-    assert_receipt_error(
-        mutated,
-        successful_expected,
-        "committed-receipt evidence malformed: block_number",
-    );
-    let mut mutated = successful_receipt.clone();
-    mutated.gas_used = None;
-    assert_receipt_error(
-        mutated,
-        successful_expected,
-        "committed-receipt evidence malformed: gas_used",
-    );
+    // Receipt fields the RPC types model as required (`status`, `gasUsed`)
+    // cannot be absent: such a receipt does not deserialize at all.
+    for required in ["status", "gasUsed"] {
+        let mut value = serde_json::to_value(&successful_receipt)?;
+        value
+            .as_object_mut()
+            .expect("receipt object")
+            .remove(required);
+        assert!(serde_json::from_value::<TransactionReceipt>(value).is_err());
+    }
 
-    let log_mutations: [(&str, fn(&mut Log), &str); 11] = [
+    let receipt_mutations: [(&str, Value, &str); 7] = [
+        (
+            "status",
+            json!("0x0"),
+            "committed-receipt execution rejected",
+        ),
+        (
+            "transactionHash",
+            hex_word(91),
+            "committed-receipt identity mismatch: transaction_hash",
+        ),
+        (
+            "from",
+            hex_address(92),
+            "committed-receipt identity mismatch: from",
+        ),
+        ("to", Value::Null, "committed-receipt identity mismatch: to"),
+        (
+            "to",
+            hex_address(97),
+            "committed-receipt identity mismatch: to",
+        ),
+        (
+            "blockHash",
+            Value::Null,
+            "committed-receipt evidence malformed: block_hash",
+        ),
+        (
+            "blockNumber",
+            Value::Null,
+            "committed-receipt evidence malformed: block_number",
+        ),
+    ];
+    for (field, replacement, category) in receipt_mutations {
+        let mutated = mutated_receipt(&successful_receipt, |value| {
+            value[field] = replacement;
+        });
+        assert_receipt_error(mutated, successful_expected, category);
+    }
+
+    let log_mutations: [(&str, Value, &str); 10] = [
         (
             "removed",
-            set_log_removed,
+            json!(true),
             "committed-receipt evidence malformed: log.removed",
         ),
         (
-            "missing removed",
-            clear_log_removed,
-            "committed-receipt evidence malformed: log.removed",
-        ),
-        (
-            "log_index",
-            clear_log_index,
+            "logIndex",
+            Value::Null,
             "committed-receipt evidence malformed: log.log_index",
         ),
         (
-            "transaction_hash",
-            replace_log_transaction_hash,
+            "transactionHash",
+            hex_word(93),
             "committed-receipt identity mismatch: log.transaction_hash",
         ),
         (
-            "missing transaction_hash",
-            clear_log_transaction_hash,
+            "transactionHash",
+            Value::Null,
             "committed-receipt evidence malformed: log.transaction_hash",
         ),
         (
-            "transaction_index",
-            replace_log_transaction_index,
+            "transactionIndex",
+            json!("0x5e"),
             "committed-receipt identity mismatch: log.transaction_index",
         ),
         (
-            "missing transaction_index",
-            clear_log_transaction_index,
+            "transactionIndex",
+            Value::Null,
             "committed-receipt evidence malformed: log.transaction_index",
         ),
         (
-            "block_hash",
-            replace_log_block_hash,
+            "blockHash",
+            hex_word(95),
             "committed-receipt identity mismatch: log.block_hash",
         ),
         (
-            "missing block_hash",
-            clear_log_block_hash,
+            "blockHash",
+            Value::Null,
             "committed-receipt evidence malformed: log.block_hash",
         ),
         (
-            "block_number",
-            replace_log_block_number,
+            "blockNumber",
+            json!("0x60"),
             "committed-receipt identity mismatch: log.block_number",
         ),
         (
-            "missing block_number",
-            clear_log_block_number,
+            "blockNumber",
+            Value::Null,
             "committed-receipt evidence malformed: log.block_number",
         ),
     ];
-    for (field, mutate_log, category) in log_mutations {
-        let mut mutated = successful_receipt.clone();
-        mutate_log(
-            mutated
-                .logs
-                .first_mut()
-                .expect("successful receipt contains logs"),
-        );
+    for (field, replacement, category) in log_mutations {
+        let mutated = mutated_receipt(&successful_receipt, |value| {
+            value["logs"][0][field] = replacement;
+        });
         let error = SimulationEvidence::from_committed_receipt(mutated, successful_expected)
             .expect_err("mutated receipt log must be rejected")
             .to_string();
@@ -638,6 +663,17 @@ async fn caught_revert_receipt_has_no_committed_payment() -> anyhow::Result<()> 
         );
     }
 
+    // A log without `removed` reads as not removed.
+    let without_removed = mutated_receipt(&successful_receipt, |value| {
+        value["logs"][0]
+            .as_object_mut()
+            .expect("log object")
+            .remove("removed");
+    });
+    assert!(
+        SimulationEvidence::from_committed_receipt(without_removed, successful_expected).is_ok()
+    );
+
     let successful_evidence =
         SimulationEvidence::from_committed_receipt(successful_receipt, successful_expected)?;
     assert_eq!(
@@ -647,7 +683,7 @@ async fn caught_revert_receipt_has_no_committed_payment() -> anyhow::Result<()> 
     let successful_logs = successful_evidence
         .legacy_payment_logs()
         .expect("committed receipt is eligible");
-    assert_eq!(reward_event_count(successful_logs, pool.address()), 1);
+    assert_eq!(reward_event_count(successful_logs, pool), 1);
 
     Ok(())
 }
@@ -655,9 +691,9 @@ async fn caught_revert_receipt_has_no_committed_payment() -> anyhow::Result<()> 
 #[tokio::test]
 async fn flat_payment_log_is_discarded_before_trace_evidence() -> anyhow::Result<()> {
     let server = MockServer::start().await;
-    let reward_pool = Address::from_low_u64_be(11);
-    let asset = Address::from_low_u64_be(12);
-    let payer = Address::from_low_u64_be(13);
+    let reward_pool = Address::with_last_byte(11);
+    let asset = Address::with_last_byte(12);
+    let payer = Address::with_last_byte(13);
     let flat_amount = U256::from(41);
     let trace_amount = U256::from(42);
     mount_flat_simulation(&server, rpc_log(reward_pool, asset, payer, flat_amount)).await;
@@ -669,7 +705,7 @@ async fn flat_payment_log_is_discarded_before_trace_evidence() -> anyhow::Result
         .respond_with(rpc_success(json!({
             "type": "CALL",
             "from": format!("{:#x}", executor.address()),
-            "to": format!("{:#x}", Address::from_low_u64_be(13)),
+            "to": format!("{:#x}", Address::with_last_byte(13)),
             "value": "0x0",
             "gas": "0x5208",
             "gasUsed": "0x5208",
@@ -688,7 +724,7 @@ async fn flat_payment_log_is_discarded_before_trace_evidence() -> anyhow::Result
         .await;
 
     let evidence = executor
-        .simulate_legacy_paid_transaction(Address::from_low_u64_be(13), Bytes::new())
+        .simulate_legacy_paid_transaction(Address::with_last_byte(13), Bytes::new())
         .await?;
 
     assert_eq!(evidence.source, SimulationSource::SuccessfulCallTrace);
@@ -696,11 +732,11 @@ async fn flat_payment_log_is_discarded_before_trace_evidence() -> anyhow::Result
         .legacy_payment_logs()
         .expect("call trace is eligible");
     assert_eq!(payment_logs.len(), 1);
-    assert_eq!(payment_logs[0].address, reward_pool);
-    assert_eq!(payment_logs[0].topics[1], address_topic(asset));
-    assert_eq!(payment_logs[0].topics[2], address_topic(payer));
+    assert_eq!(payment_logs[0].address(), reward_pool);
+    assert_eq!(payment_logs[0].topics()[1], address_topic(asset));
+    assert_eq!(payment_logs[0].topics()[2], address_topic(payer));
     let trace_data = hex::decode(amount_data(trace_amount).trim_start_matches("0x"))?;
-    assert_eq!(payment_logs[0].data.as_ref(), trace_data);
+    assert_eq!(payment_logs[0].data().data.as_ref(), trace_data);
     let requests = server
         .received_requests()
         .await
@@ -724,9 +760,9 @@ async fn flat_only_payment_evidence_fails_closed_without_broadcast() -> anyhow::
     mount_flat_simulation(
         &server,
         rpc_log(
-            Address::from_low_u64_be(21),
-            Address::from_low_u64_be(22),
-            Address::from_low_u64_be(23),
+            Address::with_last_byte(21),
+            Address::with_last_byte(22),
+            Address::with_last_byte(23),
             U256::from(43),
         ),
     )
@@ -741,7 +777,7 @@ async fn flat_only_payment_evidence_fails_closed_without_broadcast() -> anyhow::
 
     let executor = rpc_executor(&server).await?;
     let failure = executor
-        .simulate_legacy_paid_transaction(Address::from_low_u64_be(22), Bytes::new())
+        .simulate_legacy_paid_transaction(Address::with_last_byte(22), Bytes::new())
         .await;
 
     assert!(failure.is_err(), "flat-only evidence must fail closed");
@@ -768,7 +804,7 @@ async fn unsupported_flat_and_snapshot_backends_permit_trace_fallback() -> anyho
         .await;
     mount_snapshot_unavailable(&server).await;
     let executor = rpc_executor(&server).await?;
-    let target = Address::from_low_u64_be(31);
+    let target = Address::with_last_byte(31);
     let calldata = Bytes::from(vec![0xaa]);
     Mock::given(method("POST"))
         .and(JsonRpcMethod("debug_traceCall"))
@@ -832,7 +868,7 @@ async fn flat_execution_rejection_is_terminal_and_payload_free() -> anyhow::Resu
     let executor = rpc_executor(&server).await?;
 
     let failure = executor
-        .simulate_legacy_paid_transaction(Address::from_low_u64_be(32), Bytes::new())
+        .simulate_legacy_paid_transaction(Address::with_last_byte(32), Bytes::new())
         .await;
     assert_static_error(failure, "eth_simulateV1 execution rejected");
     let requests = server
@@ -862,7 +898,7 @@ async fn diagnostic_simulation_does_not_fallback_after_flat_rejection() -> anyho
     let executor = rpc_executor(&server).await?;
 
     let failure = executor
-        .simulate_transaction_evidence(Address::from_low_u64_be(39), Bytes::new())
+        .simulate_transaction_evidence(Address::with_last_byte(39), Bytes::new())
         .await;
     assert_static_error(failure, "eth_simulateV1 execution rejected");
     let requests = server
@@ -886,7 +922,7 @@ async fn malformed_flat_response_is_terminal() -> anyhow::Result<()> {
     let executor = rpc_executor(&server).await?;
 
     let failure = executor
-        .simulate_legacy_paid_transaction(Address::from_low_u64_be(33), Bytes::new())
+        .simulate_legacy_paid_transaction(Address::with_last_byte(33), Bytes::new())
         .await;
     assert_static_error(
         failure,
@@ -911,7 +947,7 @@ async fn malformed_flat_log_is_terminal() -> anyhow::Result<()> {
                 "status": "0x1",
                 "gasUsed": "0x5208",
                 "logs": [{
-                    "address": format!("{:#x}", Address::from_low_u64_be(34)),
+                    "address": format!("{:#x}", Address::with_last_byte(34)),
                     "topics": [],
                     "private-payload": "provider-sentinel",
                 }],
@@ -923,7 +959,7 @@ async fn malformed_flat_log_is_terminal() -> anyhow::Result<()> {
     let executor = rpc_executor(&server).await?;
 
     let failure = executor
-        .simulate_legacy_paid_transaction(Address::from_low_u64_be(35), Bytes::new())
+        .simulate_legacy_paid_transaction(Address::with_last_byte(35), Bytes::new())
         .await;
     assert_static_error(failure, "eth_simulateV1 evidence malformed: log.data");
     let requests = server
@@ -947,7 +983,7 @@ async fn non_method_not_found_rpc_rejection_is_terminal() -> anyhow::Result<()> 
     let executor = rpc_executor(&server).await?;
 
     let failure = executor
-        .simulate_legacy_paid_transaction(Address::from_low_u64_be(36), Bytes::new())
+        .simulate_legacy_paid_transaction(Address::with_last_byte(36), Bytes::new())
         .await;
     assert_static_error(failure, "eth_simulateV1 execution rejected");
     let requests = server
@@ -974,7 +1010,7 @@ async fn response_decode_failure_is_terminal_and_static() -> anyhow::Result<()> 
     let executor = rpc_executor(&server).await?;
 
     let failure = executor
-        .simulate_legacy_paid_transaction(Address::from_low_u64_be(37), Bytes::new())
+        .simulate_legacy_paid_transaction(Address::with_last_byte(37), Bytes::new())
         .await;
     assert_static_error(failure, "eth_simulateV1 RPC response decode failure");
     let requests = server
@@ -1003,7 +1039,7 @@ async fn transport_failure_is_terminal_and_static() -> anyhow::Result<()> {
     let executor = rpc_executor(&server).await?;
 
     let failure = executor
-        .simulate_legacy_paid_transaction(Address::from_low_u64_be(38), Bytes::new())
+        .simulate_legacy_paid_transaction(Address::with_last_byte(38), Bytes::new())
         .await;
     assert_static_error(failure, "eth_simulateV1 RPC transport failure");
     let requests = server
@@ -1026,12 +1062,12 @@ async fn receipt_rejection_after_snapshot_is_terminal() -> anyhow::Result<()> {
         .await;
     mount_snapshot(&server).await;
     let executor = rpc_executor(&server).await?;
-    let target = Address::from_low_u64_be(41);
-    let transaction_hash = H256::from_low_u64_be(42);
+    let target = Address::with_last_byte(41);
+    let transaction_hash = B256::with_last_byte(42);
     mount_receipt_transaction(
         &server,
         transaction_hash,
-        receipt_json(transaction_hash, executor.address(), target, U64::zero()),
+        receipt_json(transaction_hash, executor.address(), target, 0),
     )
     .await;
     Mock::given(method("POST"))
@@ -1066,12 +1102,12 @@ async fn diagnostic_receipt_rejection_after_snapshot_is_terminal() -> anyhow::Re
         .await;
     mount_snapshot(&server).await;
     let executor = rpc_executor(&server).await?;
-    let target = Address::from_low_u64_be(48);
-    let transaction_hash = H256::from_low_u64_be(49);
+    let target = Address::with_last_byte(48);
+    let transaction_hash = B256::with_last_byte(49);
     mount_receipt_transaction(
         &server,
         transaction_hash,
-        receipt_json(transaction_hash, executor.address(), target, U64::zero()),
+        receipt_json(transaction_hash, executor.address(), target, 0),
     )
     .await;
     Mock::given(method("POST"))
@@ -1106,12 +1142,12 @@ async fn restoration_rpc_error_overrides_valid_receipt() -> anyhow::Result<()> {
         .await;
     mount_snapshot(&server).await;
     let executor = rpc_executor(&server).await?;
-    let target = Address::from_low_u64_be(43);
-    let transaction_hash = H256::from_low_u64_be(44);
+    let target = Address::with_last_byte(43);
+    let transaction_hash = B256::with_last_byte(44);
     mount_receipt_transaction(
         &server,
         transaction_hash,
-        receipt_json(transaction_hash, executor.address(), target, U64::one()),
+        receipt_json(transaction_hash, executor.address(), target, 1),
     )
     .await;
     Mock::given(method("POST"))
@@ -1146,12 +1182,12 @@ async fn restoration_false_overrides_valid_receipt() -> anyhow::Result<()> {
         .await;
     mount_snapshot(&server).await;
     let executor = rpc_executor(&server).await?;
-    let target = Address::from_low_u64_be(45);
-    let transaction_hash = H256::from_low_u64_be(46);
+    let target = Address::with_last_byte(45);
+    let transaction_hash = B256::with_last_byte(46);
     mount_receipt_transaction(
         &server,
         transaction_hash,
-        receipt_json(transaction_hash, executor.address(), target, U64::one()),
+        receipt_json(transaction_hash, executor.address(), target, 1),
     )
     .await;
     Mock::given(method("POST"))
@@ -1186,7 +1222,7 @@ async fn unsupported_send_after_snapshot_is_terminal() -> anyhow::Result<()> {
         .await;
     mount_snapshot(&server).await;
     let executor = rpc_executor(&server).await?;
-    let target = Address::from_low_u64_be(47);
+    let target = Address::with_last_byte(47);
     for (rpc_method, response) in [
         ("eth_getTransactionCount", json!("0x0")),
         ("eth_gasPrice", json!("0x1")),

@@ -10,10 +10,14 @@
 //!
 //! Cluster API on `:9000`, per-node admin on `:9090+`.
 
+use alloy::network::{EthereumWallet, TransactionBuilder};
+use alloy::primitives::{Address, U256};
+use alloy::providers::{DynProvider, Provider, ProviderBuilder};
+use alloy::rpc::types::TransactionRequest;
+use alloy::signers::local::PrivateKeySigner;
+use alloy_node_bindings::Anvil;
 use anyhow::Result;
 use clap::Parser;
-use ethers::prelude::*;
-use ethers::utils::Anvil;
 use libp2p::multiaddr::Protocol;
 use parking_lot::RwLock;
 use rand::rngs::OsRng;
@@ -40,7 +44,10 @@ use nox_node::{NodeRole, NoxConfig, NoxNode, SledRepository, TokioEventBus};
 
 use nox_node::blockchain::observer::ChainObserver;
 
-use nox_test_infra::contracts::{MockERC20, NoxRegistry};
+use nox_test_infra::contracts::{MockERC20, NoxRegistry, NoxRewardPool};
+
+type Registry = NoxRegistry::NoxRegistryInstance<DynProvider>;
+type StakeToken = MockERC20::MockERC20Instance<DynProvider>;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -128,7 +135,7 @@ struct NodeIdentity {
     id: usize,
     secret_key: X25519SecretKey,
     public_key: X25519PublicKey,
-    eth_wallet: LocalWallet,
+    eth_wallet: PrivateKeySigner,
     layer: u8,
     role: u8,
     p2p_port: u16,
@@ -151,47 +158,38 @@ fn assign_layer(idx: usize, total: usize, entry_ratio: f64, exit_ratio: f64) -> 
 
 async fn deploy_lightweight_contracts(
     anvil_rpc: &str,
-) -> Result<(
-    Arc<SignerMiddleware<Provider<Http>, LocalWallet>>,
-    DeployedAddresses,
-    NoxRegistry<SignerMiddleware<Provider<Http>, LocalWallet>>,
-    MockERC20<SignerMiddleware<Provider<Http>, LocalWallet>>,
-)> {
+) -> Result<(DynProvider, DeployedAddresses, Registry, StakeToken)> {
     info!("Phase 1: Deploying lightweight contracts...");
 
-    let provider = nox_node::blockchain::executor::build_ethers_http1_provider(anvil_rpc)?
-        .interval(Duration::from_millis(100));
-    let chain_id = provider.get_chainid().await?.as_u64();
-
     // Use Anvil's first default account as admin
-    let admin_wallet: LocalWallet =
-        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-            .parse::<LocalWallet>()?
-            .with_chain_id(chain_id);
+    let admin_wallet: PrivateKeySigner =
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".parse()?;
     let admin_address = admin_wallet.address();
 
-    let client = Arc::new(SignerMiddleware::new(provider, admin_wallet));
+    let rpc = nox_core::chain_rpc::http1_rpc_client(anvil_rpc)?
+        .with_poll_interval(Duration::from_millis(100));
+    let client = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(admin_wallet))
+        .connect_client(rpc)
+        .erased();
 
     // 1. Deploy MockERC20 (staking token)
     info!("  [1/3] Deploying MockERC20 (staking token)...");
     let token = MockERC20::deploy(
         client.clone(),
-        ("NOX Stake Token".to_string(), "sNOX".to_string(), 18u8),
+        "NOX Stake Token".to_string(),
+        "sNOX".to_string(),
+        18u8,
     )
-    .map_err(|e| anyhow::anyhow!("MockERC20 deploy error: {e}"))?
-    .send()
     .await
-    .map_err(|e| anyhow::anyhow!("MockERC20 send error: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("MockERC20 deploy error: {e}"))?;
     info!("         MockERC20 at: {:?}", token.address());
 
     // 2. Deploy NoxRewardPool
     info!("  [2/3] Deploying NoxRewardPool...");
-    let reward_pool =
-        nox_test_infra::contracts::NoxRewardPool::deploy(client.clone(), admin_address)
-            .map_err(|e| anyhow::anyhow!("NoxRewardPool deploy error: {e}"))?
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("NoxRewardPool send error: {e}"))?;
+    let reward_pool = NoxRewardPool::deploy(client.clone(), admin_address)
+        .await
+        .map_err(|e| anyhow::anyhow!("NoxRewardPool deploy error: {e}"))?;
     info!("         NoxRewardPool at: {:?}", reward_pool.address());
 
     // 3. Deploy NoxRegistry
@@ -201,25 +199,24 @@ async fn deploy_lightweight_contracts(
     // unstakeDelay = 86400 (1 day minimum enforced by contract)
     let registry = NoxRegistry::deploy(
         client.clone(),
-        (
-            admin_address,
-            token.address(),
-            U256::zero(),      // minStake = 0 for sim
-            U256::from(86400), // unstakeDelay = 1 day (contract minimum)
-        ),
+        admin_address,
+        *token.address(),
+        U256::ZERO,        // minStake = 0 for sim
+        U256::from(86400), // unstakeDelay = 1 day (contract minimum)
     )
-    .map_err(|e| anyhow::anyhow!("NoxRegistry deploy error: {e}"))?
-    .send()
     .await
-    .map_err(|e| anyhow::anyhow!("NoxRegistry send error: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("NoxRegistry deploy error: {e}"))?;
     info!("         NoxRegistry at: {:?}", registry.address());
 
     // Enable token in reward pool
     reward_pool
-        .set_asset_status(token.address(), true)
+        .setAssetStatus(*token.address(), true)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("set_asset_status error: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("set_asset_status error: {e}"))?
+        .watch()
+        .await
+        .map_err(|e| anyhow::anyhow!("set_asset_status receipt error: {e}"))?;
 
     let addresses = DeployedAddresses {
         nox_registry: format!("{:?}", registry.address()),
@@ -233,10 +230,7 @@ async fn deploy_lightweight_contracts(
     Ok((client, addresses, registry, token))
 }
 
-async fn register_nodes_on_chain(
-    registry: &NoxRegistry<SignerMiddleware<Provider<Http>, LocalWallet>>,
-    nodes: &[DashboardNode],
-) -> Result<()> {
+async fn register_nodes_on_chain(registry: &Registry, nodes: &[DashboardNode]) -> Result<()> {
     info!(
         "Phase 3: Admin agent registering {} nodes on-chain...",
         nodes.len()
@@ -250,7 +244,12 @@ async fn register_nodes_on_chain(
         let url = node.multiaddr.clone();
 
         registry
-            .register_privileged(node.wallet_address, sphinx_key_bytes, url, on_chain_role)
+            .registerPrivileged(
+                node.wallet_address,
+                sphinx_key_bytes.into(),
+                url,
+                on_chain_role,
+            )
             .send()
             .await
             .map_err(|e| {
@@ -259,7 +258,10 @@ async fn register_nodes_on_chain(
                     node.id,
                     node.wallet_address
                 )
-            })?;
+            })?
+            .watch()
+            .await
+            .map_err(|e| anyhow::anyhow!("Registration of node {} not mined: {e}", node.id))?;
 
         let layer_name = match node.layer {
             0 => "Entry",
@@ -274,12 +276,12 @@ async fn register_nodes_on_chain(
 
     // Verify on-chain count
     let count: U256 = registry
-        .relayer_count()
+        .relayerCount()
         .call()
         .await
         .map_err(|e| anyhow::anyhow!("relayer_count call failed: {e}"))?;
-    let fingerprint: [u8; 32] = registry
-        .topology_fingerprint()
+    let fingerprint = registry
+        .topologyFingerprint()
         .call()
         .await
         .map_err(|e| anyhow::anyhow!("topology_fingerprint call failed: {e}"))?;
@@ -327,7 +329,7 @@ async fn spawn_dashboard_node(
             .unwrap_or_default()
             .into();
         c.routing_private_key = hex::encode(ident.secret_key.to_bytes());
-        c.eth_wallet_private_key = hex::encode(ident.eth_wallet.signer().to_bytes());
+        c.eth_wallet_private_key = hex::encode(ident.eth_wallet.to_bytes());
         c.min_pow_difficulty = pow_difficulty;
         c.min_gas_balance = "0".into();
         c.metrics_port = ident.admin_port;
@@ -902,7 +904,7 @@ fn create_wired_client(
 }
 
 fn spawn_churn_agent(
-    registry: NoxRegistry<SignerMiddleware<Provider<Http>, LocalWallet>>,
+    registry: Registry,
     identities_info: Vec<(usize, Address, [u8; 32], u8, u16)>,
     interval_secs: u64,
 ) {
@@ -924,7 +926,7 @@ fn spawn_churn_agent(
 
                 let url = format!("/ip4/127.0.0.1/tcp/{p2p_port}");
                 match registry
-                    .register_privileged(*addr, *sphinx_key, url, *role)
+                    .registerPrivileged(*addr, (*sphinx_key).into(), url, *role)
                     .send()
                     .await
                 {
@@ -950,7 +952,7 @@ fn spawn_churn_agent(
                 let node_idx = active[pick];
                 let (_, addr, ..) = &identities_info[node_idx];
 
-                match registry.force_unregister(*addr).send().await {
+                match registry.forceUnregister(*addr).send().await {
                     Ok(_) => {
                         deregistered.push(node_idx);
                         info!(
@@ -1020,8 +1022,7 @@ async fn main() -> Result<()> {
         let rng = OsRng;
         let sk = X25519SecretKey::random_from_rng(rng);
         let pk = X25519PublicKey::from(&sk);
-        let eth_wallet =
-            LocalWallet::new(&mut rand::thread_rng()).with_chain_id(client.signer().chain_id());
+        let eth_wallet = PrivateKeySigner::random();
         let layer = assign_layer(i, node_count, args.entry_ratio, args.exit_ratio);
         let role = if layer == 2 { 2u8 } else { 1u8 };
 
@@ -1048,13 +1049,14 @@ async fn main() -> Result<()> {
     // Second pass: fund all wallets (fire TXs sequentially -- Anvil instant mines each)
     info!("Funding {} node wallets...", identities.len());
     for ident in &identities {
-        let fund_tx = ethers::types::TransactionRequest::new()
-            .to(ident.eth_wallet.address())
-            .value(ethers::utils::parse_ether("10").unwrap_or_default());
+        let fund_tx = TransactionRequest::default()
+            .with_to(ident.eth_wallet.address())
+            .with_value(U256::from(10_000_000_000_000_000_000_u128));
         client
-            .send_transaction(fund_tx, None)
+            .send_transaction(fund_tx)
             .await
             .map_err(|e| anyhow::anyhow!("Fund node-{} error: {e}", ident.id))?
+            .get_receipt()
             .await
             .map_err(|e| anyhow::anyhow!("Fund node-{} receipt error: {e}", ident.id))?;
     }
@@ -1144,10 +1146,10 @@ async fn main() -> Result<()> {
             "Switching Anvil to {}s block time for realistic chain behavior...",
             args.block_time
         );
-        let provider = nox_node::blockchain::executor::build_ethers_http1_provider(&anvil_rpc)?;
+        let provider = nox_node::blockchain::executor::build_http1_provider(&anvil_rpc)?;
         // evm_setIntervalMining(interval_seconds) -- Anvil-specific RPC
         let _: bool = provider
-            .request("evm_setIntervalMining", [args.block_time])
+            .raw_request("evm_setIntervalMining".into(), [args.block_time])
             .await
             .unwrap_or(false);
     }

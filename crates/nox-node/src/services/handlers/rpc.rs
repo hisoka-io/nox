@@ -2,7 +2,7 @@
 //! Default provider path enforces a read-only method whitelist; user-supplied URLs allow any method.
 
 use crate::blockchain::executor::{
-    build_ethers_http1_provider, build_pinned_ethers_http1_provider, public_rpc_error,
+    build_http1_provider, build_pinned_http1_provider, legacy_call_object, public_rpc_error,
     ChainExecutor,
 };
 use crate::services::response_packer::{PackResult, ResponsePacker};
@@ -19,11 +19,15 @@ use nox_crypto::sphinx::surb::Surb;
 
 /// Max size for deserializing inner payloads from `AnonymousRequest` (7 MB).
 const MAX_INNER_PAYLOAD_SIZE: u64 = 7 * 1024 * 1024;
+use alloy::primitives::{Bytes, B256, U256, U64};
+use alloy::providers::Provider;
+use alloy::rpc::json_rpc::{RpcRecv, RpcSend};
 use async_trait::async_trait;
-use ethers::prelude::*;
-use ethers::types::transaction::eip2718::TypedTransaction;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
+use nox_core::chain_rpc::ChainProvider;
+use nox_core::eth::{block_quantity, logs_filter, parse_address, parse_fixed_hex, TopicFilter};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -43,7 +47,7 @@ pub struct RpcHandler {
     response_packer: Arc<ResponsePacker>,
     publisher: Arc<dyn IEventPublisher>,
     allowed_methods: HashSet<String>,
-    provider: Provider<Http>,
+    provider: ChainProvider,
     rate_limiter: Arc<RpcRateLimiter>,
     metrics: MetricsService,
     allow_private_ips: bool,
@@ -57,7 +61,7 @@ impl RpcHandler {
         rpc_url: &str,
         metrics: MetricsService,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let provider = build_ethers_http1_provider(rpc_url)?;
+        let provider = build_http1_provider(rpc_url)?;
 
         let allowed_methods: HashSet<String> = [
             // Account & state queries
@@ -127,7 +131,7 @@ impl RpcHandler {
         allowed_methods: HashSet<String>,
         metrics: MetricsService,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let provider = build_ethers_http1_provider(rpc_url)?;
+        let provider = build_http1_provider(rpc_url)?;
 
         let quota = Quota::per_second(NonZeroU32::new(100).unwrap_or(NonZeroU32::MIN));
         let rate_limiter = Arc::new(RateLimiter::direct(quota));
@@ -151,7 +155,7 @@ impl RpcHandler {
         rpc_url: &str,
         metrics: MetricsService,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let provider = build_ethers_http1_provider(rpc_url)?;
+        let provider = build_http1_provider(rpc_url)?;
 
         let allowed_methods: HashSet<String> = [
             "eth_call",
@@ -274,8 +278,8 @@ impl RpcHandler {
 
             // Pinned to the validated address with redirects disabled, so neither
             // DNS rebinding nor an upstream redirect can reach another host.
-            let user_provider = build_pinned_ethers_http1_provider(&validated_url, resolved_ip)
-                .map_err(|e| {
+            let user_provider =
+                build_pinned_http1_provider(&validated_url, resolved_ip).map_err(|e| {
                     ServiceError::ProcessingFailed(format!(
                         "Failed to create provider for user-supplied RPC URL: {e}"
                     ))
@@ -345,14 +349,30 @@ impl RpcHandler {
     }
 
     async fn execute_rpc_generic(
-        provider: &Provider<Http>,
+        provider: &ChainProvider,
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         provider
-            .request::<serde_json::Value, serde_json::Value>(method, params)
+            .raw_request::<serde_json::Value, serde_json::Value>(
+                Cow::Owned(method.to_string()),
+                params,
+            )
             .await
             .map_err(|e| format!("RPC call failed: {}", public_rpc_error(&e)))
+    }
+
+    /// Sends `method` to the default provider; errors carry the public text of
+    /// an upstream JSON-RPC error.
+    async fn upstream<P: RpcSend, R: RpcRecv>(
+        &self,
+        method: &'static str,
+        params: P,
+    ) -> Result<R, String> {
+        self.provider
+            .raw_request(Cow::Borrowed(method), params)
+            .await
+            .map_err(|e| format!("{method} failed: {}", public_rpc_error(&e)))
     }
 
     async fn execute_rpc(
@@ -395,10 +415,7 @@ impl RpcHandler {
         }
 
         let tx_obj = &params[0];
-        let to = tx_obj["to"]
-            .as_str()
-            .ok_or("Missing 'to' field")?
-            .parse::<Address>()
+        let to = parse_address(tx_obj["to"].as_str().ok_or("Missing 'to' field")?)
             .map_err(|e| format!("Invalid 'to' address: {e}"))?;
 
         let data = match tx_obj["data"].as_str() {
@@ -409,13 +426,8 @@ impl RpcHandler {
             None => vec![],
         };
 
-        let tx = TransactionRequest::new().to(to).data(Bytes::from(data));
-
-        let result = self
-            .provider
-            .call(&TypedTransaction::Legacy(tx), None)
-            .await
-            .map_err(|e| format!("eth_call failed: {}", public_rpc_error(&e)))?;
+        let call = legacy_call_object(None, Some(to), Some(&data), None);
+        let result: Bytes = self.upstream("eth_call", (call, "latest")).await?;
 
         Ok(serde_json::Value::String(format!(
             "0x{}",
@@ -431,17 +443,14 @@ impl RpcHandler {
             return Err("eth_getBalance requires at least 1 parameter".into());
         }
 
-        let address = params[0]
-            .as_str()
-            .ok_or("First param must be address string")?
-            .parse::<Address>()
-            .map_err(|e| format!("Invalid address: {e}"))?;
+        let address = parse_address(
+            params[0]
+                .as_str()
+                .ok_or("First param must be address string")?,
+        )
+        .map_err(|e| format!("Invalid address: {e}"))?;
 
-        let balance = self
-            .provider
-            .get_balance(address, None)
-            .await
-            .map_err(|e| format!("eth_getBalance failed: {}", public_rpc_error(&e)))?;
+        let balance: U256 = self.upstream("eth_getBalance", (address, "latest")).await?;
 
         Ok(serde_json::Value::String(format!("0x{balance:x}")))
     }
@@ -455,41 +464,35 @@ impl RpcHandler {
         }
 
         let tx_obj = &params[0];
-        let mut tx = TransactionRequest::new();
+        let to = tx_obj["to"]
+            .as_str()
+            .map(|to| parse_address(to).map_err(|e| format!("Invalid 'to': {e}")))
+            .transpose()?;
+        let data = tx_obj["data"]
+            .as_str()
+            .map(|data| {
+                hex::decode(data.trim_start_matches("0x"))
+                    .map_err(|e| format!("Invalid calldata hex: {e}"))
+            })
+            .transpose()?;
+        let value = tx_obj["value"]
+            .as_str()
+            .map(|value| {
+                U256::from_str_radix(value.trim_start_matches("0x"), 16)
+                    .map_err(|e| format!("Invalid 'value': {e}"))
+            })
+            .transpose()?;
 
-        if let Some(to) = tx_obj["to"].as_str() {
-            tx = tx.to(to
-                .parse::<Address>()
-                .map_err(|e| format!("Invalid 'to': {e}"))?);
-        }
-        if let Some(data) = tx_obj["data"].as_str() {
-            let data_bytes = hex::decode(data.trim_start_matches("0x"))
-                .map_err(|e| format!("Invalid calldata hex: {e}"))?;
-            tx = tx.data(Bytes::from(data_bytes));
-        }
-        if let Some(value) = tx_obj["value"].as_str() {
-            let value_u256 = U256::from_str_radix(value.trim_start_matches("0x"), 16)
-                .map_err(|e| format!("Invalid 'value': {e}"))?;
-            tx = tx.value(value_u256);
-        }
-
-        let gas = self
-            .provider
-            .estimate_gas(&TypedTransaction::Legacy(tx), None)
-            .await
-            .map_err(|e| format!("eth_estimateGas failed: {}", public_rpc_error(&e)))?;
+        let call = legacy_call_object(None, to, data.as_deref(), value);
+        let gas: U256 = self.upstream("eth_estimateGas", (call,)).await?;
 
         Ok(serde_json::Value::String(format!("0x{gas:x}")))
     }
 
     async fn handle_eth_block_number(&self) -> Result<serde_json::Value, String> {
-        let block = self
-            .provider
-            .get_block_number()
-            .await
-            .map_err(|e| format!("eth_blockNumber failed: {}", public_rpc_error(&e)))?;
+        let block: U64 = self.upstream("eth_blockNumber", ()).await?;
 
-        Ok(serde_json::Value::String(format!("0x{:x}", block.as_u64())))
+        Ok(serde_json::Value::String(format!("0x{block:x}")))
     }
 
     async fn handle_eth_get_transaction_receipt(
@@ -500,22 +503,17 @@ impl RpcHandler {
             return Err("eth_getTransactionReceipt requires 1 parameter".into());
         }
 
-        let tx_hash = params[0]
-            .as_str()
-            .ok_or("First param must be tx hash string")?
-            .parse::<H256>()
-            .map_err(|e| format!("Invalid tx hash: {e}"))?;
+        let tx_hash = hash_param(
+            params[0]
+                .as_str()
+                .ok_or("First param must be tx hash string")?,
+        )
+        .map_err(|e| format!("Invalid tx hash: {e}"))?;
 
-        let receipt = self
-            .provider
-            .get_transaction_receipt(tx_hash)
-            .await
-            .map_err(|e| format!("eth_getTransactionReceipt failed: {}", public_rpc_error(&e)))?;
-
-        match receipt {
-            Some(r) => serde_json::to_value(r).map_err(|e| format!("Serialization failed: {e}")),
-            None => Ok(serde_json::Value::Null),
-        }
+        let receipt: serde_json::Value = self
+            .upstream("eth_getTransactionReceipt", (tx_hash,))
+            .await?;
+        object_or_null("eth_getTransactionReceipt", receipt)
     }
 
     async fn handle_eth_get_transaction_by_hash(
@@ -526,42 +524,27 @@ impl RpcHandler {
             return Err("eth_getTransactionByHash requires 1 parameter".into());
         }
 
-        let tx_hash = params[0]
-            .as_str()
-            .ok_or("First param must be tx hash string")?
-            .parse::<H256>()
-            .map_err(|e| format!("Invalid tx hash: {e}"))?;
+        let tx_hash = hash_param(
+            params[0]
+                .as_str()
+                .ok_or("First param must be tx hash string")?,
+        )
+        .map_err(|e| format!("Invalid tx hash: {e}"))?;
 
-        let tx =
-            self.provider.get_transaction(tx_hash).await.map_err(|e| {
-                format!("eth_getTransactionByHash failed: {}", public_rpc_error(&e))
-            })?;
-
-        match tx {
-            Some(t) => serde_json::to_value(t).map_err(|e| format!("Serialization failed: {e}")),
-            None => Ok(serde_json::Value::Null),
-        }
+        let transaction: serde_json::Value = self
+            .upstream("eth_getTransactionByHash", (tx_hash,))
+            .await?;
+        object_or_null("eth_getTransactionByHash", transaction)
     }
 
     async fn handle_eth_chain_id(&self) -> Result<serde_json::Value, String> {
-        let chain_id = self
-            .provider
-            .get_chainid()
-            .await
-            .map_err(|e| format!("eth_chainId failed: {}", public_rpc_error(&e)))?;
+        let chain_id: U256 = self.upstream("eth_chainId", ()).await?;
 
-        Ok(serde_json::Value::String(format!(
-            "0x{:x}",
-            chain_id.as_u64()
-        )))
+        Ok(serde_json::Value::String(format!("0x{chain_id:x}")))
     }
 
     async fn handle_eth_gas_price(&self) -> Result<serde_json::Value, String> {
-        let gas_price = self
-            .provider
-            .get_gas_price()
-            .await
-            .map_err(|e| format!("eth_gasPrice failed: {}", public_rpc_error(&e)))?;
+        let gas_price: U256 = self.upstream("eth_gasPrice", ()).await?;
 
         Ok(serde_json::Value::String(format!("0x{gas_price:x}")))
     }
@@ -575,22 +558,18 @@ impl RpcHandler {
         }
 
         let filter_obj = &params[0];
-        let mut filter = Filter::new();
+        let mut addresses = Vec::new();
+        let mut from_block = None;
+        let mut to_block = None;
 
         if let Some(address) = filter_obj["address"].as_str() {
-            filter = filter.address(
-                address
-                    .parse::<Address>()
-                    .map_err(|e| format!("Invalid address: {e}"))?,
-            );
+            addresses.push(parse_address(address).map_err(|e| format!("Invalid address: {e}"))?);
         }
-        if let Some(from_block) = filter_obj["fromBlock"].as_str() {
-            let block = parse_block_number(from_block)?;
-            filter = filter.from_block(block);
+        if let Some(block) = filter_obj["fromBlock"].as_str() {
+            from_block = Some(parse_block_number(block)?);
         }
-        if let Some(to_block) = filter_obj["toBlock"].as_str() {
-            let block = parse_block_number(to_block)?;
-            filter = filter.to_block(block);
+        if let Some(block) = filter_obj["toBlock"].as_str() {
+            to_block = Some(parse_block_number(block)?);
         }
         // Block range validation (Audit #166): prevent unbounded log queries.
         // Both fromBlock and toBlock MUST be numeric hex when provided.
@@ -624,32 +603,31 @@ impl RpcHandler {
             }
         }
 
-        if let Some(topics) = filter_obj["topics"].as_array() {
-            for (i, topic) in topics.iter().enumerate() {
+        let mut topics: [Option<TopicFilter>; 4] = [None, None, None, None];
+        if let Some(requested) = filter_obj["topics"].as_array() {
+            for (slot, topic) in topics.iter_mut().zip(requested) {
                 if let Some(t) = topic.as_str() {
                     if !t.is_empty() {
-                        let topic_hash = t
-                            .parse::<H256>()
-                            .map_err(|e| format!("Invalid topic: {e}"))?;
-                        filter = match i {
-                            0 => filter.topic0(topic_hash),
-                            1 => filter.topic1(topic_hash),
-                            2 => filter.topic2(topic_hash),
-                            3 => filter.topic3(topic_hash),
-                            _ => filter,
-                        };
+                        let topic_hash =
+                            parse_fixed_hex::<32>(t).map_err(|e| format!("Invalid topic: {e}"))?;
+                        *slot = Some(TopicFilter::One(topic_hash));
                     }
                 }
             }
         }
 
-        let logs = self
-            .provider
-            .get_logs(&filter)
-            .await
-            .map_err(|e| format!("eth_getLogs failed: {}", public_rpc_error(&e)))?;
-
-        serde_json::to_value(logs).map_err(|e| format!("Serialization failed: {e}"))
+        let filter = logs_filter(
+            from_block.as_deref(),
+            to_block.as_deref(),
+            &addresses,
+            &topics,
+        );
+        let logs: serde_json::Value = self.upstream("eth_getLogs", (filter,)).await?;
+        if logs.is_array() {
+            Ok(logs)
+        } else {
+            Err(format!("eth_getLogs failed: {UPSTREAM_SHAPE_ERROR}"))
+        }
     }
 
     async fn handle_eth_get_code(
@@ -660,17 +638,14 @@ impl RpcHandler {
             return Err("eth_getCode requires at least 1 parameter".into());
         }
 
-        let address = params[0]
-            .as_str()
-            .ok_or("First param must be address string")?
-            .parse::<Address>()
-            .map_err(|e| format!("Invalid address: {e}"))?;
+        let address = parse_address(
+            params[0]
+                .as_str()
+                .ok_or("First param must be address string")?,
+        )
+        .map_err(|e| format!("Invalid address: {e}"))?;
 
-        let code = self
-            .provider
-            .get_code(address, None)
-            .await
-            .map_err(|e| format!("eth_getCode failed: {}", public_rpc_error(&e)))?;
+        let code: Bytes = self.upstream("eth_getCode", (address, "latest")).await?;
 
         Ok(serde_json::Value::String(format!(
             "0x{}",
@@ -686,27 +661,30 @@ impl RpcHandler {
             return Err("eth_getStorageAt requires at least 2 parameters".into());
         }
 
-        let address = params[0]
-            .as_str()
-            .ok_or("First param must be address string")?
-            .parse::<Address>()
-            .map_err(|e| format!("Invalid address: {e}"))?;
+        let address = parse_address(
+            params[0]
+                .as_str()
+                .ok_or("First param must be address string")?,
+        )
+        .map_err(|e| format!("Invalid address: {e}"))?;
 
-        let slot = params[1]
-            .as_str()
-            .ok_or("Second param must be slot string")?
-            .parse::<H256>()
-            .map_err(|e| format!("Invalid slot: {e}"))?;
+        let slot = parse_fixed_hex::<32>(
+            params[1]
+                .as_str()
+                .ok_or("Second param must be slot string")?,
+        )
+        .map_err(|e| format!("Invalid slot: {e}"))?;
 
-        let value = self
-            .provider
-            .get_storage_at(address, slot, None)
-            .await
-            .map_err(|e| format!("eth_getStorageAt failed: {}", public_rpc_error(&e)))?;
+        let value: B256 = self
+            .upstream(
+                "eth_getStorageAt",
+                (address, U256::from_be_bytes(slot.0), "latest"),
+            )
+            .await?;
 
         Ok(serde_json::Value::String(format!(
             "0x{}",
-            hex::encode(value.as_bytes())
+            hex::encode(value.as_slice())
         )))
     }
 
@@ -718,17 +696,16 @@ impl RpcHandler {
             return Err("eth_getTransactionCount requires at least 1 parameter".into());
         }
 
-        let address = params[0]
-            .as_str()
-            .ok_or("First param must be address string")?
-            .parse::<Address>()
-            .map_err(|e| format!("Invalid address: {e}"))?;
+        let address = parse_address(
+            params[0]
+                .as_str()
+                .ok_or("First param must be address string")?,
+        )
+        .map_err(|e| format!("Invalid address: {e}"))?;
 
-        let count = self
-            .provider
-            .get_transaction_count(address, None)
-            .await
-            .map_err(|e| format!("eth_getTransactionCount failed: {}", public_rpc_error(&e)))?;
+        let count: U256 = self
+            .upstream("eth_getTransactionCount", (address, "latest"))
+            .await?;
 
         Ok(serde_json::Value::String(format!("0x{count:x}")))
     }
@@ -751,21 +728,10 @@ impl RpcHandler {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        let block = if full_txs {
-            self.provider
-                .get_block_with_txs(block_id)
-                .await
-                .map_err(|e| format!("eth_getBlockByNumber failed: {}", public_rpc_error(&e)))?
-                .and_then(|b| serde_json::to_value(b).ok())
-        } else {
-            self.provider
-                .get_block(block_id)
-                .await
-                .map_err(|e| format!("eth_getBlockByNumber failed: {}", public_rpc_error(&e)))?
-                .and_then(|b| serde_json::to_value(b).ok())
-        };
-
-        Ok(block.unwrap_or(serde_json::Value::Null))
+        let block: serde_json::Value = self
+            .upstream("eth_getBlockByNumber", (block_id, full_txs))
+            .await?;
+        object_or_null("eth_getBlockByNumber", block)
     }
 
     async fn handle_eth_get_block_by_hash(
@@ -776,32 +742,22 @@ impl RpcHandler {
             return Err("eth_getBlockByHash requires at least 1 parameter".into());
         }
 
-        let block_hash = params[0]
-            .as_str()
-            .ok_or("First param must be block hash string")?
-            .parse::<H256>()
-            .map_err(|e| format!("Invalid block hash: {e}"))?;
+        let block_hash = hash_param(
+            params[0]
+                .as_str()
+                .ok_or("First param must be block hash string")?,
+        )
+        .map_err(|e| format!("Invalid block hash: {e}"))?;
 
         let full_txs = params
             .get(1)
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        let block = if full_txs {
-            self.provider
-                .get_block_with_txs(block_hash)
-                .await
-                .map_err(|e| format!("eth_getBlockByHash failed: {}", public_rpc_error(&e)))?
-                .and_then(|b| serde_json::to_value(b).ok())
-        } else {
-            self.provider
-                .get_block(block_hash)
-                .await
-                .map_err(|e| format!("eth_getBlockByHash failed: {}", public_rpc_error(&e)))?
-                .and_then(|b| serde_json::to_value(b).ok())
-        };
-
-        Ok(block.unwrap_or(serde_json::Value::Null))
+        let block: serde_json::Value = self
+            .upstream("eth_getBlockByHash", (block_hash, full_txs))
+            .await?;
+        object_or_null("eth_getBlockByHash", block)
     }
 
     async fn handle_eth_send_raw_transaction(
@@ -816,19 +772,18 @@ impl RpcHandler {
             .as_str()
             .ok_or("First param must be signed transaction hex string")?;
 
-        let tx_bytes: Bytes = raw_tx
-            .parse()
+        let tx_bytes = hex::decode(raw_tx.strip_prefix("0x").unwrap_or(raw_tx))
             .map_err(|e| format!("Invalid hex for raw transaction: {e}"))?;
 
-        let pending_tx = self
-            .provider
-            .send_raw_transaction(tx_bytes)
-            .await
-            .map_err(|e| format!("eth_sendRawTransaction failed: {}", public_rpc_error(&e)))?;
+        let tx_hash: B256 = self
+            .upstream(
+                "eth_sendRawTransaction",
+                (format!("0x{}", hex::encode(&tx_bytes)),),
+            )
+            .await?;
 
         // Return the tx hash
-        serde_json::to_value(pending_tx.tx_hash())
-            .map_err(|e| format!("Failed to serialize tx hash: {e}"))
+        serde_json::to_value(tx_hash).map_err(|e| format!("Failed to serialize tx hash: {e}"))
     }
 
     // Helper methods
@@ -845,19 +800,32 @@ impl RpcHandler {
     }
 }
 
-// Helper function to parse block number strings
-fn parse_block_number(s: &str) -> Result<BlockNumber, String> {
+/// Text returned when an upstream answer does not have the expected JSON shape.
+const UPSTREAM_SHAPE_ERROR: &str = "upstream RPC request failed";
+
+/// Block parameter: a tag, or a hex number re-encoded without leading zeros.
+fn parse_block_number(s: &str) -> Result<String, String> {
     match s {
-        "latest" => Ok(BlockNumber::Latest),
-        "pending" => Ok(BlockNumber::Pending),
-        "earliest" => Ok(BlockNumber::Earliest),
-        "finalized" => Ok(BlockNumber::Finalized),
-        "safe" => Ok(BlockNumber::Safe),
+        "latest" | "pending" | "earliest" | "finalized" | "safe" => Ok(s.to_string()),
         _ => {
             let num = u64::from_str_radix(s.trim_start_matches("0x"), 16)
                 .map_err(|e| format!("Invalid block number: {e}"))?;
-            Ok(BlockNumber::Number(num.into()))
+            Ok(block_quantity(num))
         }
+    }
+}
+
+/// 32-byte hash parameter, re-encoded as lowercase hex.
+fn hash_param(value: &str) -> Result<String, nox_core::eth::EthTextError> {
+    parse_fixed_hex::<32>(value).map(|hash| format!("{hash:?}"))
+}
+
+/// A receipt or transaction lookup answers an object, or `null` when unknown.
+fn object_or_null(method: &str, value: serde_json::Value) -> Result<serde_json::Value, String> {
+    if value.is_object() || value.is_null() {
+        Ok(value)
+    } else {
+        Err(format!("{method} failed: {UPSTREAM_SHAPE_ERROR}"))
     }
 }
 
@@ -1105,5 +1073,298 @@ mod tests {
             })
             .sum();
         assert_eq!(other_total, 50);
+    }
+}
+
+/// Golden outputs of the default-provider proxy path, recorded in
+/// `tests/golden/rpc_proxy_outputs.json` from the Ethereum library the node used
+/// before the current one. Upstream answers are canned Arbitrum-shaped JSON so
+/// the outputs are deterministic. Regenerate deliberately with `NOX_UPDATE_GOLDEN=1`.
+#[cfg(test)]
+mod golden_tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use std::sync::Mutex;
+
+    const RECEIPT: &str = r#"{
+        "blockHash": "0x9a1fbe0c4b8e5e86b8f5f6c2c4a8ab4fd0d8c7f6e5d4c3b2a19081726354a5b6",
+        "blockNumber": "0x12d9b1e0",
+        "contractAddress": null,
+        "cumulativeGasUsed": "0x2b6c4",
+        "effectiveGasPrice": "0x989680",
+        "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+        "gasUsed": "0x2b6c4",
+        "gasUsedForL1": "0x1f40",
+        "l1BlockNumber": "0x8a1b2c",
+        "logs": [{
+            "address": "0xad911ca217c6dc779fce6a6538bdda3071c38e7e",
+            "topics": [
+                "0x1fe5a7ef1d3d4e0c9f2b2c6a0d1f2e3b4c5d6e7f8091a2b3c4d5e6f708192a3b",
+                "0x00000000000000000000000074486dc1ac551e5cd3f4eef80727cc9d50d3abe9"
+            ],
+            "data": "0x00000000000000000000000000000000000000000000000000000000000003e8",
+            "blockNumber": "0x12d9b1e0",
+            "transactionHash": "0x7b1c4e5b9c10ff3569a2f968f6cdabd2351fed4f672c9f7b19f6614343b14bc7",
+            "transactionIndex": "0x1",
+            "blockHash": "0x9a1fbe0c4b8e5e86b8f5f6c2c4a8ab4fd0d8c7f6e5d4c3b2a19081726354a5b6",
+            "logIndex": "0x0",
+            "removed": false
+        }],
+        "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "status": "0x1",
+        "to": "0xad911ca217c6dc779fce6a6538bdda3071c38e7e",
+        "transactionHash": "0x7b1c4e5b9c10ff3569a2f968f6cdabd2351fed4f672c9f7b19f6614343b14bc7",
+        "transactionIndex": "0x1",
+        "type": "0x2"
+    }"#;
+
+    const TRANSACTION: &str = r#"{
+        "blockHash": "0x9a1fbe0c4b8e5e86b8f5f6c2c4a8ab4fd0d8c7f6e5d4c3b2a19081726354a5b6",
+        "blockNumber": "0x12d9b1e0",
+        "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+        "gas": "0x1d4c0",
+        "gasPrice": "0x989680",
+        "maxFeePerGas": "0x1312d00",
+        "maxPriorityFeePerGas": "0x0",
+        "hash": "0x7b1c4e5b9c10ff3569a2f968f6cdabd2351fed4f672c9f7b19f6614343b14bc7",
+        "input": "0xc0ffee00112233",
+        "nonce": "0x7",
+        "to": "0xad911ca217c6dc779fce6a6538bdda3071c38e7e",
+        "transactionIndex": "0x1",
+        "value": "0x0",
+        "type": "0x2",
+        "accessList": [],
+        "chainId": "0x66eee",
+        "v": "0x1",
+        "r": "0x5c1b0a6f2c8d3e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b",
+        "s": "0x3d2c1b0a9f8e7d6c5b4a39281706f5e4d3c2b1a0f9e8d7c6b5a4938271605f4e",
+        "yParity": "0x1"
+    }"#;
+
+    const LEGACY_TRANSACTION: &str = r#"{
+        "blockHash": "0x9a1fbe0c4b8e5e86b8f5f6c2c4a8ab4fd0d8c7f6e5d4c3b2a19081726354a5b6",
+        "blockNumber": "0x12d9b1e0",
+        "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+        "gas": "0x1d4c0",
+        "gasPrice": "0x5f5e100",
+        "hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+        "input": "0x",
+        "nonce": "0x8",
+        "to": null,
+        "transactionIndex": "0x2",
+        "value": "0xde0b6b3a7640000",
+        "type": "0x0",
+        "chainId": "0x66eee",
+        "v": "0xcdd00",
+        "r": "0x5c1b0a6f2c8d3e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b",
+        "s": "0x3d2c1b0a9f8e7d6c5b4a39281706f5e4d3c2b1a0f9e8d7c6b5a4938271605f4e"
+    }"#;
+
+    fn block(full: bool) -> Value {
+        let mut block: Value = serde_json::from_str(
+            r#"{
+            "baseFeePerGas": "0x989680",
+            "difficulty": "0x1",
+            "extraData": "0x7c4c1e8a7cf1f1e2c4a0c1b8d9e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d",
+            "gasLimit": "0x4000000000000",
+            "gasUsed": "0x2b6c4",
+            "hash": "0x9a1fbe0c4b8e5e86b8f5f6c2c4a8ab4fd0d8c7f6e5d4c3b2a19081726354a5b6",
+            "l1BlockNumber": "0x8a1b2c",
+            "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "miner": "0xa4b000000000000000000073657175656e636572",
+            "mixHash": "0x000000000000a1b20000000000000001000000000000000000000000004bd2f1",
+            "nonce": "0x00000000000209a1",
+            "number": "0x12d9b1e0",
+            "parentHash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "receiptsRoot": "0x4444444444444444444444444444444444444444444444444444444444444444",
+            "sendCount": "0x209a1",
+            "sendRoot": "0x7c4c1e8a7cf1f1e2c4a0c1b8d9e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d",
+            "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
+            "size": "0x2a0",
+            "stateRoot": "0x2222222222222222222222222222222222222222222222222222222222222222",
+            "timestamp": "0x6a1b2c3d",
+            "totalDifficulty": "0x1",
+            "transactionsRoot": "0x3333333333333333333333333333333333333333333333333333333333333333",
+            "uncles": []
+        }"#,
+        )
+        .expect("block json");
+        block["transactions"] = if full {
+            json!([
+                serde_json::from_str::<Value>(TRANSACTION).expect("tx"),
+                serde_json::from_str::<Value>(LEGACY_TRANSACTION).expect("tx"),
+            ])
+        } else {
+            json!([
+                "0x7b1c4e5b9c10ff3569a2f968f6cdabd2351fed4f672c9f7b19f6614343b14bc7",
+                "0x1111111111111111111111111111111111111111111111111111111111111111"
+            ])
+        };
+        block
+    }
+
+    fn upstream_result(method: &str, params: &Value) -> Value {
+        match method {
+            "eth_call" => json!(format!("0x{}", "00".repeat(31) + "2a")),
+            "eth_getBalance" => json!("0xde0b6b3a7640000"),
+            "eth_estimateGas" => json!("0x5208"),
+            "eth_blockNumber" => json!("0x12d9b1e0"),
+            "eth_getTransactionReceipt" => {
+                if params[0] == json!(format!("0x{}", "00".repeat(32))) {
+                    Value::Null
+                } else {
+                    serde_json::from_str(RECEIPT).expect("receipt")
+                }
+            }
+            "eth_getTransactionByHash" => {
+                if params[0] == json!(format!("0x{}", "11".repeat(32))) {
+                    serde_json::from_str(LEGACY_TRANSACTION).expect("tx")
+                } else {
+                    serde_json::from_str(TRANSACTION).expect("tx")
+                }
+            }
+            "eth_chainId" => json!("0x66eee"),
+            "eth_gasPrice" => json!("0x989680"),
+            "eth_getLogs" => {
+                let receipt: Value = serde_json::from_str(RECEIPT).expect("receipt");
+                let mut second = receipt["logs"][0].clone();
+                second["logIndex"] = json!("0x1");
+                second["topics"] = json!([]);
+                second["data"] = json!("0x");
+                json!([receipt["logs"][0].clone(), second])
+            }
+            "eth_getCode" => json!("0x6080604052"),
+            "eth_getStorageAt" => json!(format!("0x{}", "00".repeat(31) + "01")),
+            "eth_getTransactionCount" => json!("0x7"),
+            "eth_getBlockByNumber" | "eth_getBlockByHash" => {
+                block(params.get(1).and_then(Value::as_bool).unwrap_or(false))
+            }
+            "eth_sendRawTransaction" => {
+                json!("0x7b1c4e5b9c10ff3569a2f968f6cdabd2351fed4f672c9f7b19f6614343b14bc7")
+            }
+            _ => Value::Null,
+        }
+    }
+
+    async fn upstream() -> (String, Arc<Mutex<Vec<Value>>>) {
+        let requests: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let recorded = requests.clone();
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let recorded = recorded.clone();
+                async move {
+                    let method = body["method"].as_str().unwrap_or_default().to_string();
+                    let params = body.get("params").cloned().unwrap_or(Value::Null);
+                    let result = upstream_result(&method, &params);
+                    recorded
+                        .lock()
+                        .expect("requests")
+                        .push(json!({"method": method, "params": params}));
+                    axum::Json(json!({"jsonrpc": "2.0", "id": body["id"], "result": result}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (format!("http://{address}/"), requests)
+    }
+
+    #[tokio::test]
+    async fn default_provider_proxy_outputs() {
+        let (url, requests) = upstream().await;
+        let handler = RpcHandler::new_simulation(
+            Arc::new(ResponsePacker::new()),
+            nox_core::NoopPublisher::arc(),
+            &url,
+            MetricsService::new(),
+        )
+        .expect("handler");
+        let tx_hash = "0x7b1c4e5b9c10ff3569a2f968f6cdabd2351fed4f672c9f7b19f6614343b14bc7";
+        let address = "0xAD911Ca217C6dC779fCE6A6538bDda3071c38E7E";
+        let calls: Vec<(&str, Value)> = vec![
+            ("eth_call", json!([{"to": address, "data": "0x3cce4d3d"}])),
+            ("eth_call", json!([{"to": address}])),
+            ("eth_getBalance", json!([address])),
+            ("eth_estimateGas", json!([{"to": address, "data": "0xc0ffee", "value": "0x10"}])),
+            ("eth_estimateGas", json!([{}])),
+            ("eth_blockNumber", json!([])),
+            ("eth_getTransactionReceipt", json!([tx_hash])),
+            ("eth_getTransactionReceipt", json!([format!("0x{}", "00".repeat(32))])),
+            ("eth_getTransactionByHash", json!([tx_hash])),
+            ("eth_getTransactionByHash", json!([format!("0x{}", "11".repeat(32))])),
+            ("eth_chainId", json!([])),
+            ("eth_gasPrice", json!([])),
+            (
+                "eth_getLogs",
+                json!([{
+                    "address": address,
+                    "fromBlock": "0x12d9b000",
+                    "toBlock": "0x12d9b1e0",
+                    "topics": ["0x1fe5a7ef1d3d4e0c9f2b2c6a0d1f2e3b4c5d6e7f8091a2b3c4d5e6f708192a3b", "", null,
+                        "0x00000000000000000000000074486dc1ac551e5cd3f4eef80727cc9d50d3abe9"]
+                }]),
+            ),
+            ("eth_getLogs", json!([{"fromBlock": "0x1", "toBlock": "0x10"}])),
+            ("eth_getLogs", json!([{"fromBlock": "latest"}])),
+            ("eth_getLogs", json!([{"fromBlock": "0x1", "toBlock": "0x1000"}])),
+            ("eth_getCode", json!([address, "latest"])),
+            ("eth_getStorageAt", json!([address, "0x0000000000000000000000000000000000000000000000000000000000000003"])),
+            ("eth_getTransactionCount", json!([address])),
+            ("eth_getBlockByNumber", json!(["0x12d9b1e0", false])),
+            ("eth_getBlockByNumber", json!(["latest", true])),
+            ("eth_getBlockByNumber", json!(["finalized"])),
+            ("eth_getBlockByHash", json!(["0x9a1fbe0c4b8e5e86b8f5f6c2c4a8ab4fd0d8c7f6e5d4c3b2a19081726354a5b6", true])),
+            ("eth_sendRawTransaction", json!(["0xf86e078405f5e1008301d4c094ad911ca217c6dc779fce6a6538bdda3071c38e7e8087c0ffee00112233830cde00a0a73d72df8a5ddec0a9bb43bcd8180468606da3e9d1c7ec0eedf0c01572e4c677a018c12723985c84cff0aec68807abc2463030eb337c96b4fb7c4d846d20f31b08"])),
+            ("eth_getBalance", json!(["not-an-address"])),
+            ("eth_getBlockByNumber", json!(["0xzz"])),
+            ("eth_getStorageAt", json!([address, "0x03"])),
+        ];
+        let mut out = Vec::new();
+        for (method, params) in calls {
+            let result = handler.execute_rpc(method, params.clone()).await;
+            let upstream_requests = std::mem::take(&mut *requests.lock().expect("requests"));
+            out.push(json!({
+                "method": method,
+                "params": params,
+                "result": result.as_ref().ok(),
+                "error": result.as_ref().err().map(|error| error.split(':').next().unwrap_or_default().to_string()),
+                "upstream": upstream_requests,
+            }));
+        }
+        let actual = Value::Array(out);
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden/rpc_proxy_outputs.json");
+        if std::env::var_os("NOX_UPDATE_GOLDEN").is_some() {
+            std::fs::create_dir_all(path.parent().expect("dir")).expect("dir");
+            let mut text = serde_json::to_string_pretty(&actual).expect("encode");
+            text.push('\n');
+            std::fs::write(&path, text).expect("write golden");
+            return;
+        }
+        let mut expected: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("golden file"))
+                .expect("golden json");
+        // The recorded outputs come from the previous Ethereum library, which
+        // added an empty `sealFields` array to every block it re-encoded. Blocks
+        // now pass through exactly as the upstream sent them; nothing else differs.
+        for entry in expected.as_array_mut().expect("golden entries") {
+            if let Some(block) = entry["result"].as_object_mut() {
+                if block.get("sealFields") == Some(&json!([])) {
+                    block.remove("sealFields");
+                }
+            }
+        }
+        assert_eq!(
+            actual,
+            expected,
+            "proxy outputs differ:\n{}",
+            serde_json::to_string_pretty(&actual).expect("encode")
+        );
     }
 }

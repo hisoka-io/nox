@@ -4,7 +4,8 @@ use crate::surb_budget::{
     AdaptiveSurbBudget, SurbBudget, DEFAULT_RPC_SURBS, USABLE_RESPONSE_PER_SURB,
 };
 use crate::topology_node::TopologyNode;
-use ethers::types::{Address, Bytes, Filter, Log, H256, U256};
+use alloy::primitives::{Address, Bytes, B256, U256};
+use alloy::rpc::types::{BlockNumberOrTag, Filter, FilterSet, Log};
 use nox_core::models::payloads::{decode_payload, encode_payload};
 
 use futures_util::{SinkExt, StreamExt};
@@ -1207,34 +1208,27 @@ impl MixnetClient {
         serde_json::from_slice(&response_bytes).map_err(|e| MixnetClientError::Parse(e.to_string()))
     }
 
+    /// One value as a string, several as a sorted array, none as `None`.
+    fn filter_set_value<T>(set: &FilterSet<T>) -> Option<serde_json::Value>
+    where
+        T: Eq + std::hash::Hash + std::fmt::Debug,
+    {
+        let mut items: Vec<String> = set.iter().map(|item| format!("{item:?}")).collect();
+        items.sort();
+        match items.len() {
+            0 => None,
+            1 => items.pop().map(serde_json::Value::from),
+            _ => Some(serde_json::json!(items)),
+        }
+    }
+
     fn build_get_logs_params(filter: &Filter) -> serde_json::Value {
-        let address_value = filter.address.as_ref().map(|a| match a {
-            ethers::types::ValueOrArray::Value(addr) => serde_json::json!(format!("{:?}", addr)),
-            ethers::types::ValueOrArray::Array(addrs) => {
-                let addrs_str: Vec<_> = addrs.iter().map(|a| format!("{a:?}")).collect();
-                serde_json::json!(addrs_str)
-            }
-        });
+        let address_value = Self::filter_set_value(&filter.address);
 
         let topics_value: Vec<_> = filter
             .topics
             .iter()
-            .map(|t| match t {
-                Some(topic) => match topic {
-                    ethers::types::ValueOrArray::Value(Some(h)) => {
-                        serde_json::json!(format!("{:?}", h))
-                    }
-                    ethers::types::ValueOrArray::Value(None) => serde_json::Value::Null,
-                    ethers::types::ValueOrArray::Array(arr) => {
-                        let hashes: Vec<_> = arr
-                            .iter()
-                            .filter_map(|h| h.map(|x| format!("{x:?}")))
-                            .collect();
-                        serde_json::json!(hashes)
-                    }
-                },
-                None => serde_json::Value::Null,
-            })
+            .map(|topic| Self::filter_set_value(topic).unwrap_or(serde_json::Value::Null))
             .collect();
 
         let mut filter_obj = serde_json::Map::new();
@@ -1309,13 +1303,13 @@ impl MixnetClient {
             filter
                 .block_option
                 .get_from_block()
-                .and_then(ethers::types::BlockNumber::as_number),
+                .and_then(BlockNumberOrTag::as_number),
             filter
                 .block_option
                 .get_to_block()
-                .and_then(ethers::types::BlockNumber::as_number),
+                .and_then(BlockNumberOrTag::as_number),
         ) {
-            (Some(from), Some(to)) => to.saturating_sub(from).as_u64(),
+            (Some(from), Some(to)) => to.saturating_sub(from),
             _ => return SurbBudget::rpc(),
         };
 
@@ -1332,9 +1326,9 @@ impl MixnetClient {
         &self,
         to: Address,
         data: Bytes,
-    ) -> Result<H256, MixnetClientError> {
+    ) -> Result<B256, MixnetClientError> {
         let service_request = ServiceRequest::SubmitTransaction {
-            to: to.0,
+            to: to.into_array(),
             data: data.to_vec(),
         };
 
@@ -1358,7 +1352,7 @@ impl MixnetClient {
     pub async fn broadcast_signed_transaction(
         &self,
         raw_tx: Bytes,
-    ) -> Result<H256, MixnetClientError> {
+    ) -> Result<B256, MixnetClientError> {
         let service_request = ServiceRequest::BroadcastSignedTransaction {
             signed_tx: raw_tx.to_vec(),
             rpc_url: None,
@@ -1418,7 +1412,7 @@ impl MixnetClient {
     }
 
     /// Check `tx_error:` prefix BEFORE interpreting as raw hash (errors can be >32 bytes).
-    fn parse_tx_hash_response(response_bytes: &[u8]) -> Result<H256, MixnetClientError> {
+    fn parse_tx_hash_response(response_bytes: &[u8]) -> Result<B256, MixnetClientError> {
         if let Ok(s) = std::str::from_utf8(response_bytes) {
             if let Some(msg) = s.strip_prefix("tx_error:") {
                 return Err(MixnetClientError::TransactionFailed(msg.to_string()));
@@ -1426,14 +1420,13 @@ impl MixnetClient {
         }
 
         if response_bytes.len() >= 32 {
-            Ok(H256::from_slice(&response_bytes[..32]))
+            Ok(B256::from_slice(&response_bytes[..32]))
         } else {
             let hex_str = std::str::from_utf8(response_bytes)
                 .map_err(|e| MixnetClientError::Parse(e.to_string()))?
                 .trim_start_matches("0x");
 
-            hex_str
-                .parse::<H256>()
+            nox_core::eth::parse_fixed_hex::<32>(hex_str)
                 .map_err(|e| MixnetClientError::Parse(e.to_string()))
         }
     }
@@ -1469,7 +1462,7 @@ impl MixnetClient {
 
     pub async fn get_transaction_receipt(
         &self,
-        tx_hash: H256,
+        tx_hash: B256,
     ) -> Result<Option<serde_json::Value>, MixnetClientError> {
         let params = serde_json::json!([format!("{:?}", tx_hash)]);
 
@@ -1703,7 +1696,7 @@ mod tests {
             address: url.to_string(),
             public_key: pk,
             layer,
-            eth_address: ethers::types::Address::zero(),
+            eth_address: Address::ZERO,
             role,
         }
     }
@@ -1813,5 +1806,103 @@ mod tests {
     fn test_config_poll_interval_is_25ms() {
         let config = MixnetClientConfig::default();
         assert_eq!(config.http_poll_interval_ms, 25);
+    }
+}
+
+/// `eth_getLogs` params, log budgets and transaction-hash replies, pinned in
+/// `tests/golden/client_chain_vectors.json` from the Ethereum library the client
+/// used before the current one. Regenerate deliberately with `NOX_UPDATE_GOLDEN=1`.
+#[cfg(test)]
+mod golden_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn address(byte: u8) -> Address {
+        Address::from([byte; 20])
+    }
+
+    fn topic(byte: u8) -> B256 {
+        B256::from([byte; 32])
+    }
+
+    fn filters() -> Vec<(&'static str, Filter)> {
+        vec![
+            ("empty", Filter::new()),
+            (
+                "address_range",
+                Filter::new()
+                    .address(address(0xab))
+                    .from_block(1)
+                    .to_block(2_000),
+            ),
+            (
+                "addresses_topics",
+                Filter::new()
+                    .address(vec![address(0x01), address(0xfe)])
+                    .event_signature(topic(0x11))
+                    .topic2(vec![topic(0x22), topic(0x33)])
+                    .from_block(316_207_920)
+                    .to_block(316_217_919),
+            ),
+            ("topic3_only", Filter::new().topic3(topic(0x44))),
+            ("from_only", Filter::new().from_block(5)),
+            (
+                "wide_range",
+                Filter::new().from_block(0).to_block(1_000_000),
+            ),
+        ]
+    }
+
+    #[test]
+    fn get_logs_params_budgets_and_hash_replies() {
+        let logs: Vec<Value> = filters()
+            .into_iter()
+            .map(|(name, filter)| {
+                let budget = MixnetClient::estimate_log_budget(&filter);
+                json!({
+                    "name": name,
+                    "params": MixnetClient::build_get_logs_params(&filter),
+                    "budget": format!("{budget:?}"),
+                })
+            })
+            .collect();
+        let replies: Vec<Value> = [
+            vec![0x5a; 32],
+            vec![0x5a; 40],
+            format!("0x{}", "ab".repeat(32)).into_bytes(),
+            "ab".repeat(16).into_bytes(),
+            b"tx_error:nonce too low".to_vec(),
+            b"0x12".to_vec(),
+            Vec::new(),
+        ]
+        .into_iter()
+        .map(|reply| {
+            let parsed = MixnetClient::parse_tx_hash_response(&reply);
+            json!({
+                "reply": hex::encode(&reply),
+                "hash": parsed.as_ref().ok().map(|hash| format!("0x{}", hex::encode(hash.as_slice()))),
+                "ok": parsed.is_ok(),
+            })
+        })
+        .collect();
+        let actual = json!({"get_logs": logs, "tx_hash_replies": replies});
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden/client_chain_vectors.json");
+        if std::env::var_os("NOX_UPDATE_GOLDEN").is_some() {
+            std::fs::create_dir_all(path.parent().expect("dir")).expect("dir");
+            let mut text = serde_json::to_string_pretty(&actual).expect("encode");
+            text.push('\n');
+            std::fs::write(&path, text).expect("write golden");
+            return;
+        }
+        let expected: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("golden file"))
+                .expect("golden json");
+        assert_eq!(
+            actual,
+            expected,
+            "client vectors differ:\n{}",
+            serde_json::to_string_pretty(&actual).expect("encode")
+        );
     }
 }

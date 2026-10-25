@@ -1,0 +1,1526 @@
+[
+  {
+    "margin_bps": 0,
+    "candidate": [
+      "21000",
+      "10000000",
+      "0"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "1000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "21000",
+      "initial_fee_per_gas": "10000000",
+      "maximum_fee_per_gas": "19044326967",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "99987654",
+      "planned_initial_cost_value_e8": "52503",
+      "maximum_cost_value_e8": "99987654"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "21000",
+      "initial_fee_per_gas": "10000000",
+      "maximum_fee_per_gas": "30000000",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "99987654",
+      "planned_initial_cost_value_e8": "52503",
+      "maximum_cost_value_e8": "157508"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "candidate": [
+      "21000",
+      "10000000",
+      "0"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "250000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "21000",
+      "initial_fee_per_gas": "10000000",
+      "maximum_fee_per_gas": "4761081741995",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "52503",
+      "maximum_cost_value_e8": "24996913500"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "21000",
+      "initial_fee_per_gas": "10000000",
+      "maximum_fee_per_gas": "30000000",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "52503",
+      "maximum_cost_value_e8": "157508"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "candidate": [
+      "21000",
+      "10000000",
+      "0"
+    ],
+    "fee": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "9000000000000000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "21000",
+      "initial_fee_per_gas": "10000000",
+      "maximum_fee_per_gas": "5714002969",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "29999997",
+      "planned_initial_cost_value_e8": "52503",
+      "maximum_cost_value_e8": "29999997"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "21000",
+      "initial_fee_per_gas": "10000000",
+      "maximum_fee_per_gas": "30000000",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "29999997",
+      "planned_initial_cost_value_e8": "52503",
+      "maximum_cost_value_e8": "157508"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "candidate": [
+      "21000",
+      "10000000",
+      "0"
+    ],
+    "fee": [
+      "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "1"
+    ],
+    "authorize_fee": {
+      "error": "no committed payment"
+    },
+    "authorize_fee_capped": {
+      "error": "no committed payment"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "0"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "1000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "275814390",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "99987654",
+      "planned_initial_cost_value_e8": "7250359",
+      "maximum_cost_value_e8": "99987654"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "60000000",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "99987654",
+      "planned_initial_cost_value_e8": "7250359",
+      "maximum_cost_value_e8": "21751075"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "0"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "250000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "68953597642",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "7250359",
+      "maximum_cost_value_e8": "24996913500"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "60000000",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "7250359",
+      "maximum_cost_value_e8": "21751075"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "0"
+    ],
+    "fee": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "9000000000000000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "82754525",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "29999997",
+      "planned_initial_cost_value_e8": "7250359",
+      "maximum_cost_value_e8": "29999997"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "60000000",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "29999997",
+      "planned_initial_cost_value_e8": "7250359",
+      "maximum_cost_value_e8": "21751075"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "0"
+    ],
+    "fee": [
+      "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "1"
+    ],
+    "authorize_fee": {
+      "error": "no committed payment"
+    },
+    "authorize_fee_capped": {
+      "error": "no committed payment"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "123456789000"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "1000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "275729247",
+      "chain_data_fee_native": "123456789000",
+      "revenue_value_e8": "99987654",
+      "planned_initial_cost_value_e8": "7281225",
+      "maximum_cost_value_e8": "99987654"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "60000000",
+      "chain_data_fee_native": "123456789000",
+      "revenue_value_e8": "99987654",
+      "planned_initial_cost_value_e8": "7281225",
+      "maximum_cost_value_e8": "21781941"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "123456789000"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "250000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "68953512499",
+      "chain_data_fee_native": "123456789000",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "7281225",
+      "maximum_cost_value_e8": "24996913500"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "60000000",
+      "chain_data_fee_native": "123456789000",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "7281225",
+      "maximum_cost_value_e8": "21781941"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "123456789000"
+    ],
+    "fee": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "9000000000000000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "82669382",
+      "chain_data_fee_native": "123456789000",
+      "revenue_value_e8": "29999997",
+      "planned_initial_cost_value_e8": "7281225",
+      "maximum_cost_value_e8": "29999997"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "60000000",
+      "chain_data_fee_native": "123456789000",
+      "revenue_value_e8": "29999997",
+      "planned_initial_cost_value_e8": "7281225",
+      "maximum_cost_value_e8": "21781941"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "123456789000"
+    ],
+    "fee": [
+      "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "1"
+    ],
+    "authorize_fee": {
+      "error": "no committed payment"
+    },
+    "authorize_fee_capped": {
+      "error": "no committed payment"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "candidate": [
+      "30000000",
+      "1000000000",
+      "5"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "1000000"
+    ],
+    "authorize_fee": {
+      "unprofitable": {
+        "revenue_value_e8": "99987654",
+        "maximum_cost_value_e8": "7500370372"
+      }
+    },
+    "authorize_fee_capped": {
+      "unprofitable": {
+        "revenue_value_e8": "99987654",
+        "maximum_cost_value_e8": "7500370372"
+      }
+    }
+  },
+  {
+    "margin_bps": 0,
+    "candidate": [
+      "30000000",
+      "1000000000",
+      "5"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "250000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "30000000",
+      "initial_fee_per_gas": "1000000000",
+      "maximum_fee_per_gas": "3332757219",
+      "chain_data_fee_native": "5",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "7500370372",
+      "maximum_cost_value_e8": "24996913499"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "30000000",
+      "initial_fee_per_gas": "1000000000",
+      "maximum_fee_per_gas": "3000000000",
+      "chain_data_fee_native": "5",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "7500370372",
+      "maximum_cost_value_e8": "22501111113"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "candidate": [
+      "30000000",
+      "1000000000",
+      "5"
+    ],
+    "fee": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "9000000000000000000"
+    ],
+    "authorize_fee": {
+      "unprofitable": {
+        "revenue_value_e8": "29999997",
+        "maximum_cost_value_e8": "7500370372"
+      }
+    },
+    "authorize_fee_capped": {
+      "unprofitable": {
+        "revenue_value_e8": "29999997",
+        "maximum_cost_value_e8": "7500370372"
+      }
+    }
+  },
+  {
+    "margin_bps": 0,
+    "candidate": [
+      "30000000",
+      "1000000000",
+      "5"
+    ],
+    "fee": [
+      "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "1"
+    ],
+    "authorize_fee": {
+      "error": "no committed payment"
+    },
+    "authorize_fee_capped": {
+      "error": "no committed payment"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "quote_exit_fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "21000",
+      "1"
+    ],
+    "result": {
+      "Ok": "1"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "quote_exit_fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "1450000",
+      "20000000"
+    ],
+    "result": {
+      "Ok": "72513"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "quote_exit_fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "21000",
+      "1"
+    ],
+    "result": {
+      "Ok": "1"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "quote_exit_fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "1450000",
+      "20000000"
+    ],
+    "result": {
+      "Ok": "72513"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "quote_exit_fee": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "21000",
+      "1"
+    ],
+    "result": {
+      "Ok": "300000030001"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "quote_exit_fee": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "1450000",
+      "20000000"
+    ],
+    "result": {
+      "Ok": "2175107917510791752"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "quote_exit_fee": [
+      "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "21000",
+      "1"
+    ],
+    "result": {
+      "Err": "no committed payment"
+    }
+  },
+  {
+    "margin_bps": 0,
+    "quote_exit_fee": [
+      "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "1450000",
+      "20000000"
+    ],
+    "result": {
+      "Err": "no committed payment"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "candidate": [
+      "21000",
+      "10000000",
+      "0"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "1000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "21000",
+      "initial_fee_per_gas": "10000000",
+      "maximum_fee_per_gas": "17313024464",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "99987654",
+      "planned_initial_cost_value_e8": "52503",
+      "maximum_cost_value_e8": "90897867"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "21000",
+      "initial_fee_per_gas": "10000000",
+      "maximum_fee_per_gas": "30000000",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "99987654",
+      "planned_initial_cost_value_e8": "52503",
+      "maximum_cost_value_e8": "157508"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "candidate": [
+      "21000",
+      "10000000",
+      "0"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "250000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "21000",
+      "initial_fee_per_gas": "10000000",
+      "maximum_fee_per_gas": "4328256129052",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "52503",
+      "maximum_cost_value_e8": "22724466818"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "21000",
+      "initial_fee_per_gas": "10000000",
+      "maximum_fee_per_gas": "30000000",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "52503",
+      "maximum_cost_value_e8": "157508"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "candidate": [
+      "21000",
+      "10000000",
+      "0"
+    ],
+    "fee": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "9000000000000000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "21000",
+      "initial_fee_per_gas": "10000000",
+      "maximum_fee_per_gas": "5194548050",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "29999997",
+      "planned_initial_cost_value_e8": "52503",
+      "maximum_cost_value_e8": "27272724"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "21000",
+      "initial_fee_per_gas": "10000000",
+      "maximum_fee_per_gas": "30000000",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "29999997",
+      "planned_initial_cost_value_e8": "52503",
+      "maximum_cost_value_e8": "157508"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "candidate": [
+      "21000",
+      "10000000",
+      "0"
+    ],
+    "fee": [
+      "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "1"
+    ],
+    "authorize_fee": {
+      "error": "no committed payment"
+    },
+    "authorize_fee_capped": {
+      "error": "no committed payment"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "0"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "1000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "250740354",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "99987654",
+      "planned_initial_cost_value_e8": "7250359",
+      "maximum_cost_value_e8": "90897867"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "60000000",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "99987654",
+      "planned_initial_cost_value_e8": "7250359",
+      "maximum_cost_value_e8": "21751075"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "0"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "250000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "62685088765",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "7250359",
+      "maximum_cost_value_e8": "22724466818"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "60000000",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "7250359",
+      "maximum_cost_value_e8": "21751075"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "0"
+    ],
+    "fee": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "9000000000000000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "75231385",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "29999997",
+      "planned_initial_cost_value_e8": "7250359",
+      "maximum_cost_value_e8": "27272724"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "60000000",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "29999997",
+      "planned_initial_cost_value_e8": "7250359",
+      "maximum_cost_value_e8": "21751075"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "0"
+    ],
+    "fee": [
+      "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "1"
+    ],
+    "authorize_fee": {
+      "error": "no committed payment"
+    },
+    "authorize_fee_capped": {
+      "error": "no committed payment"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "123456789000"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "1000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "250655210",
+      "chain_data_fee_native": "123456789000",
+      "revenue_value_e8": "99987654",
+      "planned_initial_cost_value_e8": "7281225",
+      "maximum_cost_value_e8": "90897867"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "60000000",
+      "chain_data_fee_native": "123456789000",
+      "revenue_value_e8": "99987654",
+      "planned_initial_cost_value_e8": "7281225",
+      "maximum_cost_value_e8": "21781941"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "123456789000"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "250000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "62685003622",
+      "chain_data_fee_native": "123456789000",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "7281225",
+      "maximum_cost_value_e8": "22724466818"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "60000000",
+      "chain_data_fee_native": "123456789000",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "7281225",
+      "maximum_cost_value_e8": "21781941"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "123456789000"
+    ],
+    "fee": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "9000000000000000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "75146242",
+      "chain_data_fee_native": "123456789000",
+      "revenue_value_e8": "29999997",
+      "planned_initial_cost_value_e8": "7281225",
+      "maximum_cost_value_e8": "27272724"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "60000000",
+      "chain_data_fee_native": "123456789000",
+      "revenue_value_e8": "29999997",
+      "planned_initial_cost_value_e8": "7281225",
+      "maximum_cost_value_e8": "21781941"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "123456789000"
+    ],
+    "fee": [
+      "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "1"
+    ],
+    "authorize_fee": {
+      "error": "no committed payment"
+    },
+    "authorize_fee_capped": {
+      "error": "no committed payment"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "candidate": [
+      "30000000",
+      "1000000000",
+      "5"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "1000000"
+    ],
+    "authorize_fee": {
+      "unprofitable": {
+        "revenue_value_e8": "99987654",
+        "maximum_cost_value_e8": "7500370372"
+      }
+    },
+    "authorize_fee_capped": {
+      "unprofitable": {
+        "revenue_value_e8": "99987654",
+        "maximum_cost_value_e8": "7500370372"
+      }
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "candidate": [
+      "30000000",
+      "1000000000",
+      "5"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "250000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "30000000",
+      "initial_fee_per_gas": "1000000000",
+      "maximum_fee_per_gas": "3029779290",
+      "chain_data_fee_native": "5",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "7500370372",
+      "maximum_cost_value_e8": "22724466817"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "30000000",
+      "initial_fee_per_gas": "1000000000",
+      "maximum_fee_per_gas": "3000000000",
+      "chain_data_fee_native": "5",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "7500370372",
+      "maximum_cost_value_e8": "22501111113"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "candidate": [
+      "30000000",
+      "1000000000",
+      "5"
+    ],
+    "fee": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "9000000000000000000"
+    ],
+    "authorize_fee": {
+      "unprofitable": {
+        "revenue_value_e8": "29999997",
+        "maximum_cost_value_e8": "7500370372"
+      }
+    },
+    "authorize_fee_capped": {
+      "unprofitable": {
+        "revenue_value_e8": "29999997",
+        "maximum_cost_value_e8": "7500370372"
+      }
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "candidate": [
+      "30000000",
+      "1000000000",
+      "5"
+    ],
+    "fee": [
+      "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "1"
+    ],
+    "authorize_fee": {
+      "error": "no committed payment"
+    },
+    "authorize_fee_capped": {
+      "error": "no committed payment"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "quote_exit_fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "21000",
+      "1"
+    ],
+    "result": {
+      "Ok": "1"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "quote_exit_fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "1450000",
+      "20000000"
+    ],
+    "result": {
+      "Ok": "79764"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "quote_exit_fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "21000",
+      "1"
+    ],
+    "result": {
+      "Ok": "1"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "quote_exit_fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "1450000",
+      "20000000"
+    ],
+    "result": {
+      "Ok": "79764"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "quote_exit_fee": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "21000",
+      "1"
+    ],
+    "result": {
+      "Ok": "600000060001"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "quote_exit_fee": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "1450000",
+      "20000000"
+    ],
+    "result": {
+      "Ok": "2392618739261873927"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "quote_exit_fee": [
+      "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "21000",
+      "1"
+    ],
+    "result": {
+      "Err": "no committed payment"
+    }
+  },
+  {
+    "margin_bps": 1000,
+    "quote_exit_fee": [
+      "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "1450000",
+      "20000000"
+    ],
+    "result": {
+      "Err": "no committed payment"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "candidate": [
+      "21000",
+      "10000000",
+      "0"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "1000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "21000",
+      "initial_fee_per_gas": "10000000",
+      "maximum_fee_per_gas": "15235461536",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "99987654",
+      "planned_initial_cost_value_e8": "52503",
+      "maximum_cost_value_e8": "79990123"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "21000",
+      "initial_fee_per_gas": "10000000",
+      "maximum_fee_per_gas": "30000000",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "99987654",
+      "planned_initial_cost_value_e8": "52503",
+      "maximum_cost_value_e8": "157508"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "candidate": [
+      "21000",
+      "10000000",
+      "0"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "250000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "21000",
+      "initial_fee_per_gas": "10000000",
+      "maximum_fee_per_gas": "3808865393596",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "52503",
+      "maximum_cost_value_e8": "19997530800"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "21000",
+      "initial_fee_per_gas": "10000000",
+      "maximum_fee_per_gas": "30000000",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "52503",
+      "maximum_cost_value_e8": "157508"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "candidate": [
+      "21000",
+      "10000000",
+      "0"
+    ],
+    "fee": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "9000000000000000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "21000",
+      "initial_fee_per_gas": "10000000",
+      "maximum_fee_per_gas": "4571202261",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "29999997",
+      "planned_initial_cost_value_e8": "52503",
+      "maximum_cost_value_e8": "23999997"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "21000",
+      "initial_fee_per_gas": "10000000",
+      "maximum_fee_per_gas": "30000000",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "29999997",
+      "planned_initial_cost_value_e8": "52503",
+      "maximum_cost_value_e8": "157508"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "candidate": [
+      "21000",
+      "10000000",
+      "0"
+    ],
+    "fee": [
+      "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "1"
+    ],
+    "authorize_fee": {
+      "error": "no committed payment"
+    },
+    "authorize_fee_capped": {
+      "error": "no committed payment"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "0"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "1000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "220651511",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "99987654",
+      "planned_initial_cost_value_e8": "7250359",
+      "maximum_cost_value_e8": "79990123"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "60000000",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "99987654",
+      "planned_initial_cost_value_e8": "7250359",
+      "maximum_cost_value_e8": "21751075"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "0"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "250000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "55162878114",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "7250359",
+      "maximum_cost_value_e8": "19997530800"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "60000000",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "7250359",
+      "maximum_cost_value_e8": "21751075"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "0"
+    ],
+    "fee": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "9000000000000000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "66203618",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "29999997",
+      "planned_initial_cost_value_e8": "7250359",
+      "maximum_cost_value_e8": "23999997"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "60000000",
+      "chain_data_fee_native": "0",
+      "revenue_value_e8": "29999997",
+      "planned_initial_cost_value_e8": "7250359",
+      "maximum_cost_value_e8": "21751075"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "0"
+    ],
+    "fee": [
+      "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "1"
+    ],
+    "authorize_fee": {
+      "error": "no committed payment"
+    },
+    "authorize_fee_capped": {
+      "error": "no committed payment"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "123456789000"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "1000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "220566368",
+      "chain_data_fee_native": "123456789000",
+      "revenue_value_e8": "99987654",
+      "planned_initial_cost_value_e8": "7281225",
+      "maximum_cost_value_e8": "79990123"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "60000000",
+      "chain_data_fee_native": "123456789000",
+      "revenue_value_e8": "99987654",
+      "planned_initial_cost_value_e8": "7281225",
+      "maximum_cost_value_e8": "21781941"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "123456789000"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "250000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "55162792970",
+      "chain_data_fee_native": "123456789000",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "7281225",
+      "maximum_cost_value_e8": "19997530800"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "60000000",
+      "chain_data_fee_native": "123456789000",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "7281225",
+      "maximum_cost_value_e8": "21781941"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "123456789000"
+    ],
+    "fee": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "9000000000000000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "66118475",
+      "chain_data_fee_native": "123456789000",
+      "revenue_value_e8": "29999997",
+      "planned_initial_cost_value_e8": "7281225",
+      "maximum_cost_value_e8": "23999997"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "1450000",
+      "initial_fee_per_gas": "20000000",
+      "maximum_fee_per_gas": "60000000",
+      "chain_data_fee_native": "123456789000",
+      "revenue_value_e8": "29999997",
+      "planned_initial_cost_value_e8": "7281225",
+      "maximum_cost_value_e8": "21781941"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "candidate": [
+      "1450000",
+      "20000000",
+      "123456789000"
+    ],
+    "fee": [
+      "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "1"
+    ],
+    "authorize_fee": {
+      "error": "no committed payment"
+    },
+    "authorize_fee_capped": {
+      "error": "no committed payment"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "candidate": [
+      "30000000",
+      "1000000000",
+      "5"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "1000000"
+    ],
+    "authorize_fee": {
+      "unprofitable": {
+        "revenue_value_e8": "99987654",
+        "maximum_cost_value_e8": "7500370372"
+      }
+    },
+    "authorize_fee_capped": {
+      "unprofitable": {
+        "revenue_value_e8": "99987654",
+        "maximum_cost_value_e8": "7500370372"
+      }
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "candidate": [
+      "30000000",
+      "1000000000",
+      "5"
+    ],
+    "fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "250000000"
+    ],
+    "authorize_fee": {
+      "gas_limit": "30000000",
+      "initial_fee_per_gas": "1000000000",
+      "maximum_fee_per_gas": "2666205775",
+      "chain_data_fee_native": "5",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "7500370372",
+      "maximum_cost_value_e8": "19997530798"
+    },
+    "authorize_fee_capped": {
+      "gas_limit": "30000000",
+      "initial_fee_per_gas": "1000000000",
+      "maximum_fee_per_gas": "2666205775",
+      "chain_data_fee_native": "5",
+      "revenue_value_e8": "24996913500",
+      "planned_initial_cost_value_e8": "7500370372",
+      "maximum_cost_value_e8": "19997530798"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "candidate": [
+      "30000000",
+      "1000000000",
+      "5"
+    ],
+    "fee": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "9000000000000000000"
+    ],
+    "authorize_fee": {
+      "unprofitable": {
+        "revenue_value_e8": "29999997",
+        "maximum_cost_value_e8": "7500370372"
+      }
+    },
+    "authorize_fee_capped": {
+      "unprofitable": {
+        "revenue_value_e8": "29999997",
+        "maximum_cost_value_e8": "7500370372"
+      }
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "candidate": [
+      "30000000",
+      "1000000000",
+      "5"
+    ],
+    "fee": [
+      "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "1"
+    ],
+    "authorize_fee": {
+      "error": "no committed payment"
+    },
+    "authorize_fee_capped": {
+      "error": "no committed payment"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "quote_exit_fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "21000",
+      "1"
+    ],
+    "result": {
+      "Ok": "1"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "quote_exit_fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "1450000",
+      "20000000"
+    ],
+    "result": {
+      "Ok": "90641"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "quote_exit_fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "21000",
+      "1"
+    ],
+    "result": {
+      "Ok": "1"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "quote_exit_fee": [
+      "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "1450000",
+      "20000000"
+    ],
+    "result": {
+      "Ok": "90641"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "quote_exit_fee": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "21000",
+      "1"
+    ],
+    "result": {
+      "Ok": "600000060001"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "quote_exit_fee": [
+      "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "1450000",
+      "20000000"
+    ],
+    "result": {
+      "Ok": "2718884971888497189"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "quote_exit_fee": [
+      "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "21000",
+      "1"
+    ],
+    "result": {
+      "Err": "no committed payment"
+    }
+  },
+  {
+    "margin_bps": 2500,
+    "quote_exit_fee": [
+      "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "1450000",
+      "20000000"
+    ],
+    "result": {
+      "Err": "no committed payment"
+    }
+  }
+]

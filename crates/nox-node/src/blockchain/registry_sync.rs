@@ -7,16 +7,18 @@
 //! While both match, membership counts as verified, which is what P2P admission
 //! waits for before refusing peers outside the registry.
 
-use crate::blockchain::executor::build_ethers_http1_provider;
+use crate::blockchain::executor::build_http1_provider;
 use crate::blockchain::observer::{
-    read_registry_profile, NoxRegistryContract, ObservedChain, PrivilegedRelayerRegisteredFilter,
-    RelayerRegisteredFilter,
+    read_registry_profile, NoxRegistryContract, ObservedChain, RegistryContract,
 };
 use crate::config::NoxConfig;
 use crate::services::network_manager::{RegistryProfile, TopologyManager};
 use crate::telemetry::metrics::MetricsService;
-use ethers::contract::EthEvent;
-use ethers::prelude::*;
+use alloy::primitives::{Address, U256};
+use alloy::providers::Provider;
+use alloy::rpc::types::Log;
+use alloy::sol_types::SolEvent;
+use nox_core::eth::{block_quantity, logs_filter, TopicFilter};
 use nox_core::traits::InfrastructureError;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -64,8 +66,8 @@ impl ReconcileOutcome {
     }
 }
 
-pub struct RegistryReconciler<M: Middleware = Provider<Http>> {
-    contract: NoxRegistryContract<M>,
+pub struct RegistryReconciler {
+    contract: RegistryContract,
     topology: Arc<TopologyManager>,
     observed: Arc<ObservedChain>,
     interval: Duration,
@@ -75,21 +77,19 @@ pub struct RegistryReconciler<M: Middleware = Provider<Http>> {
     last_discovery: Option<Instant>,
 }
 
-impl RegistryReconciler<Provider<Http>> {
+impl RegistryReconciler {
     pub fn new(
         config: &NoxConfig,
         topology: Arc<TopologyManager>,
         observed: Arc<ObservedChain>,
         metrics: MetricsService,
     ) -> Result<Self, InfrastructureError> {
-        let provider = build_ethers_http1_provider(&config.eth_rpc_url)?;
-        let registry = config
-            .registry_contract_address
-            .parse::<Address>()
-            .map_err(|e| {
+        let provider = build_http1_provider(&config.eth_rpc_url)?;
+        let registry =
+            nox_core::eth::parse_address(&config.registry_contract_address).map_err(|e| {
                 InfrastructureError::Blockchain(format!("Invalid Registry Address: {e}"))
             })?;
-        let contract = NoxRegistryContract::new(registry, Arc::new(provider));
+        let contract = RegistryContract::new(registry, provider);
         Ok(Self::with_contract(
             contract,
             topology,
@@ -99,11 +99,9 @@ impl RegistryReconciler<Provider<Http>> {
             config.chain_start_block,
         ))
     }
-}
 
-impl<M: Middleware + 'static> RegistryReconciler<M> {
     pub(crate) fn with_contract(
-        contract: NoxRegistryContract<M>,
+        contract: RegistryContract,
         topology: Arc<TopologyManager>,
         observed: Arc<ObservedChain>,
         metrics: MetricsService,
@@ -270,7 +268,7 @@ impl<M: Middleware + 'static> RegistryReconciler<M> {
     ) -> Result<Vec<(String, Option<RegistryProfile>)>, InfrastructureError> {
         let mut reads = Vec::with_capacity(addresses.len());
         for address in addresses {
-            let relayer = address.parse::<Address>().map_err(|e| {
+            let relayer = nox_core::eth::parse_address(&address).map_err(|e| {
                 InfrastructureError::Blockchain(format!("Invalid member address {address}: {e}"))
             })?;
             let profile = read_registry_profile(&self.contract, relayer, Some(block)).await?;
@@ -304,26 +302,24 @@ impl<M: Middleware + 'static> RegistryReconciler<M> {
     }
 
     async fn matches_chain(&self, block: u64) -> Result<bool, InfrastructureError> {
-        let at = BlockId::Number(BlockNumber::Number(block.into()));
         let fingerprint = self
             .contract
-            .topology_fingerprint()
-            .block(at)
-            .call()
+            .call(
+                &NoxRegistryContract::topologyFingerprintCall {},
+                Some(block),
+            )
             .await
             .map_err(|e| {
                 InfrastructureError::Blockchain(format!("topologyFingerprint() at {block}: {e}"))
             })?;
         let count = self
             .contract
-            .relayer_count()
-            .block(at)
-            .call()
+            .call(&NoxRegistryContract::relayerCountCall {}, Some(block))
             .await
             .map_err(|e| {
                 InfrastructureError::Blockchain(format!("relayerCount() at {block}: {e}"))
             })?;
-        Ok(fingerprint == self.topology.get_current_fingerprint()
+        Ok(fingerprint.0 == self.topology.get_current_fingerprint()
             && count == U256::from(self.topology.member_count()))
     }
 
@@ -340,23 +336,29 @@ impl<M: Middleware + 'static> RegistryReconciler<M> {
     /// `None` when a newer registry log arrived before the reads were applied.
     async fn discover_members(&mut self, block: u64) -> Result<Option<bool>, InfrastructureError> {
         self.last_discovery = Some(Instant::now());
-        let topics = vec![
-            RelayerRegisteredFilter::signature(),
-            PrivilegedRelayerRegisteredFilter::signature(),
+        let topics = [
+            Some(TopicFilter::Any(vec![
+                NoxRegistryContract::RelayerRegistered::SIGNATURE_HASH,
+                NoxRegistryContract::PrivilegedRelayerRegistered::SIGNATURE_HASH,
+            ])),
+            None,
+            None,
+            None,
         ];
         let mut candidates = HashSet::new();
         let mut from = self.chain_start_block;
         while from <= block {
             let to = block.min(from.saturating_add(DISCOVERY_BLOCK_RANGE - 1));
-            let filter = Filter::new()
-                .address(self.contract.address())
-                .topic0(topics.clone())
-                .from_block(from)
-                .to_block(to);
-            let logs = self
+            let filter = logs_filter(
+                Some(&block_quantity(from)),
+                Some(&block_quantity(to)),
+                &[self.contract.address()],
+                &topics,
+            );
+            let logs: Vec<Log> = self
                 .contract
-                .client()
-                .get_logs(&filter)
+                .provider()
+                .raw_request(std::borrow::Cow::Borrowed("eth_getLogs"), (filter,))
                 .await
                 .map_err(|e| {
                     InfrastructureError::Blockchain(format!(
@@ -364,8 +366,8 @@ impl<M: Middleware + 'static> RegistryReconciler<M> {
                     ))
                 })?;
             for log in logs {
-                if let Some(topic) = log.topics.get(1) {
-                    candidates.insert(Address::from(*topic));
+                if let Some(topic) = log.topics().get(1) {
+                    candidates.insert(Address::from_word(*topic));
                 }
             }
             from = to + 1;
@@ -396,7 +398,11 @@ impl<M: Middleware + 'static> RegistryReconciler<M> {
 mod tests {
     use super::*;
     use crate::infra::{event_bus::TokioEventBus, storage::SledRepository};
-    use ethers::abi::Token;
+    use alloy::primitives::{Bytes, FixedBytes};
+    use alloy::providers::mock::Asserter;
+    use alloy::providers::RootProvider;
+    use alloy::rpc::client::RpcClient;
+    use alloy::sol_types::SolValue;
     use nox_core::IEventSubscriber;
 
     const A: &str = "0x74486dc1ac551e5cd3f4eef80727cc9d50d3abe9";
@@ -404,8 +410,8 @@ mod tests {
     const BLOCK: u64 = 1_000;
 
     struct Chain {
-        mock: MockProvider,
-        reconciler: RegistryReconciler<Provider<MockProvider>>,
+        mock: Asserter,
+        reconciler: RegistryReconciler,
         topology: Arc<TopologyManager>,
         observed: Arc<ObservedChain>,
         _dir: tempfile::TempDir,
@@ -419,8 +425,9 @@ mod tests {
         let topology = Arc::new(TopologyManager::new(storage, subscriber, None));
         let observed = Arc::new(ObservedChain::default());
         observed.resume_at(BLOCK);
-        let (provider, mock) = Provider::mocked();
-        let contract = NoxRegistryContract::new(Address::zero(), Arc::new(provider));
+        let mock = Asserter::new();
+        let provider = RootProvider::new(RpcClient::mocked(mock.clone()));
+        let contract = RegistryContract::new(Address::ZERO, provider);
         let reconciler = RegistryReconciler::with_contract(
             contract,
             topology.clone(),
@@ -454,52 +461,52 @@ mod tests {
     fn relayers_output(profile: Option<&RegistryProfile>) -> Bytes {
         let (key, url, ingress, stake, frozen, registered) = match profile {
             Some(p) => (
-                hex::decode(&p.sphinx_key).expect("hex"),
+                FixedBytes::<32>::from_slice(&hex::decode(&p.sphinx_key).expect("hex")),
                 p.url.clone(),
                 p.ingress_url.clone().unwrap_or_default(),
-                U256::from_dec_str(&p.stake).expect("stake"),
+                nox_core::eth::parse_decimal_u256(&p.stake).expect("stake"),
                 p.frozen,
                 true,
             ),
             None => (
-                vec![0; 32],
+                FixedBytes::<32>::ZERO,
                 String::new(),
                 String::new(),
-                U256::zero(),
+                U256::ZERO,
                 false,
                 false,
             ),
         };
-        ethers::abi::encode(&[
-            Token::FixedBytes(key),
-            Token::String(url),
-            Token::String(ingress),
-            Token::String(String::new()),
-            Token::Uint(stake),
-            Token::Uint(U256::zero()),
-            Token::Bool(registered),
-            Token::Uint(U256::from(u8::from(registered))),
-            Token::Bool(frozen),
-        ])
-        .into()
+        (
+            key,
+            url,
+            ingress,
+            String::new(),
+            stake,
+            U256::ZERO,
+            registered,
+            U256::from(u8::from(registered)),
+            frozen,
+        )
+            .abi_encode_params()
+            .into()
     }
 
     fn uint(value: u64) -> Bytes {
-        ethers::abi::encode(&[Token::Uint(U256::from(value))]).into()
+        U256::from(value).abi_encode().into()
     }
 
     fn fingerprint(addresses: &[&str]) -> Bytes {
         let owned: Vec<String> = addresses.iter().map(ToString::to_string).collect();
-        ethers::abi::encode(&[Token::FixedBytes(
-            TopologyManager::compute_topology_fingerprint(&owned).to_vec(),
-        )])
-        .into()
+        FixedBytes::<32>::from(TopologyManager::compute_topology_fingerprint(&owned))
+            .abi_encode()
+            .into()
     }
 
-    /// Queues eth_call results in call order (the mock pops the newest first).
-    fn respond(mock: &MockProvider, results: Vec<Bytes>) {
-        for result in results.into_iter().rev() {
-            mock.push::<Bytes, _>(result).expect("push");
+    /// Queues eth_call results in call order.
+    fn respond(mock: &Asserter, results: Vec<Bytes>) {
+        for result in results {
+            mock.push_success(&result);
         }
     }
 
@@ -651,9 +658,9 @@ mod tests {
         let bus = Arc::new(TokioEventBus::new(8));
         let subscriber: Arc<dyn IEventSubscriber> = bus;
         let topology = Arc::new(TopologyManager::new(storage, subscriber, None));
-        let (provider, _mock) = Provider::mocked();
+        let provider = RootProvider::new(RpcClient::mocked(Asserter::new()));
         let mut reconciler = RegistryReconciler::with_contract(
-            NoxRegistryContract::new(Address::zero(), Arc::new(provider)),
+            RegistryContract::new(Address::ZERO, provider),
             topology,
             Arc::new(ObservedChain::default()),
             MetricsService::new(),

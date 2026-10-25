@@ -7,12 +7,14 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ### Upgrade notes
 
-- Wire formats are unchanged. Configurations that set `benchmark_mode = true` now load only in builds with the
+- Configurations that set `benchmark_mode = true` now load only in builds with the
   `dev-node` feature; production nodes keep the default `false`.
   The process mesh (`nox_mesh_server`, the multi-process benchmarks and the compat-mesh job) runs its nodes in
   `benchmark_mode`, so it needs a `nox` binary built with `--features dev-node`.
 - Exits with tunnels enabled check `max_sessions` against the open-file limit at startup
   ([docs/tunnel.md](docs/tunnel.md#operating-an-exit)); the fleet setting (`max_sessions = 512`) fits.
+- Wire formats, configuration keys and stored records are unchanged; nodes on this build and rc.6 to rc.10 nodes
+  interoperate.
 
 ### Changed
 
@@ -31,11 +33,27 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 - `decode_payload_limited` rejects bytes after the encoded value, like `decode_payload`; payloads read from a
   padded Sphinx body keep using `decode_padded_relayer_payload_limited`.
 - nox-kps sizes claim responses for full 32,296-byte replies (`128 x 129,248 + 2` bytes with the defaults).
+- Chain access (registry observer and reconciler, exit executor and transaction outbox, paid quotes, the RPC proxy
+  and client topology verification) runs on Alloy 2.5. EIP-712 quote digests and exit signatures, signed
+  transactions, peer identity signatures, profitability decisions and stored records are byte-identical to rc.10,
+  and upstream JSON-RPC requests carry the same methods and parameters, pinned by golden vectors recorded before
+  the change
+  (`tests/chain_golden_vectors.rs`, RPC proxy and client vectors under `tests/golden/`). Upstream RPC requests keep
+  HTTP/1 with native TLS.
+- The RPC proxy returns blocks, transactions, receipts and logs exactly as the upstream sent them, without the
+  empty `sealFields` array the previous library added to blocks.
+- `check-config` reads `quote_rolling_loss_limit_native` as a decimal integer, the same way the exit reads it at
+  startup.
+- RUSTSEC-2025-0009, RUSTSEC-2025-0010, RUSTSEC-2025-0134 and RUSTSEC-2026-0258 left the dependency graph with the
+  previous Ethereum library, and their exceptions are removed. The bincode v1 wire stays as it is, with its
+  RUSTSEC-2025-0141 exception dated 2027-03-31 ([SECURITY.md](SECURITY.md)).
 
 ### Removed
 
 - `nox_crypto` `POLY1305_TAG_SIZE`, `PAYLOAD_OVERHEAD` and `PACKET_NONCE_SIZE`, superseded by the real header and
   body sizes above.
+- `ChainExecutor::submit_transaction` and `ChainExecutor::send_raw`, which had no callers; exits broadcast through
+  the transaction outbox.
 
 ## [0.4.0-rc.10] - 2026-10-13
 

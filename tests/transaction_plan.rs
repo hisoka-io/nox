@@ -1,8 +1,8 @@
+use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy::rpc::types::Log;
+use alloy_node_bindings::Anvil;
 use async_trait::async_trait;
-use ethers::types::{Address, Bytes, Log, H256, U256};
-use ethers::utils::keccak256;
-use ethers::utils::Anvil;
-use nox_node::blockchain::executor::ChainExecutor;
+use nox_node::blockchain::executor::{unmined_log, ChainExecutor};
 use nox_node::blockchain::transaction_plan::{buffered, CostCandidate};
 use nox_node::price::client::{FixedPriceSource, PriceClientError, PriceQuote};
 use nox_node::services::profitability::{ProfitabilityCalculator, ProfitabilityError};
@@ -68,20 +68,19 @@ fn payment_log(pool: Address, amount: U256) -> Log {
     let asset: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
         .parse()
         .unwrap();
-    let mut topic = [0_u8; 32];
-    topic[12..].copy_from_slice(asset.as_bytes());
-    let mut encoded_amount = [0_u8; 32];
-    amount.to_big_endian(&mut encoded_amount);
-    Log {
-        address: pool,
-        topics: vec![
-            H256::from(keccak256(b"RewardsDeposited(address,address,uint256)")),
-            H256::from(topic),
-            H256::zero(),
+    payment_log_for_topic(pool, asset.into_word(), amount)
+}
+
+fn payment_log_for_topic(pool: Address, asset_topic: B256, amount: U256) -> Log {
+    unmined_log(
+        pool,
+        vec![
+            keccak256(b"RewardsDeposited(address,address,uint256)"),
+            asset_topic,
+            B256::ZERO,
         ],
-        data: Bytes::from(encoded_amount.to_vec()),
-        ..Default::default()
-    }
+        Bytes::from(amount.to_be_bytes::<32>().to_vec()),
+    )
 }
 
 #[test]
@@ -90,17 +89,17 @@ fn basis_point_buffers_round_up_once() {
         buffered(U256::from(101), 2_000, "gas_limit").unwrap(),
         U256::from(122)
     );
-    assert!(buffered(U256::zero(), 2_000, "gas_limit").is_err());
+    assert!(buffered(U256::ZERO, 2_000, "gas_limit").is_err());
 }
 
 #[tokio::test]
 async fn exact_margin_boundary_accepts_and_one_unit_below_rejects() {
-    let pool = Address::from_low_u64_be(7);
+    let pool = Address::with_last_byte(7);
     let calculator = ProfitabilityCalculator::new(0, Arc::new(FixedPrices), pool);
     let candidate = CostCandidate {
         gas_limit: U256::from(1),
         initial_fee_per_gas: U256::from(1_000_000_000_000_000_000_u128),
-        chain_data_fee_native: U256::zero(),
+        chain_data_fee_native: U256::ZERO,
     };
     let accepted = calculator
         .authorize(
@@ -125,16 +124,19 @@ async fn exact_margin_boundary_accepts_and_one_unit_below_rejects() {
 
 #[tokio::test]
 async fn unknown_payment_token_never_receives_a_zero_price() {
-    let pool = Address::from_low_u64_be(7);
+    let pool = Address::with_last_byte(7);
     let calculator = ProfitabilityCalculator::new(0, Arc::new(FixedPrices), pool);
-    let mut log = payment_log(pool, U256::from(10_000_000_u64));
-    log.topics[1] = H256::from_low_u64_be(999);
+    let log = payment_log_for_topic(
+        pool,
+        B256::left_padding_from(&999_u64.to_be_bytes()),
+        U256::from(10_000_000_u64),
+    );
     let rejected = calculator
         .authorize(
             CostCandidate {
-                gas_limit: U256::one(),
-                initial_fee_per_gas: U256::one(),
-                chain_data_fee_native: U256::zero(),
+                gas_limit: U256::from(1),
+                initial_fee_per_gas: U256::from(1),
+                chain_data_fee_native: U256::ZERO,
             },
             &[log],
         )
@@ -144,14 +146,14 @@ async fn unknown_payment_token_never_receives_a_zero_price() {
 
 #[tokio::test]
 async fn zero_native_price_is_unavailable() {
-    let pool = Address::from_low_u64_be(7);
+    let pool = Address::with_last_byte(7);
     let calculator = ProfitabilityCalculator::new(0, Arc::new(InvalidNativePrice), pool);
     let rejected = calculator
         .authorize(
             CostCandidate {
-                gas_limit: U256::one(),
-                initial_fee_per_gas: U256::one(),
-                chain_data_fee_native: U256::zero(),
+                gas_limit: U256::from(1),
+                initial_fee_per_gas: U256::from(1),
+                chain_data_fee_native: U256::ZERO,
             },
             &[payment_log(pool, U256::from(1_000_000_u64))],
         )
@@ -164,14 +166,14 @@ async fn zero_native_price_is_unavailable() {
 
 #[tokio::test]
 async fn initial_twenty_percent_bid_defeats_apparent_ten_percent_margin() {
-    let pool = Address::from_low_u64_be(7);
+    let pool = Address::with_last_byte(7);
     let calculator = ProfitabilityCalculator::new(10, Arc::new(FixedPrices), pool);
     let rejected = calculator
         .authorize(
             CostCandidate {
-                gas_limit: U256::one(),
+                gas_limit: U256::from(1),
                 initial_fee_per_gas: U256::from(1_200_000_000_000_000_000_u128),
-                chain_data_fee_native: U256::zero(),
+                chain_data_fee_native: U256::ZERO,
             },
             &[payment_log(pool, U256::from(1_100_000_u64))],
         )
@@ -184,7 +186,7 @@ async fn initial_twenty_percent_bid_defeats_apparent_ten_percent_margin() {
 
 #[tokio::test]
 async fn signed_quote_cap_clamps_affordable_replacement_and_maximum_cost() {
-    let pool = Address::from_low_u64_be(7);
+    let pool = Address::with_last_byte(7);
     let calculator = ProfitabilityCalculator::new(0, Arc::new(FixedPrices), pool);
     let fee_asset: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
         .parse()
@@ -195,7 +197,7 @@ async fn signed_quote_cap_clamps_affordable_replacement_and_maximum_cost() {
             CostCandidate {
                 gas_limit: U256::from(21_000),
                 initial_fee_per_gas: U256::from(1_000_000_000_u64),
-                chain_data_fee_native: U256::zero(),
+                chain_data_fee_native: U256::ZERO,
             },
             fee_asset,
             U256::from(1_000_000_u64),
@@ -210,14 +212,14 @@ async fn signed_quote_cap_clamps_affordable_replacement_and_maximum_cost() {
 
 #[tokio::test]
 async fn widened_product_overflow_rejects() {
-    let pool = Address::from_low_u64_be(7);
+    let pool = Address::with_last_byte(7);
     let calculator = ProfitabilityCalculator::new(0, Arc::new(FixedPrices), pool);
     let rejected = calculator
         .authorize(
             CostCandidate {
                 gas_limit: U256::MAX,
                 initial_fee_per_gas: U256::MAX,
-                chain_data_fee_native: U256::zero(),
+                chain_data_fee_native: U256::ZERO,
             },
             &[payment_log(pool, U256::MAX)],
         )
@@ -236,7 +238,7 @@ async fn exact_estimate_prices_intrinsic_calldata_and_failure_is_terminal() {
     config.chain_id = anvil.chain_id();
     config.eth_wallet_private_key = hex::encode(anvil.keys()[0].to_bytes());
     let executor = ChainExecutor::new(&config).await.unwrap();
-    let target = Address::from_low_u64_be(77);
+    let target = Address::with_last_byte(77);
     let short = executor.estimate_gas(target, Bytes::new()).await.unwrap();
     let long = executor
         .estimate_gas(target, Bytes::from(vec![1; 1_024]))
@@ -253,14 +255,14 @@ async fn exact_estimate_prices_intrinsic_calldata_and_failure_is_terminal() {
     );
 
     let malformed_blake2_input = executor
-        .estimate_gas(Address::from_low_u64_be(9), Bytes::from(vec![1]))
+        .estimate_gas(Address::with_last_byte(9), Bytes::from(vec![1]))
         .await;
     assert!(malformed_blake2_input.is_err());
 }
 
 #[tokio::test]
 async fn configured_avax_price_id_is_requested() {
-    let pool = Address::from_low_u64_be(7);
+    let pool = Address::with_last_byte(7);
     let prices = Arc::new(RecordingPrices(Mutex::new(Vec::new())));
     let calculator = ProfitabilityCalculator::with_economics(
         0,
@@ -273,9 +275,9 @@ async fn configured_avax_price_id_is_requested() {
     calculator
         .authorize(
             CostCandidate {
-                gas_limit: U256::one(),
-                initial_fee_per_gas: U256::one(),
-                chain_data_fee_native: U256::zero(),
+                gas_limit: U256::from(1),
+                initial_fee_per_gas: U256::from(1),
+                chain_data_fee_native: U256::ZERO,
             },
             &[payment_log(pool, U256::from(1_000_000_u64))],
         )

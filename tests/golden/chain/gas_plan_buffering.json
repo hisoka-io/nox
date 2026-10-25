@@ -1,0 +1,674 @@
+[
+  {
+    "value": "0",
+    "bps": 0,
+    "field": "gas_limit",
+    "result": {
+      "Err": "gas estimate is zero"
+    }
+  },
+  {
+    "value": "0",
+    "bps": 0,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Err": "gas price is zero"
+    }
+  },
+  {
+    "value": "0",
+    "bps": 1,
+    "field": "gas_limit",
+    "result": {
+      "Err": "gas estimate is zero"
+    }
+  },
+  {
+    "value": "0",
+    "bps": 1,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Err": "gas price is zero"
+    }
+  },
+  {
+    "value": "0",
+    "bps": 2000,
+    "field": "gas_limit",
+    "result": {
+      "Err": "gas estimate is zero"
+    }
+  },
+  {
+    "value": "0",
+    "bps": 2000,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Err": "gas price is zero"
+    }
+  },
+  {
+    "value": "0",
+    "bps": 9999,
+    "field": "gas_limit",
+    "result": {
+      "Err": "gas estimate is zero"
+    }
+  },
+  {
+    "value": "0",
+    "bps": 9999,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Err": "gas price is zero"
+    }
+  },
+  {
+    "value": "0",
+    "bps": 10000,
+    "field": "gas_limit",
+    "result": {
+      "Err": "gas estimate is zero"
+    }
+  },
+  {
+    "value": "0",
+    "bps": 10000,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Err": "gas price is zero"
+    }
+  },
+  {
+    "value": "0",
+    "bps": 4294967295,
+    "field": "gas_limit",
+    "result": {
+      "Err": "gas estimate is zero"
+    }
+  },
+  {
+    "value": "0",
+    "bps": 4294967295,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Err": "gas price is zero"
+    }
+  },
+  {
+    "value": "1",
+    "bps": 0,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "1"
+    }
+  },
+  {
+    "value": "1",
+    "bps": 0,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "1"
+    }
+  },
+  {
+    "value": "1",
+    "bps": 1,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "2"
+    }
+  },
+  {
+    "value": "1",
+    "bps": 1,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "2"
+    }
+  },
+  {
+    "value": "1",
+    "bps": 2000,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "2"
+    }
+  },
+  {
+    "value": "1",
+    "bps": 2000,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "2"
+    }
+  },
+  {
+    "value": "1",
+    "bps": 9999,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "2"
+    }
+  },
+  {
+    "value": "1",
+    "bps": 9999,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "2"
+    }
+  },
+  {
+    "value": "1",
+    "bps": 10000,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "2"
+    }
+  },
+  {
+    "value": "1",
+    "bps": 10000,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "2"
+    }
+  },
+  {
+    "value": "1",
+    "bps": 4294967295,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "429498"
+    }
+  },
+  {
+    "value": "1",
+    "bps": 4294967295,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "429498"
+    }
+  },
+  {
+    "value": "21000",
+    "bps": 0,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "21000"
+    }
+  },
+  {
+    "value": "21000",
+    "bps": 0,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "21000"
+    }
+  },
+  {
+    "value": "21000",
+    "bps": 1,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "21003"
+    }
+  },
+  {
+    "value": "21000",
+    "bps": 1,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "21003"
+    }
+  },
+  {
+    "value": "21000",
+    "bps": 2000,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "25200"
+    }
+  },
+  {
+    "value": "21000",
+    "bps": 2000,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "25200"
+    }
+  },
+  {
+    "value": "21000",
+    "bps": 9999,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "41998"
+    }
+  },
+  {
+    "value": "21000",
+    "bps": 9999,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "41998"
+    }
+  },
+  {
+    "value": "21000",
+    "bps": 10000,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "42000"
+    }
+  },
+  {
+    "value": "21000",
+    "bps": 10000,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "42000"
+    }
+  },
+  {
+    "value": "21000",
+    "bps": 4294967295,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "9019452320"
+    }
+  },
+  {
+    "value": "21000",
+    "bps": 4294967295,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "9019452320"
+    }
+  },
+  {
+    "value": "9999",
+    "bps": 0,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "9999"
+    }
+  },
+  {
+    "value": "9999",
+    "bps": 0,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "9999"
+    }
+  },
+  {
+    "value": "9999",
+    "bps": 1,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "10000"
+    }
+  },
+  {
+    "value": "9999",
+    "bps": 1,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "10000"
+    }
+  },
+  {
+    "value": "9999",
+    "bps": 2000,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "11999"
+    }
+  },
+  {
+    "value": "9999",
+    "bps": 2000,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "11999"
+    }
+  },
+  {
+    "value": "9999",
+    "bps": 9999,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "19998"
+    }
+  },
+  {
+    "value": "9999",
+    "bps": 9999,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "19998"
+    }
+  },
+  {
+    "value": "9999",
+    "bps": 10000,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "19998"
+    }
+  },
+  {
+    "value": "9999",
+    "bps": 10000,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "19998"
+    }
+  },
+  {
+    "value": "9999",
+    "bps": 4294967295,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "4294547798"
+    }
+  },
+  {
+    "value": "9999",
+    "bps": 4294967295,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "4294547798"
+    }
+  },
+  {
+    "value": "123456789012",
+    "bps": 0,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "123456789012"
+    }
+  },
+  {
+    "value": "123456789012",
+    "bps": 0,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "123456789012"
+    }
+  },
+  {
+    "value": "123456789012",
+    "bps": 1,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "123469134691"
+    }
+  },
+  {
+    "value": "123456789012",
+    "bps": 1,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "123469134691"
+    }
+  },
+  {
+    "value": "123456789012",
+    "bps": 2000,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "148148146815"
+    }
+  },
+  {
+    "value": "123456789012",
+    "bps": 2000,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "148148146815"
+    }
+  },
+  {
+    "value": "123456789012",
+    "bps": 9999,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "246901232346"
+    }
+  },
+  {
+    "value": "123456789012",
+    "bps": 9999,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "246901232346"
+    }
+  },
+  {
+    "value": "123456789012",
+    "bps": 10000,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "246913578024"
+    }
+  },
+  {
+    "value": "123456789012",
+    "bps": 10000,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "246913578024"
+    }
+  },
+  {
+    "value": "123456789012",
+    "bps": 4294967295,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "53024410572014549"
+    }
+  },
+  {
+    "value": "123456789012",
+    "bps": 4294967295,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "53024410572014549"
+    }
+  },
+  {
+    "value": "1606938044258990275541962092341162602522202993782792835301376",
+    "bps": 0,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "1606938044258990275541962092341162602522202993782792835301376"
+    }
+  },
+  {
+    "value": "1606938044258990275541962092341162602522202993782792835301376",
+    "bps": 0,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "1606938044258990275541962092341162602522202993782792835301376"
+    }
+  },
+  {
+    "value": "1606938044258990275541962092341162602522202993782792835301376",
+    "bps": 1,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "1607098738063416174569516288550396718782455214082171114584907"
+    }
+  },
+  {
+    "value": "1606938044258990275541962092341162602522202993782792835301376",
+    "bps": 1,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "1607098738063416174569516288550396718782455214082171114584907"
+    }
+  },
+  {
+    "value": "1606938044258990275541962092341162602522202993782792835301376",
+    "bps": 2000,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "1928325653110788330650354510809395123026643592539351402361652"
+    }
+  },
+  {
+    "value": "1606938044258990275541962092341162602522202993782792835301376",
+    "bps": 2000,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "1928325653110788330650354510809395123026643592539351402361652"
+    }
+  },
+  {
+    "value": "1606938044258990275541962092341162602522202993782792835301376",
+    "bps": 9999,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "3213715394713554652056369988473091088784153767266207391319222"
+    }
+  },
+  {
+    "value": "1606938044258990275541962092341162602522202993782792835301376",
+    "bps": 9999,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "3213715394713554652056369988473091088784153767266207391319222"
+    }
+  },
+  {
+    "value": "1606938044258990275541962092341162602522202993782792835301376",
+    "bps": 10000,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "3213876088517980551083924184682325205044405987565585670602752"
+    }
+  },
+  {
+    "value": "1606938044258990275541962092341162602522202993782792835301376",
+    "bps": 10000,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "3213876088517980551083924184682325205044405987565585670602752"
+    }
+  },
+  {
+    "value": "1606938044258990275541962092341162602522202993782792835301376",
+    "bps": 4294967295,
+    "field": "gas_limit",
+    "result": {
+      "Ok": "690176241456406833307852100635598677173597159167812138930808440226"
+    }
+  },
+  {
+    "value": "1606938044258990275541962092341162602522202993782792835301376",
+    "bps": 4294967295,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Ok": "690176241456406833307852100635598677173597159167812138930808440226"
+    }
+  },
+  {
+    "value": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+    "bps": 0,
+    "field": "gas_limit",
+    "result": {
+      "Err": "gas-plan arithmetic overflow while applying gas_limit"
+    }
+  },
+  {
+    "value": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+    "bps": 0,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Err": "gas-plan arithmetic overflow while applying initial_fee_per_gas"
+    }
+  },
+  {
+    "value": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+    "bps": 1,
+    "field": "gas_limit",
+    "result": {
+      "Err": "gas-plan arithmetic overflow while applying gas_limit"
+    }
+  },
+  {
+    "value": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+    "bps": 1,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Err": "gas-plan arithmetic overflow while applying initial_fee_per_gas"
+    }
+  },
+  {
+    "value": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+    "bps": 2000,
+    "field": "gas_limit",
+    "result": {
+      "Err": "gas-plan arithmetic overflow while applying gas_limit"
+    }
+  },
+  {
+    "value": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+    "bps": 2000,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Err": "gas-plan arithmetic overflow while applying initial_fee_per_gas"
+    }
+  },
+  {
+    "value": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+    "bps": 9999,
+    "field": "gas_limit",
+    "result": {
+      "Err": "gas-plan arithmetic overflow while applying gas_limit"
+    }
+  },
+  {
+    "value": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+    "bps": 9999,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Err": "gas-plan arithmetic overflow while applying initial_fee_per_gas"
+    }
+  },
+  {
+    "value": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+    "bps": 10000,
+    "field": "gas_limit",
+    "result": {
+      "Err": "gas-plan arithmetic overflow while applying gas_limit"
+    }
+  },
+  {
+    "value": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+    "bps": 10000,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Err": "gas-plan arithmetic overflow while applying initial_fee_per_gas"
+    }
+  },
+  {
+    "value": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+    "bps": 4294967295,
+    "field": "gas_limit",
+    "result": {
+      "Err": "gas-plan arithmetic overflow while applying gas_limit"
+    }
+  },
+  {
+    "value": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+    "bps": 4294967295,
+    "field": "initial_fee_per_gas",
+    "result": {
+      "Err": "gas-plan arithmetic overflow while applying initial_fee_per_gas"
+    }
+  }
+]

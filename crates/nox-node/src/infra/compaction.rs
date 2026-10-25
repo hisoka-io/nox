@@ -31,7 +31,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ethers::utils::keccak256;
+use alloy::primitives::keccak256;
 use nox_core::traits::InfrastructureError;
 use serde::{Deserialize, Serialize};
 
@@ -124,7 +124,7 @@ impl ChainedDigest {
         self.buffer
             .extend_from_slice(&(bytes.len() as u64).to_le_bytes());
         self.buffer.extend_from_slice(bytes);
-        self.state = keccak256(&self.buffer);
+        self.state = keccak256(&self.buffer).0;
     }
 
     fn finalize(self) -> [u8; 32] {

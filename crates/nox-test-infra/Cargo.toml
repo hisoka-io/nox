@@ -10,7 +10,7 @@ repository = "https://github.com/hisoka-io/nox"
 publish = false
 
 [dependencies]
-ethers = { workspace = true }
+alloy = { workspace = true }
 serde = { workspace = true }
 
 [lints]

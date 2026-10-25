@@ -1,8 +1,14 @@
-use crate::blockchain::executor::build_ethers_http1_provider;
+use crate::blockchain::executor::build_http1_provider;
 use crate::config::NoxConfig;
 use crate::services::network_manager::RegistryProfile;
 use crate::telemetry::metrics::MetricsService;
-use ethers::prelude::*;
+use alloy::primitives::Address;
+use alloy::providers::Provider;
+use alloy::rpc::types::Log;
+use alloy::sol_types::{SolCall, SolEventInterface};
+use alloy::transports::TransportError;
+use nox_core::chain_rpc::{eth_call, ChainProvider};
+use nox_core::eth::{block_quantity, logs_filter};
 use nox_core::{
     events::NoxEvent,
     traits::{IEventPublisher, IStorageRepository, InfrastructureError},
@@ -140,76 +146,103 @@ impl ObservedChain {
     }
 }
 
-// Generate type-safe bindings for the registry events and views the node uses.
-abigen!(
-    NoxRegistryContract,
-    r#"[
-        event RelayerRegistered(address indexed relayer, bytes32 sphinxKey, string url, string ingressUrl, string metadataUrl, uint256 stake, uint8 nodeRole)
-        event PrivilegedRelayerRegistered(address indexed relayer, bytes32 sphinxKey, string url, string ingressUrl, string metadataUrl, uint8 nodeRole)
-        event RelayerRemoved(address indexed relayer, address indexed by)
-        event Unstaked(address indexed relayer, uint256 amount)
-        event KeyRotated(address indexed relayer, bytes32 newSphinxKey)
-        event RoleUpdated(address indexed relayer, uint8 newRole)
-        event RelayerUpdated(address indexed relayer, string newUrl)
-        event IngressUrlUpdated(address indexed relayer, string newIngressUrl)
-        event MetadataUrlUpdated(address indexed relayer, string newMetadataUrl)
-        event StakeAdded(address indexed relayer, uint256 amount)
-        event UnstakeRequested(address indexed relayer, uint256 unlockTime)
-        event UnstakeCancelled(address indexed relayer)
-        event RelayerFrozen(address indexed relayer, address indexed by)
-        event RelayerUnfrozen(address indexed relayer, address indexed by)
-        event Slashed(address indexed relayer, uint256 amount, address indexed slasher)
-        event Paused(address account)
-        event Unpaused(address account)
-        function relayers(address relayer) view returns (bytes32 sphinxKey, string url, string ingressUrl, string metadataUrl, uint256 stakedAmount, uint256 unlockTime, bool isRegistered, uint8 status, bool frozen)
-        function getNodeRole(address relayer) view returns (uint8)
-        function topologyFingerprint() view returns (bytes32)
-        function relayerCount() view returns (uint256)
-    ]"#
-);
+alloy::sol! {
+    /// Registry events and views the node reads.
+    interface NoxRegistryContract {
+        event RelayerRegistered(address indexed relayer, bytes32 sphinxKey, string url, string ingressUrl, string metadataUrl, uint256 stake, uint8 nodeRole);
+        event PrivilegedRelayerRegistered(address indexed relayer, bytes32 sphinxKey, string url, string ingressUrl, string metadataUrl, uint8 nodeRole);
+        event RelayerRemoved(address indexed relayer, address indexed by);
+        event Unstaked(address indexed relayer, uint256 amount);
+        event KeyRotated(address indexed relayer, bytes32 newSphinxKey);
+        event RoleUpdated(address indexed relayer, uint8 newRole);
+        event RelayerUpdated(address indexed relayer, string newUrl);
+        event IngressUrlUpdated(address indexed relayer, string newIngressUrl);
+        event MetadataUrlUpdated(address indexed relayer, string newMetadataUrl);
+        event StakeAdded(address indexed relayer, uint256 amount);
+        event UnstakeRequested(address indexed relayer, uint256 unlockTime);
+        event UnstakeCancelled(address indexed relayer);
+        event RelayerFrozen(address indexed relayer, address indexed by);
+        event RelayerUnfrozen(address indexed relayer, address indexed by);
+        event Slashed(address indexed relayer, uint256 amount, address indexed slasher);
+        event Paused(address account);
+        event Unpaused(address account);
+        function relayers(address relayer) external view returns (bytes32 sphinxKey, string url, string ingressUrl, string metadataUrl, uint256 stakedAmount, uint256 unlockTime, bool isRegistered, uint8 status, bool frozen);
+        function getNodeRole(address relayer) external view returns (uint8);
+        function topologyFingerprint() external view returns (bytes32);
+        function relayerCount() external view returns (uint256);
+    }
+}
 
-pub(crate) type RegistryContract = NoxRegistryContract<Provider<Http>>;
+use NoxRegistryContract::NoxRegistryContractEvents as RegistryEvent;
+
+/// Read access to one `NoxRegistry` deployment.
+#[derive(Clone)]
+pub(crate) struct RegistryContract {
+    provider: ChainProvider,
+    address: Address,
+}
+
+impl RegistryContract {
+    pub(crate) fn new(address: Address, provider: ChainProvider) -> Self {
+        Self { provider, address }
+    }
+
+    pub(crate) fn address(&self) -> Address {
+        self.address
+    }
+
+    pub(crate) fn provider(&self) -> &ChainProvider {
+        &self.provider
+    }
+
+    /// Calls a registry view at `block` (latest when `None`).
+    pub(crate) async fn call<C: SolCall>(
+        &self,
+        call: &C,
+        block: Option<u64>,
+    ) -> Result<C::Return, TransportError> {
+        eth_call(&self.provider, self.address, call, block).await
+    }
+}
 
 /// Reads a node's profile from the registry at `block` (latest when `None`).
 /// `Ok(None)` means the address is not registered at that block.
-pub(crate) async fn read_registry_profile<M: Middleware>(
-    contract: &NoxRegistryContract<M>,
+pub(crate) async fn read_registry_profile(
+    contract: &RegistryContract,
     relayer: Address,
     block: Option<u64>,
 ) -> Result<Option<RegistryProfile>, InfrastructureError> {
-    let at = block.map(|number| BlockId::Number(BlockNumber::Number(number.into())));
-    let mut profile_call = contract.relayers(relayer);
-    let mut role_call = contract.get_node_role(relayer);
-    if let Some(at) = at {
-        profile_call = profile_call.block(at);
-        role_call = role_call.block(at);
-    }
-    let (sphinx_key, url, ingress_url, metadata_url, staked, _unlock, registered, _status, frozen) =
-        profile_call.call().await.map_err(|e| {
+    let profile = contract
+        .call(&NoxRegistryContract::relayersCall { relayer }, block)
+        .await
+        .map_err(|e| {
             InfrastructureError::Blockchain(format!("relayers({relayer:?}) at {block:?}: {e}"))
         })?;
-    if !registered {
+    if !profile.isRegistered {
         return Ok(None);
     }
-    let role = role_call.call().await.map_err(|e| {
-        InfrastructureError::Blockchain(format!("getNodeRole({relayer:?}) at {block:?}: {e}"))
-    })?;
+    let role = contract
+        .call(&NoxRegistryContract::getNodeRoleCall { relayer }, block)
+        .await
+        .map_err(|e| {
+            InfrastructureError::Blockchain(format!("getNodeRole({relayer:?}) at {block:?}: {e}"))
+        })?;
     Ok(Some(RegistryProfile {
         address: format!("{relayer:?}"),
-        sphinx_key: hex::encode(sphinx_key),
-        url,
+        sphinx_key: hex::encode(profile.sphinxKey),
+        url: profile.url,
         // Same shape as the registration events: ingress always present,
         // metadata only when set.
-        ingress_url: Some(ingress_url),
-        metadata_url: (!metadata_url.is_empty()).then_some(metadata_url),
-        stake: staked.to_string(),
+        ingress_url: Some(profile.ingressUrl),
+        metadata_url: (!profile.metadataUrl.is_empty()).then_some(profile.metadataUrl),
+        stake: profile.stakedAmount.to_string(),
         role,
-        frozen,
+        frozen: profile.frozen,
     }))
 }
 
 pub struct ChainObserver {
-    provider: Provider<Http>,
+    provider: ChainProvider,
     registry_address: Address,
     publisher: Arc<dyn IEventPublisher>,
     storage: Arc<dyn IStorageRepository>,
@@ -232,9 +265,9 @@ impl ChainObserver {
         storage: Arc<dyn IStorageRepository>,
         metrics: MetricsService,
     ) -> Result<Self, InfrastructureError> {
-        let provider = build_ethers_http1_provider(&config.eth_rpc_url)?;
+        let provider = build_http1_provider(&config.eth_rpc_url)?;
 
-        let address = registry_address_hex.parse::<Address>().map_err(|e| {
+        let address = nox_core::eth::parse_address(registry_address_hex).map_err(|e| {
             InfrastructureError::Blockchain(format!("Invalid Registry Address: {e}"))
         })?;
 
@@ -350,7 +383,7 @@ impl ChainObserver {
             for attempt in 1..=5u64 {
                 match self.provider.get_block_number().await {
                     Ok(n) => {
-                        block_num = Some(n.as_u64());
+                        block_num = Some(n);
                         break;
                     }
                     Err(e) => {
@@ -378,12 +411,11 @@ impl ChainObserver {
 
         self.observed.resume_at(last_block);
 
-        let contract: RegistryContract =
-            NoxRegistryContract::new(self.registry_address, Arc::new(self.provider.clone()));
+        let contract = RegistryContract::new(self.registry_address, self.provider.clone());
 
         loop {
             let current_block = match self.provider.get_block_number().await {
-                Ok(n) => n.as_u64(),
+                Ok(n) => n,
                 Err(e) => {
                     error!("RPC Error: {}", e);
                     self.metrics
@@ -425,17 +457,22 @@ impl ChainObserver {
                 }
 
                 let chunk_end = current_block.min(cursor + MAX_BLOCK_RANGE);
-                let filter = Filter::new()
-                    .address(self.registry_address)
-                    .from_block(cursor + 1)
-                    .to_block(chunk_end);
+                let filter = logs_filter(
+                    Some(&block_quantity(cursor + 1)),
+                    Some(&block_quantity(chunk_end)),
+                    &[self.registry_address],
+                    &[None, None, None, None],
+                );
+                let logs: Result<Vec<Log>, _> = self
+                    .provider
+                    .raw_request(std::borrow::Cow::Borrowed("eth_getLogs"), (filter,))
+                    .await;
 
-                match self.provider.get_logs(&filter).await {
+                match logs {
                     Ok(logs) => {
                         for log in logs {
-                            self.observed.record_registry_log(
-                                log.block_number.map_or(chunk_end, |block| block.as_u64()),
-                            );
+                            self.observed
+                                .record_registry_log(log.block_number.unwrap_or(chunk_end));
                             self.process_log(&contract, log).await;
                         }
                         // Only advance past a range that was actually scanned, so a
@@ -560,34 +597,30 @@ impl ChainObserver {
     }
 
     async fn process_log(&self, contract: &RegistryContract, log: Log) {
-        let block = log.block_number.map(|number| number.as_u64());
-        let raw = ethers::abi::RawLog {
-            topics: log.topics.clone(),
-            data: log.data.to_vec(),
-        };
-        let Ok(event) = <NoxRegistryContractEvents as EthLogDecode>::decode_log(&raw) else {
+        let block = log.block_number;
+        let Ok(event) = RegistryEvent::decode_raw_log(log.topics(), &log.data().data) else {
             debug!(
-                topic = ?log.topics.first(),
+                topic = ?log.topics().first(),
                 "Ignoring registry log the node does not track"
             );
             return;
         };
 
         match event {
-            NoxRegistryContractEvents::RelayerRegisteredFilter(event) => {
+            RegistryEvent::RelayerRegistered(event) => {
                 info!(
                     "User Registered: {:?} (role={})",
-                    event.relayer, event.node_role
+                    event.relayer, event.nodeRole
                 );
-                let metadata = (!event.metadata_url.is_empty()).then_some(event.metadata_url);
+                let metadata = (!event.metadataUrl.is_empty()).then_some(event.metadataUrl);
                 self.publish(
                     NoxEvent::RelayerRegistered {
                         address: format!("{:?}", event.relayer),
-                        sphinx_key: hex::encode(event.sphinx_key),
+                        sphinx_key: hex::encode(event.sphinxKey),
                         url: event.url,
                         stake: event.stake.to_string(),
-                        role: event.node_role,
-                        ingress_url: Some(event.ingress_url),
+                        role: event.nodeRole,
+                        ingress_url: Some(event.ingressUrl),
                         metadata_url: metadata,
                     },
                     "RelayerRegistered",
@@ -595,20 +628,20 @@ impl ChainObserver {
                 );
                 self.count_event("relayer_registered");
             }
-            NoxRegistryContractEvents::PrivilegedRelayerRegisteredFilter(event) => {
+            RegistryEvent::PrivilegedRelayerRegistered(event) => {
                 info!(
                     "Privileged Node Registered: {:?} (role={})",
-                    event.relayer, event.node_role
+                    event.relayer, event.nodeRole
                 );
-                let metadata = (!event.metadata_url.is_empty()).then_some(event.metadata_url);
+                let metadata = (!event.metadataUrl.is_empty()).then_some(event.metadataUrl);
                 self.publish(
                     NoxEvent::RelayerRegistered {
                         address: format!("{:?}", event.relayer),
-                        sphinx_key: hex::encode(event.sphinx_key),
+                        sphinx_key: hex::encode(event.sphinxKey),
                         url: event.url,
                         stake: "0".to_string(), // Privileged = 0 stake
-                        role: event.node_role,
-                        ingress_url: Some(event.ingress_url),
+                        role: event.nodeRole,
+                        ingress_url: Some(event.ingressUrl),
                         metadata_url: metadata,
                     },
                     "RelayerRegistered",
@@ -616,7 +649,7 @@ impl ChainObserver {
                 );
                 self.count_event("privileged_registered");
             }
-            NoxRegistryContractEvents::RelayerRemovedFilter(event) => {
+            RegistryEvent::RelayerRemoved(event) => {
                 info!("Relayer Removed: {:?}", event.relayer);
                 self.publish(
                     NoxEvent::RelayerRemoved {
@@ -627,7 +660,7 @@ impl ChainObserver {
                 );
                 self.count_event("relayer_removed");
             }
-            NoxRegistryContractEvents::UnstakedFilter(event) => {
+            RegistryEvent::Unstaked(event) => {
                 info!("Relayer Unstaked: {:?}", event.relayer);
                 self.publish(
                     NoxEvent::RelayerRemoved {
@@ -638,86 +671,86 @@ impl ChainObserver {
                 );
                 self.count_event("unstaked");
             }
-            NoxRegistryContractEvents::KeyRotatedFilter(event) => {
+            RegistryEvent::KeyRotated(event) => {
                 info!(
                     "Key Rotated: {:?} -> {}",
                     event.relayer,
-                    hex::encode(event.new_sphinx_key)
+                    hex::encode(event.newSphinxKey)
                 );
                 let fallback = NoxEvent::RelayerKeyRotated {
                     address: format!("{:?}", event.relayer),
-                    new_sphinx_key: hex::encode(event.new_sphinx_key),
+                    new_sphinx_key: hex::encode(event.newSphinxKey),
                 };
                 self.sync_profile(contract, event.relayer, block, Some(fallback))
                     .await;
                 self.count_event("key_rotated");
             }
-            NoxRegistryContractEvents::RoleUpdatedFilter(event) => {
+            RegistryEvent::RoleUpdated(event) => {
                 info!(
                     "Role Updated: {:?} -> role={}",
-                    event.relayer, event.new_role
+                    event.relayer, event.newRole
                 );
                 let fallback = NoxEvent::RelayerRoleUpdated {
                     address: format!("{:?}", event.relayer),
-                    new_role: event.new_role,
+                    new_role: event.newRole,
                 };
                 self.sync_profile(contract, event.relayer, block, Some(fallback))
                     .await;
                 self.count_event("role_updated");
             }
-            NoxRegistryContractEvents::RelayerUpdatedFilter(event) => {
+            RegistryEvent::RelayerUpdated(event) => {
                 info!(
                     "Relayer URL Updated: {:?} -> {}",
-                    event.relayer, event.new_url
+                    event.relayer, event.newUrl
                 );
                 let fallback = NoxEvent::RelayerUrlUpdated {
                     address: format!("{:?}", event.relayer),
-                    new_url: event.new_url,
+                    new_url: event.newUrl,
                 };
                 self.sync_profile(contract, event.relayer, block, Some(fallback))
                     .await;
                 self.count_event("relayer_updated");
             }
-            NoxRegistryContractEvents::IngressUrlUpdatedFilter(event) => {
+            RegistryEvent::IngressUrlUpdated(event) => {
                 info!("Relayer ingress URL updated: {:?}", event.relayer);
                 self.sync_profile(contract, event.relayer, block, None)
                     .await;
                 self.count_event("ingress_url_updated");
             }
-            NoxRegistryContractEvents::MetadataUrlUpdatedFilter(event) => {
+            RegistryEvent::MetadataUrlUpdated(event) => {
                 info!("Relayer metadata URL updated: {:?}", event.relayer);
                 self.sync_profile(contract, event.relayer, block, None)
                     .await;
                 self.count_event("metadata_url_updated");
             }
-            NoxRegistryContractEvents::StakeAddedFilter(event) => {
+            RegistryEvent::StakeAdded(event) => {
                 info!("Relayer stake added: {:?}", event.relayer);
                 self.sync_profile(contract, event.relayer, block, None)
                     .await;
                 self.count_event("stake_added");
             }
-            NoxRegistryContractEvents::RelayerFrozenFilter(event) => {
+            RegistryEvent::RelayerFrozen(event) => {
                 warn!("Relayer frozen: {:?}", event.relayer);
                 self.sync_profile(contract, event.relayer, block, None)
                     .await;
                 self.count_event("relayer_frozen");
             }
-            NoxRegistryContractEvents::RelayerUnfrozenFilter(event) => {
+            RegistryEvent::RelayerUnfrozen(event) => {
                 info!("Relayer unfrozen: {:?}", event.relayer);
                 self.sync_profile(contract, event.relayer, block, None)
                     .await;
                 self.count_event("relayer_unfrozen");
             }
-            NoxRegistryContractEvents::UnstakeRequestedFilter(event) => {
+            RegistryEvent::UnstakeRequested(event) => {
                 // Unstaking nodes stay registered and routable until they exit.
                 info!("Relayer unstake requested: {:?}", event.relayer);
                 self.count_event("unstake_requested");
             }
-            NoxRegistryContractEvents::UnstakeCancelledFilter(event) => {
+            RegistryEvent::UnstakeCancelled(event) => {
                 info!("Relayer unstake cancelled: {:?}", event.relayer);
                 self.count_event("unstake_cancelled");
             }
-            NoxRegistryContractEvents::SlashedFilter(event) => {
+            RegistryEvent::Slashed(event) => {
                 warn!(
                     "Relayer Slashed: {:?} amount={} by={:?}",
                     event.relayer, event.amount, event.slasher
@@ -731,7 +764,7 @@ impl ChainObserver {
                     .await;
                 self.count_event("slashed");
             }
-            NoxRegistryContractEvents::PausedFilter(event) => {
+            RegistryEvent::Paused(event) => {
                 warn!("NoxRegistry PAUSED by {:?}", event.account);
                 self.publish(
                     NoxEvent::RegistryPaused {
@@ -742,7 +775,7 @@ impl ChainObserver {
                 );
                 self.count_event("paused");
             }
-            NoxRegistryContractEvents::UnpausedFilter(event) => {
+            RegistryEvent::Unpaused(event) => {
                 info!("NoxRegistry UNPAUSED by {:?}", event.account);
                 self.publish(
                     NoxEvent::RegistryUnpaused {

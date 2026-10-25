@@ -9,10 +9,11 @@
 //! on any mismatch. Identity keys (outside sled), the exit transaction outbox,
 //! quotes and nonces are left untouched.
 
-use crate::blockchain::executor::build_ethers_http1_provider;
+use crate::blockchain::executor::{build_http1_provider, legacy_call_object};
 use crate::blockchain::observer::LAST_BLOCK_KEY;
-use ethers::prelude::*;
-use ethers::types::transaction::eip2718::TypedTransaction;
+use alloy::primitives::Bytes;
+use alloy::providers::Provider;
+use nox_core::eth::parse_address;
 use nox_core::traits::{IStorageRepository, InfrastructureError};
 use tracing::{info, warn};
 
@@ -44,7 +45,7 @@ pub fn registry_scope(
     chain_id: u64,
     registry_address: &str,
 ) -> Result<String, InfrastructureError> {
-    let address = registry_address.trim().parse::<Address>().map_err(|e| {
+    let address = parse_address(registry_address.trim()).map_err(|e| {
         InfrastructureError::Blockchain(format!("Invalid registry address {registry_address}: {e}"))
     })?;
     Ok(format!("{chain_id}:{address:?}"))
@@ -137,15 +138,18 @@ pub async fn fetch_registry_fingerprint(
     rpc_url: &str,
     registry_address: &str,
 ) -> Result<[u8; 32], InfrastructureError> {
-    let provider = build_ethers_http1_provider(rpc_url)?;
-    let registry = registry_address.trim().parse::<Address>().map_err(|e| {
+    let provider = build_http1_provider(rpc_url)?;
+    let registry = parse_address(registry_address.trim()).map_err(|e| {
         InfrastructureError::Blockchain(format!("Invalid registry address {registry_address}: {e}"))
     })?;
-    let call = TransactionRequest::new()
-        .to(registry)
-        .data(Bytes::from(TOPOLOGY_FINGERPRINT_SELECTOR.to_vec()));
-    let output = provider
-        .call(&TypedTransaction::Legacy(call), None)
+    let call = legacy_call_object(
+        None,
+        Some(registry),
+        Some(&TOPOLOGY_FINGERPRINT_SELECTOR),
+        None,
+    );
+    let output: Bytes = provider
+        .raw_request(std::borrow::Cow::Borrowed("eth_call"), (call, "latest"))
         .await
         .map_err(|e| InfrastructureError::Blockchain(format!("topologyFingerprint(): {e}")))?;
     let bytes: [u8; 32] = output.as_ref().try_into().map_err(|_| {

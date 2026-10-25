@@ -2,7 +2,7 @@
 
 #![cfg(feature = "dev-node")]
 
-use ethers::prelude::*;
+use alloy::primitives::Address;
 use nox_core::{
     models::payloads::{encode_payload, RelayerPayload, ServiceRequest},
     IEventPublisher, IEventSubscriber, IStorageRepository, NoxEvent, PaidQuoteRequestV2,
@@ -72,10 +72,10 @@ async fn make_ethereum_handler(price_uri: &str) -> Arc<EthereumHandler> {
 async fn make_quote_handler(
     price_uri: &str,
 ) -> (Arc<EthereumHandler>, Arc<SledRepository>, tempfile::TempDir) {
-    let entry_point = Address::from_low_u64_be(11);
-    let adapter = Address::from_low_u64_be(12);
-    let fee_asset = Address::from_low_u64_be(13);
-    let pool = Address::from_low_u64_be(14);
+    let entry_point = Address::with_last_byte(11);
+    let adapter = Address::with_last_byte(12);
+    let fee_asset = Address::with_last_byte(13);
+    let pool = Address::with_last_byte(14);
     let mut config = NoxConfig::default();
     config.benchmark_mode = true;
     config.chain_id = 31_337;
@@ -342,13 +342,13 @@ async fn paid_quote_without_reply_surb_does_not_reserve_capacity() {
 
     let request = PaidQuoteRequestV2 {
         chain_id: 31_337,
-        entry_point: Address::from_low_u64_be(11).0,
+        entry_point: Address::with_last_byte(11).into_array(),
         client_intent_id: [2; 32],
-        payment_adapter: Address::from_low_u64_be(12).0,
+        payment_adapter: Address::with_last_byte(12).into_array(),
         payment_id: [4; 32],
-        fee_asset: Address::from_low_u64_be(13).0,
+        fee_asset: Address::with_last_byte(13).into_array(),
         payment_gas_limit: 500_000,
-        action_target: Address::from_low_u64_be(15).0,
+        action_target: Address::with_last_byte(15).into_array(),
         action_calldata_hash: [7; 32],
         action_gas_limit: 700_000,
         tracked_assets_hash: [8; 32],

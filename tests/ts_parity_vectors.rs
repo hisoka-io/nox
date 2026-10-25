@@ -3,10 +3,10 @@
 //! and `tests/bincode.test.ts`; the fingerprints are what its `computeTopologyFingerprint`
 //! returns. `nox-core` `payloads.rs` pins the other bincode vectors the two sides share.
 
+use alloy::primitives::{Address, Bytes, B256, U256};
 use curve25519_dalek::constants::X25519_BASEPOINT;
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use curve25519_dalek::scalar::Scalar;
-use ethers::types::{Address, Bytes, H256, U256};
 use hmac::{Hmac, Mac};
 use nox_core::models::payloads::encode_payload;
 use nox_core::models::topology::primary_layer_for_role;
@@ -209,20 +209,17 @@ fn fingerprint_update(previous: &[u8; 32], address: &str, action: u8) -> [u8; 32
 }
 
 /// `keccak256(target || calldata || fee)` reduced into the BN254 scalar field.
-fn execution_hash(target: &str, calldata: &[u8], fee: u64) -> H256 {
-    let mut input = Address::from_str(target).unwrap().as_bytes().to_vec();
+fn execution_hash(target: &str, calldata: &[u8], fee: u64) -> B256 {
+    let mut input = Address::from_str(target).unwrap().as_slice().to_vec();
     input.extend(Bytes::from(calldata.to_vec()).as_ref());
-    let mut fee_bytes = [0_u8; 32];
-    U256::from(fee).to_big_endian(&mut fee_bytes);
-    input.extend(fee_bytes);
+    input.extend(U256::from(fee).to_be_bytes::<32>());
 
-    let modulus = U256::from_dec_str(
+    let modulus = U256::from_str_radix(
         "21888242871839275222246405745257275088548364400416034343698204186575808495617",
+        10,
     )
     .unwrap();
-    let mut reduced = [0_u8; 32];
-    (U256::from_big_endian(&keccak256(&input)) % modulus).to_big_endian(&mut reduced);
-    H256::from(reduced)
+    B256::from((U256::from_be_bytes(keccak256(&input)) % modulus).to_be_bytes::<32>())
 }
 
 /// The two hashes of the first SDK generation, as this file defines them. Neither has a caller

@@ -1,5 +1,7 @@
 //! Shared protocol types, traits, and domain models for the NOX mixnet.
 
+pub mod chain_rpc;
+pub mod eth;
 pub mod events;
 pub mod models;
 pub mod protocol;

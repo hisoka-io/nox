@@ -1,21 +1,23 @@
-//! Type-safe Rust bindings for Nox test contracts via `ethers::abigen`.
+//! Type-safe Rust bindings for Nox test contracts, generated with `alloy::sol!`
+//! from the Hardhat artifacts in `abi/` (ABI and creation bytecode).
 
-use ethers::prelude::*;
-
-abigen!(
+alloy::sol!(
+    #[sol(rpc)]
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
     NoxRewardPool,
-    "../../abi/NoxRewardPool.json",
-    event_derives(serde::Deserialize, serde::Serialize)
+    "../../abi/NoxRewardPool.json"
 );
 
-abigen!(
+alloy::sol!(
+    #[sol(rpc)]
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
     MockERC20,
-    "../../abi/MockERC20.json",
-    event_derives(serde::Deserialize, serde::Serialize)
+    "../../abi/MockERC20.json"
 );
 
-abigen!(
+alloy::sol!(
+    #[sol(rpc)]
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
     NoxRegistry,
-    "../../abi/NoxRegistry.json",
-    event_derives(serde::Deserialize, serde::Serialize)
+    "../../abi/NoxRegistry.json"
 );

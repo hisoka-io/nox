@@ -13,7 +13,7 @@ nox-core = { path = "../nox-core", version = "0.4.0-rc.10" }
 
 nox-crypto = { path = "../nox-crypto", version = "0.4.0-rc.10" }
 
-ethers = { workspace = true }
+alloy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bincode = "1.3"
@@ -28,7 +28,6 @@ rayon = "1.10"
 parking_lot = "0.12"
 x25519-dalek = { version = "2.0.0", features = ["static_secrets", "serde"] }
 reqwest = { version = "0.12", features = ["json"] }
-reqwest-legacy = { package = "reqwest", version = "0.11.27", default-features = false, features = ["native-tls"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 [dev-dependencies]

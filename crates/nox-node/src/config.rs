@@ -1280,9 +1280,7 @@ impl NoxConfig {
             if self.quote_max_pending_sponsored_gas == 0 {
                 errors.push("quote_max_pending_sponsored_gas must be positive".to_string());
             }
-            if self
-                .quote_rolling_loss_limit_native
-                .parse::<ethers::types::U256>()
+            if nox_core::eth::parse_decimal_u256(&self.quote_rolling_loss_limit_native)
                 .map_or(true, |limit| limit.is_zero())
             {
                 errors
@@ -1299,7 +1297,7 @@ impl NoxConfig {
             }
             let mut token_addresses = HashSet::new();
             for token in &self.tokens {
-                match token.address.parse::<ethers::types::Address>() {
+                match nox_core::eth::parse_address(&token.address) {
                     Ok(address) if !address.is_zero() => {
                         if !token_addresses.insert(address) {
                             errors.push("token addresses must be unique".to_string());
@@ -1327,14 +1325,14 @@ impl NoxConfig {
                 if adapter.fee_assets.is_empty() {
                     errors.push("payment adapter must allow at least one fee asset".to_string());
                 }
-                if let Ok(address) = adapter.address.parse::<ethers::types::Address>() {
+                if let Ok(address) = nox_core::eth::parse_address(&adapter.address) {
                     if !adapter_addresses.insert(address) {
                         errors.push("payment adapter addresses must be unique".to_string());
                     }
                 }
                 let mut fee_assets = HashSet::new();
                 for asset in &adapter.fee_assets {
-                    if let Ok(address) = asset.parse::<ethers::types::Address>() {
+                    if let Ok(address) = nox_core::eth::parse_address(asset) {
                         if !fee_assets.insert(address) {
                             errors.push("payment adapter fee assets must be unique".to_string());
                         }

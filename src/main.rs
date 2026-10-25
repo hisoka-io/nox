@@ -220,7 +220,7 @@ async fn run_db_command(
 }
 
 fn run_check_config(config_path: &str) -> anyhow::Result<()> {
-    use ethers::signers::{LocalWallet, Signer};
+    use alloy::signers::local::PrivateKeySigner;
     use x25519_dalek::PublicKey as X25519PublicKey;
 
     // The loader treats the file as optional; a wrong mount would otherwise
@@ -283,7 +283,7 @@ fn run_check_config(config_path: &str) -> anyhow::Result<()> {
     }
 
     if !config.eth_wallet_private_key.is_empty() {
-        let wallet: LocalWallet = config
+        let wallet: PrivateKeySigner = config
             .eth_wallet_private_key
             .trim_start_matches("0x")
             .parse()
@@ -309,7 +309,7 @@ fn run_check_config(config_path: &str) -> anyhow::Result<()> {
 }
 
 fn run_keygen() -> anyhow::Result<()> {
-    use ethers::signers::{LocalWallet, Signer};
+    use alloy::signers::local::PrivateKeySigner;
     use rand::rngs::OsRng;
     use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
@@ -327,7 +327,7 @@ fn run_keygen() -> anyhow::Result<()> {
 
     let eth_key_bytes: [u8; 32] = rand::Rng::gen(&mut OsRng);
     let eth_private_hex = hex::encode(eth_key_bytes);
-    let wallet = LocalWallet::from_bytes(&eth_key_bytes)
+    let wallet = PrivateKeySigner::from_bytes(&eth_key_bytes.into())
         .map_err(|e| anyhow::anyhow!("Wallet creation failed: {e}"))?;
     let eth_address = format!("{:#x}", wallet.address());
 

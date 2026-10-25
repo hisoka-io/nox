@@ -3,9 +3,12 @@ use crate::blockchain::transaction_plan::{TransactionPlan, BASIS_POINTS};
 use crate::config::MAX_BUFFER_BPS;
 use crate::infra::storage::{decode_stored_transaction, CreateOutboxResult, SledRepository};
 use crate::telemetry::metrics::MetricsService;
-use ethers::prelude::*;
-use ethers::types::transaction::eip2718::TypedTransaction;
-use ethers::utils::{keccak256, rlp::Rlp};
+use alloy::consensus::transaction::SignerRecoverable;
+use alloy::consensus::{Transaction, TxEnvelope};
+use alloy::eips::eip2718::Decodable2718;
+use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy::rpc::types::TransactionReceipt;
+use nox_core::eth::{parse_decimal_u256, parse_fixed_hex};
 use nox_core::traits::{IStorageRepository, InfrastructureError};
 use nox_core::{
     DecodedTransaction, ExecutionId, LegacyPendingTransaction, LegacyTxStatus,
@@ -13,7 +16,6 @@ use nox_core::{
 };
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -29,7 +31,7 @@ const REPLACEMENT_AGE_SECS: u64 = 60;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmittedTransaction {
     pub execution_id: ExecutionId,
-    pub transaction_hash: H256,
+    pub transaction_hash: B256,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -37,7 +39,7 @@ pub enum SubmitError {
     #[error("execution {execution_id:?} already maps to {transaction_hash:?}")]
     Duplicate {
         execution_id: ExecutionId,
-        transaction_hash: H256,
+        transaction_hash: B256,
     },
     #[error("transaction gas plan rejected: {detail}")]
     GasPlan { detail: String },
@@ -49,7 +51,7 @@ pub enum SubmitError {
     Broadcast { detail: String },
     #[error("transaction broadcast outcome is ambiguous for {transaction_hash:?}: {detail}")]
     AmbiguousBroadcast {
-        transaction_hash: H256,
+        transaction_hash: B256,
         detail: String,
     },
     /// The signed nonce was consumed by another transaction from the exit wallet. The outbox
@@ -160,7 +162,8 @@ impl TransactionManager {
     }
 
     async fn sync_nonce(&self) -> Result<(), InfrastructureError> {
-        let chain_nonce = self.executor.get_nonce().await?.as_u64();
+        let chain_nonce = u64::try_from(self.executor.get_nonce().await?)
+            .map_err(|_| InfrastructureError::Blockchain("chain nonce exceeds u64".to_string()))?;
         let persisted_nonce = match self.storage.get(KEY_NONCE_LOCAL).await? {
             Some(bytes) if bytes.len() == 8 => {
                 u64::from_le_bytes(bytes.try_into().map_err(|_| {
@@ -210,7 +213,7 @@ impl TransactionManager {
                 self.executor.address(),
                 self.executor.chain_id(),
             )?;
-            if H256::from(keccak256(&transaction.raw_signed_tx)) != expected_hash {
+            if keccak256(&transaction.raw_signed_tx) != expected_hash {
                 return Err(InfrastructureError::Database(
                     "stored raw transaction hash mismatch".to_string(),
                 ));
@@ -358,7 +361,7 @@ impl TransactionManager {
                     .finalize_quote_durably(
                         transaction.execution_id,
                         QuoteStatusV2::Rejected,
-                        U256::zero(),
+                        U256::ZERO,
                         unix_now()?,
                     )
                     .await?;
@@ -386,7 +389,7 @@ impl TransactionManager {
     /// Never lowers it, and keeps the local value when the chain cannot be read.
     async fn resync_nonce_floor(&self, local_nonce: &mut u64) {
         let chain_nonce = match self.executor.get_nonce().await {
-            Ok(nonce) if nonce <= U256::from(u64::MAX) => nonce.low_u64(),
+            Ok(nonce) if nonce <= U256::from(u64::MAX) => nonce.to::<u64>(),
             Ok(_) => {
                 warn!("chain nonce exceeds u64; keeping local nonce");
                 return;
@@ -452,14 +455,14 @@ impl TransactionManager {
             .map_err(|error| SubmitError::Signing {
                 detail: error.to_string(),
             })?;
-        let transaction_hash = H256::from(keccak256(&raw_signed_tx));
+        let transaction_hash = keccak256(&raw_signed_tx);
         let now = unix_now().map_err(|error| SubmitError::Persistence {
             detail: error.to_string(),
         })?;
         let record = PendingTransactionV2 {
             execution_id,
             to: format!("{to:?}"),
-            data_hash: keccak256(&data),
+            data_hash: keccak256(&data).0,
             nonce,
             gas_limit: plan.gas_limit.to_string(),
             gas_price: plan.initial_fee_per_gas.to_string(),
@@ -641,7 +644,7 @@ impl TransactionManager {
                 .get_transaction_receipt(transaction_hash)
                 .await?
             {
-                transaction.status = if receipt.status == Some(U64::one()) {
+                transaction.status = if receipt.status() {
                     LegacyTxStatus::Mined
                 } else {
                     LegacyTxStatus::Failed
@@ -702,11 +705,11 @@ impl TransactionManager {
             self.executor.address(),
             self.executor.chain_id(),
         )?;
-        let current_price = U256::from_dec_str(&transaction.gas_price).map_err(|error| {
+        let current_price = parse_decimal_u256(&transaction.gas_price).map_err(|error| {
             InfrastructureError::Database(format!("stored gas price is invalid: {error}"))
         })?;
         let maximum_price =
-            U256::from_dec_str(&transaction.maximum_fee_per_gas).map_err(|error| {
+            parse_decimal_u256(&transaction.maximum_fee_per_gas).map_err(|error| {
                 InfrastructureError::Database(format!(
                     "stored maximum gas price is invalid: {error}"
                 ))
@@ -741,7 +744,7 @@ impl TransactionManager {
             })?;
         transaction.gas_price = required.to_string();
         transaction.raw_signed_tx = raw.to_vec();
-        transaction.tx_hash = format!("{:?}", H256::from(keccak256(&raw)));
+        transaction.tx_hash = format!("{:?}", keccak256(&raw));
         transaction.last_update_at = unix_now()?;
         transaction.status = TxStatusV2::ReplacementPrepared;
         self.storage.persist_v2_durably(&transaction).await?;
@@ -873,43 +876,26 @@ impl TransactionManager {
 
 /// Wei to a gwei gauge value, saturating at `i64::MAX`.
 fn gwei_gauge(wei: U256) -> i64 {
-    let gwei = wei / U256::exp10(9);
+    let gwei = wei / U256::from(1_000_000_000_u64);
     if gwei > U256::from(i64::MAX.unsigned_abs()) {
         i64::MAX
     } else {
-        i64::try_from(gwei.low_u64()).unwrap_or(i64::MAX)
+        i64::try_from(gwei.to::<u64>()).unwrap_or(i64::MAX)
     }
 }
 
 fn sponsored_receipt_outcome(
     receipt: &TransactionReceipt,
 ) -> Result<(bool, U256), InfrastructureError> {
-    match receipt.status {
-        Some(status) if status == U64::one() => Ok((true, U256::zero())),
-        Some(status) if status.is_zero() => {
-            let gas_used = receipt.gas_used.ok_or_else(|| {
-                InfrastructureError::Blockchain(
-                    "reverted sponsored receipt is missing gas_used".to_string(),
-                )
-            })?;
-            let effective_gas_price = receipt.effective_gas_price.ok_or_else(|| {
-                InfrastructureError::Blockchain(
-                    "reverted sponsored receipt is missing effective_gas_price".to_string(),
-                )
-            })?;
-            gas_used
-                .checked_mul(effective_gas_price)
-                .map(|loss| (false, loss))
-                .ok_or_else(|| {
-                    InfrastructureError::Blockchain(
-                        "reverted sponsored receipt cost overflow".to_string(),
-                    )
-                })
-        }
-        _ => Err(InfrastructureError::Blockchain(
-            "transaction receipt has invalid status".to_string(),
-        )),
+    if receipt.status() {
+        return Ok((true, U256::ZERO));
     }
+    U256::from(receipt.gas_used)
+        .checked_mul(U256::from(receipt.effective_gas_price))
+        .map(|loss| (false, loss))
+        .ok_or_else(|| {
+            InfrastructureError::Blockchain("reverted sponsored receipt cost overflow".to_string())
+        })
 }
 
 struct DecodedRaw {
@@ -923,49 +909,41 @@ fn decode_raw(
     expected_signer: Address,
     expected_chain_id: u64,
 ) -> Result<DecodedRaw, InfrastructureError> {
-    if H256::from(keccak256(&transaction.raw_signed_tx)) != parse_hash(&transaction.tx_hash)? {
+    if keccak256(&transaction.raw_signed_tx) != parse_hash(&transaction.tx_hash)? {
         return Err(InfrastructureError::Database(
             "stored raw transaction hash mismatch".to_string(),
         ));
     }
-    let (typed, signature) = TypedTransaction::decode_signed(&Rlp::new(&transaction.raw_signed_tx))
-        .map_err(|error| {
+    let typed =
+        TxEnvelope::decode_2718(&mut transaction.raw_signed_tx.as_slice()).map_err(|error| {
             InfrastructureError::Database(format!("stored signed transaction is invalid: {error}"))
         })?;
-    let signer = signature.recover(typed.sighash()).map_err(|error| {
+    let signer = typed.recover_signer().map_err(|error| {
         InfrastructureError::Database(format!("stored signer recovery failed: {error}"))
     })?;
-    let to = match typed.to() {
-        Some(NameOrAddress::Address(address)) => address.to_owned(),
-        _ => {
-            return Err(InfrastructureError::Database(
-                "stored target is not an address".to_string(),
-            ))
-        }
+    let Some(to) = typed.to() else {
+        return Err(InfrastructureError::Database(
+            "stored target is not an address".to_string(),
+        ));
     };
     if format!("{to:?}") != transaction.to || signer != expected_signer {
         return Err(InfrastructureError::Database(
             "stored transaction identity mismatch".to_string(),
         ));
     }
-    if typed.chain_id().map(|chain_id| chain_id.as_u64()) != Some(expected_chain_id) {
+    if typed.chain_id() != Some(expected_chain_id) {
         return Err(InfrastructureError::Database(
             "stored chain ID mismatch".to_string(),
         ));
     }
-    let data = typed.data().cloned().unwrap_or_default();
-    if keccak256(&data) != transaction.data_hash {
+    let data = typed.input().clone();
+    if keccak256(&data).0 != transaction.data_hash {
         return Err(InfrastructureError::Database(
             "stored calldata hash mismatch".to_string(),
         ));
     }
-    let gas_limit = typed
-        .gas()
-        .copied()
-        .ok_or_else(|| InfrastructureError::Database("stored gas limit missing".to_string()))?;
-    if gas_limit.to_string() != transaction.gas_limit
-        || typed.nonce().copied() != Some(U256::from(transaction.nonce))
-    {
+    let gas_limit = typed.gas_limit();
+    if gas_limit.to_string() != transaction.gas_limit || typed.nonce() != transaction.nonce {
         return Err(InfrastructureError::Database(
             "stored nonce or gas limit mismatch".to_string(),
         ));
@@ -975,10 +953,10 @@ fn decode_raw(
             "stored gas price mismatch".to_string(),
         ));
     }
-    let maximum_fee = U256::from_dec_str(&transaction.maximum_fee_per_gas).map_err(|error| {
+    let maximum_fee = parse_decimal_u256(&transaction.maximum_fee_per_gas).map_err(|error| {
         InfrastructureError::Database(format!("stored maximum gas price is invalid: {error}"))
     })?;
-    let current_fee = U256::from_dec_str(&transaction.gas_price).map_err(|error| {
+    let current_fee = parse_decimal_u256(&transaction.gas_price).map_err(|error| {
         InfrastructureError::Database(format!("stored gas price is invalid: {error}"))
     })?;
     if current_fee > maximum_fee {
@@ -989,7 +967,7 @@ fn decode_raw(
     Ok(DecodedRaw {
         to,
         data,
-        gas_limit,
+        gas_limit: U256::from(gas_limit),
     })
 }
 
@@ -1024,14 +1002,14 @@ fn replacement_price(
     Ok((required <= maximum_price).then_some(required))
 }
 
-fn parse_hash(encoded: &str) -> Result<H256, InfrastructureError> {
-    H256::from_str(encoded).map_err(|error| {
+fn parse_hash(encoded: &str) -> Result<B256, InfrastructureError> {
+    parse_fixed_hex::<32>(encoded).map_err(|error| {
         InfrastructureError::Database(format!("stored transaction hash is invalid: {error}"))
     })
 }
 
-fn parse_hash_submit(encoded: &str) -> Result<H256, SubmitError> {
-    H256::from_str(encoded).map_err(|error| SubmitError::Persistence {
+fn parse_hash_submit(encoded: &str) -> Result<B256, SubmitError> {
+    parse_fixed_hex::<32>(encoded).map_err(|error| SubmitError::Persistence {
         detail: format!("stored transaction hash is invalid: {error}"),
     })
 }
@@ -1089,7 +1067,7 @@ mod tests {
     #[tokio::test]
     async fn signed_record_validation_binds_all_transaction_fields() {
         let (executor, _, _) = dependencies().await;
-        let to = Address::from_low_u64_be(9);
+        let to = Address::with_last_byte(9);
         let data = Bytes::from(vec![1, 2, 3]);
         let raw = executor
             .sign_legacy_transaction(
@@ -1104,13 +1082,13 @@ mod tests {
         let base = PendingTransactionV2 {
             execution_id: [1; 32],
             to: format!("{to:?}"),
-            data_hash: keccak256(&data),
+            data_hash: keccak256(&data).0,
             nonce: 4,
             gas_limit: "21000".to_string(),
             gas_price: "10".to_string(),
             maximum_fee_per_gas: "20".to_string(),
             raw_signed_tx: raw.to_vec(),
-            tx_hash: format!("{:?}", H256::from(keccak256(&raw))),
+            tx_hash: format!("{:?}", keccak256(&raw)),
             prior_transaction_hashes: Vec::new(),
             replacement_attempts: 0,
             first_sent_at: 1,
@@ -1120,7 +1098,7 @@ mod tests {
         assert!(decode_raw(&base, executor.address(), executor.chain_id()).is_ok());
 
         let mut mutated = base.clone();
-        mutated.to = format!("{:?}", Address::from_low_u64_be(10));
+        mutated.to = format!("{:?}", Address::with_last_byte(10));
         assert!(decode_raw(&mutated, executor.address(), executor.chain_id()).is_err());
         let mut mutated = base.clone();
         mutated.data_hash = [0; 32];
@@ -1140,13 +1118,13 @@ mod tests {
         let mut mutated = base.clone();
         mutated.maximum_fee_per_gas = "9".to_string();
         assert!(decode_raw(&mutated, executor.address(), executor.chain_id()).is_err());
-        assert!(decode_raw(&base, Address::from_low_u64_be(11), executor.chain_id()).is_err());
+        assert!(decode_raw(&base, Address::with_last_byte(11), executor.chain_id()).is_err());
         assert!(decode_raw(&base, executor.address(), executor.chain_id() + 1).is_err());
     }
 
     #[tokio::test]
     async fn durable_flush_failure_prevents_broadcast() {
-        let anvil = ethers::utils::Anvil::new().spawn();
+        let anvil = alloy_node_bindings::Anvil::new().spawn();
         let mut config = NoxConfig::default();
         config.eth_rpc_url = anvil.endpoint();
         config.chain_id = anvil.chain_id();
@@ -1166,13 +1144,13 @@ mod tests {
         let outcome = manager
             .submit_planned(
                 [9; 32],
-                Address::from_low_u64_be(101),
+                Address::with_last_byte(101),
                 Bytes::new(),
                 TransactionPlan {
                     gas_limit: U256::from(21_000),
                     initial_fee_per_gas: U256::from(2_000_000_000_u64),
                     maximum_fee_per_gas: U256::from(3_000_000_000_u64),
-                    chain_data_fee_native: U256::zero(),
+                    chain_data_fee_native: U256::ZERO,
                 },
             )
             .await;
@@ -1180,24 +1158,24 @@ mod tests {
         let second = manager
             .submit_planned(
                 [8; 32],
-                Address::from_low_u64_be(102),
+                Address::with_last_byte(102),
                 Bytes::new(),
                 TransactionPlan {
                     gas_limit: U256::from(21_000),
                     initial_fee_per_gas: U256::from(2_000_000_000_u64),
                     maximum_fee_per_gas: U256::from(3_000_000_000_u64),
-                    chain_data_fee_native: U256::zero(),
+                    chain_data_fee_native: U256::ZERO,
                 },
             )
             .await;
         assert!(matches!(second, Err(SubmitError::Persistence { .. })));
-        assert_eq!(executor.get_nonce().await.unwrap(), U256::zero());
+        assert_eq!(executor.get_nonce().await.unwrap(), U256::ZERO);
         assert_eq!(storage.scan(b"tx:").await.unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn submitted_status_flush_failure_returns_original_ambiguous_hash() {
-        let anvil = ethers::utils::Anvil::new().spawn();
+        let anvil = alloy_node_bindings::Anvil::new().spawn();
         let mut config = NoxConfig::default();
         config.eth_rpc_url = anvil.endpoint();
         config.chain_id = anvil.chain_id();
@@ -1217,13 +1195,13 @@ mod tests {
         let outcome = manager
             .submit_planned(
                 [6; 32],
-                Address::from_low_u64_be(106),
+                Address::with_last_byte(106),
                 Bytes::new(),
                 TransactionPlan {
                     gas_limit: U256::from(21_000),
                     initial_fee_per_gas: U256::from(2_000_000_000_u64),
                     maximum_fee_per_gas: U256::from(3_000_000_000_u64),
-                    chain_data_fee_native: U256::zero(),
+                    chain_data_fee_native: U256::ZERO,
                 },
             )
             .await;
@@ -1240,12 +1218,12 @@ mod tests {
                 ..
             }) if format!("{transaction_hash:?}") == stored.tx_hash
         ));
-        assert_eq!(executor.get_nonce().await.unwrap(), U256::one());
+        assert_eq!(executor.get_nonce().await.unwrap(), U256::from(1));
     }
 
     #[tokio::test]
     async fn proven_rejection_preserves_prepared_nonce_and_blocks_next_execution() {
-        let anvil = ethers::utils::Anvil::new().spawn();
+        let anvil = alloy_node_bindings::Anvil::new().spawn();
         let mut config = NoxConfig::default();
         config.eth_rpc_url = anvil.endpoint();
         config.chain_id = anvil.chain_id();
@@ -1264,13 +1242,13 @@ mod tests {
         let outcome = manager
             .submit_planned(
                 [7; 32],
-                Address::from_low_u64_be(107),
+                Address::with_last_byte(107),
                 Bytes::new(),
                 TransactionPlan {
-                    gas_limit: U256::one(),
+                    gas_limit: U256::from(1),
                     initial_fee_per_gas: U256::from(2_000_000_000_u64),
                     maximum_fee_per_gas: U256::from(3_000_000_000_u64),
-                    chain_data_fee_native: U256::zero(),
+                    chain_data_fee_native: U256::ZERO,
                 },
             )
             .await;
@@ -1291,42 +1269,49 @@ mod tests {
         let second = manager
             .submit_planned(
                 [8; 32],
-                Address::from_low_u64_be(108),
+                Address::with_last_byte(108),
                 Bytes::new(),
                 TransactionPlan {
                     gas_limit: U256::from(21_000),
                     initial_fee_per_gas: U256::from(2_000_000_000_u64),
                     maximum_fee_per_gas: U256::from(3_000_000_000_u64),
-                    chain_data_fee_native: U256::zero(),
+                    chain_data_fee_native: U256::ZERO,
                 },
             )
             .await;
         assert!(matches!(second, Err(SubmitError::Persistence { .. })));
-        assert_eq!(executor.get_nonce().await.unwrap(), U256::zero());
+        assert_eq!(executor.get_nonce().await.unwrap(), U256::ZERO);
         assert_eq!(storage.scan(b"tx:").await.unwrap().len(), 1);
+    }
+
+    fn receipt(status: &str) -> TransactionReceipt {
+        serde_json::from_value(serde_json::json!({
+            "type": "0x0",
+            "status": status,
+            "cumulativeGasUsed": "0x5208",
+            "logs": [],
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "transactionHash": format!("0x{}", "11".repeat(32)),
+            "transactionIndex": "0x0",
+            "blockHash": format!("0x{}", "22".repeat(32)),
+            "blockNumber": "0x1",
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0xa",
+            "from": format!("0x{}", "33".repeat(20)),
+            "to": format!("0x{}", "44".repeat(20)),
+            "contractAddress": null
+        }))
+        .expect("receipt json")
     }
 
     #[test]
     fn only_top_level_revert_counts_as_unreimbursed_loss() {
-        let successful = TransactionReceipt {
-            status: Some(U64::one()),
-            gas_used: Some(U256::from(21_000)),
-            effective_gas_price: Some(U256::from(10)),
-            ..Default::default()
-        };
         assert_eq!(
-            sponsored_receipt_outcome(&successful).unwrap(),
-            (true, U256::zero())
+            sponsored_receipt_outcome(&receipt("0x1")).unwrap(),
+            (true, U256::ZERO)
         );
-
-        let reverted = TransactionReceipt {
-            status: Some(U64::zero()),
-            gas_used: Some(U256::from(21_000)),
-            effective_gas_price: Some(U256::from(10)),
-            ..Default::default()
-        };
         assert_eq!(
-            sponsored_receipt_outcome(&reverted).unwrap(),
+            sponsored_receipt_outcome(&receipt("0x0")).unwrap(),
             (false, U256::from(210_000)),
         );
     }

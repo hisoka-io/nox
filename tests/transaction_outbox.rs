@@ -1,5 +1,6 @@
-use ethers::types::{Address, Block, Bytes, TransactionReceipt, H256, U256};
-use ethers::utils::Anvil;
+use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy::rpc::types::TransactionReceipt;
+use alloy_node_bindings::{Anvil, AnvilInstance};
 use nox_core::DecodedTransaction;
 use nox_core::{
     ExecutionId, ExecutionQuoteV1, LegacyPendingTransaction, LegacyTxStatus, PaidQuoteRequestV2,
@@ -57,7 +58,7 @@ impl Respond for RawTransactionHashResponder {
         let request_json: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         let encoded = request_json["params"][0].as_str().unwrap();
         let raw = hex::decode(encoded.strip_prefix("0x").unwrap()).unwrap();
-        let hash = ethers::types::H256::from(ethers::utils::keccak256(raw));
+        let hash = keccak256(raw);
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "jsonrpc": "2.0",
             "id": request_json["id"].clone(),
@@ -82,7 +83,7 @@ impl Respond for ReplacementAmbiguityResponder {
         }
         let encoded = request_json["params"][0].as_str().unwrap();
         let raw = hex::decode(encoded.strip_prefix("0x").unwrap()).unwrap();
-        let hash = ethers::types::H256::from(ethers::utils::keccak256(raw));
+        let hash = keccak256(raw);
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "jsonrpc": "2.0",
             "id": request_json["id"].clone(),
@@ -168,7 +169,7 @@ async fn quote_counter(repository: &SledRepository, key: &[u8]) -> u64 {
     u64::from_le_bytes(encoded.try_into().unwrap())
 }
 
-async fn anvil_executor() -> (ethers::utils::AnvilInstance, Arc<ChainExecutor>) {
+async fn anvil_executor() -> (AnvilInstance, Arc<ChainExecutor>) {
     let anvil = Anvil::new().spawn();
     let mut config = NoxConfig::default();
     config.eth_rpc_url = anvil.endpoint();
@@ -178,7 +179,7 @@ async fn anvil_executor() -> (ethers::utils::AnvilInstance, Arc<ChainExecutor>) 
     (anvil, executor)
 }
 
-async fn wait_for_receipt(executor: &ChainExecutor, hash: H256) -> TransactionReceipt {
+async fn wait_for_receipt(executor: &ChainExecutor, hash: B256) -> TransactionReceipt {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Some(receipt) = executor.get_transaction_receipt(hash).await.unwrap() {
@@ -192,13 +193,13 @@ async fn wait_for_receipt(executor: &ChainExecutor, hash: H256) -> TransactionRe
 }
 
 async fn signed_record(executor: &ChainExecutor, status: TxStatusV2) -> PendingTransactionV2 {
-    let target = Address::from_low_u64_be(71);
+    let target = Address::with_last_byte(71);
     let calldata = Bytes::new();
     let raw = executor
         .sign_legacy_transaction(
             target,
             calldata.clone(),
-            U256::zero(),
+            U256::ZERO,
             U256::from(21_000),
             U256::from(2_000_000_000_u64),
         )
@@ -207,16 +208,13 @@ async fn signed_record(executor: &ChainExecutor, status: TxStatusV2) -> PendingT
     PendingTransactionV2 {
         execution_id: [7; 32],
         to: format!("{target:?}"),
-        data_hash: ethers::utils::keccak256(&calldata),
+        data_hash: keccak256(&calldata).0,
         nonce: 0,
         gas_limit: "21000".to_string(),
         gas_price: "2000000000".to_string(),
         maximum_fee_per_gas: "3000000000".to_string(),
         raw_signed_tx: raw.to_vec(),
-        tx_hash: format!(
-            "{:?}",
-            ethers::types::H256::from(ethers::utils::keccak256(&raw))
-        ),
+        tx_hash: format!("{:?}", keccak256(&raw)),
         prior_transaction_hashes: if status == TxStatusV2::ReplacementPrepared {
             vec![format!("0x{}", "33".repeat(32))]
         } else {
@@ -288,7 +286,7 @@ async fn outbox_crash_probe() {
     config.eth_wallet_private_key =
         "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string();
     let executor = ChainExecutor::new(&config).await.unwrap();
-    let target = Address::from_low_u64_be(44);
+    let target = Address::with_last_byte(44);
     let gas_price = if point.starts_with("replacement") {
         12
     } else {
@@ -298,13 +296,13 @@ async fn outbox_crash_probe() {
         .sign_legacy_transaction(
             target,
             Bytes::from(vec![4, 5, 6]),
-            U256::zero(),
+            U256::ZERO,
             U256::from(50_000),
             U256::from(gas_price),
         )
         .await
         .unwrap();
-    let hash = ethers::types::H256::from(ethers::utils::keccak256(&raw));
+    let hash = keccak256(&raw);
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "jsonrpc": "2.0",
@@ -316,7 +314,7 @@ async fn outbox_crash_probe() {
     let mut crash_record = PendingTransactionV2 {
         execution_id: [6; 32],
         to: format!("{target:?}"),
-        data_hash: ethers::utils::keccak256([4, 5, 6]),
+        data_hash: keccak256([4, 5, 6]).0,
         nonce: 0,
         gas_limit: "50000".to_string(),
         gas_price: gas_price.to_string(),
@@ -383,10 +381,7 @@ fn durable_crash_points_preserve_outbox() {
         assert_eq!(transaction.nonce, 0);
         assert_eq!(
             transaction.tx_hash,
-            format!(
-                "{:?}",
-                ethers::types::H256::from(ethers::utils::keccak256(&transaction.raw_signed_tx))
-            )
+            format!("{:?}", keccak256(&transaction.raw_signed_tx))
         );
         let nonce_floor = runtime
             .block_on(nox_core::IStorageRepository::get(
@@ -418,10 +413,10 @@ async fn concurrent_manager_submissions_allocate_one_nonce_and_broadcast() {
         gas_limit: U256::from(21_000),
         initial_fee_per_gas: U256::from(2_000_000_000_u64),
         maximum_fee_per_gas: U256::from(3_000_000_000_u64),
-        chain_data_fee_native: U256::zero(),
+        chain_data_fee_native: U256::ZERO,
     };
     let execution_id = [3; 32];
-    let target = Address::from_low_u64_be(17);
+    let target = Address::with_last_byte(17);
     let first = manager.submit_planned(execution_id, target, Bytes::new(), plan.clone());
     let second = manager.submit_planned(execution_id, target, Bytes::new(), plan);
     let (first, second) = tokio::join!(first, second);
@@ -434,7 +429,7 @@ async fn concurrent_manager_submissions_allocate_one_nonce_and_broadcast() {
             .count(),
         1
     );
-    assert_eq!(executor.get_nonce().await.unwrap(), U256::one());
+    assert_eq!(executor.get_nonce().await.unwrap(), U256::from(1));
     assert_eq!(
         nox_core::IStorageRepository::scan(repository.as_ref(), b"tx:")
             .await
@@ -517,13 +512,13 @@ async fn legacy_record_sets_nonce_floor_and_remains_monitor_only() {
     let submission = manager
         .submit_planned(
             [8; 32],
-            Address::from_low_u64_be(88),
+            Address::with_last_byte(88),
             Bytes::new(),
             TransactionPlan {
                 gas_limit: U256::from(21_000),
                 initial_fee_per_gas: U256::from(2_000_000_000_u64),
                 maximum_fee_per_gas: U256::from(3_000_000_000_u64),
-                chain_data_fee_native: U256::zero(),
+                chain_data_fee_native: U256::ZERO,
             },
         )
         .await;
@@ -607,13 +602,13 @@ async fn replacement_case(maximum_fee_per_gas: U256) -> PendingTransactionV2 {
     manager
         .submit_planned(
             [5; 32],
-            Address::from_low_u64_be(99),
+            Address::with_last_byte(99),
             Bytes::new(),
             TransactionPlan {
                 gas_limit: U256::from(21_000),
                 initial_fee_per_gas: U256::from(2_000_000_000_u64),
                 maximum_fee_per_gas,
-                chain_data_fee_native: U256::zero(),
+                chain_data_fee_native: U256::ZERO,
             },
         )
         .await
@@ -688,13 +683,13 @@ async fn capped_mined_transaction_reconciles_before_replacement() {
     manager
         .submit_planned(
             [1; 32],
-            Address::from_low_u64_be(29),
+            Address::with_last_byte(29),
             Bytes::new(),
             TransactionPlan {
                 gas_limit: U256::from(21_000),
                 initial_fee_per_gas: U256::from(2_000_000_000_u64),
                 maximum_fee_per_gas: U256::from(2_000_000_000_u64),
-                chain_data_fee_native: U256::zero(),
+                chain_data_fee_native: U256::ZERO,
             },
         )
         .await
@@ -779,13 +774,13 @@ async fn broadcast_error_case(
     let outcome = manager
         .submit_planned(
             [4; 32],
-            Address::from_low_u64_be(12),
+            Address::with_last_byte(12),
             Bytes::new(),
             TransactionPlan {
                 gas_limit: U256::from(21_000),
                 initial_fee_per_gas: U256::from(2_000_000_000_u64),
                 maximum_fee_per_gas: U256::from(3_000_000_000_u64),
-                chain_data_fee_native: U256::zero(),
+                chain_data_fee_native: U256::ZERO,
             },
         )
         .await;
@@ -878,13 +873,13 @@ async fn live_monitor_rebroadcasts_ambiguous_prepared_bytes_without_restart() {
     let outcome = manager
         .submit_planned(
             [2; 32],
-            Address::from_low_u64_be(23),
+            Address::with_last_byte(23),
             Bytes::new(),
             TransactionPlan {
                 gas_limit: U256::from(21_000),
                 initial_fee_per_gas: U256::from(2_000_000_000_u64),
                 maximum_fee_per_gas: U256::from(3_000_000_000_u64),
-                chain_data_fee_native: U256::zero(),
+                chain_data_fee_native: U256::ZERO,
             },
         )
         .await;
@@ -943,11 +938,9 @@ async fn live_monitor_rebroadcasts_ambiguous_prepared_bytes_without_restart() {
 #[tokio::test]
 async fn live_monitor_rebroadcasts_ambiguous_replacement_bytes_without_restart() {
     let server = MockServer::start().await;
-    let mut latest_block = Block::<H256>::default();
-    latest_block.timestamp = U256::from(1);
     Mock::given(method("POST"))
         .and(body_string_contains("eth_getBlockByNumber"))
-        .respond_with(JsonRpcResult(serde_json::to_value(latest_block).unwrap()))
+        .respond_with(JsonRpcResult(serde_json::json!({"timestamp": "0x1"})))
         .mount(&server)
         .await;
     for (rpc_method, value) in [
@@ -986,13 +979,13 @@ async fn live_monitor_rebroadcasts_ambiguous_replacement_bytes_without_restart()
     manager
         .submit_planned(
             [12; 32],
-            Address::from_low_u64_be(24),
+            Address::with_last_byte(24),
             Bytes::new(),
             TransactionPlan {
                 gas_limit: U256::from(21_000),
                 initial_fee_per_gas: U256::from(100),
                 maximum_fee_per_gas: U256::from(200),
-                chain_data_fee_native: U256::zero(),
+                chain_data_fee_native: U256::ZERO,
             },
         )
         .await
@@ -1044,27 +1037,20 @@ async fn live_monitor_rebroadcasts_ambiguous_replacement_bytes_without_restart()
 
 #[tokio::test]
 async fn legacy_pending_receipt_becomes_terminal_without_raw_broadcast() {
-    use ethers::middleware::SignerMiddleware;
-    use ethers::providers::{Http, Middleware, Provider};
-    use ethers::signers::{LocalWallet, Signer};
-    use ethers::types::TransactionRequest;
-
-    let anvil = Anvil::new().spawn();
-    let provider = Provider::<Http>::try_from(anvil.endpoint()).unwrap();
-    let wallet = LocalWallet::from(anvil.keys()[0].clone()).with_chain_id(anvil.chain_id());
-    let client = SignerMiddleware::new(provider, wallet);
-    let receipt = client
-        .send_transaction(
-            TransactionRequest::new()
-                .to(Address::from_low_u64_be(91))
-                .value(U256::one()),
-            None,
+    let (anvil, sender) = anvil_executor().await;
+    let gas_price = sender.get_gas_price().await.unwrap();
+    let raw = sender
+        .sign_legacy_transaction(
+            Address::with_last_byte(91),
+            Bytes::new(),
+            U256::ZERO,
+            U256::from(21_000),
+            gas_price,
         )
         .await
-        .unwrap()
-        .await
-        .unwrap()
         .unwrap();
+    let hash = sender.broadcast_raw_signed_tx(&raw).await.unwrap();
+    let receipt = wait_for_receipt(&sender, hash).await;
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1086,7 +1072,7 @@ async fn legacy_pending_receipt_becomes_terminal_without_raw_broadcast() {
     let repository = Arc::new(SledRepository::new(directory.path()).unwrap());
     let legacy = LegacyPendingTransaction {
         id: "legacy-mined".to_string(),
-        to: format!("{:?}", Address::from_low_u64_be(91)),
+        to: format!("{:?}", Address::with_last_byte(91)),
         data: Vec::new(),
         nonce: 0,
         gas_limit: "21000".to_string(),
@@ -1229,7 +1215,7 @@ fn small_plan() -> TransactionPlan {
         gas_limit: U256::from(21_000),
         initial_fee_per_gas: U256::from(2_000_000_000_u64),
         maximum_fee_per_gas: U256::from(3_000_000_000_u64),
-        chain_data_fee_native: U256::zero(),
+        chain_data_fee_native: U256::ZERO,
     }
 }
 
@@ -1238,7 +1224,7 @@ fn small_plan() -> TransactionPlan {
 async fn external_wallet_transaction(executor: &ChainExecutor, nonce: u64) {
     let raw = executor
         .sign_legacy_transaction(
-            Address::from_low_u64_be(99),
+            Address::with_last_byte(99),
             Bytes::new(),
             U256::from(nonce),
             U256::from(21_000),
@@ -1282,14 +1268,14 @@ async fn external_wallet_transaction_does_not_wedge_next_submission() {
     let submitted = manager
         .submit_planned(
             [5; 32],
-            Address::from_low_u64_be(0x1234),
+            Address::left_padding_from(&0x1234_u64.to_be_bytes()),
             Bytes::new(),
             small_plan(),
         )
         .await
         .unwrap();
     let receipt = wait_for_receipt(executor.as_ref(), submitted.transaction_hash).await;
-    assert_eq!(receipt.status, Some(1_u64.into()));
+    assert!(receipt.status());
     assert_eq!(
         stored_v2(&repository, 1).await.status,
         TxStatusV2::Submitted
@@ -1358,7 +1344,7 @@ async fn prepared_transaction_superseded_by_external_nonce_is_retired() {
     let submitted = manager
         .submit_planned(
             [6; 32],
-            Address::from_low_u64_be(0x1234),
+            Address::left_padding_from(&0x1234_u64.to_be_bytes()),
             Bytes::new(),
             small_plan(),
         )
@@ -1424,7 +1410,7 @@ async fn nonce_consumed_at_broadcast_releases_quote_and_unblocks() {
     let outcome = manager
         .submit_planned(
             execution_id,
-            Address::from_low_u64_be(12),
+            Address::with_last_byte(12),
             Bytes::new(),
             small_plan(),
         )

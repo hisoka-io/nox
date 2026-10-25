@@ -1,0 +1,404 @@
+[
+  {
+    "step": "new",
+    "chain_id": 421614,
+    "requests": [
+      {
+        "method": "eth_chainId",
+        "params": null
+      }
+    ]
+  },
+  {
+    "step": "latest_block_timestamp",
+    "result": 1780165693,
+    "requests": [
+      {
+        "method": "eth_getBlockByNumber",
+        "params": [
+          "latest",
+          false
+        ]
+      }
+    ]
+  },
+  {
+    "step": "check_gas_health",
+    "result": [
+      "1000000000000000000",
+      false
+    ],
+    "requests": [
+      {
+        "method": "eth_getBalance",
+        "params": [
+          "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+          "latest"
+        ]
+      }
+    ]
+  },
+  {
+    "step": "get_gas_price",
+    "result": "100000000",
+    "requests": [
+      {
+        "method": "eth_gasPrice",
+        "params": null
+      }
+    ]
+  },
+  {
+    "step": "get_nonce",
+    "result": "7",
+    "requests": [
+      {
+        "method": "eth_getTransactionCount",
+        "params": [
+          "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+          "pending"
+        ]
+      }
+    ]
+  },
+  {
+    "step": "get_confirmed_nonce",
+    "result": "7",
+    "requests": [
+      {
+        "method": "eth_getTransactionCount",
+        "params": [
+          "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+          "latest"
+        ]
+      }
+    ]
+  },
+  {
+    "step": "estimate_gas",
+    "result": 120000,
+    "requests": [
+      {
+        "method": "eth_estimateGas",
+        "params": [
+          {
+            "type": "0x00",
+            "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+            "to": "0xad911ca217c6dc779fce6a6538bdda3071c38e7e",
+            "data": "0xc0ffee00112233"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "step": "build_cost_candidate",
+    "result": [
+      "144000",
+      "115000000",
+      "0"
+    ],
+    "requests": [
+      {
+        "method": "eth_estimateGas",
+        "params": [
+          {
+            "type": "0x00",
+            "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+            "to": "0xad911ca217c6dc779fce6a6538bdda3071c38e7e",
+            "data": "0xc0ffee00112233"
+          }
+        ]
+      },
+      {
+        "method": "eth_gasPrice",
+        "params": null
+      }
+    ]
+  },
+  {
+    "step": "query_state",
+    "result": "0xabababababababababababababababababababababababababababababababab",
+    "requests": [
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "type": "0x00",
+            "to": "0xad911ca217c6dc779fce6a6538bdda3071c38e7e",
+            "data": "0xc0ffee00112233"
+          },
+          "latest"
+        ]
+      }
+    ]
+  },
+  {
+    "step": "simulate_transaction",
+    "result": 120000,
+    "requests": [
+      {
+        "method": "eth_estimateGas",
+        "params": [
+          {
+            "type": "0x00",
+            "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+            "to": "0xad911ca217c6dc779fce6a6538bdda3071c38e7e",
+            "data": "0xc0ffee00112233"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "step": "get_transaction_receipt",
+    "result": false,
+    "requests": [
+      {
+        "method": "eth_getTransactionReceipt",
+        "params": [
+          "0x7777777777777777777777777777777777777777777777777777777777777777"
+        ]
+      }
+    ]
+  },
+  {
+    "step": "broadcast_raw_signed_tx",
+    "result": "0x7b1c4e5b9c10ff3569a2f968f6cdabd2351fed4f672c9f7b19f6614343b14bc7",
+    "requests": [
+      {
+        "method": "eth_sendRawTransaction",
+        "params": [
+          "0xf86e078405f5e1008301d4c094ad911ca217c6dc779fce6a6538bdda3071c38e7e8087c0ffee00112233830cde00a0a73d72df8a5ddec0a9bb43bcd8180468606da3e9d1c7ec0eedf0c01572e4c677a018c12723985c84cff0aec68807abc2463030eb337c96b4fb7c4d846d20f31b08"
+        ]
+      }
+    ]
+  },
+  {
+    "step": "simulate_transaction_evidence",
+    "result": {
+      "gas_used": 177860,
+      "source": "FlatSimulation",
+      "logs": [
+        {
+          "address": "0xa487000000000000000000000000000000000361",
+          "topics": [
+            "0x1fe5a7ef1d3d4e0c9f2b2c6a0d1f2e3b4c5d6e7f8091a2b3c4d5e6f708192a3b",
+            "0x0000000000000000000000000f69cf1c9f4ff72471701036dd789c934458e630"
+          ],
+          "data": "0x00000000000000000000000000000000000000000000000000000000000003e8"
+        },
+        {
+          "address": "0xad911ca217c6dc779fce6a6538bdda3071c38e7e",
+          "topics": [],
+          "data": "0x"
+        }
+      ]
+    },
+    "requests": [
+      {
+        "method": "eth_simulateV1",
+        "params": [
+          {
+            "blockStateCalls": [
+              {
+                "stateOverrides": {
+                  "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266": {
+                    "balance": "0xDE0B6B3A7640000"
+                  }
+                },
+                "calls": [
+                  {
+                    "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+                    "to": "0xad911ca217c6dc779fce6a6538bdda3071c38e7e",
+                    "data": "0xc0ffee00112233"
+                  }
+                ]
+              }
+            ],
+            "validation": false,
+            "traceTransfers": true
+          },
+          "latest"
+        ]
+      }
+    ]
+  },
+  {
+    "step": "simulate_transaction_evidence_trace_fallback",
+    "result": {
+      "gas_used": 120000,
+      "source": "SuccessfulCallTrace",
+      "logs": [
+        {
+          "address": "0xa487000000000000000000000000000000000361",
+          "topics": [
+            "0x1fe5a7ef1d3d4e0c9f2b2c6a0d1f2e3b4c5d6e7f8091a2b3c4d5e6f708192a3b"
+          ],
+          "data": "0x01"
+        },
+        {
+          "address": "0x0f69cf1c9f4ff72471701036dd789c934458e630",
+          "topics": [
+            "0x2222222222222222222222222222222222222222222222222222222222222222"
+          ],
+          "data": "0x03"
+        }
+      ]
+    },
+    "requests": [
+      {
+        "method": "eth_simulateV1",
+        "params": [
+          {
+            "blockStateCalls": [
+              {
+                "stateOverrides": {
+                  "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266": {
+                    "balance": "0xDE0B6B3A7640000"
+                  }
+                },
+                "calls": [
+                  {
+                    "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+                    "to": "0xad911ca217c6dc779fce6a6538bdda3071c38e7e",
+                    "data": "0xc0ffee00112233"
+                  }
+                ]
+              }
+            ],
+            "validation": false,
+            "traceTransfers": true
+          },
+          "latest"
+        ]
+      },
+      {
+        "method": "debug_traceCall",
+        "params": [
+          {
+            "type": "0x00",
+            "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+            "to": "0xad911ca217c6dc779fce6a6538bdda3071c38e7e",
+            "data": "0xc0ffee00112233"
+          },
+          "latest",
+          {
+            "tracer": "callTracer",
+            "tracerConfig": {
+              "withLog": true
+            }
+          }
+        ]
+      },
+      {
+        "method": "eth_estimateGas",
+        "params": [
+          {
+            "type": "0x00",
+            "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+            "to": "0xad911ca217c6dc779fce6a6538bdda3071c38e7e",
+            "data": "0xc0ffee00112233"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "step": "simulate_legacy_paid_transaction",
+    "result": {
+      "gas_used": 120000,
+      "source": "SuccessfulCallTrace",
+      "logs": [
+        {
+          "address": "0xa487000000000000000000000000000000000361",
+          "topics": [
+            "0x1fe5a7ef1d3d4e0c9f2b2c6a0d1f2e3b4c5d6e7f8091a2b3c4d5e6f708192a3b"
+          ],
+          "data": "0x01"
+        },
+        {
+          "address": "0x0f69cf1c9f4ff72471701036dd789c934458e630",
+          "topics": [
+            "0x2222222222222222222222222222222222222222222222222222222222222222"
+          ],
+          "data": "0x03"
+        }
+      ]
+    },
+    "requests": [
+      {
+        "method": "eth_simulateV1",
+        "params": [
+          {
+            "blockStateCalls": [
+              {
+                "stateOverrides": {
+                  "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266": {
+                    "balance": "0xDE0B6B3A7640000"
+                  }
+                },
+                "calls": [
+                  {
+                    "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+                    "to": "0xad911ca217c6dc779fce6a6538bdda3071c38e7e",
+                    "data": "0xc0ffee00112233"
+                  }
+                ]
+              }
+            ],
+            "validation": false,
+            "traceTransfers": true
+          },
+          "latest"
+        ]
+      },
+      {
+        "method": "debug_traceCall",
+        "params": [
+          {
+            "type": "0x00",
+            "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+            "to": "0xad911ca217c6dc779fce6a6538bdda3071c38e7e",
+            "data": "0xc0ffee00112233"
+          },
+          "latest",
+          {
+            "tracer": "callTracer",
+            "tracerConfig": {
+              "withLog": true
+            }
+          }
+        ]
+      },
+      {
+        "method": "eth_estimateGas",
+        "params": [
+          {
+            "type": "0x00",
+            "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+            "to": "0xad911ca217c6dc779fce6a6538bdda3071c38e7e",
+            "data": "0xc0ffee00112233"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "step": "fetch_registry_fingerprint",
+    "result": "abababababababababababababababababababababababababababababababab",
+    "requests": [
+      {
+        "method": "eth_call",
+        "params": [
+          {
+            "type": "0x00",
+            "to": "0xf7bff88a1412054a001dc4b8acbddad6f9b26cb6",
+            "data": "0x3cce4d3d"
+          },
+          "latest"
+        ]
+      }
+    ]
+  }
+]
