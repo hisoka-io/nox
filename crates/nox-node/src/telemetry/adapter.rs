@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::telemetry::metrics::MetricsService;
@@ -8,6 +9,7 @@ use nox_core::{events::NoxEvent, traits::IEventSubscriber};
 pub struct MetricsAdapter {
     metrics: MetricsService,
     subscriber: Arc<dyn IEventSubscriber>,
+    cancel: CancellationToken,
 }
 
 impl MetricsAdapter {
@@ -15,7 +17,15 @@ impl MetricsAdapter {
         Self {
             metrics,
             subscriber,
+            cancel: CancellationToken::new(),
         }
+    }
+
+    /// Stops the adapter when `token` is cancelled (node shutdown).
+    #[must_use]
+    pub fn with_cancel_token(mut self, token: CancellationToken) -> Self {
+        self.cancel = token;
+        self
     }
 
     pub async fn run(&self) {
@@ -26,7 +36,14 @@ impl MetricsAdapter {
         let mut known_peers: HashSet<String> = HashSet::new();
 
         loop {
-            match rx.recv().await {
+            let received = tokio::select! {
+                received = rx.recv() => received,
+                () = self.cancel.cancelled() => {
+                    info!("Metrics Adapter stopped (shutdown).");
+                    break;
+                }
+            };
+            match received {
                 Ok(event) => {
                     let event_type = match &event {
                         NoxEvent::PacketReceived { .. } => "packet_received",
@@ -90,5 +107,29 @@ impl MetricsAdapter {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infra::event_bus::TokioEventBus;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn adapter_stops_on_cancellation() {
+        let bus = TokioEventBus::new(16);
+        let token = CancellationToken::new();
+        let adapter = MetricsAdapter::new(MetricsService::new(), Arc::new(bus.clone()))
+            .with_cancel_token(token.clone());
+        let task = tokio::spawn(async move { adapter.run().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!task.is_finished(), "adapter runs while the bus is open");
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("adapter stops within 2s of cancellation")
+            .expect("adapter task does not panic");
+        drop(bus);
     }
 }
