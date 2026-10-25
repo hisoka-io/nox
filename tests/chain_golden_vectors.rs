@@ -350,6 +350,13 @@ fn exit_config() -> NoxConfig {
     config.nox_reward_pool_address = "0x0000000000000000000000000000000000000001".to_string();
     config.nox_entry_point_address = "0xad911ca217c6dc779fce6a6538bdda3071c38e7e".to_string();
     config.oracle_url = "http://127.0.0.1:15004".to_string();
+    config.chain_id = 421_614;
+    config.native_asset_price_id = "ethereum".to_string();
+    config.quote_ttl_secs = 30;
+    config.quote_maximum_transaction_gas = 2_000_000;
+    config.quote_max_outstanding = 8;
+    config.quote_max_pending_sponsored_gas = 16_000_000;
+    config.quote_rolling_loss_window_secs = 3_600;
     config.tokens = vec![TokenConfig {
         address: "0x0f69cf1c9f4ff72471701036dd789c934458e630".to_string(),
         symbol: "SOKA".to_string(),
