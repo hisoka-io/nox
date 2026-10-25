@@ -1275,8 +1275,6 @@ fn continue_or_stash(
     }
 }
 
-/// Drops expired entries from both replenishment maps. Size caps are
-/// enforced on every insert. The two locks are never held together.
 /// Runs jobs from `receiver`, at most `concurrency` at once, until `cancel` fires or the
 /// queue closes, then waits for the jobs already started. A permit is taken before a job,
 /// so waiting jobs stay in the bounded queue; jobs still queued at shutdown are dropped.
@@ -1319,6 +1317,8 @@ async fn drive_lane<J, F, Fut>(
     }
 }
 
+/// Drops expired entries from both replenishment maps. Size caps are
+/// enforced on every insert. The two locks are never held together.
 fn prune_replenishment_maps(pending: &PendingReplenishments, accumulator: &SurbAccumulator) {
     let now = std::time::Instant::now();
     let expired_pending = pending.lock().prune_expired(now);

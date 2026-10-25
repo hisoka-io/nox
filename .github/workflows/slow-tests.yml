@@ -127,7 +127,7 @@ jobs:
           node-version: "22"
       - name: Build this commit
         run: |
-          cargo build --locked --release --bin nox
+          cargo build --locked --release --features dev-node --bin nox
           cargo build --locked --release -p nox-sim --features dev-node --bin nox_mesh_server
       # The newest release whose nox binary differs from this commit's, built in a target
       # dir of its own. A commit that changes no shipped code builds the latest release's
@@ -137,7 +137,7 @@ jobs:
         run: |
           for tag in $(git for-each-ref --sort=-creatordate --count=2 --format='%(refname:short)' 'refs/tags/v[0-9]*'); do
             git worktree add --detach "$RUNNER_TEMP/src-$tag" "$tag"
-            cargo build --locked --release --bin nox \
+            cargo build --locked --release --features dev-node --bin nox \
               --manifest-path "$RUNNER_TEMP/src-$tag/Cargo.toml" \
               --target-dir "$RUNNER_TEMP/previous-target"
             if ! cmp -s "$RUNNER_TEMP/previous-target/release/nox" target/release/nox; then

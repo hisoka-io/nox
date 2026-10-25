@@ -139,7 +139,8 @@ pub fn find_nox_binary(explicit: Option<&str>) -> Result<PathBuf> {
         .map(|p| p.display().to_string())
         .collect();
     bail!(
-        "nox binary not found. Build it first: cargo build --release --bin nox\n\
+        "nox binary not found. Mesh nodes run benchmark_mode, so build it with the dev-node \
+         feature first: cargo build --release --features dev-node --bin nox\n\
          Searched:\n  {}",
         searched.join("\n  ")
     );
