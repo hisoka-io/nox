@@ -1,6 +1,5 @@
-use ethers::abi::{encode, Token};
-use ethers::types::{Address, H256, U256};
-use ethers::utils::keccak256;
+use alloy::primitives::{keccak256, Address, B256, U256};
+use nox_core::eth::{parse_address, parse_decimal_u256};
 use nox_core::ExecutionQuoteV1;
 use nox_core::{PaidQuoteRequestV2, PaidTransactionRejectionCodeV2};
 
@@ -38,16 +37,13 @@ impl QuotePolicy {
             .payment_adapters
             .iter()
             .map(|adapter| {
-                let address = adapter
-                    .address
-                    .parse::<Address>()
+                let address = parse_address(&adapter.address)
                     .map_err(|error| format!("invalid payment adapter address: {error}"))?;
                 let fee_assets = adapter
                     .fee_assets
                     .iter()
                     .map(|asset| {
-                        asset
-                            .parse::<Address>()
+                        parse_address(asset)
                             .map_err(|error| format!("invalid payment adapter fee asset: {error}"))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -58,7 +54,7 @@ impl QuotePolicy {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let rolling_loss_limit_native = U256::from_dec_str(&config.quote_rolling_loss_limit_native)
+        let rolling_loss_limit_native = parse_decimal_u256(&config.quote_rolling_loss_limit_native)
             .map_err(|error| format!("invalid rolling loss limit: {error}"))?;
         Ok(Self {
             ttl_secs: config.quote_ttl_secs,
@@ -133,55 +129,53 @@ impl QuotePolicy {
     }
 }
 
+/// EIP-712 digest of an execution quote under the `NoxEntryPoint` v1 domain;
+/// it is also the quote's `execution_id`.
 #[must_use]
-pub fn execution_quote_digest(quote: &ExecutionQuoteV1) -> H256 {
-    let struct_hash = H256::from(keccak256(encode(&[
-        Token::FixedBytes(keccak256(QUOTE_TYPE).to_vec()),
-        Token::Uint(U256::from(quote.quote_version)),
-        Token::Uint(u256(quote.chain_id)),
-        Token::Address(Address::from(quote.entry_point)),
-        Token::Address(Address::from(quote.exit_address)),
-        Token::FixedBytes(quote.client_intent_id.to_vec()),
-        Token::Address(Address::from(quote.payment_adapter)),
-        Token::FixedBytes(quote.payment_id.to_vec()),
-        Token::Address(Address::from(quote.fee_asset)),
-        Token::Uint(u256(quote.exit_fee)),
-        Token::Uint(u256(quote.network_fee)),
-        Token::Uint(u256(quote.payment_gas_limit)),
-        Token::Address(Address::from(quote.action_target)),
-        Token::FixedBytes(quote.action_calldata_hash.to_vec()),
-        Token::Uint(u256(quote.action_gas_limit)),
-        Token::FixedBytes(quote.tracked_assets_hash.to_vec()),
-        Token::Uint(u256(quote.maximum_transaction_gas)),
-        Token::Uint(u256(quote.maximum_fee_per_gas)),
-        Token::Uint(u256(quote.return_data_limit)),
-        Token::Uint(U256::from(quote.valid_after_unix)),
-        Token::Uint(U256::from(quote.valid_until_unix)),
-        Token::Uint(u256(quote.quote_nonce)),
-    ])));
-    let domain_hash = H256::from(keccak256(encode(&[
-        Token::FixedBytes(keccak256(DOMAIN_TYPE).to_vec()),
-        Token::FixedBytes(keccak256(b"NoxEntryPoint").to_vec()),
-        Token::FixedBytes(keccak256(b"1").to_vec()),
-        Token::Uint(u256(quote.chain_id)),
-        Token::Address(Address::from(quote.entry_point)),
-    ])));
+pub fn execution_quote_digest(quote: &ExecutionQuoteV1) -> B256 {
+    let mut fields = Vec::with_capacity(22 * 32);
+    fields.extend_from_slice(keccak256(QUOTE_TYPE).as_slice());
+    fields.extend_from_slice(&u256_word(U256::from(quote.quote_version)));
+    fields.extend_from_slice(&quote.chain_id);
+    fields.extend_from_slice(Address::from(quote.entry_point).into_word().as_slice());
+    fields.extend_from_slice(Address::from(quote.exit_address).into_word().as_slice());
+    fields.extend_from_slice(&quote.client_intent_id);
+    fields.extend_from_slice(Address::from(quote.payment_adapter).into_word().as_slice());
+    fields.extend_from_slice(&quote.payment_id);
+    fields.extend_from_slice(Address::from(quote.fee_asset).into_word().as_slice());
+    fields.extend_from_slice(&quote.exit_fee);
+    fields.extend_from_slice(&quote.network_fee);
+    fields.extend_from_slice(&quote.payment_gas_limit);
+    fields.extend_from_slice(Address::from(quote.action_target).into_word().as_slice());
+    fields.extend_from_slice(&quote.action_calldata_hash);
+    fields.extend_from_slice(&quote.action_gas_limit);
+    fields.extend_from_slice(&quote.tracked_assets_hash);
+    fields.extend_from_slice(&quote.maximum_transaction_gas);
+    fields.extend_from_slice(&quote.maximum_fee_per_gas);
+    fields.extend_from_slice(&quote.return_data_limit);
+    fields.extend_from_slice(&u256_word(U256::from(quote.valid_after_unix)));
+    fields.extend_from_slice(&u256_word(U256::from(quote.valid_until_unix)));
+    fields.extend_from_slice(&quote.quote_nonce);
+    let struct_hash = keccak256(&fields);
+
+    let mut domain = Vec::with_capacity(5 * 32);
+    domain.extend_from_slice(keccak256(DOMAIN_TYPE).as_slice());
+    domain.extend_from_slice(keccak256(b"NoxEntryPoint").as_slice());
+    domain.extend_from_slice(keccak256(b"1").as_slice());
+    domain.extend_from_slice(&quote.chain_id);
+    domain.extend_from_slice(Address::from(quote.entry_point).into_word().as_slice());
+    let domain_hash = keccak256(&domain);
+
     let mut preimage = [0_u8; 66];
     preimage[..2].copy_from_slice(b"\x19\x01");
-    preimage[2..34].copy_from_slice(domain_hash.as_bytes());
-    preimage[34..].copy_from_slice(struct_hash.as_bytes());
-    H256::from(keccak256(preimage))
-}
-
-fn u256(value: [u8; 32]) -> U256 {
-    U256::from_big_endian(&value)
+    preimage[2..34].copy_from_slice(domain_hash.as_slice());
+    preimage[34..].copy_from_slice(struct_hash.as_slice());
+    keccak256(preimage)
 }
 
 #[must_use]
 pub fn u256_word(value: U256) -> [u8; 32] {
-    let mut encoded = [0_u8; 32];
-    value.to_big_endian(&mut encoded);
-    encoded
+    value.to_be_bytes::<32>()
 }
 
 #[cfg(test)]
@@ -189,9 +183,7 @@ mod tests {
     use super::*;
 
     fn word(value: u64) -> [u8; 32] {
-        let mut encoded = [0_u8; 32];
-        U256::from(value).to_big_endian(&mut encoded);
-        encoded
+        U256::from(value).to_be_bytes::<32>()
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use ethers::types::U256;
+use alloy::primitives::U256;
 use thiserror::Error;
 
 pub const BASIS_POINTS: u128 = 10_000;

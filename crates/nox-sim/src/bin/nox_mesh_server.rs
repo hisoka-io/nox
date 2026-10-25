@@ -147,7 +147,7 @@ async fn main() -> Result<()> {
     let registry = match (&cli.registry_address, cli.chain_id) {
         (Some(address), Some(chain_id)) => {
             anyhow::ensure!(
-                address.parse::<ethers::types::Address>().is_ok(),
+                nox_core::eth::parse_address(address).is_ok(),
                 "--registry-address {address} is not a 20-byte hex address"
             );
             anyhow::ensure!(

@@ -1,5 +1,6 @@
+use alloy::primitives::Address;
+use alloy::signers::local::PrivateKeySigner;
 use clap::Parser;
-use ethers::prelude::*;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use libp2p::multiaddr::Protocol;
@@ -123,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
 
         // Create Payload
         let payload = RelayerPayload::SubmitTransaction {
-            to: Address::random().0,
+            to: rand::random::<[u8; 20]>(),
             data: vec![0xaa, 0xbb, 0xcc, 0xdd],
         };
 
@@ -244,10 +245,10 @@ async fn spawn_mock_node(id: usize) -> anyhow::Result<VirtualNode> {
     let pub_bus: Arc<dyn IEventPublisher> = Arc::new(event_bus.clone());
     let sub_bus: Arc<dyn IEventSubscriber> = Arc::new(event_bus.clone());
 
-    let mut rng = rand::rngs::OsRng;
+    let rng = rand::rngs::OsRng;
     let node_sk = X25519SecretKey::random_from_rng(rng);
     let node_pk = X25519PublicKey::from(&node_sk);
-    let eth_wallet = LocalWallet::new(&mut rng);
+    let eth_wallet = PrivateKeySigner::random();
 
     let config = {
         let mut c = NoxConfig::default();
@@ -260,7 +261,7 @@ async fn spawn_mock_node(id: usize) -> anyhow::Result<VirtualNode> {
             .expect("tempdir path should be valid UTF-8")
             .into();
         c.routing_private_key = hex::encode(node_sk.to_bytes());
-        c.eth_wallet_private_key = hex::encode(eth_wallet.signer().to_bytes());
+        c.eth_wallet_private_key = hex::encode(eth_wallet.to_bytes());
         c.min_profit_margin_percent = 0; // Accept everything in benchmark
         c.min_pow_difficulty = 0; // Disable PoW for benchmark
         c

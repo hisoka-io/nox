@@ -18,7 +18,7 @@
 
 use std::path::Path;
 
-use ethers::types::U256;
+use alloy::primitives::U256;
 use nox_core::traits::IStorageRepository;
 use nox_core::{
     ExecutionQuoteV1, PaidQuoteRequestV2, PendingTransactionV2, QuoteStatusV2, StoredQuoteV2,
@@ -184,7 +184,7 @@ async fn execute(repo: &SledRepository, index: u64, now: u64) {
     record.status = TxStatusV2::Mined;
     record.last_update_at = now + STEP_SECS / 2;
     repo.persist_v2_durably(&record).await.expect("mined");
-    repo.finalize_quote_durably(execution_id, QuoteStatusV2::Confirmed, U256::zero(), now)
+    repo.finalize_quote_durably(execution_id, QuoteStatusV2::Confirmed, U256::ZERO, now)
         .await
         .expect("quote confirmed");
 

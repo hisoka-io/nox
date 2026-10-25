@@ -1,5 +1,5 @@
+use alloy::primitives::U256;
 use async_trait::async_trait;
-use ethers::types::U256;
 use sled::transaction::{ConflictableTransactionError, TransactionError, Transactional};
 use sled::{Db, Tree};
 use std::{
@@ -346,7 +346,7 @@ impl SledRepository {
         let rolling_loss_native = self
             .get(b"quote:rolling-loss")
             .await?
-            .map(|value| U256::from_big_endian(&value))
+            .map(|value| U256::from_be_slice(&value))
             .unwrap_or_default();
         Ok(QuoteCounters {
             outstanding,
@@ -389,10 +389,10 @@ impl SledRepository {
                 let window_expired =
                     now_unix.saturating_sub(stored_window_start) >= rolling_loss_window_secs;
                 let rolling_loss = if window_expired {
-                    U256::zero()
+                    U256::ZERO
                 } else {
                     tree.get(b"quote:rolling-loss")?
-                        .map(|value| U256::from_big_endian(&value))
+                        .map(|value| U256::from_be_slice(&value))
                         .unwrap_or_default()
                 };
                 if rolling_loss >= rolling_loss_limit_native {
@@ -675,10 +675,10 @@ impl SledRepository {
                         let window_expired = now_unix.saturating_sub(stored_start)
                             >= record.rolling_loss_window_secs;
                         let current_loss = if window_expired {
-                            U256::zero()
+                            U256::ZERO
                         } else {
                             tree.get(b"quote:rolling-loss")?
-                                .map(|value| U256::from_big_endian(&value))
+                                .map(|value| U256::from_be_slice(&value))
                                 .unwrap_or_default()
                         };
                         let next_loss = current_loss.checked_add(loss).ok_or_else(|| {
@@ -686,8 +686,7 @@ impl SledRepository {
                                 "rolling sponsored loss overflow".to_string(),
                             )
                         })?;
-                        let mut encoded_loss = [0_u8; 32];
-                        next_loss.to_big_endian(&mut encoded_loss);
+                        let encoded_loss = next_loss.to_be_bytes::<32>();
                         tree.insert(b"quote:rolling-loss", encoded_loss.as_slice())?;
                         if window_expired {
                             tree.insert(b"quote:loss-window-start", &now_unix.to_le_bytes())?;
@@ -731,7 +730,7 @@ impl SledRepository {
                     .finalize_quote_durably(
                         record.execution_id,
                         QuoteStatusV2::Expired,
-                        U256::zero(),
+                        U256::ZERO,
                         now_unix,
                     )
                     .await?
@@ -1485,8 +1484,7 @@ mod tests {
         repo.put(b"quote:loss-window-start", &50_u64.to_le_bytes())
             .await
             .unwrap();
-        let mut loss = [0_u8; 32];
-        U256::from(7).to_big_endian(&mut loss);
+        let loss = U256::from(7).to_be_bytes::<32>();
         repo.put(b"quote:rolling-loss", &loss).await.unwrap();
 
         assert_eq!(

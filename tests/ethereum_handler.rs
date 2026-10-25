@@ -2,7 +2,7 @@
 
 #![cfg(feature = "dev-node")]
 
-use ethers::prelude::*;
+use alloy::primitives::{Address, Bytes, Signature, B256, U256};
 use nox_core::models::payloads::RelayerPayload;
 use nox_core::traits::service::{ServiceError, ServiceHandler};
 use nox_core::{
@@ -277,10 +277,10 @@ async fn test_ethereum_handler_from_config_invalid_address() {
 #[tokio::test]
 async fn paid_quote_is_signed_reserved_and_duplicate_payment_rejected() {
     let price_server = mock_price_server().await;
-    let entry_point = Address::from_low_u64_be(11);
-    let adapter = Address::from_low_u64_be(12);
-    let fee_asset = Address::from_low_u64_be(13);
-    let pool = Address::from_low_u64_be(14);
+    let entry_point = Address::with_last_byte(11);
+    let adapter = Address::with_last_byte(12);
+    let fee_asset = Address::with_last_byte(13);
+    let pool = Address::with_last_byte(14);
     let mut config = NoxConfig::default();
     config.benchmark_mode = true;
     config.chain_id = 31_337;
@@ -338,13 +338,13 @@ async fn paid_quote_is_signed_reserved_and_duplicate_payment_rejected() {
         .as_secs();
     let request = PaidQuoteRequestV2 {
         chain_id: config.chain_id,
-        entry_point: entry_point.0,
+        entry_point: entry_point.into_array(),
         client_intent_id: [2; 32],
-        payment_adapter: adapter.0,
+        payment_adapter: adapter.into_array(),
         payment_id: [4; 32],
-        fee_asset: fee_asset.0,
+        fee_asset: fee_asset.into_array(),
         payment_gas_limit: 500_000,
-        action_target: Address::from_low_u64_be(15).0,
+        action_target: Address::with_last_byte(15).into_array(),
         action_calldata_hash: [7; 32],
         action_gas_limit: 700_000,
         tracked_assets_hash: [8; 32],
@@ -363,15 +363,20 @@ async fn paid_quote_is_signed_reserved_and_duplicate_payment_rejected() {
         panic!("expected issued quote, got {issued:?}");
     };
     assert_eq!(
-        U256::from_big_endian(&quote.maximum_transaction_gas),
+        U256::from_be_bytes(quote.maximum_transaction_gas),
         U256::from(1_600_000)
     );
-    let exit_fee = U256::from_big_endian(&quote.exit_fee);
-    let network_fee = U256::from_big_endian(&quote.network_fee);
-    assert_eq!(network_fee, (exit_fee * 500 + 9_999) / 10_000);
+    let exit_fee = U256::from_be_bytes(quote.exit_fee);
+    let network_fee = U256::from_be_bytes(quote.network_fee);
+    assert_eq!(
+        network_fee,
+        (exit_fee * U256::from(500) + U256::from(9_999)) / U256::from(10_000)
+    );
     let signature = Signature::try_from(exit_signature.as_slice()).unwrap();
     assert_eq!(
-        signature.recover(H256::from(execution_id)).unwrap(),
+        signature
+            .recover_address_from_prehash(&B256::from(execution_id))
+            .unwrap(),
         executor.address()
     );
     assert_eq!(
@@ -406,7 +411,7 @@ async fn paid_quote_is_signed_reserved_and_duplicate_payment_rejected() {
     let expired_outcome = handler
         .handle_paid_transaction_v2(PaidTransactionRequestV2 {
             chain_id: config.chain_id,
-            entry_point: entry_point.0,
+            entry_point: entry_point.into_array(),
             calldata: vec![1],
             execution_id: expired.execution_id,
             valid_until_unix: now,
@@ -433,7 +438,7 @@ async fn paid_quote_is_signed_reserved_and_duplicate_payment_rejected() {
     let duplicate_submission = handler
         .handle_paid_transaction_v2(PaidTransactionRequestV2 {
             chain_id: config.chain_id,
-            entry_point: entry_point.0,
+            entry_point: entry_point.into_array(),
             calldata: vec![1],
             execution_id,
             valid_until_unix: quote.valid_until_unix,

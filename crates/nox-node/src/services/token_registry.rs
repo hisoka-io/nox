@@ -1,6 +1,6 @@
 //! Token metadata registry: resolves decimals and price oracle IDs per token address.
 
-use ethers::types::{Address, H160};
+use alloy::primitives::{address, Address};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -26,26 +26,11 @@ impl TokenRegistry {
     /// Pre-populated with Mainnet token addresses (compile-time byte constants).
     #[must_use]
     pub fn new_mainnet() -> Self {
-        const WETH: H160 = H160([
-            0xc0, 0x2a, 0xaa, 0x39, 0xb2, 0x23, 0xfe, 0x8d, 0x0a, 0x0e, 0x5c, 0x4f, 0x27, 0xea,
-            0xd9, 0x08, 0x3c, 0x75, 0x6c, 0xc2,
-        ]);
-        const USDC: H160 = H160([
-            0xa0, 0xb8, 0x69, 0x91, 0xc6, 0x21, 0x8b, 0x36, 0xc1, 0xd1, 0x9d, 0x4a, 0x2e, 0x9e,
-            0xb0, 0xce, 0x36, 0x06, 0xeb, 0x48,
-        ]);
-        const DAI: H160 = H160([
-            0x6b, 0x17, 0x54, 0x74, 0xe8, 0x90, 0x94, 0xc4, 0x4d, 0xa9, 0x8b, 0x95, 0x4e, 0xed,
-            0xea, 0xc4, 0x95, 0x27, 0x1d, 0x0f,
-        ]);
-        const USDT: H160 = H160([
-            0xda, 0xc1, 0x7f, 0x95, 0x8d, 0x2e, 0xe5, 0x23, 0xa2, 0x20, 0x62, 0x06, 0x99, 0x45,
-            0x97, 0xc1, 0x3d, 0x83, 0x1e, 0xc7,
-        ]);
-        const WBTC: H160 = H160([
-            0x22, 0x60, 0xfa, 0xc5, 0xe5, 0x54, 0x2a, 0x77, 0x3a, 0xa4, 0x4f, 0xbc, 0xfe, 0xdf,
-            0x7c, 0x19, 0x3b, 0xc2, 0xc5, 0x99,
-        ]);
+        const WETH: Address = address!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
+        const USDC: Address = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+        const DAI: Address = address!("6b175474e89094c44da98b954eedeac495271d0f");
+        const USDT: Address = address!("dac17f958d2ee523a2206206994597c13d831ec7");
+        const WBTC: Address = address!("2260fac5e5542a773aa44fbcfedf7c193bc2c599");
 
         let mut tokens = HashMap::new();
 
@@ -175,7 +160,7 @@ mod tests {
     fn configured_tokens_replace_mainnet_defaults() {
         let mut registry = TokenRegistry::default();
         let mainnet_usdc = Address::from_str("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48").unwrap();
-        let configured = Address::from_low_u64_be(77);
+        let configured = Address::with_last_byte(77);
         registry.clear();
         registry.register(
             configured,

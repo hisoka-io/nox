@@ -1,7 +1,10 @@
 //! Fetches topology from seed nodes, verifies XOR fingerprint against on-chain
 //! `NoxRegistry.topologyFingerprint()`, and hot-swaps the client's topology.
 
-use ethers::prelude::*;
+use alloy::primitives::{Address, U256};
+use alloy::providers::Provider;
+use nox_core::chain_rpc::{eth_call, http1_provider, ChainProvider};
+use nox_core::eth::{parse_address, parse_decimal_u256};
 use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -19,15 +22,15 @@ use nox_core::models::topology::{
 const VERIFIED_TOPOLOGY_SCHEMA_VERSION: u8 = 2;
 pub const DEFAULT_LIVENESS_MAX_AGE: Duration = Duration::from_mins(3);
 
-abigen!(
-    NoxRegistryTopology,
-    r#"[
-        function relayers(address) view returns (bytes32 sphinxKey, string url, string ingressUrl, string metadataUrl, uint256 stakedAmount, uint256 unlockTime, bool isRegistered, uint8 status, bool frozen)
-        function getNodeRole(address) view returns (uint8)
-        function relayerCount() view returns (uint256)
-        function topologyFingerprint() view returns (bytes32)
-    ]"#
-);
+alloy::sol! {
+    /// Registry views the client reads to verify a topology snapshot.
+    interface NoxRegistryTopology {
+        function relayers(address relayer) external view returns (bytes32 sphinxKey, string url, string ingressUrl, string metadataUrl, uint256 stakedAmount, uint256 unlockTime, bool isRegistered, uint8 status, bool frozen);
+        function getNodeRole(address relayer) external view returns (uint8);
+        function relayerCount() external view returns (uint256);
+        function topologyFingerprint() external view returns (bytes32);
+    }
+}
 
 /// Default seed URLs tried when `seed_urls` is empty.
 pub const DEFAULT_SEED_URLS: &[&str] = &["https://api.hisoka.io/seed/topology"];
@@ -115,7 +118,7 @@ fn validate_snapshot_nodes(nodes: &[RelayerNode]) -> Result<(), TopologySyncErro
     let mut addresses = HashSet::with_capacity(nodes.len());
     let mut previous_address: Option<String> = None;
     for node in nodes {
-        let address = node.address.parse::<Address>().map_err(|e| {
+        let address = parse_address(&node.address).map_err(|e| {
             TopologySyncError::ConversionError(format!("Invalid eth address {}: {e}", node.address))
         })?;
         if !addresses.insert(address) {
@@ -179,7 +182,7 @@ fn validate_snapshot_schema(
     }
     let mut addresses = HashSet::with_capacity(snapshot.liveness.len());
     for (member, liveness) in snapshot.nodes.iter().zip(&snapshot.liveness) {
-        let address = liveness.address.parse::<Address>().map_err(|error| {
+        let address = parse_address(&liveness.address).map_err(|error| {
             TopologySyncError::InvalidLiveness(format!(
                 "invalid address {}: {error}",
                 liveness.address
@@ -240,7 +243,7 @@ fn eligible_nodes<'a>(
         .iter()
         .zip(&snapshot.liveness)
         .filter_map(|(node, liveness)| {
-            let Ok(address) = liveness.address.parse::<Address>() else {
+            let Ok(address) = parse_address(&liveness.address) else {
                 return None;
             };
             let chain_active =
@@ -290,19 +293,8 @@ fn select_verification_block(
     Ok(block)
 }
 
-fn build_ethers_http1_provider(rpc_url: &str) -> Result<Provider<Http>, TopologySyncError> {
-    let url = rpc_url.parse::<reqwest_legacy::Url>().map_err(|error| {
-        TopologySyncError::ChainError(format!("invalid Ethers RPC URL: {error}"))
-    })?;
-    let client = reqwest_legacy::Client::builder()
-        .http1_only()
-        .build()
-        .map_err(|error| {
-            TopologySyncError::ChainError(format!(
-                "Ethers HTTP/1 client initialization failed: {error}"
-            ))
-        })?;
-    Ok(Provider::new(Http::new_with_client(url, client)))
+fn build_http1_provider(rpc_url: &str) -> Result<ChainProvider, TopologySyncError> {
+    http1_provider(rpc_url).map_err(|error| TopologySyncError::ChainError(error.to_string()))
 }
 
 fn validate_registry_profile(
@@ -324,7 +316,7 @@ fn validate_registry_profile(
         return Err(profile_mismatch(node, "metadata url"));
     }
     let stake =
-        U256::from_dec_str(&node.stake).map_err(|_| profile_mismatch(node, "invalid stake"))?;
+        parse_decimal_u256(&node.stake).map_err(|_| profile_mismatch(node, "invalid stake"))?;
     if stake != profile.staked_amount {
         return Err(profile_mismatch(node, "stake"));
     }
@@ -571,7 +563,7 @@ impl TopologySyncClient {
         computed: &[u8; 32],
         block_number: u64,
     ) -> Result<(u64, HashSet<Address>), TopologySyncError> {
-        let provider = build_ethers_http1_provider(&self.config.eth_rpc_url)?;
+        let provider = build_http1_provider(&self.config.eth_rpc_url)?;
         let current_block = if block_number == 0 {
             tokio::time::timeout(Duration::from_secs(10), provider.get_block_number())
                 .await
@@ -585,21 +577,26 @@ impl TopologySyncClient {
                         "current block lookup failed for legacy seed snapshot: {error}"
                     ))
                 })?
-                .as_u64()
         } else {
             block_number
         };
         let block_number = select_verification_block(block_number, current_block)?;
-        let registry = NoxRegistryTopology::new(self.config.registry_address, Arc::new(provider));
-        let block = BlockId::Number(BlockNumber::Number(block_number.into()));
+        let registry = self.config.registry_address;
+        let block = Some(block_number);
         let on_chain = tokio::time::timeout(
             Duration::from_secs(10),
-            registry.topology_fingerprint().block(block).call(),
+            eth_call(
+                &provider,
+                registry,
+                &NoxRegistryTopology::topologyFingerprintCall {},
+                block,
+            ),
         )
         .await
         .map_err(|_| TopologySyncError::ChainError("topology fingerprint call timed out".into()))?
         .map_err(|e| TopologySyncError::ChainError(format!("topology fingerprint call: {e}")))?;
 
+        let on_chain = on_chain.0;
         if computed != &on_chain {
             return Err(TopologySyncError::FingerprintMismatch {
                 computed: hex::encode(computed),
@@ -609,7 +606,12 @@ impl TopologySyncClient {
 
         let relayer_count = tokio::time::timeout(
             Duration::from_secs(10),
-            registry.relayer_count().block(block).call(),
+            eth_call(
+                &provider,
+                registry,
+                &NoxRegistryTopology::relayerCountCall {},
+                block,
+            ),
         )
         .await
         .map_err(|_| TopologySyncError::ChainError("relayer count call timed out".into()))?
@@ -618,7 +620,7 @@ impl TopologySyncClient {
 
         let mut chain_active_addresses = HashSet::with_capacity(nodes.len());
         for node in nodes {
-            let address = node.address.parse::<Address>().map_err(|e| {
+            let address = parse_address(&node.address).map_err(|e| {
                 TopologySyncError::ConversionError(format!(
                     "Invalid eth address {}: {e}",
                     node.address
@@ -626,7 +628,12 @@ impl TopologySyncClient {
             })?;
             let profile = tokio::time::timeout(
                 Duration::from_secs(10),
-                registry.relayers(address).block(block).call(),
+                eth_call(
+                    &provider,
+                    registry,
+                    &NoxRegistryTopology::relayersCall { relayer: address },
+                    block,
+                ),
             )
             .await
             .map_err(|_| {
@@ -643,7 +650,12 @@ impl TopologySyncClient {
             })?;
             let role = tokio::time::timeout(
                 Duration::from_secs(10),
-                registry.get_node_role(address).block(block).call(),
+                eth_call(
+                    &provider,
+                    registry,
+                    &NoxRegistryTopology::getNodeRoleCall { relayer: address },
+                    block,
+                ),
             )
             .await
             .map_err(|_| {
@@ -662,14 +674,14 @@ impl TopologySyncClient {
             let is_chain_active = validate_registry_profile(
                 node,
                 &RegistryProfile {
-                    sphinx_key: profile.0,
-                    url: profile.1,
-                    ingress_url: profile.2,
-                    metadata_url: profile.3,
-                    staked_amount: profile.4,
-                    is_registered: profile.6,
-                    status: profile.7,
-                    frozen: profile.8,
+                    sphinx_key: profile.sphinxKey.0,
+                    url: profile.url,
+                    ingress_url: profile.ingressUrl,
+                    metadata_url: profile.metadataUrl,
+                    staked_amount: profile.stakedAmount,
+                    is_registered: profile.isRegistered,
+                    status: profile.status,
+                    frozen: profile.frozen,
                     role,
                 },
             )?;
@@ -811,7 +823,7 @@ mod tests {
         let config = TopologySyncConfig {
             seed_urls: vec![],
             eth_rpc_url: "http://localhost:8545".into(),
-            registry_address: Address::zero(),
+            registry_address: Address::ZERO,
             refresh_interval: Duration::from_mins(1),
             request_timeout: Duration::from_secs(10),
             liveness_max_age: DEFAULT_LIVENESS_MAX_AGE,
@@ -827,7 +839,7 @@ mod tests {
         let config = TopologySyncConfig {
             seed_urls: vec!["http://seed1:8080/topology".into()],
             eth_rpc_url: "http://localhost:8545".into(),
-            registry_address: Address::zero(),
+            registry_address: Address::ZERO,
             refresh_interval: Duration::from_mins(1),
             request_timeout: Duration::from_secs(10),
             liveness_max_age: DEFAULT_LIVENESS_MAX_AGE,
@@ -843,7 +855,7 @@ mod tests {
         let config = TopologySyncConfig {
             seed_urls: vec!["http://seed1:8080/topology".into()],
             eth_rpc_url: "http://localhost:8545".into(),
-            registry_address: Address::zero(),
+            registry_address: Address::ZERO,
             refresh_interval: Duration::from_mins(1),
             request_timeout: Duration::from_secs(10),
             liveness_max_age: Duration::ZERO,
@@ -862,7 +874,7 @@ mod tests {
         let remote = TopologySyncConfig {
             seed_urls: vec!["https://seed.example/topology".into()],
             eth_rpc_url: String::new(),
-            registry_address: Address::zero(),
+            registry_address: Address::ZERO,
             refresh_interval: Duration::from_mins(1),
             request_timeout: Duration::from_secs(10),
             liveness_max_age: DEFAULT_LIVENESS_MAX_AGE,
@@ -876,7 +888,7 @@ mod tests {
         let loopback = TopologySyncConfig {
             seed_urls: vec!["http://127.0.0.1:8080/topology".into()],
             eth_rpc_url: String::new(),
-            registry_address: Address::zero(),
+            registry_address: Address::ZERO,
             refresh_interval: Duration::from_mins(1),
             request_timeout: Duration::from_secs(10),
             liveness_max_age: DEFAULT_LIVENESS_MAX_AGE,
@@ -894,7 +906,7 @@ mod tests {
         let config = TopologySyncConfig {
             seed_urls: vec!["http://127.0.0.1:8080/topology".into()],
             eth_rpc_url: "http://127.0.0.1:8545".into(),
-            registry_address: Address::zero(),
+            registry_address: Address::ZERO,
             refresh_interval: Duration::from_mins(1),
             request_timeout: Duration::from_secs(10),
             liveness_max_age: DEFAULT_LIVENESS_MAX_AGE,

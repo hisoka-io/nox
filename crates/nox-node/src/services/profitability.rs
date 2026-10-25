@@ -1,8 +1,9 @@
+use crate::blockchain::executor::unmined_log;
 use crate::blockchain::transaction_plan::{CostCandidate, TransactionPlan, BASIS_POINTS};
 use crate::price::client::FixedPriceSource;
 use crate::services::token_registry::TokenRegistry;
-use ethers::types::{Address, Log, H256, U256, U512};
-use ethers::utils::keccak256;
+use alloy::primitives::{keccak256, Address, Bytes, B256, U256, U512};
+use alloy::rpc::types::Log;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -105,24 +106,21 @@ impl ProfitabilityCalculator {
         fee_asset: Address,
         fee_amount: U256,
     ) -> Result<ProfitAuthorization, ProfitabilityError> {
-        let mut asset_topic = [0_u8; 32];
-        asset_topic[12..].copy_from_slice(fee_asset.as_bytes());
-        let mut amount = [0_u8; 32];
-        fee_amount.to_big_endian(&mut amount);
-        self.authorize(
-            candidate,
-            &[Log {
-                address: self.nox_reward_pool_address,
-                topics: vec![
-                    H256::from(keccak256(b"RewardsDeposited(address,address,uint256)")),
-                    H256::from(asset_topic),
-                    H256::zero(),
-                ],
-                data: amount.to_vec().into(),
-                ..Default::default()
-            }],
+        self.authorize(candidate, &[self.reward_deposit_log(fee_asset, fee_amount)])
+            .await
+    }
+
+    /// The `RewardsDeposited` log a payment of `fee_amount` in `fee_asset` emits.
+    fn reward_deposit_log(&self, fee_asset: Address, fee_amount: U256) -> Log {
+        unmined_log(
+            self.nox_reward_pool_address,
+            vec![
+                keccak256(b"RewardsDeposited(address,address,uint256)"),
+                fee_asset.into_word(),
+                B256::ZERO,
+            ],
+            Bytes::from(fee_amount.to_be_bytes::<32>().to_vec()),
         )
-        .await
     }
 
     pub async fn authorize_fee_with_maximum_fee_per_gas(
@@ -132,22 +130,9 @@ impl ProfitabilityCalculator {
         fee_amount: U256,
         maximum_fee_per_gas: U256,
     ) -> Result<ProfitAuthorization, ProfitabilityError> {
-        let mut asset_topic = [0_u8; 32];
-        asset_topic[12..].copy_from_slice(fee_asset.as_bytes());
-        let mut amount = [0_u8; 32];
-        fee_amount.to_big_endian(&mut amount);
         self.authorize_with_maximum_fee_per_gas(
             candidate,
-            &[Log {
-                address: self.nox_reward_pool_address,
-                topics: vec![
-                    H256::from(keccak256(b"RewardsDeposited(address,address,uint256)")),
-                    H256::from(asset_topic),
-                    H256::zero(),
-                ],
-                data: amount.to_vec().into(),
-                ..Default::default()
-            }],
+            &[self.reward_deposit_log(fee_asset, fee_amount)],
             Some(maximum_fee_per_gas),
         )
         .await
@@ -309,19 +294,20 @@ impl ProfitabilityCalculator {
     }
 
     async fn payment_revenue(&self, logs: &[Log]) -> Result<U256, ProfitabilityError> {
-        let rewards_topic = H256::from(keccak256(b"RewardsDeposited(address,address,uint256)"));
-        let mut revenue = U256::zero();
+        let rewards_topic = keccak256(b"RewardsDeposited(address,address,uint256)");
+        let mut revenue = U256::ZERO;
         let mut payment_found = false;
 
         for log in logs {
-            if log.address != self.nox_reward_pool_address
-                || log.topics.len() != 3
-                || log.topics[0] != rewards_topic
-                || log.data.len() != 32
+            let topics = log.topics();
+            if log.address() != self.nox_reward_pool_address
+                || topics.len() != 3
+                || topics[0] != rewards_topic
+                || log.data().data.len() != 32
             {
                 continue;
             }
-            let asset = Address::from(log.topics[1]);
+            let asset = Address::from_word(topics[1]);
             let Some(price_id) = self.token_registry.get_price_id(asset) else {
                 continue;
             };
@@ -337,7 +323,7 @@ impl ProfitabilityCalculator {
                     detail: error.to_string(),
                 })?;
             validate_quote(price_id, &quote)?;
-            let amount = U256::from_big_endian(log.data.as_ref());
+            let amount = U256::from_be_slice(&log.data().data);
             let value = mul_div_floor(amount, U256::from(quote.price_e8), pow10(decimals)?)?;
             revenue = revenue
                 .checked_add(value)
@@ -383,7 +369,7 @@ fn validate_quote(
 }
 
 fn pow10(decimals: u8) -> Result<U256, ProfitabilityError> {
-    (0..decimals).try_fold(U256::one(), |value, _| {
+    (0..decimals).try_fold(U256::from(1), |value, _| {
         value
             .checked_mul(U256::from(10))
             .ok_or_else(|| ProfitabilityError::Arithmetic {
@@ -410,7 +396,7 @@ fn mul_div_ceil(left: U256, right: U256, divisor: U256) -> Result<U256, Profitab
     let numerator = U512::from(left) * U512::from(right);
     let divisor = U512::from(divisor);
     let rounded = numerator
-        .checked_add(divisor - U512::one())
+        .checked_add(divisor - U512::from(1))
         .ok_or_else(|| ProfitabilityError::Arithmetic {
             detail: "rounded numerator overflow".to_string(),
         })?;
@@ -436,7 +422,7 @@ fn mul3_div_ceil(
         })?;
     let divisor = U512::from(divisor);
     let rounded = numerator
-        .checked_add(divisor - U512::one())
+        .checked_add(divisor - U512::from(1))
         .ok_or_else(|| ProfitabilityError::Arithmetic {
             detail: "rounded widened numerator overflow".to_string(),
         })?;
@@ -468,12 +454,7 @@ fn maximum_fee_per_gas(
 }
 
 fn narrow(value: U512) -> Result<U256, ProfitabilityError> {
-    if value > U512::from(U256::MAX) {
-        return Err(ProfitabilityError::Arithmetic {
-            detail: "U512 value exceeds U256".to_string(),
-        });
-    }
-    let mut bytes = [0_u8; 64];
-    value.to_big_endian(&mut bytes);
-    Ok(U256::from_big_endian(&bytes[32..]))
+    U256::checked_from_limbs_slice(value.as_limbs()).ok_or_else(|| ProfitabilityError::Arithmetic {
+        detail: "U512 value exceeds U256".to_string(),
+    })
 }

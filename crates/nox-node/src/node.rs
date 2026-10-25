@@ -597,12 +597,9 @@ impl NoxNode {
 
             eth_handler.clear_tokens();
             for token in &config.tokens {
-                let addr = token
-                    .address
-                    .parse::<ethers::types::Address>()
-                    .map_err(|e| {
-                        anyhow::anyhow!("Invalid token address '{}': {e}", token.address)
-                    })?;
+                let addr = nox_core::eth::parse_address(&token.address).map_err(|e| {
+                    anyhow::anyhow!("Invalid token address '{}': {e}", token.address)
+                })?;
                 eth_handler.register_token(addr, &token.symbol, token.decimals, &token.price_id);
                 info!(
                     address = %token.address,

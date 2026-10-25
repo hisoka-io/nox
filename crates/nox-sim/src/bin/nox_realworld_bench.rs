@@ -3,9 +3,9 @@
 
 #![allow(clippy::expect_used)] // Benchmark binary: panicking on serialization is acceptable.
 
+use alloy::primitives::Address;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use ethers::types::Address;
 use nox_client::{HttpPacketTransport, MixnetClient, MixnetClientConfig, TopologyNode};
 use nox_node::services::handlers::http::SerializableHttpResponse;
 use nox_sim::bench_common::{self, BenchResult};
@@ -366,7 +366,7 @@ fn topology_from_mesh(mesh: &ProcessMesh) -> Vec<TopologyNode> {
                     1 => 1, // Mix
                     _ => 2, // Exit
                 },
-                eth_address: Address::zero(),
+                eth_address: Address::ZERO,
                 role: 3, // Full node
             }
         })

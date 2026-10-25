@@ -1,6 +1,6 @@
 //! Topology node representation for Sphinx routing.
 
-use ethers::types::Address;
+use alloy::primitives::Address;
 
 use nox_core::RelayerNode;
 
@@ -31,9 +31,7 @@ impl TopologyNode {
         let mut public_key = [0u8; 32];
         public_key.copy_from_slice(&sphinx_bytes);
 
-        let eth_address: Address = node
-            .address
-            .parse()
+        let eth_address: Address = nox_core::eth::parse_address(&node.address)
             .map_err(|e| format!("Invalid eth address {}: {e}", node.address))?;
 
         Ok(Self {

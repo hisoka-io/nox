@@ -37,7 +37,7 @@ rayon = "1.10"
 rand_distr = "0.4"
 x25519-dalek = { version = "2.0.0", features = ["static_secrets", "serde"] }
 zeroize = { workspace = true }
-ethers = { workspace = true }
+alloy = { workspace = true }
 libp2p = { version = "0.53", features = ["tcp", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros", "tokio", "cbor"] }
 sled = "0.34"
 prometheus-client = "0.22"
@@ -52,11 +52,11 @@ num_cpus = "1.17.0"
 parking_lot = { workspace = true }
 uuid = { version = "1.7", features = ["v4"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "http2"] }
-reqwest-legacy = { package = "reqwest", version = "0.11.27", default-features = false, features = ["native-tls"] }
 url = "2.5"
 http = "1"
 
 [dev-dependencies]
+alloy-node-bindings = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = "0.24"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

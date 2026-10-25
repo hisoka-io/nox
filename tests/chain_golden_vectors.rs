@@ -28,14 +28,14 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 /// Conversions between plain bytes/strings and the Ethereum library types the node API takes.
 mod eth {
-    pub use ethers::types::{Address, Bytes, H256 as B256, U256};
+    pub use alloy::primitives::{Address, Bytes, B256, U256};
 
     pub fn address(bytes: [u8; 20]) -> Address {
         Address::from(bytes)
     }
 
     pub fn address_hex(address: &Address) -> String {
-        format!("0x{}", hex::encode(address.as_bytes()))
+        format!("0x{}", hex::encode(address.as_slice()))
     }
 
     pub fn b256(bytes: [u8; 32]) -> B256 {
@@ -43,7 +43,7 @@ mod eth {
     }
 
     pub fn b256_hex(value: &B256) -> String {
-        format!("0x{}", hex::encode(value.as_bytes()))
+        format!("0x{}", hex::encode(value.as_slice()))
     }
 
     pub fn bytes(value: &[u8]) -> Bytes {
@@ -80,6 +80,12 @@ fn golden_path(name: &str) -> PathBuf {
 }
 
 fn check_golden(name: &str, actual: &Value) {
+    check_golden_with(name, actual, |_| {});
+}
+
+/// Like [`check_golden`], after `adjust` applies documented, intended changes
+/// to the recorded value.
+fn check_golden_with(name: &str, actual: &Value, adjust: impl Fn(&mut Value)) {
     let path = golden_path(name);
     if std::env::var_os("NOX_UPDATE_GOLDEN").is_some() {
         std::fs::create_dir_all(path.parent().expect("golden dir")).expect("create golden dir");
@@ -90,7 +96,8 @@ fn check_golden(name: &str, actual: &Value) {
     }
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("golden file {} missing: {error}", path.display()));
-    let expected: Value = serde_json::from_str(&text).expect("decode golden");
+    let mut expected: Value = serde_json::from_str(&text).expect("decode golden");
+    adjust(&mut expected);
     assert_eq!(
         actual,
         &expected,
@@ -414,7 +421,25 @@ fn operator_config_parsing() {
             json!({"input": input, "errors": validation_errors(&config)})
         })
         .collect();
-    check_golden(
+    // `validate()` used to read `quote_rolling_loss_limit_native` as hex while the
+    // quote policy reads it as decimal, so hex-only values passed validation and
+    // then stopped the exit at startup, and a decimal value too long for 256-bit
+    // hex failed validation although the policy accepts it. Validation now uses
+    // the decimal parser of the quote policy.
+    let decimal_validation = |expected: &mut Value| {
+        let error = json!(["quote_rolling_loss_limit_native must be a positive integer"]);
+        for entry in expected["validate_rolling_loss"]
+            .as_array_mut()
+            .expect("rolling loss entries")
+        {
+            match entry["input"].as_str().expect("input") {
+                "0x10" | "abc" | "a" | "ff" => entry["errors"] = error.clone(),
+                input if input == eth::u256_dec(&eth::u256_max()) => entry["errors"] = json!([]),
+                _ => {}
+            }
+        }
+    };
+    check_golden_with(
         "operator_config_parsing",
         &json!({
             "quote_policy_rolling_loss": rolling_loss,
@@ -423,6 +448,7 @@ fn operator_config_parsing() {
             "validate_rolling_loss": rolling_loss_validation,
             "validate_token_address": token_validation,
         }),
+        decimal_validation,
     );
 }
 
@@ -655,6 +681,11 @@ impl RecordingRpc {
                 "code": -32601,
                 "message": "the method eth_simulateV1 does not exist/is not available"
             })),
+            // The committed-receipt backend of `dev-node` builds probes this first.
+            "evm_snapshot" => Err(json!({
+                "code": -32601,
+                "message": "the method evm_snapshot does not exist/is not available"
+            })),
             "debug_traceCall" => {
                 let call = &params[0];
                 Ok(json!({
@@ -740,17 +771,22 @@ async fn recording_server(simulate_supported: bool) -> (MockServer, RecordingRpc
     (server, rpc)
 }
 
+/// Requests recorded since the last call. `evm_snapshot` probes are left out:
+/// only `dev-node` builds send them, and the vectors hold the production path.
 fn take_requests(rpc: &RecordingRpc) -> Vec<Value> {
     std::mem::take(&mut *rpc.requests.lock().expect("requests"))
+        .into_iter()
+        .filter(|request| request["method"] != "evm_snapshot")
+        .collect()
 }
 
-fn render_logs(logs: &[ethers::types::Log]) -> Value {
+fn render_logs(logs: &[alloy::rpc::types::Log]) -> Value {
     json!(logs
         .iter()
         .map(|log| json!({
-            "address": eth::address_hex(&log.address),
-            "topics": log.topics.iter().map(eth::b256_hex).collect::<Vec<_>>(),
-            "data": format!("0x{}", hex::encode(log.data.as_ref())),
+            "address": eth::address_hex(&log.address()),
+            "topics": log.topics().iter().map(eth::b256_hex).collect::<Vec<_>>(),
+            "data": format!("0x{}", hex::encode(&log.data().data)),
         }))
         .collect::<Vec<_>>())
 }

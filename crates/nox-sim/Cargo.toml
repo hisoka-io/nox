@@ -30,7 +30,8 @@ hex = "0.4"
 rand = "0.8"
 x25519-dalek = { version = "2.0.0", features = ["static_secrets", "serde"] }
 parking_lot = "0.12"
-ethers = { workspace = true }
+alloy = { workspace = true }
+alloy-node-bindings = { workspace = true }
 libp2p = { version = "0.53", features = ["tcp", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros", "tokio", "cbor"] }
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 axum = "0.7"

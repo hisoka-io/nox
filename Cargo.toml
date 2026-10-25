@@ -25,7 +25,8 @@ tracing = "0.1"
 async-trait = "0.1"
 rand = "0.8"
 hex = "0.4"
-ethers = { version = "2.0", default-features = false, features = ["ws", "ipc", "openssl", "abigen"] }
+alloy = { version = "2.5.0", default-features = false, features = ["std", "providers", "json-rpc", "rpc-types", "provider-debug-api", "signer-local", "sol-types", "contract", "consensus", "network", "eips", "rlp", "k256"] }
+alloy-node-bindings = "2.5.0"
 sha2 = { version = "0.10", features = ["asm"] }
 parking_lot = "0.12"
 zeroize = { version = "1.8", features = ["derive"] }
@@ -91,7 +92,7 @@ rand = "0.8"
 x25519-dalek = { version = "2.0.0", features = ["static_secrets", "serde"] }
 parking_lot = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
-ethers = { version = "2.0", default-features = false, features = ["ws", "ipc", "openssl", "abigen"] }
+alloy = { workspace = true }
 libp2p = { version = "0.53", features = ["tcp", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros", "tokio", "cbor"] }
 axum = "0.7"
 tempfile = "3.10"
@@ -112,9 +113,9 @@ sha2 = { workspace = true }
 tempfile = "3.10"
 anyhow = "1.0"
 serde_json = { version = "1.0", features = ["preserve_order"] }
-ethers = { version = "2.0", default-features = false, features = ["ws", "ipc", "openssl", "abigen"] }
+alloy = { workspace = true }
+alloy-node-bindings = { workspace = true }
 criterion = { version = "0.5", features = ["async_tokio"] }
-ethers-solc = "2.0"
 wiremock = "0.6"
 reqwest = { version = "0.12", features = ["json"] }
 tokio-util = { version = "0.7", features = ["rt"] }

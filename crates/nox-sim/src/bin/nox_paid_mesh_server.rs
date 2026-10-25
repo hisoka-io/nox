@@ -1,17 +1,17 @@
+use alloy::primitives::{Address, U256};
+use alloy::providers::Provider;
+use alloy::signers::local::PrivateKeySigner;
 use anyhow::{bail, Context, Result};
 use axum::{routing::get, Json, Router};
 use clap::Parser;
-use ethers::contract::abigen;
-use ethers::providers::Middleware;
-use ethers::signers::{LocalWallet, Signer};
-use ethers::types::{Address, BlockId, BlockNumber, U256};
 use libp2p::{identity, PeerId};
+use nox_core::chain_rpc::{eth_call, ChainProvider};
 use nox_core::primary_layer_for_role;
 use nox_core::{
     compute_topology_fingerprint, RelayerNode, TopologyLiveness, TopologyLivenessStatus,
     TopologySnapshot,
 };
-use nox_node::blockchain::executor::build_ethers_http1_provider;
+use nox_node::blockchain::executor::build_http1_provider;
 use nox_node::config::{ChainDataFeeMode, NodeRole, NoxConfig, PaymentAdapterConfig, TokenConfig};
 use nox_sim::process_mesh::{find_nox_binary, spawn_nox_process, wait_for_health, NoxProcess};
 use rand::rngs::OsRng;
@@ -36,15 +36,14 @@ const PAID_MESH_MAXIMUM_OUTSTANDING_QUOTES: u32 = 64;
 const PAID_MESH_MAXIMUM_PENDING_GAS: u64 =
     PAID_MESH_MAXIMUM_TRANSACTION_GAS * PAID_MESH_MAXIMUM_OUTSTANDING_QUOTES as u64;
 
-abigen!(
-    NoxRegistryFixture,
-    r#"[
-        function relayers(address) view returns (bytes32 sphinxKey, string url, string ingressUrl, string metadataUrl, uint256 stakedAmount, uint256 unlockTime, bool isRegistered, uint8 status, bool frozen)
-        function getNodeRole(address) view returns (uint8)
-        function relayerCount() view returns (uint256)
-        function topologyFingerprint() view returns (bytes32)
-    ]"#
-);
+alloy::sol! {
+    interface NoxRegistryFixture {
+        function relayers(address relayer) external view returns (bytes32 sphinxKey, string url, string ingressUrl, string metadataUrl, uint256 stakedAmount, uint256 unlockTime, bool isRegistered, uint8 status, bool frozen);
+        function getNodeRole(address relayer) external view returns (uint8);
+        function relayerCount() external view returns (uint256);
+        function topologyFingerprint() external view returns (bytes32);
+    }
+}
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -192,10 +191,9 @@ async fn main() -> Result<()> {
                 cli.exit_private_key_env
             )
         })?);
-    let chain_start_block = build_ethers_http1_provider(cli.rpc_url.as_str())?
+    let chain_start_block = build_http1_provider(cli.rpc_url.as_str())?
         .get_block_number()
-        .await?
-        .as_u64();
+        .await?;
     let oracle_url = format!("http://127.0.0.1:{}", cli.oracle_port);
     let (oracle, fixture_state) = start_fixture_api(&cli, cli.oracle_port).await?;
     let nox_binary = find_nox_binary(cli.nox_binary.as_deref())?;
@@ -207,12 +205,11 @@ async fn main() -> Result<()> {
         let role = if index == EXIT_NODE_INDEX { 2 } else { 1 };
         let (node_private_key, address, layer) = if index == EXIT_NODE_INDEX {
             let private_key = Zeroizing::new(exit_private_key.to_string());
-            let wallet = LocalWallet::from_str(&private_key)
-                .context("paid mesh exit private key is invalid")?
-                .with_chain_id(cli.chain_id);
+            let wallet = PrivateKeySigner::from_str(&private_key)
+                .context("paid mesh exit private key is invalid")?;
             (private_key, format!("{:?}", wallet.address()), 2)
         } else {
-            generate_relay_identity(cli.chain_id, index as u8)?
+            generate_relay_identity(index as u8)?
         };
         let generated = tokio::select! {
             () = shutdown.cancelled() => None,
@@ -359,17 +356,14 @@ async fn terminate_runtime(
     let _ = oracle.await;
 }
 
-fn generate_relay_identity(
-    chain_id: u64,
-    required_layer: u8,
-) -> Result<(Zeroizing<String>, String, u8)> {
+fn generate_relay_identity(required_layer: u8) -> Result<(Zeroizing<String>, String, u8)> {
     for _ in 0..MAX_RELAY_WALLET_ATTEMPTS {
-        let wallet = LocalWallet::new(&mut OsRng).with_chain_id(chain_id);
+        let wallet = PrivateKeySigner::random();
         let address = format!("{:?}", wallet.address());
         let layer = primary_layer_for_role(&address, 1);
         if layer == required_layer {
             return Ok((
-                Zeroizing::new(hex::encode(wallet.signer().to_bytes())),
+                Zeroizing::new(hex::encode(wallet.to_bytes())),
                 address,
                 layer,
             ));
@@ -612,32 +606,43 @@ fn validate_registration_nodes(nodes: &[RegistrationNode]) -> Result<()> {
 }
 
 async fn wait_for_registry(manifest: &RegistrationManifest, timeout: Duration) -> Result<u64> {
-    let provider = Arc::new(build_ethers_http1_provider(manifest.rpc_url.as_str())?);
-    let registry_address = manifest
+    let provider = build_http1_provider(manifest.rpc_url.as_str())?;
+    let registry = manifest
         .registry_address
         .parse::<Address>()
         .context("paid mesh registry address is invalid")?;
-    let registry = NoxRegistryFixture::new(registry_address, provider.clone());
     let expected_fingerprint = hex::decode(&manifest.topology_fingerprint)?;
     let deadline = tokio::time::Instant::now() + timeout;
 
     while tokio::time::Instant::now() < deadline {
         let block_number = match provider.get_block_number().await {
-            Ok(block) if !block.is_zero() => block,
+            Ok(block) if block != 0 => block,
             Ok(_) | Err(_) => {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue;
             }
         };
-        let block = BlockId::Number(BlockNumber::Number(block_number));
-        let fingerprint = registry.topology_fingerprint().block(block).call().await;
-        let count = registry.relayer_count().block(block).call().await;
+        let block = Some(block_number);
+        let fingerprint = eth_call(
+            &provider,
+            registry,
+            &NoxRegistryFixture::topologyFingerprintCall {},
+            block,
+        )
+        .await;
+        let count = eth_call(
+            &provider,
+            registry,
+            &NoxRegistryFixture::relayerCountCall {},
+            block,
+        )
+        .await;
         if let (Ok(fingerprint), Ok(count)) = (fingerprint, count) {
             if fingerprint.as_slice() == expected_fingerprint
                 && count == U256::from(manifest.nodes.len())
-                && registry_profiles_match(&registry, &manifest.nodes, block).await
+                && registry_profiles_match(&provider, registry, &manifest.nodes, block).await
             {
-                return Ok(block_number.as_u64());
+                return Ok(block_number);
             }
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -697,32 +702,47 @@ fn build_fixture_topology(
     })
 }
 
-async fn registry_profiles_match<M: ethers::providers::Middleware>(
-    registry: &NoxRegistryFixture<M>,
+async fn registry_profiles_match(
+    provider: &ChainProvider,
+    registry: Address,
     nodes: &[RegistrationNode],
-    block: BlockId,
+    block: Option<u64>,
 ) -> bool {
     for node in nodes {
-        let Ok(address) = node.address.parse::<Address>() else {
+        let Ok(relayer) = node.address.parse::<Address>() else {
             return false;
         };
-        let Ok(profile) = registry.relayers(address).block(block).call().await else {
+        let Ok(profile) = eth_call(
+            provider,
+            registry,
+            &NoxRegistryFixture::relayersCall { relayer },
+            block,
+        )
+        .await
+        else {
             return false;
         };
-        let Ok(role) = registry.get_node_role(address).block(block).call().await else {
+        let Ok(role) = eth_call(
+            provider,
+            registry,
+            &NoxRegistryFixture::getNodeRoleCall { relayer },
+            block,
+        )
+        .await
+        else {
             return false;
         };
         let Ok(sphinx_key) = hex::decode(&node.sphinx_key) else {
             return false;
         };
-        if profile.0.as_slice() != sphinx_key
-            || profile.1 != node.url
-            || profile.2 != node.ingress_url
-            || profile.3 != node.metadata_url
-            || !profile.4.is_zero()
-            || !profile.6
-            || !matches!(profile.7, 1 | 2)
-            || profile.8
+        if profile.sphinxKey.as_slice() != sphinx_key
+            || profile.url != node.url
+            || profile.ingressUrl != node.ingress_url
+            || profile.metadataUrl != node.metadata_url
+            || !profile.stakedAmount.is_zero()
+            || !profile.isRegistered
+            || !matches!(profile.status, 1 | 2)
+            || profile.frozen
             || role != node.role
         {
             return false;

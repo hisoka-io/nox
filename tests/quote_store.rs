@@ -1,13 +1,11 @@
-use ethers::types::U256;
+use alloy::primitives::U256;
 use nox_core::{
     ExecutionQuoteV1, IStorageRepository, PaidQuoteRequestV2, QuoteStatusV2, StoredQuoteV2,
 };
 use nox_node::infra::storage::{QuoteStoreError, SledRepository};
 
 fn word(value: u64) -> [u8; 32] {
-    let mut encoded = [0_u8; 32];
-    U256::from(value).to_big_endian(&mut encoded);
-    encoded
+    U256::from(value).to_be_bytes::<32>()
 }
 
 fn quote(id: u8, valid_until_unix: u64) -> StoredQuoteV2 {
@@ -87,7 +85,7 @@ async fn terminal_release_is_symmetric_and_idempotent() {
         .finalize_quote_durably(
             first.execution_id,
             QuoteStatusV2::Confirmed,
-            U256::zero(),
+            U256::ZERO,
             102
         )
         .await
@@ -96,7 +94,7 @@ async fn terminal_release_is_symmetric_and_idempotent() {
         .finalize_quote_durably(
             first.execution_id,
             QuoteStatusV2::Confirmed,
-            U256::zero(),
+            U256::ZERO,
             102
         )
         .await

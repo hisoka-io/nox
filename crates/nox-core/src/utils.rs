@@ -1,4 +1,4 @@
-use ethers_core::types::U256;
+use alloy::primitives::U256;
 use tiny_keccak::{Hasher, Keccak};
 use tracing::warn;
 
