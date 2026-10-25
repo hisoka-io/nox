@@ -1,7 +1,9 @@
 # NOX Development Configuration
 #
 # For local development and testing with Anvil.
-# Uses benchmark_mode=true to skip production validation checks:
+# Uses benchmark_mode=true, which only a build with the dev-node feature accepts
+# (`cargo run --features dev-node -- --config docs/examples/dev.toml`), to skip
+# production validation checks:
 #   - Allows empty private keys (ephemeral keys generated at startup)
 #   - Allows zero-address contracts
 #   - Allows chain_id=0

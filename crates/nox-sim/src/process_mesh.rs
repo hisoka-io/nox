@@ -648,7 +648,18 @@ mod tests {
         assert_eq!(config.registry_contract_address, registry.address);
         assert_eq!(config.chain_id, 31_337);
         assert_eq!(config.block_poll_interval_secs, 1);
-        assert!(config.validate().is_ok());
+        // Mesh nodes run benchmark_mode, which only dev-node builds accept.
+        let errors = config.validate().err().unwrap_or_default();
+        if cfg!(feature = "dev-node") {
+            assert!(errors.is_empty(), "{errors:?}");
+        } else {
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e == nox_node::config::BENCHMARK_MODE_REQUIRES_DEV_NODE),
+                "{errors:?}"
+            );
+        }
         Ok(())
     }
 }
