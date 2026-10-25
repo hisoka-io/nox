@@ -1,0 +1,63 @@
+{
+  "valid": [
+    {
+      "key": "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+      "peer_id": "0024080112205a4e1d0b2bd1a4c5a6c6e0ff9d1dd2c1e0b8e8c1f2a3b4c5d6e7f8091a2b3c4d",
+      "signature": "093ee0fdcaa39ba7e8cdebf9b5bac75e1e53be456030b047d3faecfe3b0403e071fc89514e319068dc36ec24e57daa5a658c4c30056feb0d1a0c6aa8237311371c"
+    },
+    {
+      "key": "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+      "peer_id": "",
+      "signature": "8aeffbfd072adec5a47c2cf0c65ea6360a8be719e48cf851ac667879c712b38276e45dc7c134e82237f1c910c73641383c77a2501751c92cb72247e0951616601b"
+    },
+    {
+      "key": "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+      "peer_id": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+      "signature": "499f48ffc55b1332bc4ef0322f7dd338e61f90cc996dc8c3f4577f0db27c153023f9be4bf0abe306b52f9213dceabd2272fa90c9d563baa1fccbea358b2dd3dd1b"
+    },
+    {
+      "key": "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+      "peer_id": "0024080112205a4e1d0b2bd1a4c5a6c6e0ff9d1dd2c1e0b8e8c1f2a3b4c5d6e7f8091a2b3c4d",
+      "signature": "c3f3cbadf0244a490174defe6601d47df1da8356b00990883ea50fa8ba135d5504b784d5692394f8667ec8907c4ed28982415d94845c7f2a440f94c287f35d091c"
+    },
+    {
+      "key": "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+      "peer_id": "",
+      "signature": "f9a45c11d904141226963b371ccbc2128a29d146ce3c0d43326414711e3e153d536804917f10c70c5d0cd7b730b559d95eb812d1d783f6dd534e5854f01b3e551b"
+    },
+    {
+      "key": "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+      "peer_id": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+      "signature": "7ce980769af08ecbd5c1cd5453a89743311df887d4b11b9ac01e56fae5482b9f3c56e722c338772b978b9466fd7e64bd81538c9e58b8ef396ce0741121db44eb1b"
+    },
+    {
+      "key": "0x0000000000000000000000000000000000000000000000000000000000000001",
+      "peer_id": "0024080112205a4e1d0b2bd1a4c5a6c6e0ff9d1dd2c1e0b8e8c1f2a3b4c5d6e7f8091a2b3c4d",
+      "signature": "558ab191ee68eae494a98b5808de9b33b8b39ddffe2c043dcfa98f4a6ec4c6db79fb382ee65f0474ad5611d3f1d8219829a2806fea83814c2120db2f3277bdb31b"
+    },
+    {
+      "key": "0x0000000000000000000000000000000000000000000000000000000000000001",
+      "peer_id": "",
+      "signature": "03925438bf9bdfed9cb8d9d9467f8fc624f389846f0db71f4f5c84b483077da62ca68cb1027ace392bc6a84fe0ba29288aa07942f571f56201dd33c009ee38861c"
+    },
+    {
+      "key": "0x0000000000000000000000000000000000000000000000000000000000000001",
+      "peer_id": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+      "signature": "5bea0e4028d2407df6881689ab6ef2aaf691b993ba651927e038b30de456b5d2464746faca951e2af73630480bdb0a939bfca8bf0b9cc19ecb81a9ac807deae71b"
+    }
+  ],
+  "invalid": [
+    {
+      "key": "zz",
+      "ok": false
+    },
+    {
+      "key": "0000000000000000000000000000000000000000000000000000000000000000",
+      "ok": false
+    },
+    {
+      "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "ok": false
+    }
+  ]
+}

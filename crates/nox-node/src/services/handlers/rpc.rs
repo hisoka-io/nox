@@ -1107,3 +1107,286 @@ mod tests {
         assert_eq!(other_total, 50);
     }
 }
+
+/// Golden outputs of the default-provider proxy path, recorded in
+/// `tests/golden/rpc_proxy_outputs.json` from the Ethereum library the node used
+/// before the current one. Upstream answers are canned Arbitrum-shaped JSON so
+/// the outputs are deterministic. Regenerate deliberately with `NOX_UPDATE_GOLDEN=1`.
+#[cfg(test)]
+mod golden_tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use std::sync::Mutex;
+
+    const RECEIPT: &str = r#"{
+        "blockHash": "0x9a1fbe0c4b8e5e86b8f5f6c2c4a8ab4fd0d8c7f6e5d4c3b2a19081726354a5b6",
+        "blockNumber": "0x12d9b1e0",
+        "contractAddress": null,
+        "cumulativeGasUsed": "0x2b6c4",
+        "effectiveGasPrice": "0x989680",
+        "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+        "gasUsed": "0x2b6c4",
+        "gasUsedForL1": "0x1f40",
+        "l1BlockNumber": "0x8a1b2c",
+        "logs": [{
+            "address": "0xad911ca217c6dc779fce6a6538bdda3071c38e7e",
+            "topics": [
+                "0x1fe5a7ef1d3d4e0c9f2b2c6a0d1f2e3b4c5d6e7f8091a2b3c4d5e6f708192a3b",
+                "0x00000000000000000000000074486dc1ac551e5cd3f4eef80727cc9d50d3abe9"
+            ],
+            "data": "0x00000000000000000000000000000000000000000000000000000000000003e8",
+            "blockNumber": "0x12d9b1e0",
+            "transactionHash": "0x7b1c4e5b9c10ff3569a2f968f6cdabd2351fed4f672c9f7b19f6614343b14bc7",
+            "transactionIndex": "0x1",
+            "blockHash": "0x9a1fbe0c4b8e5e86b8f5f6c2c4a8ab4fd0d8c7f6e5d4c3b2a19081726354a5b6",
+            "logIndex": "0x0",
+            "removed": false
+        }],
+        "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "status": "0x1",
+        "to": "0xad911ca217c6dc779fce6a6538bdda3071c38e7e",
+        "transactionHash": "0x7b1c4e5b9c10ff3569a2f968f6cdabd2351fed4f672c9f7b19f6614343b14bc7",
+        "transactionIndex": "0x1",
+        "type": "0x2"
+    }"#;
+
+    const TRANSACTION: &str = r#"{
+        "blockHash": "0x9a1fbe0c4b8e5e86b8f5f6c2c4a8ab4fd0d8c7f6e5d4c3b2a19081726354a5b6",
+        "blockNumber": "0x12d9b1e0",
+        "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+        "gas": "0x1d4c0",
+        "gasPrice": "0x989680",
+        "maxFeePerGas": "0x1312d00",
+        "maxPriorityFeePerGas": "0x0",
+        "hash": "0x7b1c4e5b9c10ff3569a2f968f6cdabd2351fed4f672c9f7b19f6614343b14bc7",
+        "input": "0xc0ffee00112233",
+        "nonce": "0x7",
+        "to": "0xad911ca217c6dc779fce6a6538bdda3071c38e7e",
+        "transactionIndex": "0x1",
+        "value": "0x0",
+        "type": "0x2",
+        "accessList": [],
+        "chainId": "0x66eee",
+        "v": "0x1",
+        "r": "0x5c1b0a6f2c8d3e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b",
+        "s": "0x3d2c1b0a9f8e7d6c5b4a39281706f5e4d3c2b1a0f9e8d7c6b5a4938271605f4e",
+        "yParity": "0x1"
+    }"#;
+
+    const LEGACY_TRANSACTION: &str = r#"{
+        "blockHash": "0x9a1fbe0c4b8e5e86b8f5f6c2c4a8ab4fd0d8c7f6e5d4c3b2a19081726354a5b6",
+        "blockNumber": "0x12d9b1e0",
+        "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+        "gas": "0x1d4c0",
+        "gasPrice": "0x5f5e100",
+        "hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+        "input": "0x",
+        "nonce": "0x8",
+        "to": null,
+        "transactionIndex": "0x2",
+        "value": "0xde0b6b3a7640000",
+        "type": "0x0",
+        "chainId": "0x66eee",
+        "v": "0xcdd00",
+        "r": "0x5c1b0a6f2c8d3e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b",
+        "s": "0x3d2c1b0a9f8e7d6c5b4a39281706f5e4d3c2b1a0f9e8d7c6b5a4938271605f4e"
+    }"#;
+
+    fn block(full: bool) -> Value {
+        let mut block: Value = serde_json::from_str(
+            r#"{
+            "baseFeePerGas": "0x989680",
+            "difficulty": "0x1",
+            "extraData": "0x7c4c1e8a7cf1f1e2c4a0c1b8d9e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d",
+            "gasLimit": "0x4000000000000",
+            "gasUsed": "0x2b6c4",
+            "hash": "0x9a1fbe0c4b8e5e86b8f5f6c2c4a8ab4fd0d8c7f6e5d4c3b2a19081726354a5b6",
+            "l1BlockNumber": "0x8a1b2c",
+            "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "miner": "0xa4b000000000000000000073657175656e636572",
+            "mixHash": "0x000000000000a1b20000000000000001000000000000000000000000004bd2f1",
+            "nonce": "0x00000000000209a1",
+            "number": "0x12d9b1e0",
+            "parentHash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "receiptsRoot": "0x4444444444444444444444444444444444444444444444444444444444444444",
+            "sendCount": "0x209a1",
+            "sendRoot": "0x7c4c1e8a7cf1f1e2c4a0c1b8d9e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d",
+            "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
+            "size": "0x2a0",
+            "stateRoot": "0x2222222222222222222222222222222222222222222222222222222222222222",
+            "timestamp": "0x6a1b2c3d",
+            "totalDifficulty": "0x1",
+            "transactionsRoot": "0x3333333333333333333333333333333333333333333333333333333333333333",
+            "uncles": []
+        }"#,
+        )
+        .expect("block json");
+        block["transactions"] = if full {
+            json!([
+                serde_json::from_str::<Value>(TRANSACTION).expect("tx"),
+                serde_json::from_str::<Value>(LEGACY_TRANSACTION).expect("tx"),
+            ])
+        } else {
+            json!([
+                "0x7b1c4e5b9c10ff3569a2f968f6cdabd2351fed4f672c9f7b19f6614343b14bc7",
+                "0x1111111111111111111111111111111111111111111111111111111111111111"
+            ])
+        };
+        block
+    }
+
+    fn upstream_result(method: &str, params: &Value) -> Value {
+        match method {
+            "eth_call" => json!(format!("0x{}", "00".repeat(31) + "2a")),
+            "eth_getBalance" => json!("0xde0b6b3a7640000"),
+            "eth_estimateGas" => json!("0x5208"),
+            "eth_blockNumber" => json!("0x12d9b1e0"),
+            "eth_getTransactionReceipt" => {
+                if params[0] == json!(format!("0x{}", "00".repeat(32))) {
+                    Value::Null
+                } else {
+                    serde_json::from_str(RECEIPT).expect("receipt")
+                }
+            }
+            "eth_getTransactionByHash" => {
+                if params[0] == json!(format!("0x{}", "11".repeat(32))) {
+                    serde_json::from_str(LEGACY_TRANSACTION).expect("tx")
+                } else {
+                    serde_json::from_str(TRANSACTION).expect("tx")
+                }
+            }
+            "eth_chainId" => json!("0x66eee"),
+            "eth_gasPrice" => json!("0x989680"),
+            "eth_getLogs" => {
+                let receipt: Value = serde_json::from_str(RECEIPT).expect("receipt");
+                let mut second = receipt["logs"][0].clone();
+                second["logIndex"] = json!("0x1");
+                second["topics"] = json!([]);
+                second["data"] = json!("0x");
+                json!([receipt["logs"][0].clone(), second])
+            }
+            "eth_getCode" => json!("0x6080604052"),
+            "eth_getStorageAt" => json!(format!("0x{}", "00".repeat(31) + "01")),
+            "eth_getTransactionCount" => json!("0x7"),
+            "eth_getBlockByNumber" | "eth_getBlockByHash" => {
+                block(params.get(1).and_then(Value::as_bool).unwrap_or(false))
+            }
+            "eth_sendRawTransaction" => {
+                json!("0x7b1c4e5b9c10ff3569a2f968f6cdabd2351fed4f672c9f7b19f6614343b14bc7")
+            }
+            _ => Value::Null,
+        }
+    }
+
+    async fn upstream() -> (String, Arc<Mutex<Vec<Value>>>) {
+        let requests: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let recorded = requests.clone();
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let recorded = recorded.clone();
+                async move {
+                    let method = body["method"].as_str().unwrap_or_default().to_string();
+                    let params = body.get("params").cloned().unwrap_or(Value::Null);
+                    let result = upstream_result(&method, &params);
+                    recorded
+                        .lock()
+                        .expect("requests")
+                        .push(json!({"method": method, "params": params}));
+                    axum::Json(json!({"jsonrpc": "2.0", "id": body["id"], "result": result}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (format!("http://{address}/"), requests)
+    }
+
+    #[tokio::test]
+    async fn default_provider_proxy_outputs() {
+        let (url, requests) = upstream().await;
+        let handler = RpcHandler::new_simulation(
+            Arc::new(ResponsePacker::new()),
+            nox_core::NoopPublisher::arc(),
+            &url,
+            MetricsService::new(),
+        )
+        .expect("handler");
+        let tx_hash = "0x7b1c4e5b9c10ff3569a2f968f6cdabd2351fed4f672c9f7b19f6614343b14bc7";
+        let address = "0xAD911Ca217C6dC779fCE6A6538bDda3071c38E7E";
+        let calls: Vec<(&str, Value)> = vec![
+            ("eth_call", json!([{"to": address, "data": "0x3cce4d3d"}])),
+            ("eth_call", json!([{"to": address}])),
+            ("eth_getBalance", json!([address])),
+            ("eth_estimateGas", json!([{"to": address, "data": "0xc0ffee", "value": "0x10"}])),
+            ("eth_estimateGas", json!([{}])),
+            ("eth_blockNumber", json!([])),
+            ("eth_getTransactionReceipt", json!([tx_hash])),
+            ("eth_getTransactionReceipt", json!([format!("0x{}", "00".repeat(32))])),
+            ("eth_getTransactionByHash", json!([tx_hash])),
+            ("eth_getTransactionByHash", json!([format!("0x{}", "11".repeat(32))])),
+            ("eth_chainId", json!([])),
+            ("eth_gasPrice", json!([])),
+            (
+                "eth_getLogs",
+                json!([{
+                    "address": address,
+                    "fromBlock": "0x12d9b000",
+                    "toBlock": "0x12d9b1e0",
+                    "topics": ["0x1fe5a7ef1d3d4e0c9f2b2c6a0d1f2e3b4c5d6e7f8091a2b3c4d5e6f708192a3b", "", null,
+                        "0x00000000000000000000000074486dc1ac551e5cd3f4eef80727cc9d50d3abe9"]
+                }]),
+            ),
+            ("eth_getLogs", json!([{"fromBlock": "0x1", "toBlock": "0x10"}])),
+            ("eth_getLogs", json!([{"fromBlock": "latest"}])),
+            ("eth_getLogs", json!([{"fromBlock": "0x1", "toBlock": "0x1000"}])),
+            ("eth_getCode", json!([address, "latest"])),
+            ("eth_getStorageAt", json!([address, "0x0000000000000000000000000000000000000000000000000000000000000003"])),
+            ("eth_getTransactionCount", json!([address])),
+            ("eth_getBlockByNumber", json!(["0x12d9b1e0", false])),
+            ("eth_getBlockByNumber", json!(["latest", true])),
+            ("eth_getBlockByNumber", json!(["finalized"])),
+            ("eth_getBlockByHash", json!(["0x9a1fbe0c4b8e5e86b8f5f6c2c4a8ab4fd0d8c7f6e5d4c3b2a19081726354a5b6", true])),
+            ("eth_sendRawTransaction", json!(["0xf86e078405f5e1008301d4c094ad911ca217c6dc779fce6a6538bdda3071c38e7e8087c0ffee00112233830cde00a0a73d72df8a5ddec0a9bb43bcd8180468606da3e9d1c7ec0eedf0c01572e4c677a018c12723985c84cff0aec68807abc2463030eb337c96b4fb7c4d846d20f31b08"])),
+            ("eth_getBalance", json!(["not-an-address"])),
+            ("eth_getBlockByNumber", json!(["0xzz"])),
+            ("eth_getStorageAt", json!([address, "0x03"])),
+        ];
+        let mut out = Vec::new();
+        for (method, params) in calls {
+            let result = handler.execute_rpc(method, params.clone()).await;
+            let upstream_requests = std::mem::take(&mut *requests.lock().expect("requests"));
+            out.push(json!({
+                "method": method,
+                "params": params,
+                "result": result.as_ref().ok(),
+                "error": result.as_ref().err().map(|error| error.split(':').next().unwrap_or_default().to_string()),
+                "upstream": upstream_requests,
+            }));
+        }
+        let actual = Value::Array(out);
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden/rpc_proxy_outputs.json");
+        if std::env::var_os("NOX_UPDATE_GOLDEN").is_some() {
+            std::fs::create_dir_all(path.parent().expect("dir")).expect("dir");
+            let mut text = serde_json::to_string_pretty(&actual).expect("encode");
+            text.push('\n');
+            std::fs::write(&path, text).expect("write golden");
+            return;
+        }
+        let expected: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("golden file"))
+                .expect("golden json");
+        assert_eq!(
+            actual,
+            expected,
+            "proxy outputs differ:\n{}",
+            serde_json::to_string_pretty(&actual).expect("encode")
+        );
+    }
+}

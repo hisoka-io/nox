@@ -1815,3 +1815,101 @@ mod tests {
         assert_eq!(config.http_poll_interval_ms, 25);
     }
 }
+
+/// `eth_getLogs` params, log budgets and transaction-hash replies, pinned in
+/// `tests/golden/client_chain_vectors.json` from the Ethereum library the client
+/// used before the current one. Regenerate deliberately with `NOX_UPDATE_GOLDEN=1`.
+#[cfg(test)]
+mod golden_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn address(byte: u8) -> Address {
+        Address::from([byte; 20])
+    }
+
+    fn topic(byte: u8) -> H256 {
+        H256::from([byte; 32])
+    }
+
+    fn filters() -> Vec<(&'static str, Filter)> {
+        vec![
+            ("empty", Filter::new()),
+            (
+                "address_range",
+                Filter::new()
+                    .address(address(0xab))
+                    .from_block(1)
+                    .to_block(2_000),
+            ),
+            (
+                "addresses_topics",
+                Filter::new()
+                    .address(vec![address(0x01), address(0xfe)])
+                    .topic0(topic(0x11))
+                    .topic2(vec![topic(0x22), topic(0x33)])
+                    .from_block(316_207_920)
+                    .to_block(316_217_919),
+            ),
+            ("topic3_only", Filter::new().topic3(topic(0x44))),
+            ("from_only", Filter::new().from_block(5)),
+            (
+                "wide_range",
+                Filter::new().from_block(0).to_block(1_000_000),
+            ),
+        ]
+    }
+
+    #[test]
+    fn get_logs_params_budgets_and_hash_replies() {
+        let logs: Vec<Value> = filters()
+            .into_iter()
+            .map(|(name, filter)| {
+                let budget = MixnetClient::estimate_log_budget(&filter);
+                json!({
+                    "name": name,
+                    "params": MixnetClient::build_get_logs_params(&filter),
+                    "budget": format!("{budget:?}"),
+                })
+            })
+            .collect();
+        let replies: Vec<Value> = [
+            vec![0x5a; 32],
+            vec![0x5a; 40],
+            format!("0x{}", "ab".repeat(32)).into_bytes(),
+            "ab".repeat(16).into_bytes(),
+            b"tx_error:nonce too low".to_vec(),
+            b"0x12".to_vec(),
+            Vec::new(),
+        ]
+        .into_iter()
+        .map(|reply| {
+            let parsed = MixnetClient::parse_tx_hash_response(&reply);
+            json!({
+                "reply": hex::encode(&reply),
+                "hash": parsed.as_ref().ok().map(|hash| format!("0x{}", hex::encode(hash.as_bytes()))),
+                "ok": parsed.is_ok(),
+            })
+        })
+        .collect();
+        let actual = json!({"get_logs": logs, "tx_hash_replies": replies});
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden/client_chain_vectors.json");
+        if std::env::var_os("NOX_UPDATE_GOLDEN").is_some() {
+            std::fs::create_dir_all(path.parent().expect("dir")).expect("dir");
+            let mut text = serde_json::to_string_pretty(&actual).expect("encode");
+            text.push('\n');
+            std::fs::write(&path, text).expect("write golden");
+            return;
+        }
+        let expected: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("golden file"))
+                .expect("golden json");
+        assert_eq!(
+            actual,
+            expected,
+            "client vectors differ:\n{}",
+            serde_json::to_string_pretty(&actual).expect("encode")
+        );
+    }
+}

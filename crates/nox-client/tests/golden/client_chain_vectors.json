@@ -1,0 +1,115 @@
+{
+  "get_logs": [
+    {
+      "name": "empty",
+      "params": [
+        {}
+      ],
+      "budget": "SurbBudget { expected_response_bytes: 0, min_surbs: 3, max_surbs: 10 }"
+    },
+    {
+      "name": "address_range",
+      "params": [
+        {
+          "address": "0xabababababababababababababababababababab",
+          "fromBlock": "0x1",
+          "toBlock": "0x7d0"
+        }
+      ],
+      "budget": "SurbBudget { expected_response_bytes: 1999000, min_surbs: 66, max_surbs: 9000 }"
+    },
+    {
+      "name": "addresses_topics",
+      "params": [
+        {
+          "address": [
+            "0x0101010101010101010101010101010101010101",
+            "0xfefefefefefefefefefefefefefefefefefefefe"
+          ],
+          "fromBlock": "0x12d8f330",
+          "toBlock": "0x12d91a3f",
+          "topics": [
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+            null,
+            [
+              "0x2222222222222222222222222222222222222222222222222222222222222222",
+              "0x3333333333333333333333333333333333333333333333333333333333333333"
+            ],
+            null
+          ]
+        }
+      ],
+      "budget": "SurbBudget { expected_response_bytes: 9999000, min_surbs: 326, max_surbs: 9000 }"
+    },
+    {
+      "name": "topic3_only",
+      "params": [
+        {
+          "topics": [
+            null,
+            null,
+            null,
+            "0x4444444444444444444444444444444444444444444444444444444444444444"
+          ]
+        }
+      ],
+      "budget": "SurbBudget { expected_response_bytes: 0, min_surbs: 3, max_surbs: 10 }"
+    },
+    {
+      "name": "from_only",
+      "params": [
+        {
+          "fromBlock": "0x5"
+        }
+      ],
+      "budget": "SurbBudget { expected_response_bytes: 0, min_surbs: 3, max_surbs: 10 }"
+    },
+    {
+      "name": "wide_range",
+      "params": [
+        {
+          "fromBlock": "0x0",
+          "toBlock": "0xf4240"
+        }
+      ],
+      "budget": "SurbBudget { expected_response_bytes: 1000000000, min_surbs: 32575, max_surbs: 9000 }"
+    }
+  ],
+  "tx_hash_replies": [
+    {
+      "reply": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "hash": "0x5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "ok": true
+    },
+    {
+      "reply": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "hash": "0x5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "ok": true
+    },
+    {
+      "reply": "307861626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162",
+      "hash": "0x3078616261626162616261626162616261626162616261626162616261626162",
+      "ok": true
+    },
+    {
+      "reply": "6162616261626162616261626162616261626162616261626162616261626162",
+      "hash": "0x6162616261626162616261626162616261626162616261626162616261626162",
+      "ok": true
+    },
+    {
+      "reply": "74785f6572726f723a6e6f6e636520746f6f206c6f77",
+      "hash": null,
+      "ok": false
+    },
+    {
+      "reply": "30783132",
+      "hash": null,
+      "ok": false
+    },
+    {
+      "reply": "",
+      "hash": null,
+      "ok": false
+    }
+  ]
+}
