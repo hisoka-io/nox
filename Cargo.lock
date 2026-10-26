@@ -4841,7 +4841,7 @@ checksum = "38bf9645c8b145698bb0b18a4637dcacbc421ea49bef2317e4fd8065a387cf21"
 
 [[package]]
 name = "nox-client"
-version = "0.4.0-rc.10"
+version = "0.4.0-rc.11"
 dependencies = [
  "alloy",
  "async-trait",
@@ -4866,7 +4866,7 @@ dependencies = [
 
 [[package]]
 name = "nox-core"
-version = "0.4.0-rc.10"
+version = "0.4.0-rc.11"
 dependencies = [
  "alloy",
  "async-trait",
@@ -4891,7 +4891,7 @@ dependencies = [
 
 [[package]]
 name = "nox-crypto"
-version = "0.4.0-rc.10"
+version = "0.4.0-rc.11"
 dependencies = [
  "blake3",
  "chacha20 0.9.1",
@@ -4915,7 +4915,7 @@ dependencies = [
 
 [[package]]
 name = "nox-kps"
-version = "0.4.0-rc.10"
+version = "0.4.0-rc.11"
 dependencies = [
  "bytes",
  "clap",
@@ -4943,7 +4943,7 @@ dependencies = [
 
 [[package]]
 name = "nox-mixnet"
-version = "0.4.0-rc.10"
+version = "0.4.0-rc.11"
 dependencies = [
  "alloy",
  "alloy-node-bindings",
@@ -4984,7 +4984,7 @@ dependencies = [
 
 [[package]]
 name = "nox-node"
-version = "0.4.0-rc.10"
+version = "0.4.0-rc.11"
 dependencies = [
  "alloy",
  "alloy-node-bindings",
@@ -5035,7 +5035,7 @@ dependencies = [
 
 [[package]]
 name = "nox-oracle"
-version = "0.4.0-rc.10"
+version = "0.4.0-rc.11"
 dependencies = [
  "async-trait",
  "axum",
@@ -5053,7 +5053,7 @@ dependencies = [
 
 [[package]]
 name = "nox-sim"
-version = "0.4.0-rc.10"
+version = "0.4.0-rc.11"
 dependencies = [
  "alloy",
  "alloy-node-bindings",
@@ -5088,7 +5088,7 @@ dependencies = [
 
 [[package]]
 name = "nox-test-infra"
-version = "0.4.0-rc.10"
+version = "0.4.0-rc.11"
 dependencies = [
  "alloy",
  "serde",
