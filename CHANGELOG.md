@@ -5,8 +5,11 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+## [0.4.0-rc.11] - 2026-10-26
+
 ### Upgrade notes
 
+- Upgrade one node at a time; configuration files from rc.10 load as they are.
 - Configurations that set `benchmark_mode = true` now load only in builds with the
   `dev-node` feature; production nodes keep the default `false`.
   The process mesh (`nox_mesh_server`, the multi-process benchmarks and the compat-mesh job) runs its nodes in

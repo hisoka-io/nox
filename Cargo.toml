@@ -14,7 +14,7 @@ members = [
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.4.0-rc.10"
+version = "0.4.0-rc.11"
 
 [workspace.dependencies]
 tokio = { version = "1.36", features = ["full"] }
@@ -97,16 +97,16 @@ libp2p = { version = "0.53", features = ["tcp", "noise", "yamux", "gossipsub", "
 axum = "0.7"
 tempfile = "3.10"
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
-nox-node = { path = "crates/nox-node", version = "0.4.0-rc.10" }
+nox-node = { path = "crates/nox-node", version = "0.4.0-rc.11" }
 
-nox-oracle = { path = "crates/nox-oracle", version = "0.4.0-rc.10" }
+nox-oracle = { path = "crates/nox-oracle", version = "0.4.0-rc.11" }
 
 [dev-dependencies]
-nox-core = { path = "crates/nox-core", version = "0.4.0-rc.10" }
+nox-core = { path = "crates/nox-core", version = "0.4.0-rc.11" }
 
-nox-crypto = { path = "crates/nox-crypto", version = "0.4.0-rc.10" }
+nox-crypto = { path = "crates/nox-crypto", version = "0.4.0-rc.11" }
 
-nox-client = { path = "crates/nox-client", version = "0.4.0-rc.10" }
+nox-client = { path = "crates/nox-client", version = "0.4.0-rc.11" }
 
 mockall = "0.12"
 sha2 = { workspace = true }
