@@ -9,11 +9,18 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::telemetry::metrics::MetricsService;
+
+/// Inserts between two refreshes of the fill gauge. A refresh counts the set
+/// bits of the active filter, a few microseconds at the default capacity.
+const FILL_REFRESH_INSERTS: u64 = 1024;
+
 struct BloomFilterState {
     current: BloomFilter,
     previous: BloomFilter,
     last_rotation: Instant,
     last_rotation_unix: u64,
+    inserts_since_fill: u64,
 }
 
 /// Serializes snapshot writes and remembers the newest snapshot on disk, so an
@@ -38,6 +45,7 @@ pub struct RotationalBloomFilter {
     false_positive_rate: f64,
     persist_path: Option<PathBuf>,
     persist: Arc<PersistState>,
+    metrics: Option<MetricsService>,
 }
 
 impl RotationalBloomFilter {
@@ -53,6 +61,7 @@ impl RotationalBloomFilter {
                 previous,
                 last_rotation: Instant::now(),
                 last_rotation_unix: now_unix,
+                inserts_since_fill: 0,
             })),
             rotation_interval,
             capacity,
@@ -63,6 +72,34 @@ impl RotationalBloomFilter {
                 written_seq: Mutex::new(0),
                 dirty: AtomicBool::new(false),
             }),
+            metrics: None,
+        }
+    }
+
+    /// Reports rotations and the fill ratio of the active filter.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: MetricsService) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Share of set bits in the active (current) filter, 0.0 to 1.0.
+    pub async fn fill_ratio(&self) -> f64 {
+        fill_ratio(&self.state.read().await.current)
+    }
+
+    /// Recomputes the fill gauge now.
+    pub async fn refresh_fill(&self) {
+        let mut state = self.state.write().await;
+        self.publish_fill(&mut state);
+    }
+
+    fn publish_fill(&self, state: &mut BloomFilterState) {
+        state.inserts_since_fill = 0;
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .replay_bloom_fill_ratio
+                .set(fill_ratio(&state.current));
         }
     }
 
@@ -158,6 +195,8 @@ impl RotationalBloomFilter {
         state.previous = previous;
         state.last_rotation = restored_last_rotation;
         state.last_rotation_unix = last_rotation_unix;
+        self.publish_fill(&mut state);
+        drop(state);
 
         info!(
             elapsed_secs,
@@ -208,6 +247,7 @@ impl RotationalBloomFilter {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
+                        self.refresh_fill().await;
                         match self.persist_if_dirty().await {
                             Ok(true) => debug!("Replay filter snapshot written"),
                             Ok(false) => {}
@@ -222,6 +262,23 @@ impl RotationalBloomFilter {
             Ok(_) => info!("Replay filter persisted for shutdown"),
             Err(e) => warn!("Replay filter shutdown persist failed: {e}"),
         }
+    }
+
+    /// Moves the last rotation `by` into the past, as if that much time had
+    /// passed. Test support for window behaviour without waiting.
+    #[cfg(test)]
+    pub(crate) async fn elapse_for_test(&self, by: Duration) {
+        let mut state = self.state.write().await;
+        if let Some(earlier) = state.last_rotation.checked_sub(by) {
+            state.last_rotation = earlier;
+        }
+    }
+
+    /// Membership check that records nothing. Test support.
+    #[cfg(test)]
+    pub(crate) async fn contains_for_test(&self, tag: &[u8]) -> bool {
+        let state = self.state.read().await;
+        state.current.contains(tag) || state.previous.contains(tag)
     }
 
     fn next_snapshot_seq(&self) -> u64 {
@@ -244,6 +301,10 @@ impl RotationalBloomFilter {
         state.previous = old_current;
         state.last_rotation = Instant::now();
         state.last_rotation_unix = unix_now_secs();
+        if let Some(metrics) = &self.metrics {
+            metrics.replay_bloom_rotations_total.inc();
+        }
+        self.publish_fill(state);
 
         if let Some(path) = self.persist_path.clone() {
             let file_bytes = Self::snapshot(state);
@@ -294,6 +355,10 @@ impl IReplayProtection for RotationalBloomFilter {
 
         state.current.insert(tag);
         self.persist.dirty.store(true, Ordering::Release);
+        state.inserts_since_fill += 1;
+        if state.inserts_since_fill >= FILL_REFRESH_INSERTS {
+            self.publish_fill(&mut state);
+        }
         Ok(false)
     }
 
@@ -422,6 +487,19 @@ fn deserialize_bloom(
     Ok(BloomFilter::from_vec(words)
         .seed(&BLOOM_SEED)
         .hashes(num_hashes))
+}
+
+fn fill_ratio(filter: &BloomFilter) -> f64 {
+    let bits = filter.num_bits();
+    if bits == 0 {
+        return 0.0;
+    }
+    let set: u64 = filter
+        .as_slice()
+        .iter()
+        .map(|w| u64::from(w.count_ones()))
+        .sum();
+    set as f64 / bits as f64
 }
 
 fn unix_now_secs() -> u64 {
@@ -681,5 +759,56 @@ mod tests {
 
         let read_back = std::fs::read(&path).unwrap();
         assert_eq!(read_back, data);
+    }
+
+    #[tokio::test]
+    async fn fill_gauge_tracks_inserts_and_rotation() {
+        let metrics = MetricsService::new();
+        let filter = RotationalBloomFilter::new(10_000, 0.001, Duration::from_hours(1))
+            .with_metrics(metrics.clone());
+        assert!(filter.fill_ratio().await.abs() < f64::EPSILON);
+
+        for i in 0..(FILL_REFRESH_INSERTS * 2) {
+            filter.check_and_tag(&i.to_le_bytes(), 0).await.unwrap();
+        }
+        let gauge = metrics.replay_bloom_fill_ratio.get();
+        assert!(gauge > 0.0 && gauge < 1.0, "gauge {gauge}");
+        assert!((filter.fill_ratio().await - gauge).abs() < f64::EPSILON);
+
+        filter.elapse_for_test(Duration::from_hours(1)).await;
+        filter.check_and_tag(b"after_rotation", 0).await.unwrap();
+        assert_eq!(metrics.replay_bloom_rotations_total.get(), 1);
+        assert!(metrics.replay_bloom_fill_ratio.get() < gauge);
+
+        let mut encoded = String::new();
+        prometheus_client::encoding::text::encode(&mut encoded, &metrics.get_registry().lock())
+            .unwrap();
+        assert!(encoded.contains("nox_replay_bloom_fill_ratio"));
+    }
+
+    /// At a tenth of the configured capacity (the default sizing is 100,000 tags
+    /// at a 0.001 target rate), unseen tags are not reported as seen.
+    #[tokio::test]
+    async fn unseen_tags_pass_at_partial_load() {
+        use rand::RngCore;
+        let filter = RotationalBloomFilter::new(100_000, 0.001, Duration::from_hours(1));
+        let mut rng = rand::rngs::OsRng;
+        let mut tag = [0u8; 32];
+        for _ in 0..10_000 {
+            rng.fill_bytes(&mut tag);
+            filter.check_and_tag(&tag, 0).await.unwrap();
+        }
+        let fill = filter.fill_ratio().await;
+        assert!(fill < 0.1, "fill {fill}");
+
+        let mut seen = 0;
+        for _ in 0..200_000 {
+            rng.fill_bytes(&mut tag);
+            if filter.contains_for_test(&tag).await {
+                seen += 1;
+            }
+        }
+        // Expected count at this fill is far below one.
+        assert!(seen <= 1, "{seen} unseen tags reported as seen");
     }
 }
