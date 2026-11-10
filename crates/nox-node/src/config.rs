@@ -98,6 +98,14 @@ pub struct RateLimitConfig {
     pub violations_before_disconnect: u32,
     pub violation_window_secs: u64,
     pub trust_promotion_time_secs: u64,
+    /// A peer's limiter state is dropped after this long without packets,
+    /// unless it holds violations inside `violation_window_secs`.
+    #[serde(default = "default_inactive_peer_ttl_secs")]
+    pub inactive_peer_ttl_secs: u64,
+}
+
+fn default_inactive_peer_ttl_secs() -> u64 {
+    600
 }
 
 impl Default for RateLimitConfig {
@@ -112,6 +120,7 @@ impl Default for RateLimitConfig {
             violations_before_disconnect: 5,
             violation_window_secs: 60,
             trust_promotion_time_secs: 3600,
+            inactive_peer_ttl_secs: default_inactive_peer_ttl_secs(),
         }
     }
 }

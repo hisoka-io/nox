@@ -101,6 +101,7 @@ Three reputation tiers: Unknown, Trusted, Penalized.
 | `burst_penalized` / `rate_penalized` | 10 / 25 | Penalized peers |
 | `violations_before_disconnect` | `5` | Strikes before disconnect |
 | `trust_promotion_time_secs` | `3600` | Time to promote to trusted |
+| `inactive_peer_ttl_secs` | `600` | Idle time before a peer's limiter state is dropped; peers with recent violations keep it |
 
 ### `[network.connection_filter]`
 

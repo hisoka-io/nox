@@ -176,6 +176,7 @@ rate_penalized = 25
 violations_before_disconnect = 5
 violation_window_secs = 60
 trust_promotion_time_secs = 3600  # 1 hour of good behavior
+inactive_peer_ttl_secs = 600      # forget idle peers without recent violations
 
 # Anti-Sybil subnet filtering
 [network.connection_filter]

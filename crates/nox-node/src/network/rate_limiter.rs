@@ -32,14 +32,17 @@ struct ViolationTracker {
     count: u32,
     first_violation: Instant,
     first_seen: Instant,
+    last_active: Instant,
 }
 
 impl Default for ViolationTracker {
     fn default() -> Self {
+        let now = Instant::now();
         Self {
             count: 0,
-            first_violation: Instant::now(),
-            first_seen: Instant::now(),
+            first_violation: now,
+            first_seen: now,
+            last_active: now,
         }
     }
 }
@@ -106,6 +109,7 @@ impl PeerRateLimiter {
 
     pub fn check(&self, peer: &PeerId) -> RateLimitResult {
         let mut entry = self.get_or_create_entry(peer);
+        entry.violations.last_active = Instant::now();
 
         if entry.reputation == PeerReputation::Unknown
             && entry.violations.first_seen.elapsed()
@@ -175,9 +179,15 @@ impl PeerRateLimiter {
         self.peers.remove(peer);
     }
 
-    pub fn cleanup_inactive(&self, max_age: Duration) {
+    /// Drops limiter state for peers idle for `inactive_peer_ttl_secs`. Peers
+    /// with violations inside the violation window keep their state.
+    pub fn cleanup_inactive(&self) {
+        let max_idle = Duration::from_secs(self.config.inactive_peer_ttl_secs);
+        let window = Duration::from_secs(self.config.violation_window_secs);
         self.peers.retain(|peer, entry| {
-            let keep = entry.violations.first_seen.elapsed() < max_age;
+            let recent_violation =
+                entry.violations.count > 0 && entry.violations.first_violation.elapsed() <= window;
+            let keep = recent_violation || entry.violations.last_active.elapsed() < max_idle;
             if !keep {
                 debug!(peer = %peer, "Cleaning up inactive peer rate limiter");
             }
@@ -285,5 +295,66 @@ mod tests {
 
         limiter.promote_to_trusted(&peer);
         assert_eq!(limiter.get_reputation(&peer), Some(PeerReputation::Trusted));
+    }
+
+    fn short_ttl_config() -> RateLimitConfig {
+        RateLimitConfig {
+            burst_unknown: 1,
+            rate_unknown: 1,
+            inactive_peer_ttl_secs: 0,
+            violation_window_secs: 3600,
+            trust_promotion_time_secs: 3600,
+            ..RateLimitConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_cleanup_keeps_recent_violations() {
+        let limiter = PeerRateLimiter::with_config(short_ttl_config());
+        let peer = test_peer();
+        let mut denied = 0;
+        for _ in 0..5 {
+            if limiter.check(&peer) == RateLimitResult::Denied {
+                denied += 1;
+            }
+        }
+        assert!(denied > 0);
+        let reputation = limiter.get_reputation(&peer);
+        limiter.cleanup_inactive();
+        assert_eq!(limiter.peer_count(), 1, "violation history dropped");
+        assert_eq!(limiter.get_reputation(&peer), reputation);
+    }
+
+    #[test]
+    fn test_cleanup_drops_idle_clean_peers_only() {
+        let config = RateLimitConfig {
+            inactive_peer_ttl_secs: 3600,
+            ..RateLimitConfig::default()
+        };
+        let limiter = PeerRateLimiter::with_config(config);
+        let peer = test_peer();
+        assert_eq!(limiter.check(&peer), RateLimitResult::Allowed);
+        limiter.cleanup_inactive();
+        assert_eq!(limiter.peer_count(), 1, "active peer dropped");
+
+        let idle = PeerRateLimiter::with_config(RateLimitConfig {
+            inactive_peer_ttl_secs: 0,
+            ..RateLimitConfig::default()
+        });
+        assert_eq!(idle.check(&peer), RateLimitResult::Allowed);
+        idle.cleanup_inactive();
+        assert_eq!(idle.peer_count(), 0);
+    }
+
+    #[test]
+    fn test_inactive_ttl_defaults_when_absent() {
+        let config: RateLimitConfig = serde_json::from_str(
+            r#"{"burst_unknown": 50, "rate_unknown": 100, "burst_trusted": 100,
+                "rate_trusted": 200, "burst_penalized": 10, "rate_penalized": 25,
+                "violations_before_disconnect": 5, "violation_window_secs": 60,
+                "trust_promotion_time_secs": 3600}"#,
+        )
+        .expect("config parses");
+        assert_eq!(config.inactive_peer_ttl_secs, 600);
     }
 }
