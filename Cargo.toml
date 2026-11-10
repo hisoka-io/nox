@@ -62,7 +62,7 @@ version.workspace = true
 edition = "2021"
 rust-version = "1.95"
 authors = ["Hisoka IO"]
-description = "Sphinx mixnet relay node for Ethereum"
+description = "Sphinx mixnet relay and exit node for HTTPS, TLS tunnels, JSON-RPC and Ethereum transactions"
 license = "Apache-2.0"
 repository = "https://github.com/hisoka-io/nox"
 

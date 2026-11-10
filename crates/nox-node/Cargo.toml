@@ -4,7 +4,7 @@ version.workspace = true
 edition = "2021"
 rust-version = "1.95"
 authors = ["Hisoka IO"]
-description = "NOX production relay/exit node: packet processing, P2P networking, Ethereum integration"
+description = "NOX relay and exit node: packet processing, P2P networking, Ethereum integration"
 license = "Apache-2.0"
 repository = "https://github.com/hisoka-io/nox"
 

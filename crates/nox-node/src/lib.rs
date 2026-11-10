@@ -1,4 +1,4 @@
-//! NOX production relay/exit node -- packet ingestion, Poisson mixing, P2P
+//! NOX relay/exit node -- packet ingestion, Poisson mixing, P2P
 //! forwarding, on-chain execution, and Prometheus telemetry.
 
 pub mod blockchain;
