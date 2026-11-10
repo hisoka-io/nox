@@ -15,8 +15,11 @@
 //!    `sled-backup-<unix>/` inside `db_path`.
 //!
 //! A crash before step 4 leaves sled untouched and the import reruns. A crash
-//! after the rename leaves `nox.redb` authoritative; the next start moves the
-//! leftover sled files into a backup directory.
+//! after the rename leaves `nox.redb` and the sled files with the same
+//! records; the next start compares them and moves the sled files into a
+//! backup directory. sled files that differ from `nox.redb` (restored for a
+//! rollback, or written by an older release since) stop startup instead, so a
+//! stale `nox.redb` never replaces newer sled data.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -144,6 +147,42 @@ fn move_to_backup(
 
 /// Imports a sled database in `db_path` when there is one and no `nox.redb`.
 /// Returns what was imported, or `None` when there was nothing to do.
+/// Checks that sled files found next to `nox.redb` hold exactly the records
+/// of `nox.redb`, which is the state a crash between installing the import and
+/// moving the sled files leaves.
+fn ensure_leftover_matches(db_path: &Path, target: &Path) -> Result<(), InfrastructureError> {
+    let sled = sled::open(db_path).map_err(|error| {
+        import_error(
+            &format!(
+                "open sled at {} (stop any other process using it)",
+                db_path.display()
+            ),
+            error,
+        )
+    })?;
+    let (default, outbox, replay, _) = read_sled(&sled)?;
+    drop(sled);
+    let imported = Database::open(target)
+        .map_err(|error| import_error(&format!("open {}", target.display()), error))?;
+    let matches = read_table(&imported, DEFAULT_TABLE)? == default
+        && read_table(&imported, OUTBOX_TABLE)? == outbox
+        && read_table(&imported, REPLAY_TABLE)? == replay;
+    drop(imported);
+    if matches {
+        return Ok(());
+    }
+    Err(import_error(
+        "leftover sled files",
+        format!(
+            "{} holds both nox.redb and sled files with different records (sled files restored \
+             or written by an older release after the import). Nothing was changed. To import \
+             the sled files, move nox.redb out of the directory; to keep nox.redb, move the sled \
+             files (conf, db, blobs, snap.*) out of it",
+            db_path.display()
+        ),
+    ))
+}
+
 pub fn import_if_present(db_path: &Path) -> Result<Option<ImportReport>, InfrastructureError> {
     import_with_lock_timeout(db_path, SLED_RELEASE_TIMEOUT)
 }
@@ -167,6 +206,13 @@ fn import_with_lock_timeout(
     if target.exists() {
         wait_for_sled_release(db_path, lock_timeout)
             .map_err(|error| import_error("wait for the sled lock", error))?;
+        ensure_leftover_matches(db_path, &target)?;
+        // Opening sled for the comparison can leave new snapshot files; list
+        // the files again once its background work released the lock.
+        wait_for_sled_release(db_path, SLED_RELEASE_TIMEOUT)
+            .map_err(|error| import_error("wait for sled to close", error))?;
+        let sled_files =
+            sled_entries(db_path).map_err(|error| import_error("list sled files", error))?;
         let backup = move_to_backup(db_path, &sled_files)?;
         warn!(
             backup = %backup.display(),
@@ -350,6 +396,35 @@ mod tests {
         sled_fixture(dir.path());
         assert_eq!(import_if_present(dir.path()).unwrap(), None);
         assert!(sled_entries(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sled_files_that_differ_from_nox_redb_stop_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        sled_fixture(dir.path());
+        import_if_present(dir.path()).unwrap();
+        // A rollback restored sled and the older release wrote to it, but
+        // nox.redb was left in place.
+        sled_fixture(dir.path());
+        {
+            let db = sled::open(dir.path()).unwrap();
+            db.insert(b"nonce:local", &10_u64.to_le_bytes()).unwrap();
+            db.flush().unwrap();
+        }
+        let error = import_if_present(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("different records"), "{error}");
+        assert!(NodeStore::new(dir.path()).is_err());
+        // Nothing moved: the sled files and nox.redb are both still there.
+        assert!(!sled_entries(dir.path()).unwrap().is_empty());
+        assert!(dir.path().join(DATABASE_FILE).exists());
+        // Moving nox.redb out imports the newer sled data.
+        std::fs::rename(
+            dir.path().join(DATABASE_FILE),
+            dir.path().join("nox.redb.rolled-back"),
+        )
+        .unwrap();
+        let report = import_if_present(dir.path()).unwrap().unwrap();
+        assert_eq!(report.default_records, 3);
     }
 
     #[test]
