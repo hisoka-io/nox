@@ -4,6 +4,7 @@
 pub mod cover_traffic;
 pub mod http_transport;
 pub mod mixnet_client;
+pub mod route;
 pub mod surb_budget;
 pub mod topology_node;
 pub mod topology_sync;

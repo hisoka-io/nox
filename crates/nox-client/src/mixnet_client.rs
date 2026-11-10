@@ -18,7 +18,6 @@ use nox_crypto::sphinx::packet::{MAX_PAYLOAD_SIZE, PACKET_SIZE};
 use nox_crypto::sphinx::surb::{Surb, SurbError, SurbRecovery};
 use nox_crypto::sphinx::{build_multi_hop_packet, PathHop, SphinxError};
 use parking_lot::RwLock;
-use rand::seq::SliceRandom;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -40,6 +39,9 @@ pub struct MixnetClientConfig {
     pub default_fec_ratio: f64,
     /// HTTP poll interval (ms) for SURB responses from entry node.
     pub http_poll_interval_ms: u64,
+    /// Accept a 2-hop `[entry, exit]` path when no mix with a distinct key is
+    /// available. Off by default: route selection then returns `NoRoute`.
+    pub allow_short_paths: bool,
 }
 
 impl Default for MixnetClientConfig {
@@ -51,6 +53,7 @@ impl Default for MixnetClientConfig {
             entry_node_pubkey: None,
             default_fec_ratio: 0.3,
             http_poll_interval_ms: 25,
+            allow_short_paths: false,
         }
     }
 }
@@ -821,102 +824,14 @@ impl MixnetClient {
 
     fn select_route(&self) -> Result<Vec<PathHop>, MixnetClientError> {
         let topology = self.topology.read();
-
-        use nox_core::models::topology::layers_for_role;
-
-        let entries: Vec<_> = topology
-            .iter()
-            .filter(|n| layers_for_role(n.role).contains(&0))
-            .collect();
-        let mixes: Vec<_> = topology
-            .iter()
-            .filter(|n| layers_for_role(n.role).contains(&1))
-            .collect();
-        let exits: Vec<_> = topology
-            .iter()
-            .filter(|n| layers_for_role(n.role).contains(&2) && (n.role == 2 || n.role == 3))
-            .collect();
-
-        if entries.is_empty() && self.config.entry_node_pubkey.is_none() {
-            return Err(MixnetClientError::NoRoute(
-                "No entry nodes available".into(),
-            ));
-        }
-        if exits.is_empty() {
-            return Err(MixnetClientError::NoRoute(
-                "No exit-capable nodes available (layer=2, role=Exit|Full)".into(),
-            ));
-        }
-
         let mut rng = rand::rngs::OsRng;
-        let mut path = Vec::new();
-
-        let entry = if let Some(ref configured_pk) = self.config.entry_node_pubkey {
-            // Search all nodes: TopologyManager may reassign layers by address hash
-            topology
-                .iter()
-                .find(|n| n.public_key == *configured_pk)
-                .ok_or_else(|| {
-                    MixnetClientError::NoRoute("Configured entry node not found in topology".into())
-                })?
-        } else {
-            entries
-                .choose(&mut rng)
-                .ok_or_else(|| MixnetClientError::NoRoute("Entry node list became empty".into()))?
-        };
-        path.push(PathHop {
-            public_key: x25519_dalek::PublicKey::from(entry.public_key),
-            address: entry.address.clone(),
-        });
-
-        // Exclude entry node and exit-role nodes from mix candidates.
-        // Exit nodes in the mix slot create paths like [entry, exit, exit] where the
-        // exit node tries to forward to itself via libp2p, which silently fails.
-        if !mixes.is_empty() {
-            let eligible_mixes: Vec<_> = mixes
-                .iter()
-                .filter(|n| n.public_key != entry.public_key)
-                .copied()
-                .collect();
-            let mix_only: Vec<_> = eligible_mixes
-                .iter()
-                .filter(|n| !exits.iter().any(|e| e.public_key == n.public_key))
-                .copied()
-                .collect();
-            let mix_pool = if mix_only.is_empty() {
-                &eligible_mixes
-            } else {
-                &mix_only
-            };
-            if let Some(mix) = mix_pool.choose(&mut rng) {
-                path.push(PathHop {
-                    public_key: x25519_dalek::PublicKey::from(mix.public_key),
-                    address: mix.address.clone(),
-                });
-            } else {
-                warn!("No eligible mix nodes (all are the entry node); using 2-hop path");
-            }
-        }
-
-        let used_keys: Vec<_> = path.iter().map(|h| h.public_key.to_bytes()).collect();
-        let eligible_exits: Vec<_> = exits
-            .iter()
-            .filter(|n| !used_keys.contains(&n.public_key))
-            .copied()
-            .collect();
-        let exit = if let Some(e) = eligible_exits.choose(&mut rng) {
-            e
-        } else {
-            exits
-                .choose(&mut rng)
-                .ok_or_else(|| MixnetClientError::NoRoute("Exit node list became empty".into()))?
-        };
-        path.push(PathHop {
-            public_key: x25519_dalek::PublicKey::from(exit.public_key),
-            address: exit.address.clone(),
-        });
-
-        Ok(path)
+        crate::route::select_path(
+            &topology,
+            self.config.entry_node_pubkey.as_ref(),
+            self.config.allow_short_paths,
+            &mut rng,
+        )
+        .map_err(MixnetClientError::NoRoute)
     }
 
     fn get_first_hop(&self, path: &[PathHop]) -> String {
@@ -1729,14 +1644,40 @@ mod tests {
         let (_tx, rx) = mpsc::channel(1);
         let client = MixnetClient::new(topology, bus, rx, MixnetClientConfig::default());
 
-        let result = client.select_route();
-        assert!(result.is_ok(), "expected Ok route, got {result:?}");
-        let path = result.unwrap();
-        assert!(
-            path.len() >= 2 && path.len() <= 3,
-            "expected 2-3 hops, got {}",
-            path.len()
+        let path = client.select_route().expect("route");
+        let mut keys: Vec<_> = path.iter().map(|h| h.public_key.to_bytes()).collect();
+        assert_eq!(keys.len(), 3, "expected 3 hops");
+        assert_eq!(keys[2], [3u8; 32], "exit slot must hold the exit");
+        keys.sort_unstable();
+        assert_eq!(keys, vec![[1u8; 32], [2u8; 32], [3u8; 32]]);
+    }
+
+    #[test]
+    fn test_select_route_short_path_needs_opt_in() {
+        let entry = make_topo_node([1u8; 32], "http://e:8080", 0, 1);
+        let exit = make_topo_node([3u8; 32], "http://x:8082", 2, 2);
+        let topology = Arc::new(RwLock::new(vec![entry, exit]));
+
+        let (_tx, rx) = mpsc::channel(1);
+        let client = MixnetClient::new(
+            topology.clone(),
+            Arc::new(NoopPublisher),
+            rx,
+            MixnetClientConfig::default(),
         );
+        assert!(matches!(
+            client.select_route(),
+            Err(MixnetClientError::NoRoute(_))
+        ));
+
+        let (_tx, rx) = mpsc::channel(1);
+        let config = MixnetClientConfig {
+            allow_short_paths: true,
+            ..Default::default()
+        };
+        let client = MixnetClient::new(topology, Arc::new(NoopPublisher), rx, config);
+        let path = client.select_route().expect("short route");
+        assert_eq!(path.len(), 2);
     }
 
     #[test]
