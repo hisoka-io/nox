@@ -33,6 +33,8 @@ impl MixStage {
             tokio::select! {
                 Some(msg) = self.mix_rx.recv() => {
                     let delay = msg.delay;
+                    // DelayQueue fires on whole-millisecond timer ticks, so a
+                    // sub-millisecond delay is released on the next tick.
                     self.metrics.record_mix_delay(delay.as_secs_f64());
                     delay_queue.insert(msg, delay);
                     self.metrics.relayer_mix_queue_depth.set(delay_queue.len() as i64);
