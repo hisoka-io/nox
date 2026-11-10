@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use nox_core::IReplayProtection;
 use nox_node::infra::persistence::rotational_bloom::RotationalBloomFilter;
-use nox_node::SledRepository;
+use nox_node::NodeStore;
 use rand::Rng;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +16,7 @@ fn bench_replay_protection(c: &mut Criterion) {
 
     // Setup Sled
     let dir = tempdir().unwrap();
-    let sled_repo = Arc::new(SledRepository::new(dir.path()).unwrap());
+    let sled_repo = Arc::new(NodeStore::new(dir.path()).unwrap());
 
     // Setup Bloom
     let bloom_filter = Arc::new(RotationalBloomFilter::new(

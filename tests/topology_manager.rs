@@ -2,14 +2,14 @@
 
 use nox_core::models::topology::RelayerNode;
 use nox_core::{events::NoxEvent, IEventPublisher, IEventSubscriber};
-use nox_node::{services::network_manager::TopologyManager, SledRepository, TokioEventBus};
+use nox_node::{services::network_manager::TopologyManager, NodeStore, TokioEventBus};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 
-fn make_storage() -> (Arc<SledRepository>, TempDir) {
+fn make_storage() -> (Arc<NodeStore>, TempDir) {
     let dir = TempDir::new().expect("tempdir");
-    let repo = Arc::new(SledRepository::new(dir.path()).expect("sled"));
+    let repo = Arc::new(NodeStore::new(dir.path()).expect("sled"));
     (repo, dir)
 }
 
