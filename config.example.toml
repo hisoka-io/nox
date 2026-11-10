@@ -252,6 +252,8 @@ claim_retain_grace_ms = 20000
 claim_wait_max_ms = 20000
 # Claims that may long-poll at once; beyond it a claim answers at once.
 claim_wait_max_concurrent = 256
+# Reply IDs one WebSocket connection may subscribe to; further IDs are ignored.
+ws_max_subscriptions = 65536
 
 # Exit dispatch lanes: each payload type has its own queue and concurrency limit.
 # Payloads beyond queue_capacity are dropped and counted in

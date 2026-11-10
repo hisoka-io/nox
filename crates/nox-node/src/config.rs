@@ -452,6 +452,9 @@ pub struct IngressConfig {
     pub claim_wait_max_ms: u64,
     /// Claims that may long-poll at once; beyond it a claim answers at once.
     pub claim_wait_max_concurrent: usize,
+    /// Most reply IDs one WebSocket connection (`/api/v1/ws`) may subscribe
+    /// to; further IDs are ignored.
+    pub ws_max_subscriptions: usize,
 }
 
 /// Default for `ingress.claim_retain_grace_ms`.
@@ -471,6 +474,7 @@ impl Default for IngressConfig {
             claim_retain_grace_ms: DEFAULT_CLAIM_RETAIN_GRACE_MS,
             claim_wait_max_ms: crate::ingress::claim::DEFAULT_CLAIM_WAIT_MAX_MS,
             claim_wait_max_concurrent: crate::ingress::claim::DEFAULT_CLAIM_WAIT_MAX_CONCURRENT,
+            ws_max_subscriptions: crate::ingress::claim::DEFAULT_WS_MAX_SUBSCRIPTIONS,
         }
     }
 }
@@ -512,6 +516,9 @@ impl IngressConfig {
                 "ingress.claim_wait_max_concurrent must be at least 1 when ingress.claim_wait_max_ms is set"
                     .to_string(),
             );
+        }
+        if self.ws_max_subscriptions == 0 {
+            errors.push("ingress.ws_max_subscriptions must be at least 1".to_string());
         }
         for origin in &self.cors_allowed_origins {
             let is_http_origin = (origin.starts_with("https://") || origin.starts_with("http://"))

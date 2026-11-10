@@ -196,7 +196,8 @@ impl NoxNode {
                 claim: ClaimSettings::new(
                     Duration::from_millis(config.ingress.claim_wait_max_ms),
                     config.ingress.claim_wait_max_concurrent,
-                ),
+                )
+                .with_ws_max_subscriptions(config.ingress.ws_max_subscriptions),
             });
             let ingress_router = IngressServer::router_with_policy(ingress_state, &config.ingress)
                 .layer(middleware::from_fn(
