@@ -13,7 +13,6 @@ ignore = [
     "RUSTSEC-2024-0384", # expires=2026-12-31 owner=networking
     "RUSTSEC-2024-0436", # expires=2026-12-31 owner=networking
     "RUSTSEC-2026-0387", # expires=2026-12-31 owner=chain-signing
-    "RUSTSEC-2026-0441", # expires=2026-12-31 owner=networking,nox-kps
 ]
 
 [licenses]
