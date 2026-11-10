@@ -1,6 +1,6 @@
 # Architecture
 
-NOX is a 3-layer stratified mix network implementing the [Loopix](https://www.usenix.org/conference/usenixsecurity17/technical-sessions/presentation/piotrowska) anonymity model. Clients encrypt messages as Sphinx packets, each node peels one layer and applies a random delay, and exit nodes execute the request on Ethereum. Responses return via SURBs with Reed-Solomon FEC.
+NOX is a Sphinx mix network built on Loopix building blocks (Poisson per-hop delay, loop and drop cover, SURBs) with 3-hop routes chosen by on-chain role (entry, mix, exit); strict per-layer routing and default-on client cover are the next milestones. Clients encrypt messages as Sphinx packets, each node peels one layer and applies a random delay, and exit nodes execute the request on Ethereum. Responses return via SURBs with Reed-Solomon FEC.
 
 ## Sphinx packet format
 
@@ -232,8 +232,8 @@ a 256-descriptor reserve fits; when it does not, the node stops with the largest
 
 [SECURITY.md](../SECURITY.md) has the reporting policy, the scope and the dependency exception table. In summary:
 
-**Protected against**: IP identification, content analysis, replay, packet flooding, sender-receiver linkability, key compromise (current packets), header tagging, MEV/front-running, relay payment linkability.
+**Protected against**: IP identification by destinations, content analysis, header tagging, packet flooding (PoW), relay payment linkability, replay within the replay window.
 
-**Partial**: Inter-node traffic analysis (server cover only), timing correlation (depends on traffic volume), Sybil attacks (staking; P2P peers must be registered).
+**Partial**: sender-receiver linkability against a global observer (grows with traffic volume and client cover), inter-node traffic analysis (node cover today), timing correlation (depends on traffic volume), long-lived replay (key epochs next), Sybil resistance (staking; P2P peers must be registered).
 
 **Next milestones**: client cover traffic on by default, which hides when a client is active (the Rust client ships an opt-in cover sender); scheduled routing-key rotation, which keeps recorded traffic sealed after a later key compromise (nodes already follow key rotations published in the registry).
