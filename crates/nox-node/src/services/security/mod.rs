@@ -92,6 +92,11 @@ pub fn is_ip_allowed(ip: IpAddr, allow_private: bool) -> Result<(), SsrfError> {
                         reason: format!("IPv6 link-local {ip} blocked"),
                     });
                 }
+                if (segments[0] & 0xffc0) == 0xfec0 {
+                    return Err(SsrfError::Blocked {
+                        reason: format!("IPv6 site-local {ip} blocked"),
+                    });
+                }
                 if let Some(embedded) = embedded_ipv4(segments) {
                     return is_ip_allowed(IpAddr::V4(embedded), allow_private);
                 }
@@ -302,6 +307,19 @@ mod tests {
         // ::ffff:8.8.8.8 -- public IP wrapped should still be allowed
         let mapped_public: IpAddr = "::ffff:8.8.8.8".parse().expect("valid mapped public");
         assert!(is_ip_allowed(mapped_public, false).is_ok());
+    }
+
+    #[test]
+    fn test_is_ip_allowed_blocks_ipv6_site_local() {
+        for blocked in ["fec0::1", "fed0::1", "feff:ffff::1"] {
+            let ip: IpAddr = blocked.parse().expect("valid site-local");
+            assert!(is_ip_allowed(ip, false).is_err(), "{blocked} allowed");
+        }
+        // Neighbours of fec0::/10 keep their own results.
+        let link_local: IpAddr = "febf::1".parse().expect("valid link-local");
+        assert!(is_ip_allowed(link_local, false).is_err());
+        let public: IpAddr = "2606:4700::1111".parse().expect("valid public");
+        assert!(is_ip_allowed(public, false).is_ok());
     }
 
     #[test]
