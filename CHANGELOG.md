@@ -5,6 +5,18 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- The node database moves from sled to redb (`<db_path>/nox.redb`). The first start imports the sled database,
+  verifies every record, and moves the sled files to `<db_path>/sled-backup-<unix>/`. Rolling back to an older
+  release needs `nox.redb` moved out of `db_path` and those files moved back (records written after the upgrade
+  are then lost). A start that finds sled files next to `nox.redb` with different records stops and names both ways out,
+  instead of keeping the older copy.
+- `[storage] compact_on_start_blob_bytes` is replaced by `compact_on_start_fragmented_bytes`; a config that still
+  sets the old key fails validation and names the replacement. The `nox_storage_blob_*` gauges are replaced by
+  `nox_storage_stored_bytes` and `nox_storage_fragmented_bytes`.
+- Wire formats and stored record encodings are unchanged; the golden stored-outbox vector decodes as before.
+
 ## [0.4.0-rc.12] - 2026-11-10
 
 ### Upgrade notes

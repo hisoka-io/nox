@@ -220,12 +220,19 @@ exit relays TLS records between it and one upstream host. Destinations follow
 
 ### `[storage]`
 
+The node database is one redb file, `<db_path>/nox.redb`. A `db_path` that still holds a
+sled database (rc.11 and earlier) is imported once at startup: every record is copied, compared,
+and the sled files are moved into `<db_path>/sled-backup-<unix>/`. Delete that directory once the
+node runs well. To start an older release from that data, stop the node, move `nox.redb` out of
+`db_path` and move the backup's files back into `db_path`; records written since the upgrade are
+then lost, and the next upgrade imports the sled database again.
+
 A maintenance pass runs at startup and then every `maintenance_interval_secs`. It slims and
-deletes records whose work is complete, updates `nox_storage_records{tree,kind}`,
-`nox_storage_blob_files` and `nox_storage_blob_bytes`, and flushes the database. Records the
-node may still act on are kept: transactions until they are mined or failed, quotes that are
-outstanding, inflight or submitted, `nonce:local` and the quote counters. Removed records are
-counted in `nox_storage_retention_total{record,action}`.
+deletes records the node never reads again and updates `nox_storage_records{tree,kind}`,
+`nox_storage_stored_bytes` and `nox_storage_fragmented_bytes`. Records the node may still act
+on are kept: transactions that are not mined or failed, quotes that are outstanding, inflight or
+submitted, `nonce:local` and the quote counters. Removed records are counted in
+`nox_storage_retention_total{record,action}`.
 
 | Field | Default | Description |
 |---|---|---|
@@ -236,21 +243,18 @@ counted in `nox_storage_retention_total{record,action}`.
 | `expired_quote_retention_secs` | `600` | Seconds after `valid_until` before an unused expired quote is deleted |
 | `terminal_quote_retention_secs` | `604800` | Seconds after `valid_until` before a confirmed, reverted or rejected quote is deleted |
 | `maintenance_batch_limit` | `2000` | Most transaction records one pass changes. Quotes have their own budget: twice the most quotes the cap admits per interval (`2 * quote_max_outstanding * ceil(maintenance_interval_secs / quote_ttl_secs)`, 10240 for the example exit), and at least this value |
-| `compact_on_start_blob_bytes` | `268435456` | Compact at startup when sled blob files exceed this (256 MiB); `0` = never |
+| `compact_on_start_fragmented_bytes` | `67108864` | Compact at startup when the file holds more free bytes than this (64 MiB) |
 
-sled 0.34 forgets blob files that were pending deletion whenever the node stops, so blob
-files can accumulate across restarts while the live data stays small. Compaction copies every
-record into a fresh database, checks a digest of the copy, swaps it in and removes the old
-files. It runs at startup above `compact_on_start_blob_bytes`, or offline with the node
-stopped:
+Free pages inside `nox.redb` are reused by later writes, so the file does not grow with
+churn. Compaction returns them to the filesystem; it runs at startup above the threshold, or
+offline with the node stopped:
 
 ```bash
-nox db stats   --config /etc/nox/config.toml      # size, blob files, records per kind
-nox db compact --config /etc/nox/config.toml      # add --keep-backup to keep the old files
+nox db stats   --config /etc/nox/config.toml      # file size, page usage, records per kind
+nox db compact --config /etc/nox/config.toml
 ```
 
-`--db-path <dir>` overrides the config. If a compaction is interrupted during the swap, the
-node refuses to open the database until `nox db compact` is run again to finish it.
+`--db-path <dir>` overrides the config.
 
 ## Node roles
 
