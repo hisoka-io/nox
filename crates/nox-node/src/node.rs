@@ -368,7 +368,8 @@ impl NoxNode {
                 0.001, // FP Rate
                 std::time::Duration::from_secs(config.relayer.replay_window),
             )
-            .with_file_persistence(&bloom_path);
+            .with_file_persistence(&bloom_path)
+            .with_metrics(metrics_service.clone());
 
             if let Err(e) = filter.restore_from_file().await {
                 error!(

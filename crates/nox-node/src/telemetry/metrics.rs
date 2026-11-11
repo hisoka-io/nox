@@ -4,7 +4,7 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{exponential_buckets, Histogram};
 use prometheus_client::registry::Registry;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
 
 use super::quantile::QuantileHistogram;
@@ -86,6 +86,7 @@ pub struct MetricsService {
     pub p2p_outbound_dropped_total: Family<Vec<(String, String)>, Counter>,
     pub replay_checks_total: Family<Vec<(String, String)>, Counter>,
     pub replay_bloom_rotations_total: Counter,
+    pub replay_bloom_fill_ratio: Gauge<f64, AtomicU64>,
     pub event_bus_lag_total: Counter,
     pub event_bus_events_total: Family<Vec<(String, String)>, Counter>,
     pub event_bus_publish_errors_total: Family<Vec<(String, String)>, Counter>,
@@ -421,6 +422,13 @@ impl MetricsService {
             "nox_replay_bloom_rotations_total",
             "Bloom filter rotations in replay protection",
             replay_bloom_rotations_total.clone(),
+        );
+
+        let replay_bloom_fill_ratio = Gauge::<f64, AtomicU64>::default();
+        registry.register(
+            "nox_replay_bloom_fill_ratio",
+            "Share of set bits in the active replay filter",
+            replay_bloom_fill_ratio.clone(),
         );
 
         let event_bus_lag_total = Counter::default();
@@ -964,6 +972,7 @@ impl MetricsService {
             p2p_outbound_dropped_total,
             replay_checks_total,
             replay_bloom_rotations_total,
+            replay_bloom_fill_ratio,
             event_bus_lag_total,
             event_bus_events_total,
             event_bus_publish_errors_total,
