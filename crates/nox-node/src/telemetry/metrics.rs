@@ -7,6 +7,8 @@ use prometheus_client::registry::Registry;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 
+use super::quantile::QuantileHistogram;
+
 /// Exit dispatch lanes, used as the `lane` label.
 pub const EXIT_LANES: [&str; 5] = ["paid", "quote", "proxy", "control", "tunnel"];
 /// Reasons an exit payload is dropped before dispatch, used as the `reason` label.
@@ -129,7 +131,7 @@ pub struct MetricsService {
     pub cover_loop_returned_total: Family<Vec<(String, String)>, Counter>,
     pub cover_loop_lost_total: Family<Vec<(String, String)>, Counter>,
     pub cover_loop_outcomes_total: Family<Vec<(String, String)>, Counter>,
-    pub cover_loop_rtt_seconds: Histogram,
+    pub cover_loop_rtt_seconds: QuantileHistogram,
     pub p2p_admission_total: Family<Vec<(String, String)>, Counter>,
     pub topology_reconcile_total: Family<Vec<(String, String)>, Counter>,
     pub topology_membership_verified: Gauge<i64, AtomicI64>,
@@ -732,11 +734,11 @@ impl MetricsService {
             cover_loop_outcomes_total.clone(),
         );
 
-        let cover_loop_rtt_seconds = Histogram::new(exponential_buckets(0.05, 2.0, 12));
+        let cover_loop_rtt_seconds = QuantileHistogram::new(exponential_buckets(0.05, 2.0, 12));
         registry.register(
             "nox_cover_loop_rtt_seconds",
             "Round-trip time of returned loop cover packets",
-            cover_loop_rtt_seconds.clone(),
+            cover_loop_rtt_seconds.histogram(),
         );
 
         let p2p_admission_total = Family::<Vec<(String, String)>, Counter>::default();
@@ -1508,6 +1510,18 @@ impl MetricsService {
             fc0(&self.event_bus_publish_errors_total).into(),
         );
 
+        // Loop cover round trip, in milliseconds, estimated from the
+        // `nox_cover_loop_rtt_seconds` buckets. Absent until a loop returns.
+        for (key, q) in [
+            ("latencyP50", 0.50),
+            ("latencyP95", 0.95),
+            ("latencyP99", 0.99),
+        ] {
+            if let Some(secs) = self.cover_loop_rtt_seconds.quantile(q) {
+                m.insert(key.into(), (secs * 1000.0).into());
+            }
+        }
+
         m.insert("uptimeSeconds".into(), self.uptime_seconds.get().into());
         m.insert("healthStatus".into(), self.health_status.get().into());
         m.insert(
@@ -1663,5 +1677,31 @@ mod tests {
             .iter()
             .filter(|key| key.starts_with("tunnel"))
             .all(|key| !key.contains("Bytes") && !key.contains("Parts")));
+    }
+
+    #[test]
+    fn json_reports_loop_rtt_percentiles_in_ms() {
+        let metrics = MetricsService::new();
+        let projection = metrics.to_json();
+        assert!(projection.get("latencyP50").is_none());
+
+        for _ in 0..90 {
+            metrics.cover_loop_rtt_seconds.observe(0.08);
+        }
+        for _ in 0..10 {
+            metrics.cover_loop_rtt_seconds.observe(0.3);
+        }
+        let projection = metrics.to_json();
+        let p50 = projection["latencyP50"].as_f64().expect("p50");
+        let p95 = projection["latencyP95"].as_f64().expect("p95");
+        let p99 = projection["latencyP99"].as_f64().expect("p99");
+        assert!((50.0..=100.0).contains(&p50), "p50 {p50}");
+        assert!((200.0..=400.0).contains(&p95), "p95 {p95}");
+        assert!(p95 <= p99 && p99 <= 400.0, "p99 {p99}");
+
+        let mut encoded = String::new();
+        prometheus_client::encoding::text::encode(&mut encoded, &metrics.get_registry().lock())
+            .expect("encode");
+        assert!(encoded.contains("nox_cover_loop_rtt_seconds_count 100"));
     }
 }
