@@ -57,6 +57,7 @@ Full setup guide, prerequisites, environment variables, and testing in [docs/qui
 - [Architecture](docs/architecture.md)
 - [Configuration](docs/configuration.md)
 - [End-to-end TLS tunnels](docs/tunnel.md)
+- [Exit policy](docs/exit-policy.md)
 - [KPS entry (nox-kps)](crates/nox-kps/README.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security](SECURITY.md)

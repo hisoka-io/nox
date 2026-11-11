@@ -195,6 +195,7 @@ replay_window = 3600              # Replay tag TTL in seconds
 # bloom_persist_interval_secs = 60  # Write the replay filter to disk this often while it changes
 
 # Poisson mix delay (ms). Higher = more anonymity, more latency.
+# 500 is the node default; the Hisoka testnet fleet runs 40 (run-nox templates).
 # Set to 0.0 to disable mixing (instant forwarding).
 mix_delay_ms = 500.0
 
