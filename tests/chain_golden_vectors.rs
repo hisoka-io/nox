@@ -931,7 +931,7 @@ async fn stored_outbox_records() {
     use nox_node::blockchain::transaction_plan::TransactionPlan;
     use nox_node::blockchain::tx_manager::TransactionManager;
     use nox_node::telemetry::metrics::MetricsService;
-    use nox_node::SledRepository;
+    use nox_node::NodeStore;
 
     let (server, _rpc) = recording_server(true).await;
     let mut config = NoxConfig::default();
@@ -940,7 +940,7 @@ async fn stored_outbox_records() {
     config.eth_wallet_private_key = KEYS[1].to_string();
     let executor = Arc::new(ChainExecutor::new(&config).await.expect("executor"));
     let directory = tempfile::tempdir().expect("tempdir");
-    let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+    let storage = Arc::new(NodeStore::new(directory.path()).expect("storage"));
     let manager = TransactionManager::new(
         executor,
         storage.clone(),

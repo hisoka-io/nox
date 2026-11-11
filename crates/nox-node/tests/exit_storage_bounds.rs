@@ -7,14 +7,12 @@
 //! execution (about 240 MB for 3,000). The test asserts that record counts
 //! and bytes on disk stay bounded across restarts instead. Pull requests run
 //! 300 executions; the 3,000-execution horizon is `#[ignore]`d and runs
-//! nightly (`slow-tests.yml`), with the same ratios between run length,
-//! maintenance interval, restart interval and compaction threshold.
+//! nightly (`slow-tests.yml`).
 //!
-//! Retention alone does not bound bytes on sled 0.34: every restart forgets
-//! the blob files that were pending deletion. With a restart every 100
-//! executions and no compaction, blob bytes grew from 12 MB to 78 MB over
-//! this run while the record counts stayed flat. The restart step therefore
-//! applies the startup compaction (`storage.compact_on_start_blob_bytes`).
+//! On sled 0.34 retention alone did not bound bytes: every restart forgot the
+//! blob files pending deletion (12 MB to 78 MB over the long run with a
+//! restart every 100 executions). redb reuses freed pages, so both horizons
+//! restart without any compaction and still assert a bound.
 
 use std::path::Path;
 
@@ -25,11 +23,8 @@ use nox_core::{
     StoredTransactionV2, TxStatusV2,
 };
 use nox_node::config::StorageConfig;
-use nox_node::infra::compaction::{compact_database, sled_files_size, CompactionOptions};
-use nox_node::infra::retention::{
-    blob_usage, RetentionPolicy, TREE_LABEL_DEFAULT, TREE_LABEL_OUTBOX,
-};
-use nox_node::infra::storage::{CreateOutboxResult, QuoteStoreError, SledRepository};
+use nox_node::infra::retention::{RetentionPolicy, TREE_LABEL_DEFAULT, TREE_LABEL_OUTBOX};
+use nox_node::infra::storage::{CreateOutboxResult, NodeStore, QuoteStoreError};
 
 /// Length of a run and how often it maintains storage and restarts.
 #[derive(Clone, Copy)]
@@ -39,8 +34,6 @@ struct Horizon {
     maintenance_every: u64,
     /// Executions between restarts.
     restart_every: u64,
-    /// Startup compaction threshold used by the restart step.
-    compact_on_start_blob_bytes: u64,
 }
 
 /// Simulated seconds between executions.
@@ -133,7 +126,7 @@ fn raw_transaction(index: u64) -> Vec<u8> {
         .collect()
 }
 
-async fn reserve(repo: &SledRepository, record: &StoredQuoteV2, now: u64) {
+async fn reserve(repo: &NodeStore, record: &StoredQuoteV2, now: u64) {
     repo.create_quote_durably(
         record,
         10_000,
@@ -147,7 +140,7 @@ async fn reserve(repo: &SledRepository, record: &StoredQuoteV2, now: u64) {
 }
 
 /// One paid execution through the full outbox lifecycle.
-async fn execute(repo: &SledRepository, index: u64, now: u64) {
+async fn execute(repo: &NodeStore, index: u64, now: u64) {
     let execution_id = id(1, index);
     reserve(repo, &quote(execution_id, now + QUOTE_TTL_SECS), now).await;
     repo.take_quote_durably(execution_id, now)
@@ -196,13 +189,13 @@ async fn execute(repo: &SledRepository, index: u64, now: u64) {
 
 struct Sample {
     executions: u64,
-    sled_bytes: u64,
-    blob_bytes: u64,
+    file_bytes: u64,
+    fragmented_bytes: u64,
     outbox_keys: u64,
     quote_keys: u64,
 }
 
-async fn sample(repo: &SledRepository, path: &Path, executions: u64) -> Sample {
+async fn sample(repo: &NodeStore, executions: u64) -> Sample {
     let counts = repo.record_counts().await.expect("record counts");
     let count = |tree: &str, kind: &str| {
         counts
@@ -213,27 +206,18 @@ async fn sample(repo: &SledRepository, path: &Path, executions: u64) -> Sample {
     };
     Sample {
         executions,
-        sled_bytes: sled_files_size(path).expect("sled size"),
-        blob_bytes: blob_usage(path).expect("blob usage").1,
+        file_bytes: repo.size_on_disk().await.expect("file size"),
+        fragmented_bytes: repo.stats().await.expect("stats").fragmented_bytes,
         outbox_keys: count(TREE_LABEL_OUTBOX, "outbox") + count(TREE_LABEL_OUTBOX, "transaction"),
         quote_keys: count(TREE_LABEL_DEFAULT, "quote")
             + count(TREE_LABEL_DEFAULT, "quote_payment_index"),
     }
 }
 
-/// Restart: drop every handle, compact when blobs pass the startup threshold
-/// (what `storage.compact_on_start_blob_bytes` does), reopen.
-fn restart(
-    repo: SledRepository,
-    path: &Path,
-    compact_on_start_blob_bytes: u64,
-) -> (SledRepository, bool) {
+/// Restart: drop every handle and reopen. No compaction.
+fn restart(repo: NodeStore, path: &Path) -> NodeStore {
     drop(repo);
-    let compacted = blob_usage(path).expect("blob usage").1 > compact_on_start_blob_bytes;
-    if compacted {
-        compact_database(path, CompactionOptions { keep_backup: false }).expect("compaction");
-    }
-    (SledRepository::new(path).expect("reopen"), compacted)
+    NodeStore::new(path).expect("reopen")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -242,7 +226,6 @@ async fn exit_storage_stays_bounded_over_hundreds_of_paid_executions() {
         executions: 300,
         maintenance_every: 10,
         restart_every: 50,
-        compact_on_start_blob_bytes: 1024 * 1024,
     })
     .await;
 }
@@ -253,8 +236,7 @@ async fn exit_storage_stays_bounded_over_thousands_of_paid_executions() {
     assert_storage_stays_bounded(Horizon {
         executions: 3_000,
         maintenance_every: 100,
-        restart_every: 500,
-        compact_on_start_blob_bytes: 8 * 1024 * 1024,
+        restart_every: 100,
     })
     .await;
 }
@@ -262,10 +244,9 @@ async fn exit_storage_stays_bounded_over_thousands_of_paid_executions() {
 async fn assert_storage_stays_bounded(horizon: Horizon) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("nox_db");
-    let mut repo = SledRepository::new(&path).expect("open");
+    let mut repo = NodeStore::new(&path).expect("open");
     let mut now = 1_800_000_000_u64;
     let mut samples = Vec::new();
-    let mut compactions = 0_u32;
 
     for index in 0..horizon.executions {
         execute(&repo, index, now).await;
@@ -277,23 +258,20 @@ async fn assert_storage_stays_bounded(horizon: Horizon) {
             repo.apply_retention(policy(), now)
                 .await
                 .expect("retention");
-            samples.push(sample(&repo, &path, index + 1).await);
+            samples.push(sample(&repo, index + 1).await);
         }
         if (index + 1) % horizon.restart_every == 0 {
-            let (reopened, compacted) = restart(repo, &path, horizon.compact_on_start_blob_bytes);
-            repo = reopened;
-            compactions += u32::from(compacted);
+            repo = restart(repo, &path);
         }
     }
 
-    println!("executions  sled_bytes  blob_bytes  outbox_keys  quote_keys");
+    println!("executions  file_bytes  fragmented  outbox_keys  quote_keys");
     for s in &samples {
         println!(
             "{:>10}  {:>10}  {:>10}  {:>11}  {:>10}",
-            s.executions, s.sled_bytes, s.blob_bytes, s.outbox_keys, s.quote_keys
+            s.executions, s.file_bytes, s.fragmented_bytes, s.outbox_keys, s.quote_keys
         );
     }
-    println!("startup compactions: {compactions}");
 
     // Records: everything newer than the retention window plus one
     // maintenance interval, for both keys of each record.
@@ -316,17 +294,17 @@ async fn assert_storage_stays_bounded(horizon: Horizon) {
     }
 
     // Bytes: the last third of the run must not exceed the peak of the first
-    // third by more than sled's own slack, and stays far below the ~240 MB
+    // third by more than the allocator's slack, and stays far below the ~240 MB
     // an unpruned outbox would hold.
     let third = samples.len() / 3;
     let early_peak = samples[..third]
         .iter()
-        .map(|s| s.sled_bytes)
+        .map(|s| s.file_bytes)
         .max()
         .unwrap_or(0);
     let late_peak = samples[2 * third..]
         .iter()
-        .map(|s| s.sled_bytes)
+        .map(|s| s.file_bytes)
         .max()
         .unwrap_or(0);
     assert!(
@@ -355,7 +333,7 @@ const PAID_EXECUTIONS_PER_PASS: u64 = 1_100;
 
 /// Writes a mined transaction (outbox and per-nonce key) without a flush per
 /// record; retention reads the same bytes `persist_v2_durably` writes.
-async fn store_mined(repo: &SledRepository, index: u64, now: u64) {
+async fn store_mined(repo: &NodeStore, index: u64, now: u64) {
     let execution_id = id(4, index);
     let record = PendingTransactionV2 {
         execution_id,
@@ -391,7 +369,7 @@ async fn store_mined(repo: &SledRepository, index: u64, now: u64) {
 /// Writes a quote in the state the quote service leaves it once its TTL has
 /// passed (`Expired`, payment index still present), without a flush per
 /// record.
-async fn store_expired_quote(repo: &SledRepository, execution_id: [u8; 32], valid_until: u64) {
+async fn store_expired_quote(repo: &NodeStore, execution_id: [u8; 32], valid_until: u64) {
     let mut record = quote(execution_id, valid_until);
     record.status = QuoteStatusV2::Expired;
     let execution_key = format!("quote:execution:{}", hex::encode(execution_id));
@@ -435,7 +413,7 @@ async fn quote_records_stay_bounded_at_the_quote_cap_over_eighty_minutes() {
 async fn assert_quote_records_stay_bounded(passes: u64, issued_ceilings: u64) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("nox_db");
-    let repo = SledRepository::new(&path).expect("open");
+    let repo = NodeStore::new(&path).expect("open");
     let storage = StorageConfig::default();
     let policy = RetentionPolicy::from_config(
         &storage,
@@ -520,7 +498,7 @@ async fn assert_quote_records_stay_bounded(passes: u64, issued_ceilings: u64) {
             "pass {pass}: quote budget ran out ({} pruned)",
             report.quotes_pruned
         );
-        let quote_keys = sample(&repo, &path, pass).await.quote_keys;
+        let quote_keys = sample(&repo, pass).await.quote_keys;
         println!(
             "pass {pass:>2}  quotes issued {next_quote:>6}  quotes pruned {:>5}  quote keys {quote_keys:>6}",
             report.quotes_pruned

@@ -14,7 +14,7 @@ use nox_node::blockchain::tx_manager::TransactionManager;
 use nox_node::price::client::PriceClient;
 use nox_node::services::handlers::ethereum::EthereumHandler;
 use nox_node::telemetry::metrics::MetricsService;
-use nox_node::{NoxConfig, SledRepository};
+use nox_node::{NodeStore, NoxConfig};
 use std::str::FromStr;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -38,7 +38,7 @@ async fn make_mock_chain_executor() -> Arc<ChainExecutor> {
 
 async fn make_tx_manager(executor: Arc<ChainExecutor>) -> Arc<TransactionManager> {
     let dir = tempdir().expect("tempdir");
-    let storage = Arc::new(SledRepository::new(dir.path()).expect("SledRepository"));
+    let storage = Arc::new(NodeStore::new(dir.path()).expect("NodeStore"));
     let metrics = MetricsService::new();
     Arc::new(
         TransactionManager::new(
@@ -301,7 +301,7 @@ async fn paid_quote_is_signed_reserved_and_duplicate_payment_rejected() {
     }];
     let executor = Arc::new(ChainExecutor::new(&config).await.unwrap());
     let directory = tempdir().unwrap();
-    let storage = Arc::new(SledRepository::new(directory.path()).unwrap());
+    let storage = Arc::new(NodeStore::new(directory.path()).unwrap());
     let manager = Arc::new(
         TransactionManager::new(
             executor.clone(),

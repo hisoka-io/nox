@@ -32,7 +32,7 @@ use nox_node::services::mixing::{NoMixStrategy, PoissonMixStrategy};
 use nox_node::services::network_manager::TopologyManager;
 use nox_node::services::relayer::RelayerService;
 use nox_node::telemetry::metrics::MetricsService;
-use nox_node::{NoxConfig, SledRepository, TokioEventBus};
+use nox_node::{NodeStore, NoxConfig, TokioEventBus};
 use nox_sim::bench_common::{
     self, AttackResult, BenchResult, CombinedAnonymityPoint, CorrelationResult, CoverAnalysisPoint,
     CoverTrafficPoint, EntropyPoint, EntropyVsUsersPoint, FecOptimalRatio, FecRatioPoint,
@@ -490,7 +490,7 @@ struct BenchNode {
     bus_publisher: Arc<dyn IEventPublisher>,
     bus_subscriber: Arc<dyn IEventSubscriber>,
     #[allow(dead_code)]
-    storage: Arc<SledRepository>,
+    storage: Arc<NodeStore>,
     _db_dir: tempfile::TempDir,
 }
 
@@ -515,7 +515,7 @@ fn spawn_completion_watcher(subscriber: Arc<dyn IEventSubscriber>, registry: Com
 
 async fn spawn_bench_node(id: usize, mix_delay_ms: f64, bus_capacity: usize) -> Result<BenchNode> {
     let dir = tempdir()?;
-    let db = Arc::new(SledRepository::new(dir.path())?);
+    let db = Arc::new(NodeStore::new(dir.path())?);
     let event_bus = TokioEventBus::new(bus_capacity);
     let pub_bus: Arc<dyn IEventPublisher> = Arc::new(event_bus.clone());
     let sub_bus: Arc<dyn IEventSubscriber> = Arc::new(event_bus.clone());
@@ -1716,7 +1716,7 @@ async fn run_cover_traffic(
 
                 // Each TrafficShapingService gets its own TopologyManager with a fresh DB.
                 let cover_dir = tempdir()?;
-                let cover_db = Arc::new(SledRepository::new(cover_dir.path())?);
+                let cover_db = Arc::new(NodeStore::new(cover_dir.path())?);
                 let cover_bus = TokioEventBus::new(bus_capacity);
                 let cover_pub: Arc<dyn IEventPublisher> = Arc::new(cover_bus.clone());
                 let cover_sub: Arc<dyn IEventSubscriber> = Arc::new(cover_bus.clone());
@@ -2561,7 +2561,7 @@ async fn run_replay_detection(
     // Test 2: Sled-based replay protection
     {
         let db_dir = tempdir()?;
-        let sled_db = SledRepository::new(db_dir.path())?;
+        let sled_db = NodeStore::new(db_dir.path())?;
         let ttl = 3600_u64;
 
         // Phase 1: Insert unique tags
@@ -2955,7 +2955,7 @@ async fn run_entropy_vs_cover(
                 cover_cancels.push(cover_cancel.clone());
 
                 let cover_dir = tempdir()?;
-                let cover_db = Arc::new(SledRepository::new(cover_dir.path())?);
+                let cover_db = Arc::new(NodeStore::new(cover_dir.path())?);
                 let cover_bus = TokioEventBus::new(bus_capacity);
                 let cover_pub: Arc<dyn IEventPublisher> = Arc::new(cover_bus.clone());
                 let cover_sub: Arc<dyn IEventSubscriber> = Arc::new(cover_bus.clone());
@@ -3704,7 +3704,7 @@ async fn run_cover_analysis(
                 cover_cancels.push(cover_cancel.clone());
 
                 let cover_dir = tempdir()?;
-                let cover_db = Arc::new(SledRepository::new(cover_dir.path())?);
+                let cover_db = Arc::new(NodeStore::new(cover_dir.path())?);
                 let cover_bus = TokioEventBus::new(bus_capacity);
                 let cover_pub: Arc<dyn IEventPublisher> = Arc::new(cover_bus.clone());
                 let cover_sub: Arc<dyn IEventSubscriber> = Arc::new(cover_bus.clone());
