@@ -5,17 +5,42 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+## [0.4.0-rc.13] - 2026-11-11
+
 ### Upgrade notes
 
+- Upgrade one node at a time. The Sphinx wire, fragment, FEC and SURB formats stay as in rc.12; nodes on this build
+  and rc.6 to rc.12 nodes, nox-kps relays and published clients interoperate.
 - The node database moves from sled to redb (`<db_path>/nox.redb`). The first start imports the sled database,
   verifies every record, and moves the sled files to `<db_path>/sled-backup-<unix>/`. Rolling back to an older
   release needs `nox.redb` moved out of `db_path` and those files moved back (records written after the upgrade
   are then lost). A start that finds sled files next to `nox.redb` with different records stops and names both ways out,
-  instead of keeping the older copy.
+  instead of keeping the older copy. Keep the pre-upgrade data snapshot until the node has run cleanly.
 - `[storage] compact_on_start_blob_bytes` is replaced by `compact_on_start_fragmented_bytes`; a config that still
   sets the old key fails validation and names the replacement. The `nox_storage_blob_*` gauges are replaced by
   `nox_storage_stored_bytes` and `nox_storage_fragmented_bytes`.
-- Wire formats and stored record encodings are unchanged; the golden stored-outbox vector decodes as before.
+- New optional keys with defaults: `network.rate_limit.inactive_peer_ttl_secs` (600) and
+  `ingress.ws_max_subscriptions` (65536). Other configuration files load as they are.
+- Stored record encodings are unchanged; the golden stored-outbox vector decodes as before.
+
+### Added
+
+- `/metrics/json` reports `latencyP50`, `latencyP95` and `latencyP99`: loop cover round-trip time in milliseconds,
+  estimated from the `nox_cover_loop_rtt_seconds` buckets (present once a loop has returned).
+- `nox_replay_bloom_fill_ratio` gauge, and `nox_replay_bloom_rotations_total` now counts rotations.
+- `nox_crypto::sphinx::MAX_PATH_HOPS` (4): the packet and reply-block builders return an error for longer paths.
+- Rust client: `MixnetClientConfig::allow_short_paths` (off by default).
+
+### Changed
+
+- Node store on redb, with the one-time sled import described above.
+- Mix delays keep sub-millisecond precision; the mix queue releases them on its millisecond timer tick.
+- Rust client route selection returns `NoRoute` unless it finds three distinct keys (entry, mix, exit), and uses
+  relays for the entry and mix slots whenever relays are available. Cover traffic uses the same selection.
+- P2P rate-limiter state expires after the configured idle time and keeps peers with recent violations.
+- WebSocket reply subscriptions are capped per connection (`ingress.ws_max_subscriptions`).
+- Exit destination checks also refuse IPv6 site-local addresses (fec0::/10).
+- Dependency update: rustix 1.1.6 (RUSTSEC-2026-0486).
 
 ## [0.4.0-rc.12] - 2026-11-10
 
