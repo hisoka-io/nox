@@ -88,6 +88,27 @@ struct PersistedSession {
     registry_verified: bool,
 }
 
+/// Why this node closed its links to a peer; the `reason` label on
+/// `nox_peers_disconnected_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisconnectReason {
+    Admission,
+    RateLimit,
+    PingFailure,
+}
+
+impl DisconnectReason {
+    const REMOTE_OR_IDLE: &'static str = "remote_or_idle";
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Admission => "admission",
+            Self::RateLimit => "rate_limit",
+            Self::PingFailure => "ping_failure",
+        }
+    }
+}
+
 /// P2P network service with rate limiting, connection filtering, and health monitoring.
 pub struct P2PService {
     swarm: Swarm<NoxBehaviour>,
@@ -112,6 +133,9 @@ pub struct P2PService {
     wire_ids: crate::config::WireIdMode,
     outbound: OutboundWindow<OutboundRequestId, SystemMessage>,
     cancel_token: Option<CancellationToken>,
+    /// Reasons for disconnects this node started, read when the last
+    /// connection to the peer closes.
+    disconnect_reasons: std::collections::HashMap<PeerId, DisconnectReason>,
 }
 
 impl P2PService {
@@ -205,6 +229,7 @@ impl P2PService {
                 config.network.max_queued_packets_per_peer,
             ),
             cancel_token: None,
+            disconnect_reasons: std::collections::HashMap::new(),
         };
 
         let addr_str = format!("/ip4/{}/tcp/{}", config.p2p_listen_addr, config.p2p_port);
@@ -328,10 +353,22 @@ impl P2PService {
     fn enforce_membership(&mut self) {
         let connected: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
         for peer in self.admission.sweep(connected) {
-            if self.swarm.disconnect_peer_id(peer).is_err() {
+            if !self.disconnect(peer, DisconnectReason::Admission) {
                 debug!(peer = %peer, "disconnect_peer_id failed -- peer may already be gone");
             }
         }
+    }
+
+    /// Closes every connection to `peer` and records why, for the
+    /// `reason` label once the last connection closes. Returns false when
+    /// the peer had no open connection.
+    fn disconnect(&mut self, peer: PeerId, reason: DisconnectReason) -> bool {
+        self.disconnect_reasons.insert(peer, reason);
+        if self.swarm.disconnect_peer_id(peer).is_err() {
+            self.disconnect_reasons.remove(&peer);
+            return false;
+        }
+        true
     }
 
     /// Dials registered members this node has no link to, so liveness reflects
@@ -460,15 +497,23 @@ impl P2PService {
                 );
             }
             libp2p::swarm::SwarmEvent::ConnectionEstablished {
-                peer_id, endpoint, ..
+                peer_id,
+                endpoint,
+                num_established,
+                ..
             } => {
                 let remote_addr = endpoint.get_remote_address().clone();
-                debug!(peer = %peer_id, addr = %remote_addr, "Connection established");
+                debug!(peer = %peer_id, addr = %remote_addr, open = num_established, "Connection established");
 
                 self.peer_addresses.insert(peer_id, remote_addr.clone());
                 self.connection_filter.register_connection(&remote_addr);
                 self.topology_manager.record_peer_seen(peer_id, unix_now());
 
+                if num_established.get() > 1 {
+                    // A further connection to a peer that is already linked
+                    // (both sides dialed); the link itself did not change.
+                    return;
+                }
                 if let Err(e) = self.event_bus.publish(NoxEvent::PeerConnected {
                     peer_id: peer_id.to_string(),
                 }) {
@@ -506,9 +551,16 @@ impl P2PService {
                 }) {
                     debug!(peer = %peer_id, error = %e, "Failed to publish PeerDisconnected event");
                 }
+                let reason = self
+                    .disconnect_reasons
+                    .remove(&peer_id)
+                    .map_or(DisconnectReason::REMOTE_OR_IDLE, DisconnectReason::label);
                 self.metrics
                     .peers_disconnected
-                    .get_or_create(&vec![("type".to_string(), "established".to_string())])
+                    .get_or_create(&vec![
+                        ("type".to_string(), "established".to_string()),
+                        ("reason".to_string(), reason.to_string()),
+                    ])
                     .inc();
             }
             libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -603,7 +655,7 @@ impl P2PService {
                                             self.connection_filter.ban_ip(&addr);
                                         }
                                     }
-                                    if self.swarm.disconnect_peer_id(peer).is_err() {
+                                    if !self.disconnect(peer, DisconnectReason::RateLimit) {
                                         debug!(peer = %peer, "disconnect_peer_id failed -- peer may already be gone");
                                     }
                                 }
@@ -851,7 +903,7 @@ impl P2PService {
                         };
 
                         self.peer_health.remove(&peer);
-                        if self.swarm.disconnect_peer_id(peer).is_err() {
+                        if !self.disconnect(peer, DisconnectReason::PingFailure) {
                             debug!(peer = %peer, "disconnect_peer_id after ping failure -- peer already gone");
                         }
                     }

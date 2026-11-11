@@ -122,6 +122,7 @@ struct TestPeer {
     addr: libp2p::Multiaddr,
     publisher: Arc<TokioEventBus>,
     subscriber: Arc<TokioEventBus>,
+    cancel: tokio_util::sync::CancellationToken,
     _dir: tempfile::TempDir,
 }
 
@@ -142,6 +143,7 @@ async fn spawn_peer() -> anyhow::Result<TestPeer> {
         .to_string();
     let (tx, rx) = oneshot::channel();
     let topology = Arc::new(TopologyManager::new(db.clone(), subscriber.clone(), None));
+    let cancel = tokio_util::sync::CancellationToken::new();
     let mut service = P2PService::new(
         &config,
         publisher.clone(),
@@ -151,7 +153,8 @@ async fn spawn_peer() -> anyhow::Result<TestPeer> {
         topology,
     )
     .await?
-    .with_bind_signal(tx);
+    .with_bind_signal(tx)
+    .with_cancel_token(cancel.clone());
     tokio::spawn(async move { service.run().await });
     let (peer_id, addr) = rx.await?;
     Ok(TestPeer {
@@ -159,6 +162,7 @@ async fn spawn_peer() -> anyhow::Result<TestPeer> {
         addr: addr.with(Protocol::P2p(peer_id)),
         publisher,
         subscriber,
+        cancel,
         _dir: dir,
     })
 }
@@ -231,6 +235,61 @@ async fn packets_survive_refused_duplicate_connections() -> anyhow::Result<()> {
     assert_eq!(
         received, PACKETS,
         "{received} of {PACKETS} packets reached B after duplicate connections were refused"
+    );
+    Ok(())
+}
+
+/// Counts `PeerConnected` and `PeerDisconnected` events for `peer` until
+/// `wait` passes.
+async fn link_events(
+    events: &mut tokio::sync::broadcast::Receiver<NoxEvent>,
+    peer: &str,
+    wait: Duration,
+) -> (usize, usize) {
+    let (mut up, mut down) = (0, 0);
+    let _ = tokio::time::timeout(wait, async {
+        loop {
+            match events.recv().await {
+                Ok(NoxEvent::PeerConnected { peer_id }) if peer_id == peer => up += 1,
+                Ok(NoxEvent::PeerDisconnected { peer_id }) if peer_id == peer => down += 1,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    })
+    .await;
+    (up, down)
+}
+
+/// Both sides dial each other, so A holds two connections to B. The link
+/// events describe the link, not each connection: one connect while both
+/// are open, one disconnect when B goes away.
+#[tokio::test]
+async fn two_connections_to_one_peer_give_one_link_event_each_way() -> anyhow::Result<()> {
+    let a = spawn_peer().await?;
+    let b = spawn_peer().await?;
+    let b_id = b.peer_id.to_string();
+    let mut a_events = a.subscriber.subscribe();
+
+    a.publisher.publish(registered(&b, "0xNODE_B"))?;
+    let (up, _) = link_events(&mut a_events, &b_id, Duration::from_secs(2)).await;
+    assert_eq!(up, 1, "A should report B connected once after dialing it");
+
+    // B dials A as well: a second connection on A, the same link.
+    b.publisher.publish(registered(&a, "0xNODE_A"))?;
+    let (up, down) = link_events(&mut a_events, &b_id, Duration::from_secs(2)).await;
+    assert_eq!(
+        (up, down),
+        (0, 0),
+        "a second connection to B is not a link change"
+    );
+
+    b.cancel.cancel();
+    let (up, down) = link_events(&mut a_events, &b_id, Duration::from_secs(5)).await;
+    assert_eq!(
+        (up, down),
+        (0, 1),
+        "A should report B gone once when both connections close"
     );
     Ok(())
 }
