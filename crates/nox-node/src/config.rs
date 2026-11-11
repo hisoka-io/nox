@@ -348,6 +348,8 @@ impl Default for RelayerConfig {
             replay_window: 3600,
             bloom_capacity: 100_000,
             bloom_persist_interval_secs: default_bloom_persist_interval_secs(),
+            // Reference default. The Hisoka testnet fleet sets 40 in its config
+            // (run-nox templates); the default stays at 500 for new deployments.
             mix_delay_ms: 500.0,
             cover_traffic_rate: 0.05,
             drop_traffic_rate: 0.05,
