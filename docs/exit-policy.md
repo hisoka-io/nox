@@ -2,7 +2,7 @@
 
 An exit is the last hop of a Nox route. It turns a client's request into a connection to the public internet or
 to Ethereum, so the services a client calls see the exit's address. This page states what a Nox exit relays,
-what it refuses, the limits it applies and how to report abuse. It describes the node at `v0.4.0-rc.12` with the
+what it refuses, the limits it applies and how to report abuse. It describes the node at `v0.4.0-rc.13` with the
 exit template in [run-nox](https://github.com/hisoka-io/run-nox) (`configs/exit.toml`). The 10 testnet nodes,
 including the three exits, are run by the Hisoka team today; operator onboarding is open with a public kit, and
 outside exits follow this policy.
