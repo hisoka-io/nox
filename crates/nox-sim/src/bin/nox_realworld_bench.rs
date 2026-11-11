@@ -408,6 +408,7 @@ fn create_mixnet_client(
         default_fec_ratio: 0.3,
         // Fast polling for benchmarks -- 500ms default adds up to 250ms avg latency
         http_poll_interval_ms: 25,
+        allow_short_paths: false,
     };
 
     let transport = Arc::new(HttpPacketTransport::with_client(

@@ -306,7 +306,7 @@ impl P2PService {
                     }
                 }
                 _ = cleanup_interval.tick() => {
-                    self.rate_limiter.cleanup_inactive(Duration::from_mins(10));
+                    self.rate_limiter.cleanup_inactive();
                     self.connection_filter.cleanup_expired();
                     let ttl = self.session_ttl;
                     self.session_cache.retain(|_, state| state.created_at.elapsed() < ttl);
@@ -1225,7 +1225,7 @@ fn load_or_generate_p2p_key(identity_path: &str) -> Result<identity::Keypair, In
 
 #[cfg(test)]
 mod tests {
-    use crate::infra::{event_bus::TokioEventBus, storage::SledRepository};
+    use crate::infra::{event_bus::TokioEventBus, storage::NodeStore};
 
     use super::*;
     use nox_core::models::topology::RelayerNode;
@@ -1234,7 +1234,7 @@ mod tests {
     #[tokio::test]
     async fn test_p2p_service_initialization() {
         let dir = tempdir().unwrap();
-        let db = Arc::new(SledRepository::new(dir.path()).unwrap());
+        let db = Arc::new(NodeStore::new(dir.path()).unwrap());
         let bus = TokioEventBus::new(10);
         let pub_bus = Arc::new(bus.clone());
         let sub_bus = Arc::new(bus.clone());
@@ -1259,7 +1259,7 @@ mod tests {
     #[tokio::test]
     async fn test_bootstrap_logic() {
         let dir = tempdir().unwrap();
-        let db = Arc::new(SledRepository::new(dir.path()).unwrap());
+        let db = Arc::new(NodeStore::new(dir.path()).unwrap());
 
         let peer_node = RelayerNode::new(
             "0x123".into(),

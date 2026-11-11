@@ -12,7 +12,7 @@ use nox_core::{IEventPublisher, IEventSubscriber, NoxEvent};
 use nox_node::network::service::P2PService;
 use nox_node::services::network_manager::TopologyManager;
 use nox_node::telemetry::metrics::MetricsService;
-use nox_node::{NoxConfig, SledRepository, TokioEventBus};
+use nox_node::{NodeStore, NoxConfig, TokioEventBus};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -35,7 +35,7 @@ struct Node {
 
 async fn start(max_concurrent_streams: usize) -> Node {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = Arc::new(SledRepository::new(dir.path()).expect("db"));
+    let db = Arc::new(NodeStore::new(dir.path()).expect("db"));
     let bus = TokioEventBus::new(4096);
     let publisher: Arc<dyn IEventPublisher> = Arc::new(bus.clone());
     let subscriber: Arc<dyn IEventSubscriber> = Arc::new(bus.clone());

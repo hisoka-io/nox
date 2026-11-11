@@ -287,7 +287,7 @@ impl NetworkBehaviour for AdmissionGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infra::{event_bus::TokioEventBus, storage::SledRepository};
+    use crate::infra::{event_bus::TokioEventBus, storage::NodeStore};
     use crate::services::network_manager::RegistryProfile;
     use nox_core::IEventSubscriber;
 
@@ -300,7 +300,7 @@ mod tests {
     }
 
     async fn topology_with_member(dir: &tempfile::TempDir) -> Arc<TopologyManager> {
-        let storage = Arc::new(SledRepository::new(dir.path()).expect("storage"));
+        let storage = Arc::new(NodeStore::new(dir.path()).expect("storage"));
         let bus = Arc::new(TokioEventBus::new(8));
         let subscriber: Arc<dyn IEventSubscriber> = bus;
         let topology = Arc::new(TopologyManager::new(storage, subscriber, None));

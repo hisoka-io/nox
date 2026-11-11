@@ -14,9 +14,9 @@ dev-node = []
 hop-metrics = ["nox-crypto/hop-metrics"]
 
 [dependencies]
-nox-core = { path = "../nox-core", version = "0.4.0-rc.12" }
+nox-core = { path = "../nox-core", version = "0.4.0-rc.13" }
 
-nox-crypto = { path = "../nox-crypto", version = "0.4.0-rc.12" }
+nox-crypto = { path = "../nox-crypto", version = "0.4.0-rc.13" }
 
 tokio = { version = "1.36", features = ["full", "tracing"] }
 futures = "0.3"
@@ -40,6 +40,7 @@ zeroize = { workspace = true }
 alloy = { workspace = true }
 libp2p = { version = "0.53", features = ["tcp", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros", "tokio", "cbor"] }
 sled = "0.34"
+redb = "4.3"
 prometheus-client = "0.22"
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["cors"] }

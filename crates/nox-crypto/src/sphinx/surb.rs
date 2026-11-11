@@ -126,6 +126,7 @@ impl Surb {
         if path.is_empty() {
             return Err(SurbError::EmptyPath);
         }
+        super::check_path_len(path.len())?;
 
         for (i, hop) in path.iter().enumerate() {
             if hop.address.is_empty() {
@@ -481,6 +482,22 @@ mod tests {
         assert_eq!(recovery.payload_keys.k2, surb.payload_keys.k2);
         assert_eq!(recovery.payload_keys.k3, surb.payload_keys.k3);
         assert_eq!(recovery.payload_keys.k4, surb.payload_keys.k4);
+    }
+
+    #[test]
+    fn surb_path_length_is_bounded() {
+        use crate::sphinx::MAX_PATH_HOPS;
+        let id: [u8; 16] = rand::random();
+        let (longest, _) = generate_test_path(MAX_PATH_HOPS);
+        assert!(Surb::new(&longest, id, 0).is_ok());
+        assert!(Surb::new_v2(&longest, 0).is_ok());
+
+        let (too_long, _) = generate_test_path(MAX_PATH_HOPS + 1);
+        assert!(matches!(
+            Surb::new(&too_long, id, 0),
+            Err(SurbError::Sphinx(SphinxError::Serialization(_)))
+        ));
+        assert!(Surb::new_v2(&too_long, 0).is_err());
     }
 
     #[test]

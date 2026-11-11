@@ -621,7 +621,7 @@ fn parse_hex_key(hex: &str) -> anyhow::Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infra::{event_bus::TokioEventBus, storage::SledRepository};
+    use crate::infra::{event_bus::TokioEventBus, storage::NodeStore};
     use crate::services::network_manager::RegistryProfile;
     use libp2p::PeerId;
     use nox_crypto::sphinx::{into_result, ProcessResult, SphinxHeader};
@@ -673,7 +673,7 @@ mod tests {
     #[tokio::test]
     async fn self_addressed_loop_returns_to_sender() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let storage = Arc::new(NodeStore::new(directory.path()).expect("storage"));
         let bus = TokioEventBus::new(64);
         let subscriber: Arc<dyn IEventSubscriber> = Arc::new(bus.clone());
         let publisher: Arc<dyn IEventPublisher> = Arc::new(bus.clone());
@@ -759,7 +759,7 @@ mod tests {
     #[tokio::test]
     async fn loop_cover_without_registry_identity_falls_back_to_exit_path() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage = Arc::new(SledRepository::new(directory.path()).expect("storage"));
+        let storage = Arc::new(NodeStore::new(directory.path()).expect("storage"));
         let bus = TokioEventBus::new(64);
         let subscriber: Arc<dyn IEventSubscriber> = Arc::new(bus.clone());
         let publisher: Arc<dyn IEventPublisher> = Arc::new(bus.clone());

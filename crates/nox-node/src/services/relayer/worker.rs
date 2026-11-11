@@ -607,4 +607,60 @@ mod tests {
         let result = mix_rx.try_recv();
         assert!(result.is_err(), "Corrupted packet should be dropped");
     }
+
+    /// Records current behaviour: the filter remembers a tag for one to two
+    /// replay windows (default `replay_window` 3600 s, so up to 2 h). A packet
+    /// captured and resent after two windows is processed again.
+    #[tokio::test]
+    async fn replayed_packet_after_two_hours_is_processed() {
+        use crate::infra::persistence::rotational_bloom::RotationalBloomFilter;
+
+        let window = Duration::from_secs(crate::config::NoxConfig::default().relayer.replay_window);
+        assert_eq!(window, Duration::from_hours(1));
+        let filter = Arc::new(RotationalBloomFilter::new(1000, 0.001, window));
+        let (sks, pks) = create_test_keys(1);
+        let (header, body) = exit_packet(pks[0]);
+
+        let run = |pid: &str| {
+            let filter = Arc::clone(&filter);
+            let packet = (header.clone(), body.clone(), pid.to_string());
+            let sk = sks[0].clone();
+            async move {
+                let (worker_tx, worker_rx) = bounded::<(SphinxHeader, Vec<u8>, PacketMeta)>(4);
+                let (mix_tx, mut mix_rx) = mpsc::channel::<MixMessage>(4);
+                let guard = ReplayGuard {
+                    db: filter,
+                    window_secs: window.as_secs(),
+                };
+                let worker = WorkerStage::new(
+                    worker_rx,
+                    mix_tx,
+                    Arc::new(sk),
+                    guard,
+                    Arc::new(PoissonMixStrategy::new(1.0)),
+                    MetricsService::new(),
+                );
+                worker_tx
+                    .send((packet.0, packet.1, PacketMeta::local(packet.2)))
+                    .await
+                    .unwrap();
+                drop(worker_tx);
+                worker.run().await;
+                mix_rx.try_recv().ok().map(|m| m.packet_id)
+            }
+        };
+
+        assert_eq!(run("captured").await.as_deref(), Some("captured"));
+        assert_eq!(run("replay_now").await, None);
+
+        filter.elapse_for_test(window).await;
+        assert_eq!(run("replay_1h").await, None, "dropped within two windows");
+
+        filter.elapse_for_test(window).await;
+        assert_eq!(
+            run("replay_2h").await.as_deref(),
+            Some("replay_2h"),
+            "after two windows the tag has left the filter"
+        );
+    }
 }

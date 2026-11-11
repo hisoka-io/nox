@@ -3,7 +3,7 @@ use nox_core::{IEventPublisher, IEventSubscriber, NoxEvent};
 use nox_node::config::PeerAdmissionMode;
 use nox_node::network::service::P2PService;
 use nox_node::services::network_manager::{RegistryProfile, TopologyManager};
-use nox_node::{NoxConfig, SledRepository, TokioEventBus};
+use nox_node::{NodeStore, NoxConfig, TokioEventBus};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::{tempdir, TempDir};
@@ -19,7 +19,7 @@ struct Node {
 
 async fn start_node() -> anyhow::Result<Node> {
     let dir = tempdir()?;
-    let db = Arc::new(SledRepository::new(dir.path())?);
+    let db = Arc::new(NodeStore::new(dir.path())?);
     let bus = TokioEventBus::new(100);
     let publisher = Arc::new(bus.clone());
     let subscriber = Arc::new(bus.clone());

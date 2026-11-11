@@ -4,8 +4,10 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{exponential_buckets, Histogram};
 use prometheus_client::registry::Registry;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
+
+use super::quantile::QuantileHistogram;
 
 /// Exit dispatch lanes, used as the `lane` label.
 pub const EXIT_LANES: [&str; 5] = ["paid", "quote", "proxy", "control", "tunnel"];
@@ -84,6 +86,7 @@ pub struct MetricsService {
     pub p2p_outbound_dropped_total: Family<Vec<(String, String)>, Counter>,
     pub replay_checks_total: Family<Vec<(String, String)>, Counter>,
     pub replay_bloom_rotations_total: Counter,
+    pub replay_bloom_fill_ratio: Gauge<f64, AtomicU64>,
     pub event_bus_lag_total: Counter,
     pub event_bus_events_total: Family<Vec<(String, String)>, Counter>,
     pub event_bus_publish_errors_total: Family<Vec<(String, String)>, Counter>,
@@ -114,8 +117,8 @@ pub struct MetricsService {
     pub storage_degraded: Gauge<i64, AtomicI64>,
     pub storage_size_on_disk_bytes: Gauge<i64, AtomicI64>,
     pub storage_records: Family<Vec<(String, String)>, Gauge<i64, AtomicI64>>,
-    pub storage_blob_files: Gauge<i64, AtomicI64>,
-    pub storage_blob_bytes: Gauge<i64, AtomicI64>,
+    pub storage_stored_bytes: Gauge<i64, AtomicI64>,
+    pub storage_fragmented_bytes: Gauge<i64, AtomicI64>,
     pub storage_retention_total: Family<Vec<(String, String)>, Counter>,
     pub storage_maintenance_errors_total: Counter,
     pub exit_payloads_dropped_total: Family<Vec<(String, String)>, Counter>,
@@ -129,7 +132,7 @@ pub struct MetricsService {
     pub cover_loop_returned_total: Family<Vec<(String, String)>, Counter>,
     pub cover_loop_lost_total: Family<Vec<(String, String)>, Counter>,
     pub cover_loop_outcomes_total: Family<Vec<(String, String)>, Counter>,
-    pub cover_loop_rtt_seconds: Histogram,
+    pub cover_loop_rtt_seconds: QuantileHistogram,
     pub p2p_admission_total: Family<Vec<(String, String)>, Counter>,
     pub topology_reconcile_total: Family<Vec<(String, String)>, Counter>,
     pub topology_membership_verified: Gauge<i64, AtomicI64>,
@@ -421,6 +424,13 @@ impl MetricsService {
             replay_bloom_rotations_total.clone(),
         );
 
+        let replay_bloom_fill_ratio = Gauge::<f64, AtomicU64>::default();
+        registry.register(
+            "nox_replay_bloom_fill_ratio",
+            "Share of set bits in the active replay filter",
+            replay_bloom_fill_ratio.clone(),
+        );
+
         let event_bus_lag_total = Counter::default();
         registry.register(
             "nox_event_bus_lag_total",
@@ -622,7 +632,7 @@ impl MetricsService {
         let storage_size_on_disk_bytes = Gauge::<i64, AtomicI64>::default();
         registry.register(
             "nox_storage_size_on_disk_bytes",
-            "Bytes the sled database occupies on disk, log file plus blob files",
+            "Bytes the database file occupies on disk",
             storage_size_on_disk_bytes.clone(),
         );
 
@@ -633,18 +643,18 @@ impl MetricsService {
             storage_records.clone(),
         );
 
-        let storage_blob_files = Gauge::<i64, AtomicI64>::default();
+        let storage_stored_bytes = Gauge::<i64, AtomicI64>::default();
         registry.register(
-            "nox_storage_blob_files",
-            "Blob files in the sled blobs directory",
-            storage_blob_files.clone(),
+            "nox_storage_stored_bytes",
+            "Bytes of live keys and values in the database",
+            storage_stored_bytes.clone(),
         );
 
-        let storage_blob_bytes = Gauge::<i64, AtomicI64>::default();
+        let storage_fragmented_bytes = Gauge::<i64, AtomicI64>::default();
         registry.register(
-            "nox_storage_blob_bytes",
-            "Bytes in the sled blobs directory; growth without matching records points at leaked blobs (nox db compact)",
-            storage_blob_bytes.clone(),
+            "nox_storage_fragmented_bytes",
+            "Free bytes inside the database file; reused by later writes, returned to the filesystem by compaction",
+            storage_fragmented_bytes.clone(),
         );
 
         let storage_retention_total = Family::<Vec<(String, String)>, Counter>::default();
@@ -732,11 +742,11 @@ impl MetricsService {
             cover_loop_outcomes_total.clone(),
         );
 
-        let cover_loop_rtt_seconds = Histogram::new(exponential_buckets(0.05, 2.0, 12));
+        let cover_loop_rtt_seconds = QuantileHistogram::new(exponential_buckets(0.05, 2.0, 12));
         registry.register(
             "nox_cover_loop_rtt_seconds",
             "Round-trip time of returned loop cover packets",
-            cover_loop_rtt_seconds.clone(),
+            cover_loop_rtt_seconds.histogram(),
         );
 
         let p2p_admission_total = Family::<Vec<(String, String)>, Counter>::default();
@@ -962,6 +972,7 @@ impl MetricsService {
             p2p_outbound_dropped_total,
             replay_checks_total,
             replay_bloom_rotations_total,
+            replay_bloom_fill_ratio,
             event_bus_lag_total,
             event_bus_events_total,
             event_bus_publish_errors_total,
@@ -990,8 +1001,8 @@ impl MetricsService {
             storage_degraded,
             storage_size_on_disk_bytes,
             storage_records,
-            storage_blob_files,
-            storage_blob_bytes,
+            storage_stored_bytes,
+            storage_fragmented_bytes,
             storage_retention_total,
             storage_maintenance_errors_total,
             exit_payloads_dropped_total,
@@ -1508,6 +1519,18 @@ impl MetricsService {
             fc0(&self.event_bus_publish_errors_total).into(),
         );
 
+        // Loop cover round trip, in milliseconds, estimated from the
+        // `nox_cover_loop_rtt_seconds` buckets. Absent until a loop returns.
+        for (key, q) in [
+            ("latencyP50", 0.50),
+            ("latencyP95", 0.95),
+            ("latencyP99", 0.99),
+        ] {
+            if let Some(secs) = self.cover_loop_rtt_seconds.quantile(q) {
+                m.insert(key.into(), (secs * 1000.0).into());
+            }
+        }
+
         m.insert("uptimeSeconds".into(), self.uptime_seconds.get().into());
         m.insert("healthStatus".into(), self.health_status.get().into());
         m.insert(
@@ -1663,5 +1686,31 @@ mod tests {
             .iter()
             .filter(|key| key.starts_with("tunnel"))
             .all(|key| !key.contains("Bytes") && !key.contains("Parts")));
+    }
+
+    #[test]
+    fn json_reports_loop_rtt_percentiles_in_ms() {
+        let metrics = MetricsService::new();
+        let projection = metrics.to_json();
+        assert!(projection.get("latencyP50").is_none());
+
+        for _ in 0..90 {
+            metrics.cover_loop_rtt_seconds.observe(0.08);
+        }
+        for _ in 0..10 {
+            metrics.cover_loop_rtt_seconds.observe(0.3);
+        }
+        let projection = metrics.to_json();
+        let p50 = projection["latencyP50"].as_f64().expect("p50");
+        let p95 = projection["latencyP95"].as_f64().expect("p95");
+        let p99 = projection["latencyP99"].as_f64().expect("p99");
+        assert!((50.0..=100.0).contains(&p50), "p50 {p50}");
+        assert!((200.0..=400.0).contains(&p95), "p95 {p95}");
+        assert!(p95 <= p99 && p99 <= 400.0, "p99 {p99}");
+
+        let mut encoded = String::new();
+        prometheus_client::encoding::text::encode(&mut encoded, &metrics.get_registry().lock())
+            .expect("encode");
+        assert!(encoded.contains("nox_cover_loop_rtt_seconds_count 100"));
     }
 }

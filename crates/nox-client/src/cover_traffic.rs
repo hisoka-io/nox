@@ -8,7 +8,6 @@ use nox_core::NoxEvent;
 use nox_crypto::sphinx::packet::PACKET_SIZE;
 use nox_crypto::sphinx::{build_multi_hop_packet, PathHop};
 use parking_lot::RwLock;
-use rand::seq::SliceRandom;
 use rand_distr::{Distribution, Exp};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -141,52 +140,9 @@ impl CoverTrafficController {
 
     fn select_route(&self) -> Result<Vec<PathHop>, String> {
         let topology = self.topology.read();
-        use nox_core::models::topology::layers_for_role;
-
-        let entries: Vec<_> = topology
-            .iter()
-            .filter(|n| layers_for_role(n.role).contains(&0))
-            .collect();
-        let mixes: Vec<_> = topology
-            .iter()
-            .filter(|n| layers_for_role(n.role).contains(&1))
-            .collect();
-        let exits: Vec<_> = topology
-            .iter()
-            .filter(|n| layers_for_role(n.role).contains(&2) && (n.role == 2 || n.role == 3))
-            .collect();
-
-        if entries.is_empty() || exits.is_empty() {
-            return Err("Insufficient topology for cover traffic".into());
-        }
-
         let mut rng = rand::rngs::OsRng;
-        let mut path = Vec::new();
-
-        let entry = entries
-            .choose(&mut rng)
-            .ok_or("No entry nodes after filter")?;
-        path.push(PathHop {
-            public_key: x25519_dalek::PublicKey::from(entry.public_key),
-            address: entry.address.clone(),
-        });
-
-        if let Some(mix) = mixes.choose(&mut rng) {
-            if mix.public_key != entry.public_key {
-                path.push(PathHop {
-                    public_key: x25519_dalek::PublicKey::from(mix.public_key),
-                    address: mix.address.clone(),
-                });
-            }
-        }
-
-        let exit = exits.choose(&mut rng).ok_or("No exit nodes after filter")?;
-        path.push(PathHop {
-            public_key: x25519_dalek::PublicKey::from(exit.public_key),
-            address: exit.address.clone(),
-        });
-
-        Ok(path)
+        crate::route::select_path(&topology, None, false, &mut rng)
+            .map_err(|e| format!("Insufficient topology for cover traffic: {e}"))
     }
 }
 

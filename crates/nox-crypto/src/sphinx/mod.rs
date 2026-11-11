@@ -57,6 +57,22 @@ pub const NONCE_SIZE: usize = 8;
 pub const HEADER_SIZE: usize = 32 + ROUTING_INFO_SIZE + MAC_SIZE + NONCE_SIZE;
 /// Per-hop routing info shift: Flag(1) + Len(1) + MAC(32) + Address(max ~90) = 124, rounded to 128.
 pub const SHIFT_SIZE: usize = 128;
+/// Longest path a header can carry: every hop but the last adds `SHIFT_SIZE`
+/// bytes of filler, which must fit in the routing info.
+pub const MAX_PATH_HOPS: usize = ROUTING_INFO_SIZE / SHIFT_SIZE + 1;
+
+/// Rejects an empty path or one longer than [`MAX_PATH_HOPS`].
+pub(crate) fn check_path_len(len: usize) -> Result<(), SphinxError> {
+    if len == 0 {
+        return Err(SphinxError::Serialization("Empty path".into()));
+    }
+    if len > MAX_PATH_HOPS {
+        return Err(SphinxError::Serialization(format!(
+            "Path has {len} hops, max {MAX_PATH_HOPS}"
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Error)]
 pub enum SphinxError {
@@ -593,9 +609,7 @@ pub fn build_multi_hop_packet(
     payload: &[u8],
     pow_difficulty: u32,
 ) -> Result<Vec<u8>, SphinxError> {
-    if path.is_empty() {
-        return Err(SphinxError::Serialization("Empty path".into()));
-    }
+    check_path_len(path.len())?;
 
     let mut rng = rand::rngs::OsRng;
 
@@ -711,6 +725,56 @@ pub fn build_multi_hop_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn keyed_path(n: usize) -> (Vec<X25519SecretKey>, Vec<PathHop>) {
+        let mut rng = rand::thread_rng();
+        let sks: Vec<X25519SecretKey> = (0..n)
+            .map(|_| X25519SecretKey::random_from_rng(&mut rng))
+            .collect();
+        let path = sks
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| PathHop {
+                public_key: X25519PublicKey::from(sk),
+                address: format!("node_{i}"),
+            })
+            .collect();
+        (sks, path)
+    }
+
+    #[test]
+    fn longest_path_is_processed_by_every_hop() {
+        let (sks, path) = keyed_path(MAX_PATH_HOPS);
+        let mut bytes = build_multi_hop_packet(&path, b"edge", 0).expect("build");
+        for (i, sk) in sks.iter().enumerate() {
+            let (header, body) = SphinxHeader::from_bytes(&bytes).expect("parse");
+            match into_result(header.process(sk, body.to_vec()).expect("process")) {
+                ProcessResult::Forward {
+                    next_hop,
+                    next_packet,
+                    processed_body,
+                    ..
+                } => {
+                    assert_eq!(next_hop, format!("node_{}", i + 1));
+                    bytes = next_packet.to_bytes(&processed_body);
+                }
+                ProcessResult::Exit { payload } => {
+                    assert_eq!(i, MAX_PATH_HOPS - 1, "exit at hop {i}");
+                    assert_eq!(&payload[..4], b"edge");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn path_longer_than_max_is_rejected() {
+        let (_, path) = keyed_path(MAX_PATH_HOPS + 1);
+        assert!(matches!(
+            build_multi_hop_packet(&path, b"x", 0),
+            Err(SphinxError::Serialization(_))
+        ));
+        assert!(build_multi_hop_packet(&[], b"x", 0).is_err());
+    }
 
     #[test]
     // #[ignore]
