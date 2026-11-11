@@ -38,9 +38,19 @@ impl IMixStrategy for PoissonMixStrategy {
             #[allow(clippy::expect_used)]
             Exp::new(0.01).expect("valid lambda")
         };
-        let delay_ms = exp.sample(&mut rng);
-        Duration::from_millis(delay_ms as u64)
+        delay_from_ms(exp.sample(&mut rng), 1.0 / self.lambda)
     }
+}
+
+/// Converts a sampled delay in milliseconds to a `Duration` without truncating
+/// to whole milliseconds, so draws below 1 ms stay non-zero. The timer that
+/// consumes the delay (`DelayQueue` in the mix stage) still fires on whole
+/// millisecond ticks. A sample that is not a finite non-negative number falls
+/// back to the configured mean.
+fn delay_from_ms(delay_ms: f64, mean_ms: f64) -> Duration {
+    Duration::try_from_secs_f64(delay_ms / 1000.0)
+        .or_else(|_| Duration::try_from_secs_f64(mean_ms / 1000.0))
+        .unwrap_or(Duration::ZERO)
 }
 
 /// Zero-delay strategy for benchmarking only. Destroys timing anonymity.
@@ -68,12 +78,46 @@ mod tests {
     #[test]
     fn test_poisson_delay_mean_in_range() {
         let strategy = PoissonMixStrategy::new(100.0);
-        let total: u128 = (0..2000).map(|_| strategy.get_delay().as_millis()).sum();
-        let mean = total / 2000;
+        let total: f64 = (0..2000)
+            .map(|_| strategy.get_delay().as_secs_f64() * 1000.0)
+            .sum();
+        let mean = total / 2000.0;
         assert!(
-            (50..=250).contains(&mean),
+            (50.0..=250.0).contains(&mean),
             "mean {mean}ms outside expected 50-250ms for 100ms Poisson"
         );
+    }
+
+    #[test]
+    fn test_sub_millisecond_draw_is_kept() {
+        assert_eq!(delay_from_ms(0.4, 40.0), Duration::from_micros(400));
+        assert_eq!(delay_from_ms(12.5, 40.0), Duration::from_micros(12_500));
+        assert_eq!(delay_from_ms(0.0, 40.0), Duration::ZERO);
+    }
+
+    #[test]
+    fn test_invalid_draw_falls_back_to_mean() {
+        assert_eq!(delay_from_ms(f64::NAN, 40.0), Duration::from_millis(40));
+        assert_eq!(delay_from_ms(-1.0, 40.0), Duration::from_millis(40));
+        assert_eq!(
+            delay_from_ms(f64::INFINITY, 40.0),
+            Duration::from_millis(40)
+        );
+    }
+
+    #[test]
+    fn test_no_zero_delays_at_fleet_mean() {
+        // With whole-ms truncation about 2.5% of draws at a 40 ms mean became 0.
+        let strategy = PoissonMixStrategy::new(40.0);
+        let draws = 20_000;
+        let zero = (0..draws)
+            .filter(|_| strategy.get_delay() == Duration::ZERO)
+            .count();
+        let sub_ms = (0..draws)
+            .filter(|_| strategy.get_delay() < Duration::from_millis(1))
+            .count();
+        assert_eq!(zero, 0, "{zero} of {draws} draws were exactly zero");
+        assert!(sub_ms > 0, "expected some sub-millisecond draws");
     }
 
     #[test]
