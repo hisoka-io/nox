@@ -117,7 +117,7 @@ Three reputation tiers: Unknown, Trusted, Penalized.
 | `replay_window` | `3600` | Replay filter rotation window (seconds) |
 | `bloom_capacity` | `100000` | Replay filter capacity per window |
 | `bloom_persist_interval_secs` | `60` | How often the replay filter is written to disk while it changes (also written on rotation and graceful shutdown; `0` = only those) |
-| `mix_delay_ms` | `500.0` | Average Poisson delay (ms) |
+| `mix_delay_ms` | `500.0` | Average Poisson delay per hop (ms). The Hisoka testnet fleet runs `40.0`, the value in the run-nox templates; benchmarks and the paper also use evaluation settings such as 100 |
 | `cover_traffic_rate` | `0.05` | Loop cover packets/sec |
 | `drop_traffic_rate` | `0.05` | Drop cover packets/sec |
 | `cover_loop_timeout_secs` | `60` | A loop cover packet not back within this time counts as lost |
