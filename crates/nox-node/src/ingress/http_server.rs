@@ -252,6 +252,24 @@ fn ws_message_surb_ids(msg: &serde_json::Value) -> Vec<SurbId> {
     )
 }
 
+/// Adds `ids` to a connection's subscriptions up to `cap` entries. Returns how
+/// many new IDs did not fit.
+fn add_ws_subscriptions(
+    subscribed: &mut HashSet<SurbId>,
+    ids: impl IntoIterator<Item = SurbId>,
+    cap: usize,
+) -> u64 {
+    let mut rejected = 0;
+    for id in ids {
+        if subscribed.len() < cap || subscribed.contains(&id) {
+            subscribed.insert(id);
+        } else {
+            rejected += 1;
+        }
+    }
+    rejected
+}
+
 /// `POST /api/v1/responses/claim` -- Claim SURB responses by SURB ID.
 ///
 /// The client sends a JSON body with `surb_ids` -- the hex-encoded SURB IDs
@@ -580,7 +598,12 @@ async fn ws_handler(mut socket: WebSocket, state: Arc<IngressState>) {
 
                             match msg_type {
                                 "subscribe" => {
-                                    subscribed.extend(ids);
+                                    let cap = state.claim.ws_max_subscriptions;
+                                    let rejected = add_ws_subscriptions(&mut subscribed, ids, cap);
+                                    if rejected > 0 {
+                                        debug!(rejected, cap, "WebSocket subscription cap reached");
+                                        count_claim_event(&state, "ws_subscribe_capped", rejected);
+                                    }
                                 }
                                 "unsubscribe" => {
                                     for id in &ids {
@@ -1476,6 +1499,18 @@ mod tests {
         assert_eq!(headers[CLAIM_VERSION_HEADER], "2");
         assert!(String::from_utf8_lossy(&body).contains("ack[0]"));
         assert_eq!(state.response_buffer.len(), 1);
+    }
+
+    #[test]
+    fn test_ws_subscriptions_stop_at_the_cap() {
+        let id = |n: u8| -> SurbId { [n; 16] };
+        let mut subscribed = HashSet::new();
+        assert_eq!(add_ws_subscriptions(&mut subscribed, (0..3).map(id), 4), 0);
+        // Re-subscribing a known ID never counts against the cap.
+        assert_eq!(add_ws_subscriptions(&mut subscribed, (0..6).map(id), 4), 2);
+        assert_eq!(subscribed.len(), 4);
+        assert_eq!(add_ws_subscriptions(&mut subscribed, [id(0)], 4), 0);
+        assert_eq!(subscribed.len(), 4);
     }
 
     fn wait_state(wait_max_ms: u64, slots: usize) -> Arc<IngressState> {

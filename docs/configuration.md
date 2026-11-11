@@ -101,6 +101,7 @@ Three reputation tiers: Unknown, Trusted, Penalized.
 | `burst_penalized` / `rate_penalized` | 10 / 25 | Penalized peers |
 | `violations_before_disconnect` | `5` | Strikes before disconnect |
 | `trust_promotion_time_secs` | `3600` | Time to promote to trusted |
+| `inactive_peer_ttl_secs` | `600` | Idle time before a peer's limiter state is dropped; peers with recent violations keep it |
 
 ### `[network.connection_filter]`
 
@@ -160,6 +161,7 @@ host keeps resolving to addresses it was pinned to.
 | `claim_retain_grace_ms` | `20000` | How long a reply returned by a retaining claim stays re-claimable after its first claim (claim protocol v2, [claim-api.md](claim-api.md)) |
 | `claim_wait_max_ms` | `20000` | Longest claim long-poll honoured; 0 answers claims at once |
 | `claim_wait_max_concurrent` | `256` | Claims that may long-poll at once |
+| `ws_max_subscriptions` | `65536` | Reply IDs one WebSocket connection may subscribe to; further IDs are ignored |
 
 ### `[exit_workers]` (exit node)
 

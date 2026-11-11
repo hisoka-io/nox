@@ -176,6 +176,7 @@ rate_penalized = 25
 violations_before_disconnect = 5
 violation_window_secs = 60
 trust_promotion_time_secs = 3600  # 1 hour of good behavior
+inactive_peer_ttl_secs = 600      # forget idle peers without recent violations
 
 # Anti-Sybil subnet filtering
 [network.connection_filter]
@@ -251,6 +252,8 @@ claim_retain_grace_ms = 20000
 claim_wait_max_ms = 20000
 # Claims that may long-poll at once; beyond it a claim answers at once.
 claim_wait_max_concurrent = 256
+# Reply IDs one WebSocket connection may subscribe to; further IDs are ignored.
+ws_max_subscriptions = 65536
 
 # Exit dispatch lanes: each payload type has its own queue and concurrency limit.
 # Payloads beyond queue_capacity are dropped and counted in

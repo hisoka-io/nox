@@ -130,6 +130,9 @@ impl ClaimRequest {
     }
 }
 
+/// Default for `ingress.ws_max_subscriptions`.
+pub const DEFAULT_WS_MAX_SUBSCRIPTIONS: usize = 65_536;
+
 /// Long-poll limits shared by every claim.
 #[derive(Debug, Clone)]
 pub struct ClaimSettings {
@@ -137,6 +140,8 @@ pub struct ClaimSettings {
     pub wait_max: Duration,
     /// One permit per claim that is long-polling.
     pub wait_slots: Arc<Semaphore>,
+    /// Most reply IDs one WebSocket connection may subscribe to.
+    pub ws_max_subscriptions: usize,
 }
 
 impl ClaimSettings {
@@ -145,7 +150,15 @@ impl ClaimSettings {
         Self {
             wait_max,
             wait_slots: Arc::new(Semaphore::new(max_concurrent_waits)),
+            ws_max_subscriptions: DEFAULT_WS_MAX_SUBSCRIPTIONS,
         }
+    }
+
+    /// Sets the per-connection WebSocket subscription cap.
+    #[must_use]
+    pub fn with_ws_max_subscriptions(mut self, max: usize) -> Self {
+        self.ws_max_subscriptions = max;
+        self
     }
 }
 

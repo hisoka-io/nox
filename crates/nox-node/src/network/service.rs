@@ -306,7 +306,7 @@ impl P2PService {
                     }
                 }
                 _ = cleanup_interval.tick() => {
-                    self.rate_limiter.cleanup_inactive(Duration::from_mins(10));
+                    self.rate_limiter.cleanup_inactive();
                     self.connection_filter.cleanup_expired();
                     let ttl = self.session_ttl;
                     self.session_cache.retain(|_, state| state.created_at.elapsed() < ttl);
