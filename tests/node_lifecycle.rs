@@ -43,8 +43,26 @@ async fn spawn_topology_manager(
     ));
     let mgr_clone = mgr.clone();
     tokio::spawn(async move { mgr_clone.run().await });
-    tokio::time::sleep(Duration::from_millis(15)).await;
+    // The manager subscribes inside `run`; events published before that are lost.
+    let publisher: Arc<dyn IEventPublisher> = bus.clone();
+    wait_for("topology manager subscribed", || {
+        publisher
+            .publish(NoxEvent::NodeStarted { timestamp: 0 })
+            .is_ok_and(|receivers| receivers > 0)
+    })
+    .await;
     mgr
+}
+
+/// Polls `cond` until it holds; fails the test after 5 s.
+async fn wait_for(what: &str, cond: impl Fn() -> bool) {
+    let polled = tokio::time::timeout(Duration::from_secs(5), async {
+        while !cond() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(polled.is_ok(), "timed out waiting for: {what}");
 }
 
 /// Event bus + topology manager accept node registrations after startup.
@@ -69,7 +87,10 @@ async fn test_subsystem_starts_and_reaches_ready() {
         .publish(registration_event("0xCC", 2))
         .expect("pub");
 
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    wait_for("3 nodes, 1 exit", || {
+        mgr.get_all_nodes().len() == 3 && mgr.get_nodes_in_layer(2).len() == 1
+    })
+    .await;
 
     assert_eq!(mgr.get_all_nodes().len(), 3, "all 3 nodes registered");
     assert_eq!(mgr.get_nodes_in_layer(0).len(), 3, "all 3 in layer 0");
@@ -119,8 +140,7 @@ async fn test_topology_survives_restart() {
         .publish(registration_event("0xC1", 2))
         .expect("pub");
 
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    assert_eq!(mgr1.get_all_nodes().len(), 3);
+    wait_for("3 nodes", || mgr1.get_all_nodes().len() == 3).await;
     let fingerprint1 = mgr1.get_current_fingerprint();
 
     cancel1.cancel();
@@ -135,7 +155,7 @@ async fn test_topology_survives_restart() {
     let snapshot = mgr1.get_all_nodes();
     mgr2.hydrate_from_snapshot(snapshot).await;
 
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for("3 nodes after restart", || mgr2.get_all_nodes().len() == 3).await;
 
     assert_eq!(mgr2.get_all_nodes().len(), 3, "3 nodes after restart");
     assert_eq!(
@@ -177,8 +197,7 @@ async fn test_add_remove_cycle() {
         .publish(registration_event("0x04", 2))
         .expect("pub");
 
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    assert_eq!(mgr.get_all_nodes().len(), 5);
+    wait_for("5 nodes", || mgr.get_all_nodes().len() == 5).await;
 
     publisher
         .publish(NoxEvent::RelayerRemoved {
@@ -191,8 +210,7 @@ async fn test_add_remove_cycle() {
         })
         .expect("pub");
 
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    assert_eq!(mgr.get_all_nodes().len(), 3, "2 removed, 3 remain");
+    wait_for("2 removed, 3 remain", || mgr.get_all_nodes().len() == 3).await;
 
     assert!(mgr.lookup_by_address("0x00").is_none(), "0x00 removed");
     assert!(mgr.lookup_by_address("0x02").is_none(), "0x02 removed");
@@ -217,9 +235,8 @@ async fn test_re_registration_same_role_no_duplicate() {
     publisher
         .publish(registration_event("0xAA", 2))
         .expect("pub");
-    tokio::time::sleep(Duration::from_millis(15)).await;
+    wait_for("1 exit", || mgr.get_nodes_in_layer(2).len() == 1).await;
     assert_eq!(mgr.get_all_nodes().len(), 1);
-    assert_eq!(mgr.get_nodes_in_layer(2).len(), 1);
 
     let event = NoxEvent::RelayerRegistered {
         address: "0xAA".to_string(),
@@ -231,7 +248,11 @@ async fn test_re_registration_same_role_no_duplicate() {
         metadata_url: None,
     };
     publisher.publish(event).expect("pub");
-    tokio::time::sleep(Duration::from_millis(15)).await;
+    wait_for("new key applied", || {
+        mgr.lookup_by_address("0xAA")
+            .is_some_and(|node| node.sphinx_key == "0xNEW_KEY")
+    })
+    .await;
 
     assert_eq!(mgr.get_all_nodes().len(), 1, "no duplicate");
     assert_eq!(mgr.get_nodes_in_layer(2).len(), 1, "still 1 exit");
