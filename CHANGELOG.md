@@ -17,6 +17,19 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
   `nox_storage_stored_bytes` and `nox_storage_fragmented_bytes`.
 - Wire formats and stored record encodings are unchanged; the golden stored-outbox vector decodes as before.
 
+## [0.4.0-rc.12] - 2026-11-10
+
+### Upgrade notes
+
+- Upgrade one node at a time; configuration files from rc.11 load as they are. Wire formats, configuration keys and
+  stored records are unchanged; nodes on this build and rc.6 to rc.11 nodes interoperate.
+
+### Security
+
+- yamux 0.13.10 (remote panic on malformed frames; GHSA-vxx9-2994-q338, GHSA-4w32-2493-32g7).
+- Lockfile update moves futures and hyper off pin-utils, replaces the yanked keccak 0.1.5 and spin 0.9.8, and
+  picks up the openssl fixes (RUSTSEC-2026-0463, 0473 to 0479).
+
 ## [0.4.0-rc.11] - 2026-10-26
 
 ### Upgrade notes
