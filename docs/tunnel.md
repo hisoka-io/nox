@@ -110,7 +110,8 @@ Rejections carry a `TunnelRejectCodeV1`: `Malformed`, `Disabled`, `PortNotAllowe
 - Once the upstream closes, a tunnel closes after `closed_linger_ms` without a client request.
 - `http.allowed_domains` applies to the TLS server name. Hosts behind a shared CDN front are reached as
   the CDN routes them.
-- Opens are rate-limited exit-wide (`opens_per_sec`, `opens_burst`). When `max_sessions` is reached the
+- Opens are rate-limited exit-wide (`opens_per_sec`, `opens_burst`) and per destination host
+  (`[exit_limits]`, shared with the HTTP proxy). When `max_sessions` is reached the
   longest-idle tunnel with nothing in flight is closed to make room, or else the tunnel whose upstream
   has been silent longest, past `stall_evict_ms`; clients move to another tunnel exit on `SessionLimit`
   or `RateLimited`.
