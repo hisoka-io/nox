@@ -5,6 +5,13 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+### Added
+
+- Exit rate limits per destination host (HTTP proxy, tunnel opens, client-named RPC and broadcast URLs) and per
+  payment credential of a paid quote, in `[exit_limits]`, with `nox_exit_rate_limited_total{scope,service}`,
+  `nox_exit_rate_limit_tracked{scope}` and `nox_exit_rate_limit_untracked_total{scope}`. Defaults sit well above
+  testnet traffic.
+
 ## [0.4.0-rc.13] - 2026-11-11
 
 ### Upgrade notes

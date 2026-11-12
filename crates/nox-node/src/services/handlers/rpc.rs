@@ -51,6 +51,8 @@ pub struct RpcHandler {
     rate_limiter: Arc<RpcRateLimiter>,
     metrics: MetricsService,
     allow_private_ips: bool,
+    /// Per-destination rate limit on user-supplied RPC URLs.
+    destination_limiter: Option<Arc<crate::services::exit_limits::KeyedRateLimiter>>,
 }
 
 impl RpcHandler {
@@ -120,6 +122,7 @@ impl RpcHandler {
             rate_limiter,
             metrics,
             allow_private_ips: false,
+            destination_limiter: None,
         })
     }
 
@@ -145,6 +148,7 @@ impl RpcHandler {
             rate_limiter,
             metrics,
             allow_private_ips: false,
+            destination_limiter: None,
         })
     }
 
@@ -190,7 +194,19 @@ impl RpcHandler {
             rate_limiter,
             metrics,
             allow_private_ips: true,
+            destination_limiter: None,
         })
+    }
+
+    /// Limits requests to user-supplied RPC URLs per destination host with `limiter`
+    /// (shared with the HTTP proxy and tunnels). The exit's own provider is not limited here.
+    #[must_use]
+    pub fn with_destination_limiter(
+        mut self,
+        limiter: Option<Arc<crate::services::exit_limits::KeyedRateLimiter>>,
+    ) -> Self {
+        self.destination_limiter = limiter;
+        self
     }
 
     /// Metric label for `method`: the method itself when it is on the
@@ -201,6 +217,15 @@ impl RpcHandler {
         } else {
             OTHER_METHOD_LABEL.to_string()
         }
+    }
+
+    fn destination_refusal(
+        &self,
+        url: &str,
+    ) -> Option<crate::services::exit_limits::RateLimitExceeded> {
+        let limiter = self.destination_limiter.as_ref()?;
+        let key = crate::services::exit_limits::url_destination_key(url)?;
+        limiter.check(&key, "rpc").err()
     }
 
     pub async fn handle_rpc_request(
@@ -242,6 +267,27 @@ impl RpcHandler {
         };
 
         let result = if let Some(url) = rpc_url {
+            if let Some(refused) = self.destination_refusal(url) {
+                debug!(
+                    request_id = request_id,
+                    error = %refused,
+                    "User-supplied RPC URL refused by the destination rate limit"
+                );
+                self.metrics
+                    .rpc_requests_total
+                    .get_or_create(&vec![
+                        ("method".into(), self.method_label(method)),
+                        ("result".into(), "rate_limited".into()),
+                    ])
+                    .inc();
+                let response = RpcResponse {
+                    id: request_id,
+                    result: Err(refused.to_string()),
+                };
+                let response_bytes = bincode::serialize(&response)
+                    .map_err(|e| ServiceError::ProcessingFailed(e.to_string()))?;
+                return self.pack_and_return(request_id, &response_bytes, surbs);
+            }
             debug!(
                 request_id = request_id,
                 method = method,
@@ -1073,6 +1119,47 @@ mod tests {
             })
             .sum();
         assert_eq!(other_total, 50);
+    }
+
+    #[tokio::test]
+    async fn user_supplied_urls_are_limited_per_destination() {
+        let metrics = MetricsService::new();
+        let limits = crate::config::ExitLimitsConfig {
+            destination_per_sec: 1,
+            destination_burst: 1,
+            ..crate::config::ExitLimitsConfig::default()
+        };
+        let handler = simulation_handler(metrics.clone()).with_destination_limiter(
+            crate::services::exit_limits::KeyedRateLimiter::destination(&limits, &metrics),
+        );
+        for (index, url) in ["http://127.0.0.1:1/", "http://127.0.0.1:2/a"]
+            .into_iter()
+            .enumerate()
+        {
+            let _ = handler
+                .handle_rpc_request(index as u64, "eth_chainId", b"[]", Some(url), Vec::new())
+                .await;
+        }
+        let count = |result: &str| {
+            metrics
+                .rpc_requests_total
+                .get_or_create(&vec![
+                    ("method".into(), "eth_chainId".into()),
+                    ("result".into(), result.into()),
+                ])
+                .get()
+        };
+        assert_eq!(count("rate_limited"), 1, "same host, other port and path");
+        assert_eq!(
+            metrics
+                .exit_rate_limited_total
+                .get_or_create(&vec![
+                    ("scope".into(), "destination".into()),
+                    ("service".into(), "rpc".into()),
+                ])
+                .get(),
+            1
+        );
     }
 }
 

@@ -452,3 +452,104 @@ async fn paid_quote_is_signed_reserved_and_duplicate_payment_rejected() {
         }
     ));
 }
+
+#[tokio::test]
+async fn paid_quotes_are_limited_per_payment_credential() {
+    use nox_node::config::ExitLimitsConfig;
+    use nox_node::services::exit_limits::KeyedRateLimiter;
+
+    let price_server = mock_price_server().await;
+    let adapter = Address::with_last_byte(12);
+    let fee_asset = Address::with_last_byte(13);
+    let mut config = NoxConfig::default();
+    config.benchmark_mode = true;
+    config.chain_id = 31_337;
+    config.quote_ttl_secs = 30;
+    config.quote_network_fee_bps = 500;
+    config.quote_maximum_transaction_gas = 2_000_000;
+    config.quote_max_outstanding = 4;
+    config.quote_max_pending_sponsored_gas = 8_000_000;
+    config.quote_rolling_loss_limit_native = "100000000000000000".to_string();
+    config.quote_rolling_loss_window_secs = 3_600;
+    config.payment_adapters = vec![nox_node::config::PaymentAdapterConfig {
+        address: format!("{adapter:?}"),
+        fee_assets: vec![format!("{fee_asset:?}")],
+        maximum_payment_gas: 600_000,
+    }];
+    let metrics = MetricsService::new();
+    let limits = ExitLimitsConfig {
+        credential_per_min: 1,
+        credential_burst: 1,
+        ..ExitLimitsConfig::default()
+    };
+    let handler = make_handler(&price_server.uri())
+        .await
+        .with_quote_policy(&config)
+        .expect("quote policy")
+        .with_credential_limiter(KeyedRateLimiter::credential(&limits, &metrics));
+
+    // A request for another chain: refused by validation, after the credential check.
+    let request = PaidQuoteRequestV2 {
+        chain_id: 1,
+        entry_point: Address::with_last_byte(11).into_array(),
+        client_intent_id: [2; 32],
+        payment_adapter: adapter.into_array(),
+        payment_id: [4; 32],
+        fee_asset: fee_asset.into_array(),
+        payment_gas_limit: 500_000,
+        action_target: Address::with_last_byte(15).into_array(),
+        action_calldata_hash: [7; 32],
+        action_gas_limit: 700_000,
+        tracked_assets_hash: [8; 32],
+        maximum_transaction_gas: 1_600_000,
+        return_data_limit: 256,
+        valid_until_unix: 0,
+    };
+    let rejected_code = |outcome: &PaidQuoteOutcomeV2| match outcome {
+        PaidQuoteOutcomeV2::Rejected { code, .. } => *code,
+        PaidQuoteOutcomeV2::Issued { .. } => panic!("expected a rejection"),
+    };
+
+    let first = handler.handle_paid_quote_v2(request.clone()).await;
+    assert_ne!(
+        rejected_code(&first),
+        nox_core::PaidTransactionRejectionCodeV2::QuoteCapacityExceeded
+    );
+
+    let second = handler.handle_paid_quote_v2(request.clone()).await;
+    let PaidQuoteOutcomeV2::Rejected {
+        code,
+        retryable,
+        detail,
+    } = &second
+    else {
+        panic!("expected a rejection");
+    };
+    assert_eq!(
+        *code,
+        nox_core::PaidTransactionRejectionCodeV2::QuoteCapacityExceeded
+    );
+    assert!(*retryable);
+    assert!(detail.contains("payment credential"), "{detail}");
+    assert!(!detail.contains(&hex::encode([4u8; 32])), "{detail}");
+
+    let other_payment = PaidQuoteRequestV2 {
+        payment_id: [5; 32],
+        ..request
+    };
+    let third = handler.handle_paid_quote_v2(other_payment).await;
+    assert_ne!(
+        rejected_code(&third),
+        nox_core::PaidTransactionRejectionCodeV2::QuoteCapacityExceeded
+    );
+    assert_eq!(
+        metrics
+            .exit_rate_limited_total
+            .get_or_create(&vec![
+                ("scope".into(), "credential".into()),
+                ("service".into(), "quote".into()),
+            ])
+            .get(),
+        1
+    );
+}

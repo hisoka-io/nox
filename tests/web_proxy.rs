@@ -293,3 +293,73 @@ async fn test_truncation_for_large_response() {
 
     assert!(result.is_ok());
 }
+
+#[tokio::test]
+async fn http_requests_are_limited_per_destination() {
+    use nox_node::config::ExitLimitsConfig;
+    use nox_node::services::exit_limits::KeyedRateLimiter;
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/limited"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&mock_server)
+        .await;
+
+    let metrics = MetricsService::new();
+    let limits = ExitLimitsConfig {
+        destination_per_sec: 1,
+        destination_burst: 1,
+        ..ExitLimitsConfig::default()
+    };
+    let handler = HttpHandler::new(
+        HttpConfig {
+            allow_private_ips: true,
+            ..Default::default()
+        },
+        Arc::new(ResponsePacker::new()),
+        Arc::new(TokioEventBus::new(100)),
+        metrics.clone(),
+    )
+    .with_destination_limiter(KeyedRateLimiter::destination(&limits, &metrics));
+
+    let request = ServiceRequest::HttpRequest {
+        method: "GET".to_string(),
+        url: format!("{}/limited", mock_server.uri()),
+        headers: vec![],
+        body: vec![],
+    };
+    for request_id in [1_u64, 2] {
+        let surbs: Vec<Surb> = generate_test_surbs(2).into_iter().map(|(s, _)| s).collect();
+        let packed = handler
+            .handle_http_request(request_id, &request, surbs)
+            .await
+            .expect("both requests are answered");
+        assert!(!packed.packets.is_empty());
+    }
+
+    let count = |result: &str| {
+        metrics
+            .http_proxy_requests_total
+            .get_or_create(&vec![("result".into(), result.into())])
+            .get()
+    };
+    assert_eq!(count("success"), 1);
+    assert_eq!(count("rate_limited"), 1);
+    assert_eq!(
+        metrics
+            .exit_rate_limited_total
+            .get_or_create(&vec![
+                ("scope".into(), "destination".into()),
+                ("service".into(), "http".into()),
+            ])
+            .get(),
+        1
+    );
+    let received = mock_server.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        received.len(),
+        1,
+        "the refused request never reached upstream"
+    );
+}

@@ -515,6 +515,10 @@ impl NoxNode {
                 response_packer.clone(),
                 bus_publisher.clone(),
             );
+            let destination_limiter = crate::services::exit_limits::KeyedRateLimiter::destination(
+                &config.exit_limits,
+                &metrics_service,
+            );
             let http_handler = Arc::new(
                 crate::services::handlers::http::HttpHandler::new(
                     config.http.clone(),
@@ -522,7 +526,8 @@ impl NoxNode {
                     bus_publisher.clone(),
                     metrics_service.clone(),
                 )
-                .with_stash_remaining(stash),
+                .with_stash_remaining(stash)
+                .with_destination_limiter(destination_limiter.clone()),
             );
             crate::services::handlers::http::HttpHandler::spawn_upstream_warmer(&http_handler);
             let echo_handler = Arc::new(crate::services::handlers::echo::EchoHandler::new(
@@ -535,6 +540,7 @@ impl NoxNode {
                 response_packer.clone(),
                 bus_publisher.clone(),
                 shutdown_token.clone(),
+                destination_limiter.clone(),
             );
 
             let exit_service = if has_rpc {
@@ -544,7 +550,8 @@ impl NoxNode {
                     &config.eth_rpc_url,
                     metrics_service.clone(),
                 )
-                .map_err(|e| anyhow::anyhow!("Failed to create RPC handler: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("Failed to create RPC handler: {e}"))?
+                .with_destination_limiter(destination_limiter);
 
                 ExitService::simulation_with_rpc(
                     bus_subscriber.clone(),
@@ -612,6 +619,10 @@ impl NoxNode {
                 .with_metrics(metrics_service.clone()),
             );
 
+            let destination_limiter = crate::services::exit_limits::KeyedRateLimiter::destination(
+                &config.exit_limits,
+                &metrics_service,
+            );
             let mut eth_handler =
                 crate::services::handlers::ethereum::EthereumHandler::from_config(
                     executor.clone(),
@@ -627,7 +638,14 @@ impl NoxNode {
                     config.initial_fee_buffer_bps,
                     &config.nox_entry_point_address,
                 )?
-                .with_quote_policy(&config)?;
+                .with_quote_policy(&config)?
+                .with_credential_limiter(
+                    crate::services::exit_limits::KeyedRateLimiter::credential(
+                        &config.exit_limits,
+                        &metrics_service,
+                    ),
+                )
+                .with_destination_limiter(destination_limiter.clone());
 
             eth_handler.clear_tokens();
             for token in &config.tokens {
@@ -673,7 +691,8 @@ impl NoxNode {
                     bus_publisher.clone(),
                     metrics_service.clone(),
                 )
-                .with_stash_remaining(stash),
+                .with_stash_remaining(stash)
+                .with_destination_limiter(destination_limiter.clone()),
             );
             crate::services::handlers::http::HttpHandler::spawn_upstream_warmer(&http_handler);
             let echo_handler = Arc::new(crate::services::handlers::echo::EchoHandler::new(
@@ -686,6 +705,7 @@ impl NoxNode {
                 response_packer.clone(),
                 bus_publisher.clone(),
                 shutdown_token.clone(),
+                destination_limiter.clone(),
             );
             let rpc_handler = Arc::new(
                 crate::services::handlers::rpc::RpcHandler::new(
@@ -695,7 +715,8 @@ impl NoxNode {
                     &config.eth_rpc_url,
                     metrics_service.clone(),
                 )
-                .map_err(|e| anyhow::anyhow!("RPC handler init failed: {e}"))?,
+                .map_err(|e| anyhow::anyhow!("RPC handler init failed: {e}"))?
+                .with_destination_limiter(destination_limiter.clone()),
             );
 
             let exit_service = ExitService::with_all_handlers(
@@ -907,6 +928,7 @@ impl NoxNode {
         packer: Arc<crate::services::response_packer::ResponsePacker>,
         publisher: Arc<dyn IEventPublisher>,
         shutdown: CancellationToken,
+        destination_limiter: Option<Arc<crate::services::exit_limits::KeyedRateLimiter>>,
     ) -> Arc<crate::services::handlers::tunnel::TunnelHandler> {
         if config.tunnel.enabled {
             metrics.add_capability(nox_core::TUNNEL_V1_CAPABILITY);
@@ -916,14 +938,17 @@ impl NoxNode {
                 "End-to-end TLS tunnels enabled"
             );
         }
-        Arc::new(crate::services::handlers::tunnel::TunnelHandler::new(
-            config.tunnel.clone(),
-            &config.http,
-            packer,
-            publisher,
-            metrics.clone(),
-            shutdown,
-        ))
+        Arc::new(
+            crate::services::handlers::tunnel::TunnelHandler::new(
+                config.tunnel.clone(),
+                &config.http,
+                packer,
+                publisher,
+                metrics.clone(),
+                shutdown,
+            )
+            .with_destination_limiter(destination_limiter),
+        )
     }
 
     /// Imports a sled database if one is present, then compacts `nox.redb`

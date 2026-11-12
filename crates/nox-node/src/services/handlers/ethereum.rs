@@ -148,6 +148,10 @@ pub struct EthereumHandler {
     nox_entry_point_address: Address,
     quote_policy: Option<QuotePolicy>,
     last_quote_prune_unix: AtomicU64,
+    /// Per-credential rate limit on paid quote requests.
+    credential_limiter: Option<Arc<crate::services::exit_limits::KeyedRateLimiter>>,
+    /// Per-destination rate limit on client-named broadcast RPC URLs.
+    destination_limiter: Option<Arc<crate::services::exit_limits::KeyedRateLimiter>>,
 }
 
 impl EthereumHandler {
@@ -175,7 +179,31 @@ impl EthereumHandler {
             nox_entry_point_address: Address::ZERO,
             quote_policy: None,
             last_quote_prune_unix: AtomicU64::new(0),
+            credential_limiter: None,
+            destination_limiter: None,
         }
+    }
+
+    /// Limits broadcasts to client-named RPC URLs per destination host with `limiter`
+    /// (shared with the HTTP proxy and tunnels).
+    #[must_use]
+    pub fn with_destination_limiter(
+        mut self,
+        limiter: Option<Arc<crate::services::exit_limits::KeyedRateLimiter>>,
+    ) -> Self {
+        self.destination_limiter = limiter;
+        self
+    }
+
+    /// Limits paid quote requests per payment credential (payment adapter and payment id)
+    /// with `limiter`. A quote is checked before any RPC, oracle or signing work.
+    #[must_use]
+    pub fn with_credential_limiter(
+        mut self,
+        limiter: Option<Arc<crate::services::exit_limits::KeyedRateLimiter>>,
+    ) -> Self {
+        self.credential_limiter = limiter;
+        self
     }
 
     pub fn register_token(&mut self, address: Address, symbol: &str, decimals: u8, price_id: &str) {
@@ -220,6 +248,20 @@ impl EthereumHandler {
                 "paid quote policy unavailable",
             );
         };
+        if let Some(limiter) = &self.credential_limiter {
+            let key = crate::services::exit_limits::credential_key(
+                &request.payment_adapter,
+                &request.payment_id,
+            );
+            if let Err(refused) = limiter.check(&key, "quote") {
+                debug!(error = %refused, "Paid quote refused by the credential rate limit");
+                return paid_quote_rejection(
+                    nox_core::PaidTransactionRejectionCodeV2::QuoteCapacityExceeded,
+                    true,
+                    &refused.to_string(),
+                );
+            }
+        }
         let wall_timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(duration) => duration.as_secs(),
             Err(_) => {
@@ -1024,6 +1066,15 @@ impl EthereumHandler {
         }
 
         let response_bytes = if let Some(ref url) = rpc_url {
+            if let (Some(limiter), Some(key)) = (
+                &self.destination_limiter,
+                crate::services::exit_limits::url_destination_key(url),
+            ) {
+                limiter.check(&key, "broadcast").map_err(|refused| {
+                    debug!(packet_id, error = %refused, "Broadcast refused by the destination rate limit");
+                    ServiceError::ProcessingFailed(refused.to_string())
+                })?;
+            }
             let (resolved_ip, validated_url) =
                 security::validate_url_ssrf(url, false).await.map_err(|e| {
                     debug!(
@@ -1216,6 +1267,8 @@ impl EthereumHandler {
             nox_entry_point_address,
             quote_policy: None,
             last_quote_prune_unix: AtomicU64::new(0),
+            credential_limiter: None,
+            destination_limiter: None,
         })
     }
 }

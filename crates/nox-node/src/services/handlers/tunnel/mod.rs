@@ -9,6 +9,7 @@ mod records;
 mod window;
 
 use crate::config::{HttpConfig, TunnelConfig};
+use crate::services::exit_limits::{destination_key, KeyedRateLimiter};
 use crate::services::response_packer::ResponsePacker;
 use crate::services::security;
 use crate::telemetry::metrics::MetricsService;
@@ -347,6 +348,8 @@ impl Shared {
 /// and handed to one task per tunnel, which owns the upstream socket.
 pub struct TunnelHandler {
     shared: Arc<Shared>,
+    /// Per-destination rate limit on opens, shared with the HTTP proxy.
+    destination_limiter: Option<Arc<KeyedRateLimiter>>,
 }
 
 impl TunnelHandler {
@@ -381,7 +384,16 @@ impl TunnelHandler {
                 started: now,
                 cancel,
             }),
+            destination_limiter: None,
         }
+    }
+
+    /// Limits tunnel opens per destination host with `limiter` (shared with the HTTP proxy).
+    /// It applies to new tunnels only; copies and later requests of an open tunnel pass.
+    #[must_use]
+    pub fn with_destination_limiter(mut self, limiter: Option<Arc<KeyedRateLimiter>>) -> Self {
+        self.destination_limiter = limiter;
+        self
     }
 
     /// Open tunnels.
@@ -521,6 +533,14 @@ impl TunnelHandler {
                 exchange,
             ));
         };
+        if let Some(limiter) = &self.destination_limiter {
+            if let Err(refused) = limiter.check(&destination_key(&open.host), "tunnel") {
+                return Err((
+                    TunnelError::new(TunnelRejectCodeV1::RateLimited, refused.to_string()),
+                    exchange,
+                ));
+            }
+        }
         if !table.opens.try_take(now) {
             return Err((
                 TunnelError::new(TunnelRejectCodeV1::RateLimited, "tunnel open rate exceeded"),

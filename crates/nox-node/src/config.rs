@@ -894,6 +894,86 @@ impl TunnelConfig {
     }
 }
 
+/// Default for `exit_limits.destination_per_sec`.
+pub const DEFAULT_EXIT_DESTINATION_PER_SEC: u32 = 20;
+/// Default for `exit_limits.destination_burst`.
+pub const DEFAULT_EXIT_DESTINATION_BURST: u32 = 200;
+/// Default for `exit_limits.credential_per_min`.
+pub const DEFAULT_EXIT_CREDENTIAL_PER_MIN: u32 = 12;
+/// Default for `exit_limits.credential_burst`.
+pub const DEFAULT_EXIT_CREDENTIAL_BURST: u32 = 12;
+/// Default for `exit_limits.max_tracked`.
+pub const DEFAULT_EXIT_LIMITS_MAX_TRACKED: usize = 65_536;
+
+/// Rate limits an exit applies per destination host and per payment credential, on top of
+/// the exit-wide lane and tunnel limits. Refusals are counted in
+/// `nox_exit_rate_limited_total{scope, service}`; destinations and credentials are never
+/// logged or used as labels.
+#[derive(Debug, Deserialize, Clone, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ExitLimitsConfig {
+    /// Sustained requests per second to one destination host, HTTP proxy requests and
+    /// tunnel opens together. 0 disables the per-destination limit.
+    pub destination_per_sec: u32,
+    /// Requests to one destination host allowed in a burst above the sustained rate.
+    pub destination_burst: u32,
+    /// Sustained paid quote requests per minute for one payment credential (payment adapter
+    /// and payment id). 0 disables the per-credential limit.
+    pub credential_per_min: u32,
+    /// Paid quote requests for one payment credential allowed in a burst.
+    pub credential_burst: u32,
+    /// Most destinations, and separately most credentials, tracked at once. A key whose
+    /// bucket has refilled is dropped, so this bounds memory under many distinct keys.
+    pub max_tracked: usize,
+}
+
+impl Default for ExitLimitsConfig {
+    fn default() -> Self {
+        Self {
+            destination_per_sec: DEFAULT_EXIT_DESTINATION_PER_SEC,
+            destination_burst: DEFAULT_EXIT_DESTINATION_BURST,
+            credential_per_min: DEFAULT_EXIT_CREDENTIAL_PER_MIN,
+            credential_burst: DEFAULT_EXIT_CREDENTIAL_BURST,
+            max_tracked: DEFAULT_EXIT_LIMITS_MAX_TRACKED,
+        }
+    }
+}
+
+impl ExitLimitsConfig {
+    #[must_use]
+    pub fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for (rate_name, rate, burst_name, burst) in [
+            (
+                "destination_per_sec",
+                self.destination_per_sec,
+                "destination_burst",
+                self.destination_burst,
+            ),
+            (
+                "credential_per_min",
+                self.credential_per_min,
+                "credential_burst",
+                self.credential_burst,
+            ),
+        ] {
+            if rate > 0 && burst == 0 {
+                errors.push(format!(
+                    "exit_limits.{burst_name} must be at least 1 when exit_limits.{rate_name} is set (got: 0)"
+                ));
+            }
+        }
+        let enabled = self.destination_per_sec > 0 || self.credential_per_min > 0;
+        if enabled && self.max_tracked == 0 {
+            errors.push(
+                "exit_limits.max_tracked must be at least 1 when a per-destination or per-credential limit is set (got: 0)"
+                    .to_string(),
+            );
+        }
+        errors
+    }
+}
+
 #[derive(Deserialize, Clone, Serialize)]
 pub struct NoxConfig {
     pub eth_rpc_url: String,
@@ -943,6 +1023,9 @@ pub struct NoxConfig {
     pub exit_replenishment: ReplenishmentConfig,
     #[serde(default)]
     pub tunnel: TunnelConfig,
+    /// Per-destination and per-credential rate limits at an exit.
+    #[serde(default)]
+    pub exit_limits: ExitLimitsConfig,
     /// Retention and maintenance of the node database.
     #[serde(default)]
     pub storage: StorageConfig,
@@ -1038,6 +1121,7 @@ impl std::fmt::Debug for NoxConfig {
             .field("exit_workers", &self.exit_workers)
             .field("exit_replenishment", &self.exit_replenishment)
             .field("tunnel", &self.tunnel)
+            .field("exit_limits", &self.exit_limits)
             .field("storage", &self.storage)
             .field("block_poll_interval_secs", &self.block_poll_interval_secs)
             .field(
@@ -1125,6 +1209,7 @@ impl Default for NoxConfig {
             exit_workers: ExitWorkerConfig::default(),
             exit_replenishment: ReplenishmentConfig::default(),
             tunnel: TunnelConfig::default(),
+            exit_limits: ExitLimitsConfig::default(),
             storage: StorageConfig::default(),
 
             block_poll_interval_secs: 12,
@@ -1233,6 +1318,7 @@ impl NoxConfig {
         errors.extend(self.storage.validation_errors());
         errors.extend(self.exit_replenishment.validation_errors());
         errors.extend(self.tunnel.validation_errors());
+        errors.extend(self.exit_limits.validation_errors());
 
         if self.chain_id == 0 && !bench {
             errors.push("chain_id is 0 (must be set for production)".into());
@@ -2055,5 +2141,43 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.contains("tunnel.session_queue")));
+    }
+
+    #[test]
+    fn exit_limits_defaults_and_validation() {
+        let defaults = ExitLimitsConfig::default();
+        assert!(defaults.validation_errors().is_empty());
+        let parsed: ExitLimitsConfig =
+            serde_json::from_str(r#"{"destination_per_sec": 5}"#).expect("parses");
+        assert_eq!(parsed.destination_per_sec, 5);
+        assert_eq!(parsed.destination_burst, DEFAULT_EXIT_DESTINATION_BURST);
+
+        let disabled = ExitLimitsConfig {
+            destination_per_sec: 0,
+            destination_burst: 0,
+            credential_per_min: 0,
+            credential_burst: 0,
+            max_tracked: 0,
+        };
+        assert!(disabled.validation_errors().is_empty());
+
+        let errors = ExitLimitsConfig {
+            destination_burst: 0,
+            credential_burst: 0,
+            max_tracked: 0,
+            ..ExitLimitsConfig::default()
+        }
+        .validation_errors();
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert!(errors[0].starts_with("exit_limits.destination_burst must be at least 1"));
+        assert!(errors[1].starts_with("exit_limits.credential_burst must be at least 1"));
+        assert!(errors[2].starts_with("exit_limits.max_tracked must be at least 1"));
+
+        let mut config = NoxConfig::default();
+        config.exit_limits.destination_burst = 0;
+        let errors = config.validate().unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("exit_limits.destination_burst")));
     }
 }

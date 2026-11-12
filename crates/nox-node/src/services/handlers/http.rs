@@ -2,6 +2,7 @@
 //! SSRF protection, DNS rebinding mitigation, optional domain whitelist.
 
 use crate::config::HttpConfig;
+use crate::services::exit_limits::{destination_key, KeyedRateLimiter};
 use crate::services::response_packer::{PackResult, ResponsePacker};
 use crate::services::security;
 use crate::telemetry::metrics::MetricsService;
@@ -111,6 +112,8 @@ pub struct HttpHandler {
     /// Pinned clients by origin. A client is reused while every address the
     /// host resolves to is one it was pinned to.
     client_cache: parking_lot::Mutex<HashMap<OriginKey, PinnedUpstream>>,
+    /// Per-destination rate limit, shared with the tunnel handler.
+    destination_limiter: Option<Arc<KeyedRateLimiter>>,
 }
 
 impl HttpHandler {
@@ -127,7 +130,15 @@ impl HttpHandler {
             metrics,
             stash_remaining: None,
             client_cache: parking_lot::Mutex::new(HashMap::new()),
+            destination_limiter: None,
         }
+    }
+
+    /// Limits requests per destination host with `limiter` (shared with tunnel opens).
+    #[must_use]
+    pub fn with_destination_limiter(mut self, limiter: Option<Arc<KeyedRateLimiter>>) -> Self {
+        self.destination_limiter = limiter;
+        self
     }
 
     #[must_use]
@@ -178,6 +189,17 @@ impl HttpHandler {
         let port = url
             .port_or_known_default()
             .unwrap_or(if scheme == "https" { 443 } else { 80 });
+
+        if let Some(limiter) = &self.destination_limiter {
+            if let Err(refused) = limiter.check(&destination_key(host), "http") {
+                debug!(request_id = request_id, error = %refused, "HTTP request refused by the destination rate limit");
+                self.metrics
+                    .http_proxy_requests_total
+                    .get_or_create(&vec![("result".into(), "rate_limited".into())])
+                    .inc();
+                return self.pack_error_response(request_id, 429, &refused.to_string(), surbs);
+            }
+        }
 
         let resolved_ips = match security::resolve_hostname_all(host, port).await {
             Ok(ips) => ips,

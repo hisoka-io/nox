@@ -8,7 +8,8 @@ use nox_core::{
     TunnelRequestV1, TUNNEL_ID_LEN,
 };
 use nox_crypto::{PathHop, Surb, SurbRecovery, HEADER_SIZE};
-use nox_node::config::{HttpConfig, TunnelConfig};
+use nox_node::config::{ExitLimitsConfig, HttpConfig, TunnelConfig};
+use nox_node::services::exit_limits::KeyedRateLimiter;
 use nox_node::services::handlers::tunnel::TunnelHandler;
 use nox_node::services::response_packer::ResponsePacker;
 use nox_node::telemetry::metrics::MetricsService;
@@ -460,6 +461,64 @@ async fn policy_rejects_before_connecting() {
         assert_eq!(exit.handler.sessions(), 0, "{name}");
     }
     assert!(upstream.received.lock().is_empty());
+}
+
+#[tokio::test]
+async fn opens_to_one_host_are_limited_per_destination() {
+    let upstream = start_upstream(10).await;
+    let bus = TokioEventBus::new(4_096);
+    let events = bus.subscribe();
+    let metrics = MetricsService::new();
+    let limits = ExitLimitsConfig {
+        destination_per_sec: 1,
+        destination_burst: 1,
+        ..ExitLimitsConfig::default()
+    };
+    let http = HttpConfig {
+        allow_private_ips: true,
+        ..HttpConfig::default()
+    };
+    let handler = TunnelHandler::new(
+        tunnel_config(upstream.port),
+        &http,
+        Arc::new(ResponsePacker::new()),
+        Arc::new(bus),
+        metrics.clone(),
+        CancellationToken::new(),
+    )
+    .with_destination_limiter(KeyedRateLimiter::destination(&limits, &metrics));
+    let mut exit = Exit { handler, events };
+
+    let mut first = Client::new(&upstream.ca, HOST);
+    first.handshake(&mut exit, upstream.port).await;
+    assert_eq!(exit.handler.sessions(), 1);
+
+    let mut second = Client::new(&upstream.ca, HOST);
+    let hello = second.tls_out();
+    let (request, surbs) = second.request(Some(upstream.port), hello, 1);
+    exit.handler.handle(request, surbs);
+    let reply = second.reply(&mut exit).await;
+    assert_eq!(rejection(&reply), TunnelRejectCodeV1::RateLimited);
+    let TunnelReplyV1::Rejected {
+        detail, retryable, ..
+    } = &reply
+    else {
+        panic!("expected a rejection");
+    };
+    assert!(*retryable);
+    assert!(detail.contains("destination host"), "{detail}");
+    assert!(!detail.contains(HOST), "{detail}");
+    assert_eq!(exit.handler.sessions(), 1);
+    assert_eq!(
+        metrics
+            .exit_rate_limited_total
+            .get_or_create(&vec![
+                ("scope".into(), "destination".into()),
+                ("service".into(), "tunnel".into()),
+            ])
+            .get(),
+        1
+    );
 }
 
 #[tokio::test]
