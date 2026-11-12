@@ -2,6 +2,8 @@ pub mod lioness;
 pub mod packet;
 pub mod pow;
 pub mod surb;
+#[cfg(test)]
+mod vectors;
 
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::{ChaCha20, Key, Nonce};
@@ -9,6 +11,7 @@ use curve25519_dalek::constants::X25519_BASEPOINT;
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use curve25519_dalek::scalar::Scalar;
 use hmac::{Hmac, Mac};
+use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 use sha2::{Digest, Sha256};
@@ -589,6 +592,85 @@ pub(crate) fn apply_stream_cipher(key: &[u8; 32], iv: &[u8; 12], data: &mut [u8]
     cipher.apply_keystream(data);
 }
 
+/// First routing byte a final hop's padding may cover: the hop type and the
+/// format 2 flag come before it.
+pub const FINAL_PADDING_OFFSET: usize = FINAL_FLAG_OFFSET + 1;
+
+/// How a builder fills the final hop's unused routing bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinalHopFill {
+    /// Random bytes, so the final hop cannot tell where the filler starts and
+    /// so cannot read the path length.
+    Random,
+    /// Zeros, as builders did before random padding.
+    #[cfg_attr(not(any(test, feature = "zero-fill-builder")), expect(dead_code))]
+    Zero,
+}
+
+/// Writes the filler at the end of the final hop's plaintext routing info
+/// and fills the bytes between the flag and the filler. The filler region is
+/// what every earlier hop's shift leaves there, so it must hold the filler
+/// exactly; the bytes before it are read by no hop and covered by the MACs
+/// computed after this.
+pub(crate) fn fill_final_routing<R: RngCore + CryptoRng>(
+    routing: &mut [u8; ROUTING_INFO_SIZE],
+    filler: &[u8],
+    fill: FinalHopFill,
+    rng: &mut R,
+) {
+    let filler_start = ROUTING_INFO_SIZE - filler.len();
+    if fill == FinalHopFill::Random && filler_start > FINAL_PADDING_OFFSET {
+        rng.fill_bytes(&mut routing[FINAL_PADDING_OFFSET..filler_start]);
+    }
+    routing[filler_start..].copy_from_slice(filler);
+}
+
+/// Builders that leave the final hop's unused routing bytes zero, as clients
+/// did before random padding. Nodes read neither fill, so tests use these to
+/// show that packets from older clients still go through.
+#[cfg(any(test, feature = "zero-fill-builder"))]
+pub mod zero_fill {
+    use super::surb::{Surb, SurbError, SurbRecovery, SURB_V2_MARKER};
+    use super::{build_forward_packet, FinalHopFill, PathHop, SphinxError};
+    use rand::{CryptoRng, RngCore};
+
+    /// [`super::build_multi_hop_packet_with_rng`] with zero final-hop padding.
+    pub fn build_multi_hop_packet_with_rng<R: RngCore + CryptoRng>(
+        path: &[PathHop],
+        payload: &[u8],
+        pow_difficulty: u32,
+        rng: &mut R,
+    ) -> Result<Vec<u8>, SphinxError> {
+        build_forward_packet(path, payload, pow_difficulty, rng, FinalHopFill::Zero)
+    }
+
+    /// [`Surb::new_with_rng`] with zero final-hop padding.
+    pub fn surb_with_rng<R: RngCore + CryptoRng>(
+        path: &[PathHop],
+        id: [u8; 16],
+        pow_difficulty: u32,
+        rng: &mut R,
+    ) -> Result<(Surb, SurbRecovery), SurbError> {
+        Surb::build(path, id, pow_difficulty, false, rng, FinalHopFill::Zero)
+    }
+
+    /// [`Surb::new_v2_with_rng`] with zero final-hop padding.
+    pub fn surb_v2_with_rng<R: RngCore + CryptoRng>(
+        path: &[PathHop],
+        pow_difficulty: u32,
+        rng: &mut R,
+    ) -> Result<(Surb, SurbRecovery), SurbError> {
+        Surb::build(
+            path,
+            SURB_V2_MARKER,
+            pow_difficulty,
+            true,
+            rng,
+            FinalHopFill::Zero,
+        )
+    }
+}
+
 /// Single-hop convenience wrapper for tests only.
 #[cfg(test)]
 pub fn build_packet(
@@ -609,9 +691,27 @@ pub fn build_multi_hop_packet(
     payload: &[u8],
     pow_difficulty: u32,
 ) -> Result<Vec<u8>, SphinxError> {
-    check_path_len(path.len())?;
+    build_multi_hop_packet_with_rng(path, payload, pow_difficulty, &mut rand::rngs::OsRng)
+}
 
-    let mut rng = rand::rngs::OsRng;
+/// [`build_multi_hop_packet`] drawing every random value from `rng`.
+pub fn build_multi_hop_packet_with_rng<R: RngCore + CryptoRng>(
+    path: &[PathHop],
+    payload: &[u8],
+    pow_difficulty: u32,
+    rng: &mut R,
+) -> Result<Vec<u8>, SphinxError> {
+    build_forward_packet(path, payload, pow_difficulty, rng, FinalHopFill::Random)
+}
+
+pub(crate) fn build_forward_packet<R: RngCore + CryptoRng>(
+    path: &[PathHop],
+    payload: &[u8],
+    pow_difficulty: u32,
+    rng: &mut R,
+    fill: FinalHopFill,
+) -> Result<Vec<u8>, SphinxError> {
+    check_path_len(path.len())?;
 
     // Body must be padded to full capacity BEFORE Lioness encryption.
     // Lioness output depends on the full block size -- a size mismatch between
@@ -626,7 +726,7 @@ pub fn build_multi_hop_packet(
     let mut blinding_factors = Vec::with_capacity(path.len());
 
     // Raw Scalar avoids X25519 clamping interference during blinding
-    let mut current_secret_scalar = Scalar::random(&mut rng);
+    let mut current_secret_scalar = Scalar::random(rng);
     let initial_pk_point = X25519_BASEPOINT * current_secret_scalar;
     let mut accumulated_blinding = Scalar::ONE;
 
@@ -684,10 +784,7 @@ pub fn build_multi_hop_packet(
         let mut current_routing = [0u8; ROUTING_INFO_SIZE];
         if i == path.len() - 1 {
             current_routing[0] = 0x01;
-            if !filler.is_empty() {
-                let filler_start = ROUTING_INFO_SIZE - filler.len();
-                current_routing[filler_start..].copy_from_slice(&filler);
-            }
+            fill_final_routing(&mut current_routing, &filler, fill, rng);
         } else {
             current_routing[0] = 0x00;
             let next_addr_bytes = path[i + 1].address.as_bytes();

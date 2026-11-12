@@ -4,7 +4,8 @@
 pub mod sphinx;
 
 pub use sphinx::{
-    build_multi_hop_packet, derive_keys, PathHop, ProcessResult, SphinxError, SphinxHeader,
+    build_multi_hop_packet, build_multi_hop_packet_with_rng, derive_keys, PathHop, ProcessResult,
+    SphinxError, SphinxHeader,
 };
 
 pub use sphinx::{HEADER_SIZE, MAC_SIZE, NONCE_SIZE, ROUTING_INFO_SIZE, SHIFT_SIZE};

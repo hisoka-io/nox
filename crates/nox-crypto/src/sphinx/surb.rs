@@ -3,13 +3,13 @@
 use super::lioness::{lioness_decrypt, lioness_encrypt, LionessKeys, MIN_BODY_SIZE};
 use super::packet::{PacketError, SphinxPacket};
 use super::{
-    apply_stream_cipher, compute_mac, delivery_id_from_shared_secret, derive_keys, PathHop,
-    SphinxError, SphinxHeader, FINAL_FLAG_OFFSET, MAX_FLAGGED_ADDRESS_LEN, RELAY_FLAG_OFFSET,
-    REPLY_V2_FLAG, ROUTING_INFO_SIZE, SHIFT_SIZE,
+    apply_stream_cipher, compute_mac, delivery_id_from_shared_secret, derive_keys,
+    fill_final_routing, FinalHopFill, PathHop, SphinxError, SphinxHeader, FINAL_FLAG_OFFSET,
+    MAX_FLAGGED_ADDRESS_LEN, RELAY_FLAG_OFFSET, REPLY_V2_FLAG, ROUTING_INFO_SIZE, SHIFT_SIZE,
 };
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use curve25519_dalek::scalar::Scalar;
-use rand::Rng;
+use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -94,7 +94,17 @@ impl Surb {
         id: [u8; 16],
         pow_difficulty: u32,
     ) -> Result<(Self, SurbRecovery), SurbError> {
-        Self::build(path, id, pow_difficulty, false)
+        Self::new_with_rng(path, id, pow_difficulty, &mut rand::rngs::OsRng)
+    }
+
+    /// [`Surb::new`] drawing every random value from `rng`.
+    pub fn new_with_rng<R: RngCore + CryptoRng>(
+        path: &[PathHop],
+        id: [u8; 16],
+        pow_difficulty: u32,
+        rng: &mut R,
+    ) -> Result<(Self, SurbRecovery), SurbError> {
+        Self::build(path, id, pow_difficulty, false, rng, FinalHopFill::Random)
     }
 
     /// Creates a format 2 SURB.
@@ -108,7 +118,23 @@ impl Surb {
         path: &[PathHop],
         pow_difficulty: u32,
     ) -> Result<(Self, SurbRecovery), SurbError> {
-        Self::build(path, SURB_V2_MARKER, pow_difficulty, true)
+        Self::new_v2_with_rng(path, pow_difficulty, &mut rand::rngs::OsRng)
+    }
+
+    /// [`Surb::new_v2`] drawing every random value from `rng`.
+    pub fn new_v2_with_rng<R: RngCore + CryptoRng>(
+        path: &[PathHop],
+        pow_difficulty: u32,
+        rng: &mut R,
+    ) -> Result<(Self, SurbRecovery), SurbError> {
+        Self::build(
+            path,
+            SURB_V2_MARKER,
+            pow_difficulty,
+            true,
+            rng,
+            FinalHopFill::Random,
+        )
     }
 
     /// Whether this SURB asks for a format 2 reply.
@@ -117,11 +143,13 @@ impl Surb {
         self.id == SURB_V2_MARKER
     }
 
-    fn build(
+    pub(crate) fn build<R: RngCore + CryptoRng>(
         path: &[PathHop],
         id: [u8; 16],
         pow_difficulty: u32,
         v2: bool,
+        rng: &mut R,
+        fill: FinalHopFill,
     ) -> Result<(Self, SurbRecovery), SurbError> {
         if path.is_empty() {
             return Err(SurbError::EmptyPath);
@@ -152,14 +180,12 @@ impl Surb {
             }
         }
 
-        let mut rng = rand::rngs::OsRng;
-
         // Raw Scalar multiplication (not X25519SecretKey::diffie_hellman) to avoid clamping mismatch
         let mut ephemeral_public_keys = Vec::with_capacity(path.len());
         let mut shared_secrets = Vec::with_capacity(path.len());
         let mut blinding_factors = Vec::with_capacity(path.len());
 
-        let mut current_secret_scalar = Scalar::random(&mut rng);
+        let mut current_secret_scalar = Scalar::random(rng);
         let initial_pk_point =
             curve25519_dalek::constants::X25519_BASEPOINT * current_secret_scalar;
         let mut accumulated_blinding = Scalar::ONE;
@@ -223,10 +249,7 @@ impl Surb {
                 if v2 {
                     current_routing[FINAL_FLAG_OFFSET] = REPLY_V2_FLAG;
                 }
-                if !filler.is_empty() {
-                    let filler_start = ROUTING_INFO_SIZE - filler.len();
-                    current_routing[filler_start..].copy_from_slice(&filler);
-                }
+                fill_final_routing(&mut current_routing, &filler, fill, rng);
             } else {
                 // Forward hop
                 current_routing[0] = 0x00;
@@ -250,7 +273,7 @@ impl Surb {
         }
 
         let mut payload_pi = [0u8; 32];
-        rng.fill(&mut payload_pi);
+        rng.fill_bytes(&mut payload_pi);
         let payload_keys = LionessKeys::from_pi(&payload_pi);
 
         let mut header = SphinxHeader {

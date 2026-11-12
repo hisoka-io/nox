@@ -5,6 +5,18 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+### Changed
+
+- Sphinx packet and SURB builders fill the final hop's unused routing bytes with random bytes instead of zeros, so
+  the final hop cannot read the path length from where the filler starts. Nodes read the same bytes as before, so the
+  wire format is unchanged and packets from older and newer clients interoperate.
+
+### Added
+
+- `build_multi_hop_packet_with_rng`, `Surb::new_with_rng` and `Surb::new_v2_with_rng` take the RNG to draw from.
+  The `zero-fill-builder` feature of nox-crypto keeps the zero-padding builders for compatibility tests. Golden
+  vectors for both fills are in `crates/nox-crypto/tests/vectors/`.
+
 ## [0.4.0-rc.13] - 2026-11-11
 
 ### Upgrade notes
