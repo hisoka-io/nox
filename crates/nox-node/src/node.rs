@@ -237,7 +237,7 @@ impl NoxNode {
             });
         }
 
-        let chain_executor = if config.benchmark_mode {
+        let chain_executor = if config.benchmark_mode_active() {
             info!("Skipping Chain Executor (benchmark mode -- simulation exit service used).");
             None
         } else if config.node_role.is_exit_capable() {
@@ -489,7 +489,7 @@ impl NoxNode {
             });
         }
 
-        if config.benchmark_mode && config.node_role.is_exit_capable() {
+        if config.benchmark_mode_active() && config.node_role.is_exit_capable() {
             let has_rpc = !config.eth_rpc_url.is_empty();
             info!(
                 rpc_proxy = has_rpc,
