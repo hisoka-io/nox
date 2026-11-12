@@ -312,8 +312,15 @@ mod tests {
     use crate::infra::storage::NodeStore;
     use nox_core::traits::IStorageRepository;
 
+    /// Opens sled once a handle dropped earlier in the test has let go of the
+    /// lock (sled's flusher thread can hold it briefly after the drop).
+    fn open_sled(path: &Path) -> sled::Db {
+        wait_for_sled_release(path, SLED_RELEASE_TIMEOUT).unwrap();
+        sled::open(path).unwrap()
+    }
+
     fn sled_fixture(path: &Path) {
-        let db = sled::open(path).unwrap();
+        let db = open_sled(path);
         db.insert(b"nonce:local", &9_u64.to_le_bytes()).unwrap();
         db.insert(b"chain_observer:last_block", &7_u64.to_be_bytes())
             .unwrap();
@@ -407,7 +414,7 @@ mod tests {
         // nox.redb was left in place.
         sled_fixture(dir.path());
         {
-            let db = sled::open(dir.path()).unwrap();
+            let db = open_sled(dir.path());
             db.insert(b"nonce:local", &10_u64.to_le_bytes()).unwrap();
             db.flush().unwrap();
         }

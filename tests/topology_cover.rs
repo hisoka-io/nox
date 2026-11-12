@@ -11,6 +11,26 @@ use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::time::Duration;
 
+/// Waits until the manager has subscribed (events published before `run` subscribes are lost).
+async fn wait_subscribed(bus: &TokioEventBus) {
+    wait_for("topology manager subscribed", || {
+        bus.publish(NoxEvent::NodeStarted { timestamp: 0 })
+            .is_ok_and(|receivers| receivers > 0)
+    })
+    .await;
+}
+
+/// Polls `cond` until it holds; fails the test after 10 s.
+async fn wait_for(what: &str, cond: impl Fn() -> bool) {
+    let polled = tokio::time::timeout(Duration::from_secs(10), async {
+        while !cond() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(polled.is_ok(), "timed out waiting for: {what}");
+}
+
 #[tokio::test]
 async fn test_stratified_assignment() {
     let dir = tempdir().unwrap();
@@ -26,7 +46,7 @@ async fn test_stratified_assignment() {
         tm_clone.run().await;
     });
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_subscribed(&bus).await;
 
     for i in 0..100 {
         let addr = format!("0xNode{}", i);
@@ -42,7 +62,10 @@ async fn test_stratified_assignment() {
         .unwrap();
     }
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for("100 registrations applied", || {
+        tm_arc.get_all_nodes().len() == 100
+    })
+    .await;
 
     let l0 = tm_arc.get_nodes_in_layer(0);
     let l1 = tm_arc.get_nodes_in_layer(1);
@@ -82,7 +105,7 @@ async fn test_role_based_layer_assignment() {
         tm_clone.run().await;
     });
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_subscribed(&bus).await;
 
     for i in 0..50 {
         bus.publish(NoxEvent::RelayerRegistered {
@@ -110,7 +133,10 @@ async fn test_role_based_layer_assignment() {
         .unwrap();
     }
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for("70 registrations applied", || {
+        tm_arc.get_all_nodes().len() == 70
+    })
+    .await;
 
     let l0 = tm_arc.get_nodes_in_layer(0);
     let l1 = tm_arc.get_nodes_in_layer(1);
