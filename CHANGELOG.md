@@ -5,6 +5,11 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+### Security
+
+- quinn-udp 0.5.16 in nox-kps (RUSTSEC-2026-0538) and url 2.5.9 (RUSTSEC-2026-0592).
+- The libp2p-gossipsub advisories RUSTSEC-2026-0534 to 0537 carry dated exceptions to 2026-12-19 until the libp2p 0.57 upgrade ([SECURITY.md](SECURITY.md)).
+
 ### Changed
 
 - Sphinx packet and SURB builders fill the final hop's unused routing bytes with random bytes instead of zeros, so
