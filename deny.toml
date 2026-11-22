@@ -14,6 +14,12 @@ ignore = [
     "RUSTSEC-2024-0436", # expires=2026-12-31 owner=networking
     "RUSTSEC-2026-0387", # expires=2026-12-31 owner=chain-signing
     "RUSTSEC-2026-0441", # expires=2027-03-31 owner=networking,nox-kps
+    # libp2p-gossipsub 0.46 via libp2p 0.53: cleared by the libp2p 0.57 upgrade planned for v0.4.0-rc.15 (SECURITY.md)
+    "RUSTSEC-2026-0534", # expires=2026-12-19 owner=networking
+    "RUSTSEC-2026-0535", # expires=2026-12-19 owner=networking
+    "RUSTSEC-2026-0536", # expires=2026-12-19 owner=networking
+    "RUSTSEC-2026-0537", # expires=2026-12-19 owner=networking
+    "RUSTSEC-2026-0543", # expires=2027-03-31 owner=nox-mixnet,nox-oracle,nox-sim
 ]
 
 [licenses]
