@@ -21,6 +21,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 - `build_multi_hop_packet_with_rng`, `Surb::new_with_rng` and `Surb::new_v2_with_rng` take the RNG to draw from.
   The `zero-fill-builder` feature of nox-crypto keeps the zero-padding builders for compatibility tests. Golden
   vectors for both fills are in `crates/nox-crypto/tests/vectors/`.
+- Exit rate limits per destination host (HTTP proxy, tunnel opens, client-named RPC and broadcast URLs) and per
+  payment credential of a paid quote, in `[exit_limits]`, with `nox_exit_rate_limited_total{scope,service}`,
+  `nox_exit_rate_limit_tracked{scope}` and `nox_exit_rate_limit_untracked_total{scope}`. Defaults sit well above
+  testnet traffic.
 
 ## [0.4.0-rc.13] - 2026-11-11
 

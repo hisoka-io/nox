@@ -148,6 +148,13 @@ pub struct MetricsService {
     pub exit_reassembler_pending: Gauge<i64, AtomicI64>,
     pub tunnel_sessions_active: Gauge<i64, AtomicI64>,
     pub tunnel_opens_total: Family<Vec<(String, String)>, Counter>,
+    /// Exit requests refused by a per-destination or per-credential rate limit, by
+    /// `scope` and `service`. Never labelled with the destination or credential.
+    pub exit_rate_limited_total: Family<Vec<(String, String)>, Counter>,
+    /// New keys let through untracked because a rate-limit table was full, by `scope`.
+    pub exit_rate_limit_untracked_total: Family<Vec<(String, String)>, Counter>,
+    /// Keys held by a rate-limit table, by `scope`.
+    pub exit_rate_limit_tracked: Family<Vec<(String, String)>, Gauge<i64, AtomicI64>>,
     pub tunnel_exchanges_total: Family<Vec<(String, String)>, Counter>,
     pub tunnel_parts_total: Counter,
     pub tunnel_bytes_total: Family<Vec<(String, String)>, Counter>,
@@ -901,6 +908,25 @@ impl MetricsService {
             "TLS tunnel opens, by result (opened or the reject code)",
             tunnel_opens_total.clone(),
         );
+        let exit_rate_limited_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_exit_rate_limited",
+            "Exit requests refused by a per-destination or per-credential rate limit, by scope and service",
+            exit_rate_limited_total.clone(),
+        );
+        let exit_rate_limit_untracked_total = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "nox_exit_rate_limit_untracked",
+            "New keys let through untracked because a rate-limit table was full, by scope",
+            exit_rate_limit_untracked_total.clone(),
+        );
+        let exit_rate_limit_tracked =
+            Family::<Vec<(String, String)>, Gauge<i64, AtomicI64>>::default();
+        registry.register(
+            "nox_exit_rate_limit_tracked",
+            "Keys held by an exit rate-limit table, by scope",
+            exit_rate_limit_tracked.clone(),
+        );
         let tunnel_exchanges_total = Family::<Vec<(String, String)>, Counter>::default();
         registry.register(
             "nox_tunnel_exchanges",
@@ -1031,6 +1057,9 @@ impl MetricsService {
             exit_reassembler_pending,
             tunnel_sessions_active,
             tunnel_opens_total,
+            exit_rate_limited_total,
+            exit_rate_limit_untracked_total,
+            exit_rate_limit_tracked,
             tunnel_exchanges_total,
             tunnel_parts_total,
             tunnel_bytes_total,

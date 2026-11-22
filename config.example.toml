@@ -301,6 +301,18 @@ max_write_bytes = 4259840
 max_surbs_per_exchange = 32
 session_queue = 8
 
+# Rate limits an exit applies per destination host (HTTP proxy requests,
+# tunnel opens and client-named RPC and broadcast URLs together) and per
+# payment credential of a paid quote (payment adapter and payment id). Refusals
+# are counted in nox_exit_rate_limited_total{scope,service}; hosts and
+# credentials are never logged or used as labels. 0 disables a limit.
+[exit_limits]
+destination_per_sec = 20
+destination_burst = 200
+credential_per_min = 12
+credential_burst = 12
+max_tracked = 65536                  # per limit; refilled entries are dropped
+
 # Database maintenance: mined/failed transactions and finished quotes are
 # slimmed, then deleted after their retention. Records the node may still act
 # on are always kept. See docs/configuration.md.

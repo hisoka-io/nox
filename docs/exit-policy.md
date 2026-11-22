@@ -43,10 +43,12 @@ outside exits follow this policy.
 | JSON-RPC calls | 100 per second per exit, 15 s per call | Shares the exit's provider fairly |
 | Open tunnels | 512 per exit (`[tunnel] max_sessions`) | One socket each; the node checks this against its open-file limit at start |
 | Tunnel opens | 50 per second, bursts of 200 (node defaults) | Bounds connection churn upstream |
+| Requests per destination host | 20 per second, bursts of 200, HTTP, tunnel opens and client-named RPC URLs together (`[exit_limits]`, node defaults) | Bounds what one host receives from an exit and keeps capacity for other hosts |
 | Tunnel lifetime | 600 s and 64 MiB per tunnel (node defaults) | Long transfers use fresh tunnels and fresh routes |
 | Work in flight | per class: paid 4, quotes 8, HTTP/RPC/broadcast 32, tunnels 64 (node defaults) | Each class keeps moving when another is busy |
 | Packet admission | proof of work on every packet (`min_pow_difficulty = 3`) and per-peer packet rates (`[network.rate_limit]`) | Floods cost the sender |
 | Paid quotes | outstanding quotes, pending sponsored gas and a rolling loss limit (`quote_*` keys) | Caps what an exit can spend on paid execution |
+| Paid quotes per payment credential | 12 per minute, bursts of 12 (`[exit_limits]`, node defaults) | Repeated quotes for one payment are answered before any RPC, price or signing work |
 
 Requests past a limit get an error reply (`RateLimited` and `SessionLimit` tunnel errors are marked retryable), and
 the client tries again or picks another exit.

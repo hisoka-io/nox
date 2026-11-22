@@ -220,6 +220,22 @@ exit relays TLS records between it and one upstream host. Destinations follow
 | `max_surbs_per_exchange` | `32` | SURBs used from one request |
 | `session_queue` | `8` | Requests waiting per tunnel |
 
+### `[exit_limits]` (exit node)
+
+Rate limits per destination host and per payment credential, on top of the exit-wide limits above. One
+per-destination limit covers HTTP proxy requests, tunnel opens, and RPC and broadcast requests to a URL the
+client names (the exit's own provider is limited by its own rate). The per-credential limit covers paid quote
+requests and keys on the payment adapter and payment id, before any RPC, price or signing work. Keys are held
+only as a keyed hash; refusals are counted in `nox_exit_rate_limited_total{scope,service}`, and neither hosts nor
+credentials appear in logs or labels. A refused request gets an error reply with the limit and a retry time
+(`429` on the HTTP proxy, `RateLimited` on tunnels, `QuoteCapacityExceeded` marked retryable on quotes).
+
+| Field | Default | Description |
+|---|---|---|
+| `destination_per_sec` / `destination_burst` | 20 / 200 | Token bucket per destination host. 0 disables it |
+| `credential_per_min` / `credential_burst` | 12 / 12 | Token bucket per payment credential for paid quotes. 0 disables it |
+| `max_tracked` | `65536` | Keys held per limit. A key whose bucket has refilled is dropped (`nox_exit_rate_limit_tracked{scope}`); when the table is full of keys still refilling, a new key passes untracked and is counted in `nox_exit_rate_limit_untracked_total{scope}` |
+
 ### `[storage]`
 
 The node database is one redb file, `<db_path>/nox.redb`. A `db_path` that still holds a
