@@ -2,7 +2,7 @@
 
 An exit is the last hop of a Nox route. It turns a client's request into a connection to the public internet or
 to Ethereum, so the services a client calls see the exit's address. This page states what a Nox exit relays,
-what it refuses, the limits it applies and how to report abuse. It describes the node at `v0.4.0-rc.13` with the
+what it refuses, the limits it applies and how to report abuse. It describes the node at `v0.4.0-rc.14` with the
 exit template in [run-nox](https://github.com/hisoka-io/run-nox) (`configs/exit.toml`). The 10 testnet nodes,
 including the three exits, are run by the Hisoka team today; operator onboarding is open with a public kit, and
 outside exits follow this policy.
@@ -48,7 +48,7 @@ outside exits follow this policy.
 | Work in flight | per class: paid 4, quotes 8, HTTP/RPC/broadcast 32, tunnels 64 (node defaults) | Each class keeps moving when another is busy |
 | Packet admission | proof of work on every packet (`min_pow_difficulty = 3`) and per-peer packet rates (`[network.rate_limit]`) | Floods cost the sender |
 | Paid quotes | outstanding quotes, pending sponsored gas and a rolling loss limit (`quote_*` keys) | Caps what an exit can spend on paid execution |
-| Paid quotes per payment credential | 12 per minute, bursts of 12 (`[exit_limits]`, node defaults) | Repeated quotes for one payment are answered before any RPC, price or signing work |
+| Paid quotes per payment credential | 12 per minute, bursts of 12 (`[exit_limits]`, node defaults) | Slows repeated quotes for one payment before any RPC, price or signing work |
 
 Requests past a limit get an error reply (`RateLimited` and `SessionLimit` tunnel errors are marked retryable), and
 the client tries again or picks another exit.
