@@ -152,6 +152,8 @@ pub struct EthereumHandler {
     credential_limiter: Option<Arc<crate::services::exit_limits::KeyedRateLimiter>>,
     /// Per-destination rate limit on client-named broadcast RPC URLs.
     destination_limiter: Option<Arc<crate::services::exit_limits::KeyedRateLimiter>>,
+    /// Timeout and reply size limit for client-named broadcast URLs.
+    client_url_limits: nox_core::chain_rpc::ChainRpcLimits,
 }
 
 impl EthereumHandler {
@@ -181,6 +183,7 @@ impl EthereumHandler {
             last_quote_prune_unix: AtomicU64::new(0),
             credential_limiter: None,
             destination_limiter: None,
+            client_url_limits: crate::config::ChainRpcConfig::default().client_url_limits(),
         }
     }
 
@@ -203,6 +206,17 @@ impl EthereumHandler {
         limiter: Option<Arc<crate::services::exit_limits::KeyedRateLimiter>>,
     ) -> Self {
         self.credential_limiter = limiter;
+        self
+    }
+
+    /// Timeout and reply size limit for broadcast URLs named by a client
+    /// (`chain_rpc` in the node config).
+    #[must_use]
+    pub const fn with_client_url_limits(
+        mut self,
+        limits: nox_core::chain_rpc::ChainRpcLimits,
+    ) -> Self {
+        self.client_url_limits = limits;
         self
     }
 
@@ -1088,11 +1102,12 @@ impl EthereumHandler {
             // Pinned to the validated address with redirects disabled, so neither
             // DNS rebinding nor an upstream redirect can reach another host.
             let user_provider =
-                build_pinned_http1_provider(&validated_url, resolved_ip).map_err(|e| {
-                    ServiceError::ProcessingFailed(format!(
-                        "Failed to create provider for user-supplied RPC URL: {e}"
-                    ))
-                })?;
+                build_pinned_http1_provider(&validated_url, resolved_ip, self.client_url_limits)
+                    .map_err(|e| {
+                        ServiceError::ProcessingFailed(format!(
+                            "Failed to create provider for user-supplied RPC URL: {e}"
+                        ))
+                    })?;
 
             debug!(
                 packet_id,
@@ -1269,6 +1284,7 @@ impl EthereumHandler {
             last_quote_prune_unix: AtomicU64::new(0),
             credential_limiter: None,
             destination_limiter: None,
+            client_url_limits: crate::config::ChainRpcConfig::default().client_url_limits(),
         })
     }
 }

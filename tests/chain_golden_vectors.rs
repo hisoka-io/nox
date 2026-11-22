@@ -914,6 +914,7 @@ async fn executor_upstream_requests() {
 
     let fingerprint = fetch_registry_fingerprint(
         &server.uri(),
+        nox_core::chain_rpc::ChainRpcLimits::default(),
         " 0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6 ",
     )
     .await

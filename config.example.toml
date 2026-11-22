@@ -231,6 +231,18 @@ max_response_bytes = 1048576      # 1 MB
 # max_cached_hosts = 256
 
 # ---
+# [chain_rpc] -- Chain RPC clients (eth_rpc_url and client-named RPC URLs)
+# ---
+
+[chain_rpc]
+# Whole-request timeout of every chain RPC call, from connect to the last byte.
+request_timeout_secs = 30
+# Largest reply read from eth_rpc_url.
+max_response_bytes = 16777216               # 16 MiB
+# Largest reply read from an RPC or broadcast URL named by a client (exit node).
+client_url_max_response_bytes = 4194304     # 4 MiB
+
+# ---
 # [ingress] -- Abuse controls for ingress_port (and CORS on metrics_port)
 # ---
 

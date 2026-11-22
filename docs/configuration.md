@@ -151,6 +151,21 @@ Each upstream origin gets a client pinned to the addresses its host resolves
 to. Every address must pass the SSRF check; the client is reused while the
 host keeps resolving to addresses it was pinned to.
 
+### `[chain_rpc]`
+
+Limits for every JSON-RPC client the node opens: the operator's `eth_rpc_url` (chain observer, registry sync,
+paid execution, the exit's RPC proxy) and the RPC and broadcast URLs that clients name at an exit.
+
+| Field | Default | Description |
+|---|---|---|
+| `request_timeout_secs` | `30` | Whole-request timeout of a chain RPC call, from connect until the last reply byte. A call over it fails as a timeout |
+| `max_response_bytes` | `16777216` | Largest reply read from `eth_rpc_url` (16 MiB) |
+| `client_url_max_response_bytes` | `4194304` | Largest reply read from an RPC or broadcast URL named by a client (4 MiB) |
+
+Reply bodies are read in chunks and reading stops at the limit. A client whose URL hits a limit gets
+`upstream RPC reply exceeds the exit's size limit` or `upstream RPC request timed out`. All three values must be at
+least 1. The 15 s proxy timeouts of the exit's RPC and broadcast services still apply on top.
+
 ### `[ingress]`
 
 | Field | Default | Description |

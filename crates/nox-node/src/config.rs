@@ -424,6 +424,70 @@ impl Default for HttpConfig {
     }
 }
 
+/// Default largest reply read from a client-named RPC or broadcast URL (4 MiB).
+pub const DEFAULT_CHAIN_RPC_CLIENT_URL_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Limits on the node's JSON-RPC clients: the operator's `eth_rpc_url` and the
+/// RPC and broadcast URLs that clients name at an exit.
+#[derive(Debug, Deserialize, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ChainRpcConfig {
+    /// Whole-request timeout of every chain RPC call, from connect until the
+    /// last reply byte.
+    pub request_timeout_secs: u64,
+    /// Largest reply body read from `eth_rpc_url`.
+    pub max_response_bytes: usize,
+    /// Largest reply body read from an RPC or broadcast URL named by a client.
+    pub client_url_max_response_bytes: usize,
+}
+
+impl Default for ChainRpcConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout_secs: nox_core::chain_rpc::DEFAULT_REQUEST_TIMEOUT.as_secs(),
+            max_response_bytes: nox_core::chain_rpc::DEFAULT_MAX_RESPONSE_BYTES,
+            client_url_max_response_bytes: DEFAULT_CHAIN_RPC_CLIENT_URL_MAX_RESPONSE_BYTES,
+        }
+    }
+}
+
+impl ChainRpcConfig {
+    /// Limits for the operator's `eth_rpc_url`.
+    #[must_use]
+    pub const fn operator_limits(&self) -> nox_core::chain_rpc::ChainRpcLimits {
+        nox_core::chain_rpc::ChainRpcLimits {
+            request_timeout: std::time::Duration::from_secs(self.request_timeout_secs),
+            max_response_bytes: self.max_response_bytes,
+        }
+    }
+
+    /// Limits for an RPC or broadcast URL named by a client.
+    #[must_use]
+    pub const fn client_url_limits(&self) -> nox_core::chain_rpc::ChainRpcLimits {
+        nox_core::chain_rpc::ChainRpcLimits {
+            request_timeout: std::time::Duration::from_secs(self.request_timeout_secs),
+            max_response_bytes: self.client_url_max_response_bytes,
+        }
+    }
+
+    #[must_use]
+    pub fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.request_timeout_secs == 0 {
+            errors.push("chain_rpc.request_timeout_secs must be at least 1 (got: 0)".to_string());
+        }
+        if self.max_response_bytes == 0 {
+            errors.push("chain_rpc.max_response_bytes must be at least 1 (got: 0)".to_string());
+        }
+        if self.client_url_max_response_bytes == 0 {
+            errors.push(
+                "chain_rpc.client_url_max_response_bytes must be at least 1 (got: 0)".to_string(),
+            );
+        }
+        errors
+    }
+}
+
 /// Default sustained requests per second one client IP may send to the HTTP ingress.
 pub const DEFAULT_INGRESS_RATE_LIMIT_PER_SEC: u32 = 100;
 /// Default number of requests one client IP may send in a burst above the sustained rate.
@@ -1016,6 +1080,9 @@ pub struct NoxConfig {
 
     pub node_role: NodeRole,
     pub http: HttpConfig,
+    /// Timeout and reply size limits of every chain RPC client.
+    #[serde(default)]
+    pub chain_rpc: ChainRpcConfig,
     #[serde(default)]
     pub exit_workers: ExitWorkerConfig,
     /// Caps on partial responses waiting for more SURBs at an exit.
@@ -1118,6 +1185,7 @@ impl std::fmt::Debug for NoxConfig {
             .field("benchmark_mode", &self.benchmark_mode)
             .field("node_role", &self.node_role)
             .field("http", &self.http)
+            .field("chain_rpc", &self.chain_rpc)
             .field("exit_workers", &self.exit_workers)
             .field("exit_replenishment", &self.exit_replenishment)
             .field("tunnel", &self.tunnel)
@@ -1206,6 +1274,7 @@ impl Default for NoxConfig {
             benchmark_mode: false,
             node_role: NodeRole::default(),
             http: HttpConfig::default(),
+            chain_rpc: ChainRpcConfig::default(),
             exit_workers: ExitWorkerConfig::default(),
             exit_replenishment: ReplenishmentConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -1319,6 +1388,7 @@ impl NoxConfig {
         errors.extend(self.exit_replenishment.validation_errors());
         errors.extend(self.tunnel.validation_errors());
         errors.extend(self.exit_limits.validation_errors());
+        errors.extend(self.chain_rpc.validation_errors());
 
         if self.chain_id == 0 && !bench {
             errors.push("chain_id is 0 (must be set for production)".into());
@@ -2053,6 +2123,51 @@ mod tests {
             parsed.maintenance_interval_secs,
             DEFAULT_STORAGE_MAINTENANCE_INTERVAL_SECS
         );
+    }
+
+    #[test]
+    fn chain_rpc_defaults_overrides_and_zero_values() {
+        let defaults = ChainRpcConfig::default();
+        assert!(defaults.validation_errors().is_empty());
+        assert_eq!(
+            defaults.operator_limits(),
+            nox_core::chain_rpc::ChainRpcLimits::default()
+        );
+        assert_eq!(
+            defaults.client_url_limits().max_response_bytes,
+            DEFAULT_CHAIN_RPC_CLIENT_URL_MAX_RESPONSE_BYTES
+        );
+
+        let parsed: ChainRpcConfig = Config::builder()
+            .add_source(config::File::from_str(
+                "request_timeout_secs = 5\nclient_url_max_response_bytes = 65536",
+                config::FileFormat::Toml,
+            ))
+            .build()
+            .and_then(Config::try_deserialize)
+            .expect("chain_rpc section");
+        assert_eq!(
+            parsed.client_url_limits().request_timeout,
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(parsed.client_url_limits().max_response_bytes, 65536);
+        assert_eq!(
+            parsed.max_response_bytes,
+            nox_core::chain_rpc::DEFAULT_MAX_RESPONSE_BYTES
+        );
+
+        let zero = ChainRpcConfig {
+            request_timeout_secs: 0,
+            max_response_bytes: 0,
+            client_url_max_response_bytes: 0,
+        };
+        assert_eq!(zero.validation_errors().len(), 3);
+        let mut config = NoxConfig::default();
+        config.chain_rpc.request_timeout_secs = 0;
+        let errors = config.validate().unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("chain_rpc.request_timeout_secs")));
     }
 
     #[test]
