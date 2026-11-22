@@ -5,10 +5,23 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 
 ## [Unreleased]
 
+## [0.4.0-rc.14] - 2026-11-22
+
+### Upgrade notes
+
+- Upgrade one node at a time; configuration files from rc.13 load as they are. The Sphinx wire, fragment, FEC and
+  SURB formats and the stored record encodings stay as in rc.13; nodes on this build and rc.6 to rc.13 nodes,
+  nox-kps relays and published clients interoperate. rc.13 and rc.14 read the same `nox.redb`.
+- New optional sections with defaults: `[exit_limits]` and `[chain_rpc]` (see docs/configuration.md).
+- `nox_peers_connected_total{type="established"}` now counts each peer once, not each connection, and
+  `nox_peers_disconnected_total` carries a `reason` label. Panels comparing these counters across the upgrade show
+  a step.
+
 ### Security
 
 - quinn-udp 0.5.16 in nox-kps (RUSTSEC-2026-0538) and url 2.5.9 (RUSTSEC-2026-0592).
 - The libp2p-gossipsub advisories RUSTSEC-2026-0534 to 0537 carry dated exceptions to 2026-12-19 until the libp2p 0.57 upgrade ([SECURITY.md](SECURITY.md)).
+- The pin-utils exception (RUSTSEC-2026-0441) runs to 2027-03-31 and clears when `if-watch` or `webrtc-util` moves to nix 0.29.
 
 ### Changed
 
@@ -20,6 +33,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
   `client_url_max_response_bytes` 4 MiB for RPC and broadcast URLs named by a client). Clients get
   `upstream RPC request timed out` or `upstream RPC reply exceeds the exit's size limit` when one applies.
   `nox_core::chain_rpc` provider builders take a `ChainRpcLimits`.
+- Peer link counters count each peer once and label why this node closed a link.
+- Node startup checks `benchmark_mode_active()`, so builds without `dev-node` always take the chain exit path.
 
 ### Added
 
@@ -27,9 +42,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
   The `zero-fill-builder` feature of nox-crypto keeps the zero-padding builders for compatibility tests. Golden
   vectors for both fills are in `crates/nox-crypto/tests/vectors/`.
 - Exit rate limits per destination host (HTTP proxy, tunnel opens, client-named RPC and broadcast URLs) and per
-  payment credential of a paid quote, in `[exit_limits]`, with `nox_exit_rate_limited_total{scope,service}`,
-  `nox_exit_rate_limit_tracked{scope}` and `nox_exit_rate_limit_untracked_total{scope}`. Defaults sit well above
-  testnet traffic.
+  payment credential of a paid quote (repeated quotes for one payment), in `[exit_limits]`, with
+  `nox_exit_rate_limited_total{scope,service}`, `nox_exit_rate_limit_tracked{scope}` and
+  `nox_exit_rate_limit_untracked_total{scope}`. Defaults sit well above testnet traffic.
+- [docs/exit-policy.md](docs/exit-policy.md): what an exit relays and refuses, its limits and how to report abuse.
 
 ## [0.4.0-rc.13] - 2026-11-11
 
