@@ -136,9 +136,10 @@ pub fn log_registry_scope_outcome(
 /// Reads `topologyFingerprint()` from the registry at the latest block.
 pub async fn fetch_registry_fingerprint(
     rpc_url: &str,
+    limits: nox_core::chain_rpc::ChainRpcLimits,
     registry_address: &str,
 ) -> Result<[u8; 32], InfrastructureError> {
-    let provider = build_http1_provider(rpc_url)?;
+    let provider = build_http1_provider(rpc_url, limits)?;
     let registry = parse_address(registry_address.trim()).map_err(|e| {
         InfrastructureError::Blockchain(format!("Invalid registry address {registry_address}: {e}"))
     })?;

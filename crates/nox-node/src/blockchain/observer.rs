@@ -265,7 +265,8 @@ impl ChainObserver {
         storage: Arc<dyn IStorageRepository>,
         metrics: MetricsService,
     ) -> Result<Self, InfrastructureError> {
-        let provider = build_http1_provider(&config.eth_rpc_url)?;
+        let provider =
+            build_http1_provider(&config.eth_rpc_url, config.chain_rpc.operator_limits())?;
 
         let address = nox_core::eth::parse_address(registry_address_hex).map_err(|e| {
             InfrastructureError::Blockchain(format!("Invalid Registry Address: {e}"))

@@ -15,6 +15,11 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 - Sphinx packet and SURB builders fill the final hop's unused routing bytes with random bytes instead of zeros, so
   the final hop cannot read the path length from where the filler starts. Nodes read the same bytes as before, so the
   wire format is unchanged and packets from older and newer clients interoperate.
+- Every chain RPC client has a whole-request timeout and reads reply bodies up to a byte limit, set in the new
+  `[chain_rpc]` section (`request_timeout_secs` 30, `max_response_bytes` 16 MiB for `eth_rpc_url`,
+  `client_url_max_response_bytes` 4 MiB for RPC and broadcast URLs named by a client). Clients get
+  `upstream RPC request timed out` or `upstream RPC reply exceeds the exit's size limit` when one applies.
+  `nox_core::chain_rpc` provider builders take a `ChainRpcLimits`.
 
 ### Added
 

@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 use axum::{routing::get, Json, Router};
 use clap::Parser;
 use libp2p::{identity, PeerId};
+use nox_core::chain_rpc::ChainRpcLimits;
 use nox_core::chain_rpc::{eth_call, ChainProvider};
 use nox_core::primary_layer_for_role;
 use nox_core::{
@@ -191,7 +192,7 @@ async fn main() -> Result<()> {
                 cli.exit_private_key_env
             )
         })?);
-    let chain_start_block = build_http1_provider(cli.rpc_url.as_str())?
+    let chain_start_block = build_http1_provider(cli.rpc_url.as_str(), ChainRpcLimits::default())?
         .get_block_number()
         .await?;
     let oracle_url = format!("http://127.0.0.1:{}", cli.oracle_port);
@@ -606,7 +607,7 @@ fn validate_registration_nodes(nodes: &[RegistrationNode]) -> Result<()> {
 }
 
 async fn wait_for_registry(manifest: &RegistrationManifest, timeout: Duration) -> Result<u64> {
-    let provider = build_http1_provider(manifest.rpc_url.as_str())?;
+    let provider = build_http1_provider(manifest.rpc_url.as_str(), ChainRpcLimits::default())?;
     let registry = manifest
         .registry_address
         .parse::<Address>()

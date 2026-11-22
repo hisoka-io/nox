@@ -443,7 +443,10 @@ async fn caught_revert_receipt_has_no_committed_payment() -> anyhow::Result<()> 
     let deployer_address = deployer.address();
     let client = ProviderBuilder::new()
         .wallet(EthereumWallet::from(deployer))
-        .connect_client(nox_core::chain_rpc::http1_rpc_client(&anvil.endpoint())?)
+        .connect_client(nox_core::chain_rpc::http1_rpc_client(
+            &anvil.endpoint(),
+            nox_core::chain_rpc::ChainRpcLimits::default(),
+        )?)
         .erased();
 
     let token = deploy_contract(

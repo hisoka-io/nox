@@ -11,7 +11,7 @@ use alloy::rpc::types::{Log, TransactionReceipt};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::SignerSync;
 use alloy::transports::{RpcError, TransportError};
-use nox_core::chain_rpc::{self, ChainProvider};
+use nox_core::chain_rpc::{self, ChainProvider, ChainRpcLimits};
 use std::borrow::Cow;
 use std::str::FromStr;
 #[cfg(feature = "dev-node")]
@@ -22,9 +22,13 @@ use zeroize::Zeroizing;
 use crate::config::NoxConfig;
 use nox_core::traits::InfrastructureError;
 
-/// Provider for an operator-configured RPC URL (HTTP/1 only).
-pub fn build_http1_provider(rpc_url: &str) -> Result<ChainProvider, InfrastructureError> {
-    chain_rpc::http1_provider(rpc_url)
+/// Provider for an operator-configured RPC URL (HTTP/1 only), with the
+/// request timeout and reply size limit in `limits`.
+pub fn build_http1_provider(
+    rpc_url: &str,
+    limits: ChainRpcLimits,
+) -> Result<ChainProvider, InfrastructureError> {
+    chain_rpc::http1_provider(rpc_url, limits)
         .map_err(|error| InfrastructureError::Blockchain(error.to_string()))
 }
 
@@ -35,8 +39,9 @@ pub fn build_http1_provider(rpc_url: &str) -> Result<ChainProvider, Infrastructu
 pub fn build_pinned_http1_provider(
     url: &url::Url,
     pinned_ip: std::net::IpAddr,
+    limits: ChainRpcLimits,
 ) -> Result<ChainProvider, InfrastructureError> {
-    chain_rpc::pinned_http1_provider(url, pinned_ip)
+    chain_rpc::pinned_http1_provider(url, pinned_ip, limits)
         .map_err(|error| InfrastructureError::Blockchain(error.to_string()))
 }
 
@@ -90,6 +95,10 @@ pub fn json_rpc_error_text(payload: &ErrorPayload) -> String {
 pub fn public_rpc_error(error: &TransportError) -> String {
     match error.as_error_resp() {
         Some(response) => json_rpc_error_text(response),
+        None if chain_rpc::is_timeout(error) => "upstream RPC request timed out".to_string(),
+        None if chain_rpc::is_response_too_large(error) => {
+            "upstream RPC reply exceeds the exit's size limit".to_string()
+        }
         None => "upstream RPC request failed".to_string(),
     }
 }
@@ -479,7 +488,8 @@ struct BlockTimestamp {
 
 impl ChainExecutor {
     pub async fn new(config: &NoxConfig) -> Result<Self, InfrastructureError> {
-        let provider = build_http1_provider(&config.eth_rpc_url)?;
+        let provider =
+            build_http1_provider(&config.eth_rpc_url, config.chain_rpc.operator_limits())?;
 
         // Determine mock mode -- only available with dev-node feature
         #[cfg(feature = "dev-node")]
@@ -1362,7 +1372,8 @@ mod tests {
     }
 
     async fn executor_with_rpc_url(rpc_url: &str) -> ChainExecutor {
-        let provider = build_http1_provider(rpc_url).expect("test provider URL");
+        let provider =
+            build_http1_provider(rpc_url, ChainRpcLimits::default()).expect("test provider URL");
         let wallet = PrivateKeySigner::random();
         ChainExecutor {
             provider,
@@ -1794,9 +1805,12 @@ mod user_rpc_provider_tests {
         let hits = Arc::new(AtomicUsize::new(0));
         let target = counting_rpc_server(hits.clone()).await;
 
-        let provider =
-            build_pinned_http1_provider(&user_url(target.port()), IpAddr::V4(Ipv4Addr::LOCALHOST))
-                .expect("provider");
+        let provider = build_pinned_http1_provider(
+            &user_url(target.port()),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ChainRpcLimits::default(),
+        )
+        .expect("provider");
         let result: serde_json::Value = provider
             .raw_request(Cow::Borrowed("eth_blockNumber"), ())
             .await
@@ -1829,6 +1843,7 @@ mod user_rpc_provider_tests {
         let provider = build_pinned_http1_provider(
             &user_url(redirector.port()),
             IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ChainRpcLimits::default(),
         )
         .expect("provider");
         let error = provider
@@ -1856,6 +1871,7 @@ mod user_rpc_provider_tests {
         let provider = build_pinned_http1_provider(
             &user_url(reverting.port()),
             IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ChainRpcLimits::default(),
         )
         .expect("provider");
         let error = provider
@@ -1867,15 +1883,78 @@ mod user_rpc_provider_tests {
         let html =
             serve(Router::new().route("/", post(|| async { "<html>internal admin page</html>" })))
                 .await;
-        let provider =
-            build_pinned_http1_provider(&user_url(html.port()), IpAddr::V4(Ipv4Addr::LOCALHOST))
-                .expect("provider");
+        let provider = build_pinned_http1_provider(
+            &user_url(html.port()),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ChainRpcLimits::default(),
+        )
+        .expect("provider");
         let error = provider
             .raw_request::<_, serde_json::Value>(Cow::Borrowed("eth_call"), ())
             .await
             .expect_err("a non JSON-RPC body is an error");
         let public = public_rpc_error(&error);
         assert!(!public.contains("internal admin page"), "{public}");
+        assert!(!public.contains(UNRESOLVABLE_HOST), "{public}");
+    }
+
+    fn short_limits() -> ChainRpcLimits {
+        ChainRpcLimits {
+            request_timeout: std::time::Duration::from_millis(300),
+            max_response_bytes: 1024,
+        }
+    }
+
+    #[tokio::test]
+    async fn hung_upstream_is_classified_as_timeout() {
+        let silent = serve(Router::new().route(
+            "/",
+            post(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                "late"
+            }),
+        ))
+        .await;
+        let provider =
+            build_http1_provider(&format!("http://{silent}/"), short_limits()).expect("provider");
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider.raw_request::<_, serde_json::Value>(Cow::Borrowed("eth_simulateV1"), ()),
+        )
+        .await
+        .expect("client timeout fires first")
+        .expect_err("timeout");
+        assert_eq!(
+            classify_provider_error(&error, "eth_simulateV1"),
+            SimulationBackendError::Timeout {
+                backend: "eth_simulateV1",
+            }
+        );
+        assert_eq!(public_rpc_error(&error), "upstream RPC request timed out");
+    }
+
+    #[tokio::test]
+    async fn oversized_reply_gets_a_fixed_public_error() {
+        let large = serve(Router::new().route("/", post(|| async { "x".repeat(8192) }))).await;
+        let provider = build_pinned_http1_provider(
+            &user_url(large.port()),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            short_limits(),
+        )
+        .expect("provider");
+        let error = provider
+            .raw_request::<_, serde_json::Value>(Cow::Borrowed("eth_call"), ())
+            .await
+            .expect_err("reply over the limit");
+        assert!(chain_rpc::is_response_too_large(&error), "{error}");
+        assert_eq!(
+            classify_provider_error(&error, "eth_simulateV1"),
+            SimulationBackendError::Transport {
+                backend: "eth_simulateV1",
+            }
+        );
+        let public = public_rpc_error(&error);
+        assert_eq!(public, "upstream RPC reply exceeds the exit's size limit");
         assert!(!public.contains(UNRESOLVABLE_HOST), "{public}");
     }
 }

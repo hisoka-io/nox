@@ -25,7 +25,7 @@ use alloy::rpc::json_rpc::{RpcRecv, RpcSend};
 use async_trait::async_trait;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
-use nox_core::chain_rpc::ChainProvider;
+use nox_core::chain_rpc::{ChainProvider, ChainRpcLimits};
 use nox_core::eth::{block_quantity, logs_filter, parse_address, parse_fixed_hex, TopicFilter};
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -53,6 +53,8 @@ pub struct RpcHandler {
     allow_private_ips: bool,
     /// Per-destination rate limit on user-supplied RPC URLs.
     destination_limiter: Option<Arc<crate::services::exit_limits::KeyedRateLimiter>>,
+    /// Timeout and reply size limit for client-named RPC URLs.
+    client_url_limits: ChainRpcLimits,
 }
 
 impl RpcHandler {
@@ -61,9 +63,10 @@ impl RpcHandler {
         response_packer: Arc<ResponsePacker>,
         publisher: Arc<dyn IEventPublisher>,
         rpc_url: &str,
+        chain_rpc: &crate::config::ChainRpcConfig,
         metrics: MetricsService,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let provider = build_http1_provider(rpc_url)?;
+        let provider = build_http1_provider(rpc_url, chain_rpc.operator_limits())?;
 
         let allowed_methods: HashSet<String> = [
             // Account & state queries
@@ -123,6 +126,7 @@ impl RpcHandler {
             metrics,
             allow_private_ips: false,
             destination_limiter: None,
+            client_url_limits: chain_rpc.client_url_limits(),
         })
     }
 
@@ -131,10 +135,11 @@ impl RpcHandler {
         response_packer: Arc<ResponsePacker>,
         publisher: Arc<dyn IEventPublisher>,
         rpc_url: &str,
+        chain_rpc: &crate::config::ChainRpcConfig,
         allowed_methods: HashSet<String>,
         metrics: MetricsService,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let provider = build_http1_provider(rpc_url)?;
+        let provider = build_http1_provider(rpc_url, chain_rpc.operator_limits())?;
 
         let quota = Quota::per_second(NonZeroU32::new(100).unwrap_or(NonZeroU32::MIN));
         let rate_limiter = Arc::new(RateLimiter::direct(quota));
@@ -149,6 +154,7 @@ impl RpcHandler {
             metrics,
             allow_private_ips: false,
             destination_limiter: None,
+            client_url_limits: chain_rpc.client_url_limits(),
         })
     }
 
@@ -157,9 +163,10 @@ impl RpcHandler {
         response_packer: Arc<ResponsePacker>,
         publisher: Arc<dyn IEventPublisher>,
         rpc_url: &str,
+        chain_rpc: &crate::config::ChainRpcConfig,
         metrics: MetricsService,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let provider = build_http1_provider(rpc_url)?;
+        let provider = build_http1_provider(rpc_url, chain_rpc.operator_limits())?;
 
         let allowed_methods: HashSet<String> = [
             "eth_call",
@@ -195,6 +202,7 @@ impl RpcHandler {
             metrics,
             allow_private_ips: true,
             destination_limiter: None,
+            client_url_limits: chain_rpc.client_url_limits(),
         })
     }
 
@@ -325,11 +333,12 @@ impl RpcHandler {
             // Pinned to the validated address with redirects disabled, so neither
             // DNS rebinding nor an upstream redirect can reach another host.
             let user_provider =
-                build_pinned_http1_provider(&validated_url, resolved_ip).map_err(|e| {
-                    ServiceError::ProcessingFailed(format!(
-                        "Failed to create provider for user-supplied RPC URL: {e}"
-                    ))
-                })?;
+                build_pinned_http1_provider(&validated_url, resolved_ip, self.client_url_limits)
+                    .map_err(|e| {
+                        ServiceError::ProcessingFailed(format!(
+                            "Failed to create provider for user-supplied RPC URL: {e}"
+                        ))
+                    })?;
 
             tokio::time::timeout(
                 RPC_REQUEST_TIMEOUT,
@@ -1067,6 +1076,7 @@ mod tests {
             Arc::new(ResponsePacker::new()),
             nox_core::NoopPublisher::arc(),
             "http://127.0.0.1:1",
+            &crate::config::ChainRpcConfig::default(),
             metrics,
         )
         .unwrap()
@@ -1369,6 +1379,7 @@ mod golden_tests {
             Arc::new(ResponsePacker::new()),
             nox_core::NoopPublisher::arc(),
             &url,
+            &crate::config::ChainRpcConfig::default(),
             MetricsService::new(),
         )
         .expect("handler");
@@ -1453,5 +1464,63 @@ mod golden_tests {
             "proxy outputs differ:\n{}",
             serde_json::to_string_pretty(&actual).expect("encode")
         );
+    }
+
+    /// A client-named RPC URL whose reply passes
+    /// `chain_rpc.client_url_max_response_bytes` gets a fixed error, never the
+    /// body, and the request counts as an error.
+    #[tokio::test]
+    async fn client_url_reply_over_the_limit_gets_a_fixed_error() {
+        let router =
+            axum::Router::new().route("/", axum::routing::post(|| async { "x".repeat(8192) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let url = format!("http://{address}/");
+
+        let chain_rpc = crate::config::ChainRpcConfig {
+            client_url_max_response_bytes: 1024,
+            ..crate::config::ChainRpcConfig::default()
+        };
+        let metrics = MetricsService::new();
+        let handler = RpcHandler::new_simulation(
+            Arc::new(ResponsePacker::new()),
+            nox_core::NoopPublisher::arc(),
+            "http://127.0.0.1:1",
+            &chain_rpc,
+            metrics.clone(),
+        )
+        .expect("handler");
+        assert_eq!(handler.client_url_limits.max_response_bytes, 1024);
+
+        let provider = build_pinned_http1_provider(
+            &url.parse().expect("url"),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            handler.client_url_limits,
+        )
+        .expect("provider");
+        let error = RpcHandler::execute_rpc_generic(&provider, "eth_chainId", json!([]))
+            .await
+            .expect_err("reply over the limit");
+        assert_eq!(
+            error,
+            "RPC call failed: upstream RPC reply exceeds the exit's size limit"
+        );
+
+        let _ = handler
+            .handle_rpc_request(1, "eth_chainId", b"[]", Some(&url), Vec::new())
+            .await;
+        let errors = metrics
+            .rpc_requests_total
+            .get_or_create(&vec![
+                ("method".into(), "eth_chainId".into()),
+                ("result".into(), "error".into()),
+            ])
+            .get();
+        assert_eq!(errors, 1);
     }
 }

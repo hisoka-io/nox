@@ -283,6 +283,7 @@ impl NoxNode {
             let bootstrap_result = if registry_configured {
                 match fetch_registry_fingerprint(
                     &config.eth_rpc_url,
+                    config.chain_rpc.operator_limits(),
                     &config.registry_contract_address,
                 )
                 .await
@@ -548,6 +549,7 @@ impl NoxNode {
                     response_packer,
                     bus_publisher.clone(),
                     &config.eth_rpc_url,
+                    &config.chain_rpc,
                     metrics_service.clone(),
                 )
                 .map_err(|e| anyhow::anyhow!("Failed to create RPC handler: {e}"))?
@@ -638,6 +640,7 @@ impl NoxNode {
                     config.initial_fee_buffer_bps,
                     &config.nox_entry_point_address,
                 )?
+                .with_client_url_limits(config.chain_rpc.client_url_limits())
                 .with_quote_policy(&config)?
                 .with_credential_limiter(
                     crate::services::exit_limits::KeyedRateLimiter::credential(
@@ -713,6 +716,7 @@ impl NoxNode {
                     response_packer.clone(),
                     bus_publisher.clone(),
                     &config.eth_rpc_url,
+                    &config.chain_rpc,
                     metrics_service.clone(),
                 )
                 .map_err(|e| anyhow::anyhow!("RPC handler init failed: {e}"))?

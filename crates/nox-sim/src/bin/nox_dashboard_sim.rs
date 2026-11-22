@@ -166,8 +166,11 @@ async fn deploy_lightweight_contracts(
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".parse()?;
     let admin_address = admin_wallet.address();
 
-    let rpc = nox_core::chain_rpc::http1_rpc_client(anvil_rpc)?
-        .with_poll_interval(Duration::from_millis(100));
+    let rpc = nox_core::chain_rpc::http1_rpc_client(
+        anvil_rpc,
+        nox_core::chain_rpc::ChainRpcLimits::default(),
+    )?
+    .with_poll_interval(Duration::from_millis(100));
     let client = ProviderBuilder::new()
         .wallet(EthereumWallet::from(admin_wallet))
         .connect_client(rpc)
@@ -1146,7 +1149,10 @@ async fn main() -> Result<()> {
             "Switching Anvil to {}s block time for realistic chain behavior...",
             args.block_time
         );
-        let provider = nox_node::blockchain::executor::build_http1_provider(&anvil_rpc)?;
+        let provider = nox_node::blockchain::executor::build_http1_provider(
+            &anvil_rpc,
+            nox_core::chain_rpc::ChainRpcLimits::default(),
+        )?;
         // evm_setIntervalMining(interval_seconds) -- Anvil-specific RPC
         let _: bool = provider
             .raw_request("evm_setIntervalMining".into(), [args.block_time])

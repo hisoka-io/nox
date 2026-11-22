@@ -3,7 +3,7 @@
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
-use nox_core::chain_rpc::{eth_call, http1_provider, ChainProvider};
+use nox_core::chain_rpc::{eth_call, http1_provider, ChainProvider, ChainRpcLimits};
 use nox_core::eth::{parse_address, parse_decimal_u256};
 use parking_lot::RwLock;
 use std::collections::HashSet;
@@ -293,8 +293,18 @@ fn select_verification_block(
     Ok(block)
 }
 
-fn build_http1_provider(rpc_url: &str) -> Result<ChainProvider, TopologySyncError> {
-    http1_provider(rpc_url).map_err(|error| TopologySyncError::ChainError(error.to_string()))
+/// Chain RPC provider for registry verification. Calls share the seed
+/// request timeout and the default reply size limit.
+fn build_http1_provider(
+    rpc_url: &str,
+    request_timeout: Duration,
+) -> Result<ChainProvider, TopologySyncError> {
+    let limits = ChainRpcLimits {
+        request_timeout,
+        ..ChainRpcLimits::default()
+    };
+    http1_provider(rpc_url, limits)
+        .map_err(|error| TopologySyncError::ChainError(error.to_string()))
 }
 
 fn validate_registry_profile(
@@ -563,7 +573,7 @@ impl TopologySyncClient {
         computed: &[u8; 32],
         block_number: u64,
     ) -> Result<(u64, HashSet<Address>), TopologySyncError> {
-        let provider = build_http1_provider(&self.config.eth_rpc_url)?;
+        let provider = build_http1_provider(&self.config.eth_rpc_url, self.config.request_timeout)?;
         let current_block = if block_number == 0 {
             tokio::time::timeout(Duration::from_secs(10), provider.get_block_number())
                 .await
